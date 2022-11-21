@@ -22,7 +22,7 @@ __global__ void sortFieldData2D(MultiLevelSparseGrid &grid)
   START_CELL_LOOP
 
   BlockType &block grid.blockList[bIndex]
-  uint old_bIndex = block.index;
+  u32 old_bIndex = block.index;
 
   Array &rhou = grid.getFieldArray(bIndex, RHOU);
   Array &rhov = grid.getFieldArray(bIndex, RHOV);
@@ -344,7 +344,7 @@ __global__ void normalizeImData(Array<dType> &ImData, dType maxImData, dType min
 
   dType delta = maxImData - minImData;
   if(i > 0 && j > 0 && i < ImData.len_i && j < ImData.len_j){  //interior cells
-    ImData(i,j) = ((ImData(i,j)-minImData)/delta)*65535;     // normalize 0to1 then multiply by max 16 bit uint
+    ImData(i,j) = ((ImData(i,j)-minImData)/delta)*65535;     // normalize 0to1 then multiply by max 16 bit u32
   }
 
 }

@@ -4,7 +4,7 @@
 #include "MultiLevelSparseGrid.cuh"
 
 
-enum Fields : uint {
+enum Fields : u32 {
   RHO = 0,
   RHOU = 1,
   RHOV = 2,
@@ -25,7 +25,7 @@ enum Fields : uint {
 
 class CompressibleSolver : public MultiLevelSparseGrid {
 public:
-  CompressibleSolver(uint baseSize_[], uint nLvlsMax_) :
+  CompressibleSolver(u32 baseSize_[], u32 nLvlsMax_) :
   MultiLevelSparseGrid(baseSize_, nLvlsMax_, 15){}
 
 };

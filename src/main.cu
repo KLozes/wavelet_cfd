@@ -7,11 +7,11 @@
 //#include "png.hpp"
 
 int main(int argc, char* argv[]) {
-  uint baseSize[2] = {blockSize*40, blockSize*40};
-  uint nLvlsMax = 1;
+  u32 baseSize[2] = {blockSize*40, blockSize*40};
+  u32 nLvlsMax = 1;
 
   CompressibleSolver *solver = new CompressibleSolver(baseSize, nLvlsMax);
-  solver->initGrid();
+  //solver->initGrid();
 
 	cudaDeviceReset();
 }

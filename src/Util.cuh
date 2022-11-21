@@ -3,11 +3,11 @@
 
 #include "Settings.cuh"
 
-__host__ __device__ constexpr uint log2(uint n) {
+__host__ __device__ constexpr u32 log2(u32 n) {
   return ((n<2) ? 1 : 1+log2(n/2));
 }
 
-__host__ __device__ constexpr uint powi(const uint base, const uint expnt) {
+__host__ __device__ constexpr u32 powi(const u32 base, const u32 expnt) {
     return ((expnt<=0) ? 1 : base*powi(base, expnt-1));
 }
 
@@ -15,14 +15,14 @@ constexpr bool isPowerOf2(int v) {
     return v && ((v & (v - 1)) == 0);
 }
 
-static constexpr uint log2BlockSize = log2(blockSize);
+static constexpr u32 log2BlockSize = log2(blockSize);
 
 // a simple square array data structure
-template<typename T, uint size>
+template<typename T, u32 size>
 struct Array {
   T data[powi(size, nDim)];
 
-  inline __host__ __device__ T& operator()(const uint i=0, const uint j=0, const uint k=0) {
+  inline __host__ __device__ T& operator()(const u32 i=0, const u32 j=0, const u32 k=0) {
     return data[size*size*k + size*j + i];
   }
 
@@ -45,14 +45,16 @@ public:
     void *ptr;
     cudaMallocManaged(&ptr, len);
     cudaDeviceSynchronize();
+  }
   void operator delete(void *ptr) {
     cudaDeviceSynchronize();
     cudaFree(ptr);
   }
 };
 
-static constexpr uint blockSizeTot = powi(blockSize, nDim);
-static constexpr uint nBlocksPerCudaBlock = cudaBlockSize/blockSizeTot;
-static constexpr uint bEmpty = nBlocksMax-1;
+static constexpr u32 blockSizeTot = powi(blockSize, nDim);
+static constexpr u32 nBlocksPerCudaBlock = cudaBlockSize/blockSizeTot;
+static constexpr u32 bEmpty = nBlocksMax-1;
+static constexpr u32 nBlocksMaxPow2 = powi(2, log2(nBlocksMax)+1);
 
 #endif
