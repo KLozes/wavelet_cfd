@@ -1,40 +1,37 @@
 #include "MultiLevelSparseGrid.cuh"
 #include "MultiLevelSparseGridKernels.cuh"
 
-/*
 void MultiLevelSparseGrid::initGrid(void) {
-  // initialize the blocks of the base grid level in cartesian order
-  u32 ind = 0;
-  for(u32 j=0; j<max(1,baseGridSize[1]/blockSize); j++) {
-    for(u32 i=0; i<max(1,baseGridSize[0]/blockSize); i++) {
-      blockLocList[ind] = mortonEncode(0, i, j);
-      blockList[ind].loc = blockLocList[ind];
-      blockList[ind].index = ind;
-      blockList[ind].parent = bEmpty;
-      blockList[ind].children = bEmpty;
-      blockList[ind].neighbors = 0;
-      ind++;
-    }
+  // initialize the hashtable keys and value to bEmpty!
+  for(u32 idx = 0; idx < nBlocksMax; idx++) {
+    hashKeyList[idx] = kEmpty;
+    hashValueList[idx] = bEmpty;
+    blockLocList[idx] = kEmpty;
+    blockIdxList[idx] = bEmpty;
+  }
+
+  // initialize the blocks of the base grid level
+  dim3 nCudaBlocks(max(1,baseGridSizeB[0]/8), max(1, baseGridSizeB[1]/8));
+	dim3 nCudaThreads(8,8);
+  initGridKernel<<<nCudaBlocks, nCudaThreads>>>(*this);
+  cudaDeviceSynchronize();
+
+  for(u32 idx = 0; idx < nBlocks; idx++) {
+    printf("blockIdx = %d\n", blockIdxList[idx]);
+    printf("blockLoc = %llu\n", blockLocList[idx]);
   }
 
   // sort the blocks and then reassign indices
-  thrust::sort_by_key(thrust::host, blockLocList, blockLocList+nBlocks, blockList);
-  for(ind = 0; ind < nBlocks; ind++) {
-    blockList[ind].index = ind;
-    u32 lvl, i, j;
-    mortonDecode(blockList[ind].loc, lvl, i, j);
-    getBaseBlockIndex(i, j) = ind;
+  sortBlocks();
+
+  for(u32 idx = 0; idx < nBlocks; idx++) {
+    printf("blockIdx = %d\n", blockIdxList[idx]);
+    printf("blockLoc = %llu\n", blockLocList[idx]);
   }
 
-  // set the Empty grid block data
-  blockList[bEmpty].loc = 0;
-  blockList[bEmpty].index = bEmpty;
-  blockList[bEmpty].parent = bEmpty;
-  blockList[bEmpty].children = bEmpty;
-  blockList[bEmpty].neighbors = 0;
-
-  sortBlocks();
 }
+
+/*
 
 __device__ u32& MultiLevelSparseGrid::getBaseBlockIndex(int i, int j) {
   i = max(0, min(int(baseGridSize[0]/blockSize)-1, i));
@@ -44,20 +41,33 @@ __device__ u32& MultiLevelSparseGrid::getBaseBlockIndex(int i, int j) {
 
 __device__  u32 MultiLevelSparseGrid::getBlockIndex(u32 lvl, u32 i, u32 j) {
   // get the base grid block
-  u32 bIndex = getBaseBlockIndex(i>>lvl, j>>lvl);
+  u32 bIdx = getBaseBlockIndex(i>>lvl, j>>lvl);
 
   // search up the tree
   for(u32 l = 1; l < lvl+1; l++) {
     u32 ib = (i >> (lvl-l)) & 1;
     u32 jb = (j >> (lvl-l)) & 1;
-    bIndex = blockList[bIndex].children(ib, jb);
+    bIdx = blockList[bIdx].children(ib, jb);
   }
-  return bIndex;
+  return bIdx;
+}
+*/
+
+__device__ void MultiLevelSparseGrid::activateBlock(u32 lvl, u32 i, u32 j, u32 k) {
+  u64 loc = mortonEncode(lvl, i, j);
+  u32 idx = hashInsert(loc);
+  blockLocList[idx] = loc;
+  blockIdxList[idx] = idx;
 }
 
-__device__ void MultiLevelSparseGrid::activateBlock(u32 lvl, u32 i, u32 j) {
-  // get the base grid block
-  u32 parent = getBaseBlockIndex(i>>lvl, j>>lvl);
+__device__ void MultiLevelSparseGrid::deactivateBlock(u32 lvl, u32 i, u32 j, u32 k) {
+  u64 loc = mortonEncode(lvl, i, j);
+  u32 idx = hashDelete(loc);
+  blockLocList[idx] = kEmpty;
+  blockIdxList[idx] = bEmpty;
+}
+
+/*
 
   // search up the tree and activate blocks if they do not exist
   for(u32 l = 1; l < lvl+1; l++) {
@@ -66,13 +76,13 @@ __device__ void MultiLevelSparseGrid::activateBlock(u32 lvl, u32 i, u32 j) {
     u32 jb = j >> (lvl-l);
     u64 locb = mortonEncode(lvlb, ib, jb);
 
-    // get the pointer the child index
+    // get the pointer the child idx
     u32 *child = &(blockList[parent].children(ib&1, jb&1));
 
-    // swap in a temp index if it is empty
+    // swap in a temp idx if it is empty
     u32 prev = atomicCAS(child, bEmpty, 0);
 
-    // wait until temp index changes to a real index
+    // wait until temp idx changes to a real idx
     while(*child == 0) {
       // if the previous value of the atomicCAS was empty,
       // increment the nBlocks counter create the child block
@@ -81,7 +91,7 @@ __device__ void MultiLevelSparseGrid::activateBlock(u32 lvl, u32 i, u32 j) {
 
         blockLocList[nBlocksPrev] = locb;
         blockList[nBlocksPrev].loc = locb;
-        blockList[nBlocksPrev].index = nBlocksPrev;
+        blockList[nBlocksPrev].idx = nBlocksPrev;
         blockList[nBlocksPrev].parent = parent;
         blockList[nBlocksPrev].children = bEmpty;
         blockList[nBlocksPrev].neighbors = bEmpty;
@@ -92,14 +102,15 @@ __device__ void MultiLevelSparseGrid::activateBlock(u32 lvl, u32 i, u32 j) {
     parent = *child;
   }
 }
-
-__device__ void MultiLevelSparseGrid::deactivateBlock(u32 bIndex) {
-  blockLocList[bIndex] = 0;
-  blockList[bIndex].loc = 0;
-  blockList[bIndex].index = bEmpty;
-  blockList[bIndex].parent = bEmpty;
-  blockList[bIndex].children = bEmpty;
-  blockList[bIndex].neighbors = bEmpty;
+*/
+/*
+__device__ void MultiLevelSparseGrid::deactivateBlock(u32 bIdx) {
+  blockLocList[bIdx] = 0;
+  blockList[bIdx].loc = 0;
+  blockList[bIdx].idx = bEmpty;
+  blockList[bIdx].parent = bEmpty;
+  blockList[bIdx].children = bEmpty;
+  blockList[bIdx].neighbors = bEmpty;
 }
 
 __device__ void MultiLevelSparseGrid::getDijk(u32 n, u32 &di, u32 &dj) {
@@ -107,14 +118,14 @@ __device__ void MultiLevelSparseGrid::getDijk(u32 n, u32 &di, u32 &dj) {
     dj = n / 3 - 1;
 }
 
-__device__ dataType& MultiLevelSparseGrid::getFieldValue(u32 fIndex, u32 bIndex, u32 i, u32 j) {
-  return fieldDataList[fIndex*nBlocksMax + bIndex](i, j);
+__device__ dataType& MultiLevelSparseGrid::getFieldValue(u32 fIdx, u32 bIdx, u32 i, u32 j) {
+  return fieldDataList[fIdx*nBlocksMax + bIdx](i, j);
 }
 
-__device__ dataType& MultiLevelSparseGrid::getParentFieldValue(u32 fIndex, u32 bIndex, u32 ib, u32 jb, u32 i, u32 j) {
+__device__ dataType& MultiLevelSparseGrid::getParentFieldValue(u32 fIdx, u32 bIdx, u32 ib, u32 jb, u32 i, u32 j) {
   i = i/2 + ib&1*blockSize/2;
   j = j/2 + jb&1*blockSize/2;
-  return fieldDataList[fIndex*nBlocksMax + blockList[bIndex].parent](i, j);
+  return fieldDataList[fIdx*nBlocksMax + blockList[bIdx].parent](i, j);
 }
 */
 
@@ -128,29 +139,34 @@ __device__ u64 MultiLevelSparseGrid::hash(u64 x) {
   return x;
 }
 
-__device__ void MultiLevelSparseGrid::hashInsert(u64 key, u32 value) {
-    u32 slot = (hash(key) % (nBlocksMax-1));
-
-    while (true) {
-        u64 prev = atomicCAS(&hashKeyList[slot], (u64)bEmpty, key);
-        if (prev == bEmpty || prev == key) {
-            hashValueList[slot] = value;
-            return;
-        }
-        slot = (slot + 1) % (nBlocksMax-1);
-    }
+__device__ u32 MultiLevelSparseGrid::hashInsert(u64 key) {
+  u32 slot = hash(key) % (nBlocksMax-1);
+  while (true) {
+      u64 prev = atomicCAS(&hashKeyList[slot], kEmpty, key);
+      if (prev == kEmpty) {
+        uint value = atomicAdd(&nBlocks, 1);
+        hashValueList[slot] = value;
+        return value;
+      }
+      if (prev == key) {
+        return hashValueList[slot];
+      }
+      slot = (slot + 1) % (nBlocksMax-1);
+  }
 }
 
-__device__ void MultiLevelSparseGrid::hashDelete(u64 key) {
+__device__ u32 MultiLevelSparseGrid::hashDelete(u64 key) {
   u32 slot = hash(key) % (nBlocksMax-1);
   while (true) {
       if (hashKeyList[slot] == key) {
-          hashKeyList[slot] = bEmpty;
-          hashValueList[slot] = bEmpty;
-          return;
+        hashKeyList[slot] = kEmpty;
+        u32 value = hashValueList[slot];
+        hashValueList[slot] = bEmpty;
+        atomicAdd(&nBlocks, -1);
+        return value;
       }
-      if (hashKeyList[slot] == bEmpty) {
-          return;
+      if (hashKeyList[slot] == kEmpty) {
+        return bEmpty;
       }
       slot = (slot + 1) % (nBlocksMax - 1);
   }
@@ -158,13 +174,27 @@ __device__ void MultiLevelSparseGrid::hashDelete(u64 key) {
 
 __device__ u32 MultiLevelSparseGrid::hashGetValue(u64 key) {
   u32 slot = hash(key) % (nBlocksMax-1);
-
   while (true) {
     if (hashKeyList[slot] == key) {
-        return hashValueList[slot];
+      return hashValueList[slot];
     }
-    if (hashKeyList[slot] == bEmpty) {
-        return bEmpty;
+    if (hashKeyList[slot] == kEmpty) {
+      return bEmpty;
+    }
+    slot = (slot + 1) % (nBlocksMax - 1);
+  }
+}
+
+__device__ u32 MultiLevelSparseGrid::hashSetValue(u64 key, u32 value) {
+  u32 slot = hash(key) % (nBlocksMax-1);
+  while (true) {
+    if (hashKeyList[slot] == key) {
+      u32 v = hashValueList[slot];
+      hashValueList[slot] = value;
+      return v;
+    }
+    if (hashKeyList[slot] == kEmpty) {
+      return bEmpty;
     }
     slot = (slot + 1) % (nBlocksMax - 1);
   }
@@ -206,7 +236,7 @@ __device__ u32 MultiLevelSparseGrid::compact(u64 w) {
   return (u32)w;
 }
 
-// decode morton code into ijk index and resolution level
+// decode morton code into ijk idx and resolution level
 __device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j) {
   lvl = u32((morton & ((u64)15 << 60)) >> 60);   // get the level stored in the last 4 bits
   morton &= ~ ((u64)15 << 60); // remove the last 4 bits
@@ -214,7 +244,7 @@ __device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, u32 &lvl, u32 &i,
   j = compact(morton >> 1);
 }
 
-// decode morton code into ijk index and resolution level
+// decode morton code into ijk idx and resolution level
 __device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j, u32 &k) {
   lvl = u32((morton & ((u64)15 << 60)) >> 60);   // get the level stored in the last 4 bits
   morton &= ~ ((u64)15 << 60); // remove the last 4 bits
@@ -223,17 +253,16 @@ __device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, u32 &lvl, u32 &i,
   k = compact(morton >> 2);
 }
 
-/*
-void MultiLevelSparseGrid::sortBlocks(void) {
-  copyBlockListToBlockListOld<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  thrust::sort_by_key(thrust::device, blockLocList, blockLocList+nBlocks, blockList);
-  updateBlockConnectivity<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  sortFields();
-  copyBlockListOldToBlockList<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
 
-  findNeighbors<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+void MultiLevelSparseGrid::sortBlocks(void) {
+  thrust::sort_by_key(thrust::device, blockLocList, blockLocList+nBlocks, blockIdxList);
+  updateBlockIndices<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  //sortFields();
+  //copyBlockListOldToBlockList<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  //computeNbrData<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
 }
 
+/*
 void MultiLevelSparseGrid::resetBlockCounter(void) {
   zeroBlockCounter<<<1, 1>>>(*this);
 }

@@ -14,12 +14,12 @@ __global__ void forwardWaveletTransform(MultiLevelSparseGrid &grid)
 
   START_CELL_LOOP
 
-  u32 flags = solver.blockList[bIndex].flags;
+  u32 flags = solver.blockList[bIdx].flags;
 
   if (flags & ACTIVE) {
     // calculate wavelet coefficients in active cells
     for (u32 f=0; f<4; f++){
-      dataType& q = solver.getFieldValue(fields[f], bIndex, index);
+      dataType& q = solver.getFieldValue(fields[f], bIdx, index);
       LOAD_LOW_RES_DATA(aux_fields[f])
 
     }
@@ -28,7 +28,7 @@ __global__ void forwardWaveletTransform(MultiLevelSparseGrid &grid)
   else if (flags & GHOST) {
     // set wavelet coefficients to zero in ghost cells
     for (u32 f=0; f<4; f++){
-      solver.getFieldValue(fields[f], bIndex, index) = 0.0;
+      solver.getFieldValue(fields[f], bIdx, index) = 0.0;
     }
 
   }
@@ -51,12 +51,12 @@ __global__ void restrictFields(MultiLevelSparseGrid &grid)
 {
   START_CELL_LOOP
 
-  u32 flags = solver.blockList[bIndex].flags;
+  u32 flags = solver.blockList[bIdx].flags;
 
   if (flags & ACTIVE == ACTIVE && lvl > 0) {
     for (u32 f=0; f<4; f++){
-      dataType& q = solver.getFieldValue(aux_fields[f], bIndex, i, j);
-      dataType& qp = solver.getParentFieldValue(fields[f], bIndex, ib, jb, i, j);
+      dataType& q = solver.getFieldValue(aux_fields[f], bIdx, i, j);
+      dataType& qp = solver.getParentFieldValue(fields[f], bIdx, ib, jb, i, j);
       atomicAdd(&qp, q/4);
     }
   }

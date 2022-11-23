@@ -45,6 +45,7 @@ public:
     void *ptr;
     cudaMallocManaged(&ptr, len);
     cudaDeviceSynchronize();
+    return ptr;
   }
   void operator delete(void *ptr) {
     cudaDeviceSynchronize();
@@ -55,6 +56,7 @@ public:
 static constexpr u32 blockSizeTot = powi(blockSize, nDim);
 static constexpr u32 nBlocksPerCudaBlock = cudaBlockSize/blockSizeTot;
 static constexpr u32 bEmpty = nBlocksMax-1;
+static constexpr u64 kEmpty = 0xFFFFFFFFFFFFFFFF;
 static constexpr u32 nBlocksMaxPow2 = powi(2, log2(nBlocksMax)+1);
 
 #endif

@@ -21,19 +21,19 @@ __global__ void sortFieldData2D(MultiLevelSparseGrid &grid)
 {
   START_CELL_LOOP
 
-  BlockType &block grid.blockList[bIndex]
+  BlockType &block grid.blockList[bIdx]
   u32 old_bIndex = block.index;
 
-  Array &rhou = grid.getFieldArray(bIndex, RHOU);
-  Array &rhov = grid.getFieldArray(bIndex, RHOV);
+  Array &rhou = grid.getFieldArray(bIdx, RHOU);
+  Array &rhov = grid.getFieldArray(bIdx, RHOV);
 
-  Array &old_rhou = grid.getFieldArray(bIndex, RHOU);
-  Array &old_rhov = grid.getFieldArray(bIndex, RHOV);
+  Array &old_rhou = grid.getFieldArray(bIdx, RHOU);
+  Array &old_rhov = grid.getFieldArray(bIdx, RHOV);
 
-  rho(bIndex) = old_rho(old_bIndex);
-  rhou(bIndex) = old_rhou(old_bIndex);
-  rhov(bIndex) = old_rhov(old_bIndex);
-  e(bIndex) = old_e(old_bIndex);
+  rho(bIdx) = old_rho(old_bIndex);
+  rhou(bIdx) = old_rhou(old_bIndex);
+  rhov(bIdx) = old_rhov(old_bIndex);
+  e(bIdx) = old_e(old_bIndex);
 
   END_CELL_LOOP
 }
