@@ -27,7 +27,7 @@ public:
   CompressibleSolver(u32 *baseGridSize_, u32 nLvls_) :
     MultiLevelSparseGrid(baseGridSize_, nLvls_, 16) {}
 
-  void sortData(void);
+  void sortfieldArray(void);
 };
 
 #endif

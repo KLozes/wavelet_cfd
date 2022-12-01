@@ -7,11 +7,11 @@
 //#include "png.hpp"
 
 int main(int argc, char* argv[]) {
-  u32 baseSize[nDim] = {blockSize*4, blockSize*6};
+  u32 baseSize[nDim] = {24, 28};
   u32 nLvls = 1;
 
   CompressibleSolver *solver = new CompressibleSolver(baseSize, nLvls);
-  solver->initGrid();
-  cudaDeviceSynchronize();
+
+  delete solver;
 	cudaDeviceReset();
 }

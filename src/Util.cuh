@@ -3,6 +3,11 @@
 
 #include "Settings.cuh"
 
+typedef int i32;
+typedef unsigned int u32;
+typedef long long int i64;
+typedef unsigned long long int u64;
+
 __host__ __device__ constexpr u32 log2(u32 n) {
   return ((n<2) ? 1 : 1+log2(n/2));
 }
@@ -26,6 +31,10 @@ struct Array {
     return data[size*size*k + size*j + i];
   }
 
+  inline __host__ __device__ T& operator[](const u32 i) {
+    return data[i];
+  }
+
   __host__ __device__ void operator=(T in) {
     for(int i=0; i<powi(size, nDim); i++) {
       data[i] = in;
@@ -36,6 +45,14 @@ struct Array {
     for(int i=0; i<powi(size, nDim); i++) {
       data[i] = arr(i);
     }
+  }
+
+  __host__ __device__ bool operator==(T rhs) {
+    bool result = true;
+    for(int i=0; i<powi(size, nDim); i++) {
+      result = result && (data[i]&rhs==rhs);
+    }
+    return result;
   }
 };
 
@@ -53,10 +70,15 @@ public:
   }
 };
 
+typedef Array<dataType, blockSize> fieldArray;
+typedef Array<u32, blockSize+2*haloSize> nbrArray;
+typedef Array<u32, 2> chldArray;
+
 static constexpr u32 blockSizeTot = powi(blockSize, nDim);
 static constexpr u32 nBlocksPerCudaBlock = cudaBlockSize/blockSizeTot;
 static constexpr u32 bEmpty = nBlocksMax-1;
 static constexpr u64 kEmpty = 0xFFFFFFFFFFFFFFFF;
 static constexpr u32 nBlocksMaxPow2 = powi(2, log2(nBlocksMax)+1);
+
 
 #endif

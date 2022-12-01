@@ -13,11 +13,9 @@ __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
 }
 
 __global__ void updateBlockIndices(MultiLevelSparseGrid &grid) {
-  // after sorting blocks and field data, update the blockIdxList and hashValueList
+  // after sorting blocks and field data, update the idxList and hashValueList
   START_BLOCK_LOOP
-  u64 key = grid.hashKeyList[bIdx];
-  grid.blockIdxList[bIdx] = bIdx;
-  grid.hashSetValue(key, bIdx);
+  grid.idxList[bIdx] = bIdx;
   END_BLOCK_LOOP
 }
 

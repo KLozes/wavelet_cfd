@@ -3,9 +3,20 @@
 
 #include "CompressibleSolver.cuh"
 
+__device__ static constexpr u32 fields[4] = {RHO, RHOU, RHOV, RHOE};
+__device__ static constexpr u32 auxFields[4] = {AUX_RHO, AUX_RHOU, AUX_RHOV, AUX_RHOE};
 
-static const int fields = {RHO, RHOU, RHOV, RHOE};
-static const u32 aux_fields = {AUX_RHO, AUX_RHOU, AUX_RHOV, AUX_RHOE};
+__global__ void sortfieldArrayKernel(MultiLevelSparseGrid &grid)
+{
+  START_CELL_LOOP
+  for (u32 f=0; f<4; f++) {
+    fieldArray &dataArray = grid.fieldArrayList[bIdx + fields[f]*nBlocksMax];
+    fieldArray &dataArrayAux = grid.fieldArrayList[bIdx + auxFields[f]*nBlocksMax];
+    dataArray[idx] = dataArrayAux[idx];
+  }
+  END_CELL_LOOP
+}
+
 
 /*
 __global__ void forwardWaveletTransform(MultiLevelSparseGrid &grid)
@@ -64,3 +75,5 @@ __global__ void restrictFields(MultiLevelSparseGrid &grid)
   END_CELL_LOOP
 }
 */
+
+#endif

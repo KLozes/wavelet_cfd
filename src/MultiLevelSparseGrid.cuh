@@ -2,6 +2,7 @@
 #define MULTILEVEL_SPARSE_GRID_H
 
 #include <thrust/sort.h>
+#include <algorithm>
 #include <thrust/execution_policy.h>
 
 #include "Settings.cuh"
@@ -17,51 +18,80 @@
 class MultiLevelSparseGrid : public Managed {
 public:
 
-  u32 baseGridSize[nDim];
-  u32 baseGridSizeB[nDim];
+  u32 baseGridSize[3] = {1,1,1};
+  u32 baseGridSizeB[3] = {1,1,1};
   u32 nLvls;
   u32 nFields;
 
   u32 blockCounter;
   i32 nBlocks;
 
-  u64 *hashKeyList; // hash keys are block morton codes
-  u32 *hashValueList; // hash values are block memory indices
+  u64 *locList; // block morton codes
+  u32 *idxList; // block memory indices
+  u32 *baseIdxArray; // base block memory index array
 
-  u64 *blockLocList; // block morton codes
-  u32 *blockIdxList; // block memory indices
+  u32 *prntList; // block parent indices
+  chldArray *chldArrayList; // block child indices
 
-  typedef Array<dataType, blockSize> fieldData;
-  fieldData *fieldDataList;
-
-  typedef Array<u32, blockSize+2*haloSize> nbrData;
-  nbrData *nbrDataList;
+  fieldArray *fieldArrayList; // flow field data arrays
+  nbrArray *nbrArrayList; // cell neighbor index arrays
 
   MultiLevelSparseGrid(u32 *baseGridSize_, u32 nLvls_, u32 nFields_) {
 
+    u32 nBaseBlocks = 1;
     for(int d=0; d<nDim; d++) {
       baseGridSize[d] = baseGridSize_[d];
       baseGridSizeB[d] = baseGridSize[d]/blockSize;
+      nBaseBlocks *= baseGridSizeB[d];
     }
     nLvls = nLvls_;
     nFields = nFields_;
 
     assert(isPowerOf2(blockSize));
-    nBlocks = 0; // the empty block at index 0
+    nBlocks = 0;
 
-    cudaMallocManaged(&hashKeyList, nBlocksMax*sizeof(u64));
-    cudaMallocManaged(&hashValueList, nBlocksMax*sizeof(u32));
-    cudaMallocManaged(&blockLocList, nBlocksMax*sizeof(u64));
-    cudaMallocManaged(&blockIdxList, nBlocksMax*sizeof(u32));
-    cudaMallocManaged(&fieldDataList, nBlocksMax*nFields*sizeof(fieldData));
-    cudaMallocManaged(&nbrDataList, nBlocksMax*sizeof(nbrData));
+    cudaMallocManaged(&locList, nBlocksMax*sizeof(u64));
+    cudaMallocManaged(&idxList, nBlocksMax*sizeof(u32));
+    cudaMallocManaged(&baseIdxArray, max(1024, nBaseBlocks)*sizeof(u32));
+    cudaMallocManaged(&prntList, nBlocksMax*sizeof(u32));
+    cudaMallocManaged(&chldArrayList, nBlocksMax*sizeof(chldArray));
+    cudaMallocManaged(&fieldArrayList, nBlocksMax*nFields*sizeof(fieldArray));
+    cudaMallocManaged(&nbrArrayList, nBlocksMax*sizeof(nbrArray));
 
-    cudaMemset(&hashKeyList, 1, nBlocksMax*sizeof(u64));
-    cudaMemset(&hashValueList, 0, nBlocksMax*sizeof(u32));
-    cudaMemset(&blockLocList, 1, nBlocksMax*sizeof(u64));
-    cudaMemset(&blockIdxList, 0, nBlocksMax*sizeof(u32));
-    cudaMemset(&fieldDataList, 0, nBlocksMax*nFields*sizeof(fieldData));
-    cudaMemset(&nbrDataList, 0, nBlocksMax*sizeof(nbrData));
+    cudaMemset(&locList, 1, nBlocksMax*sizeof(u64));
+    cudaMemset(&idxList, 0, nBlocksMax*sizeof(u32));
+    cudaMemset(&baseIdxArray, 0, max(1024, nBaseBlocks)*sizeof(u32));
+    cudaMemset(&prntList, 0, nBlocksMax*sizeof(u32));
+    cudaMemset(&chldArrayList, 0, nBlocksMax*sizeof(chldArray));
+    cudaMemset(&fieldArrayList, 0, nBlocksMax*nFields*sizeof(fieldArray));
+    cudaMemset(&nbrArrayList, 0, nBlocksMax*sizeof(nbrArray));
+
+    for(u32 idx = 0; idx < nBlocksMax; idx++) {
+      locList[idx] = kEmpty;
+      idxList[idx] = bEmpty;
+    }
+
+
+    // fill the locList with base grid blocks in cartesian order
+    for (u32 k = 0; k < baseGridSizeB[2]; k++) {
+      for (u32 j = 0; j < baseGridSizeB[1]; j++) {
+        for (u32 i = 0; i < baseGridSizeB[0]; i++) {
+          locList[nBlocks] = mortonEncode(0, i, j, k);
+          nBlocks++;
+        }
+      }
+    }
+
+    // sort the locList
+    thrust::sort(thrust::host, locList, locList+nBlocks);
+
+    // fill the baseIdxArray and idxList
+    for(u32 idx = 0; idx < nBlocks; idx++) {
+      idxList[idx] = idx;
+      u32 lvl, i, j, k;
+      mortonDecode(locList[idx], lvl, i, j, k);
+      getBaseIdx(i,j,k) = idx;
+    }
 
     cudaDeviceSynchronize();
   }
@@ -69,39 +99,33 @@ public:
   ~MultiLevelSparseGrid(void)
   {
     cudaDeviceSynchronize();
-    cudaFree(hashKeyList);
-    cudaFree(hashValueList);
-    cudaFree(blockLocList);
-    cudaFree(blockIdxList);
-    cudaFree(fieldDataList);
-    cudaFree(nbrDataList);
+    cudaFree(locList);
+    cudaFree(idxList);
+    cudaFree(prntList);
+    cudaFree(chldArrayList);
+    cudaFree(fieldArrayList);
+    cudaFree(nbrArrayList);
   }
 
   void initGrid(void);
   void sortBlocks(void);
-  void sortHashTable(void);
-  virtual void sortFields(void){};
+  virtual void sortfieldArray(void){};
 
-  __device__ u32 getBlockIndex(u32 lvl, u32 i, u32 j=0, u32 k=0);
+  __host__ __device__ u32 &getBaseIdx(u32 i, u32 j=0, u32 k=0);
 
   __device__ void activateBlock(u32 lvl, u32 i, u32 j=0, u32 k=0);
   __device__ void deactivateBlock(u32 lvl, u32 i, u32 j=0, u32 k=0);
+  __device__ void deactivateBlock(u32 idx);
 
   __device__ void getDijk(u32 n, u32 &di, u32 &dj);
 
-  __device__ u64 hash(u64 x);
-  __device__ u32 hashInsert(u64 key);
-  __device__ u32 hashDelete(u64 key);
-  __device__ u32 hashGetValue(u64 key);
-  __device__ u32 hashSetValue(u64 key, u32 value);
+  __host__ __device__ u64 split(u32 a);
+  __host__ __device__ u64 mortonEncode(u64 lvl, u32 i, u32 j);
+  __host__ __device__ u64 mortonEncode(u64 lvl, u32 i, u32 j, u32 k);
 
-  __device__ u64 split(u32 a);
-  __device__ u64 mortonEncode(u64 lvl, u32 i, u32 j);
-  __device__ u64 mortonEncode(u64 lvl, u32 i, u32 j, u32 k);
-
-  __device__ u32 compact(u64 w);
-  __device__ void mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j);
-  __device__ void mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j, u32 &k);
+  __host__ __device__ u32 compact(u64 w);
+  __host__ __device__ void mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j);
+  __host__ __device__ void mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j, u32 &k);
 
   void resetBlockCounter(void);
 
@@ -118,10 +142,9 @@ public:
   while (bIdx < grid.nBlocks) {
 */
 
-
 #define START_CELL_LOOP \
   u32 bIdx = blockIdx.x * nBlocksPerCudaBlock + threadIdx.x / blockSizeTot; \
-  u32 index = threadIdx.x % blockSizeTot; \
+  u32 idx = threadIdx.x % blockSizeTot; \
   while (bIdx < grid.nBlocks) {
 
 #define END_CELL_LOOP bIdx += gridDim.x; __syncthreads();}
