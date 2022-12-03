@@ -1,36 +1,6 @@
 #include "MultiLevelSparseGrid.cuh"
 #include "MultiLevelSparseGridKernels.cuh"
 
-void MultiLevelSparseGrid::initGrid(void) {
-  // initialize the hashtable keys and value to bEmpty!
-  for(u32 idx = 0; idx < nBlocksMax; idx++) {
-    hashKeyList[idx] = kEmpty;
-    hashValueList[idx] = bEmpty;
-    blockLocList[idx] = kEmpty;
-    blockIdxList[idx] = bEmpty;
-  }
-
-  // initialize the blocks of the base grid level
-  dim3 nCudaBlocks(max(1,baseGridSizeB[0]/8), max(1, baseGridSizeB[1]/8));
-	dim3 nCudaThreads(8,8);
-  initGridKernel<<<nCudaBlocks, nCudaThreads>>>(*this);
-  cudaDeviceSynchronize();
-
-  for(u32 idx = 0; idx < nBlocks; idx++) {
-    printf("blockIdx = %d\n", blockIdxList[idx]);
-    printf("blockLoc = %llu\n", blockLocList[idx]);
-  }
-
-  // sort the blocks and then reassign indices
-  sortBlocks();
-
-  for(u32 idx = 0; idx < nBlocks; idx++) {
-    printf("blockIdx = %d\n", blockIdxList[idx]);
-    printf("blockLoc = %llu\n", blockLocList[idx]);
-  }
-
-}
-
 /*
 
 __device__ u32& MultiLevelSparseGrid::getBaseBlockIndex(int i, int j) {
@@ -55,14 +25,22 @@ __device__  u32 MultiLevelSparseGrid::getBlockIndex(u32 lvl, u32 i, u32 j) {
 
 __device__ void MultiLevelSparseGrid::activateBlock(u32 lvl, u32 i, u32 j, u32 k) {
   u64 loc = mortonEncode(lvl, i, j);
-  u32 idx = hashInsert(loc);
-  blockLocList[idx] = loc;
-  blockIdxList[idx] = idx;
+  if (hashInsert(loc)) {
+#ifdef __CUDA_ARCH__
+    u32 idx = atomicAdd(&nBlocks, 1);
+#else
+    u32 idx = nBlocks;
+    nBlocks++;
+#endif
+    blockLocList[idx] = loc;
+    blockIdxList[idx] = idx;
+  }
+
 }
 
 __device__ void MultiLevelSparseGrid::deactivateBlock(u32 lvl, u32 i, u32 j, u32 k) {
   u64 loc = mortonEncode(lvl, i, j);
-  u32 idx = hashDelete(loc);
+  u32 idx = hashDeleta(loc);
   blockLocList[idx] = kEmpty;
   blockIdxList[idx] = bEmpty;
 }
@@ -139,41 +117,44 @@ __device__ u64 MultiLevelSparseGrid::hash(u64 x) {
   return x;
 }
 
-__device__ u32 MultiLevelSparseGrid::hashInsert(u64 key) {
-  u32 slot = hash(key) % (nBlocksMax-1);
+__host__ __device__ u32 MultiLevelSparseGrid::hashInsert(u64 key, u32 value) {
+  u32 slot = hash(key) % (nBlocksMax - 1);
   while (true) {
+#ifdef __CUDA_ARCH__
       u64 prev = atomicCAS(&hashKeyList[slot], kEmpty, key);
+#else
+      u64 prev = hashKeyList[slot];
+      if (prev == kEmpty) {hashKeyList[slot] = key;} // host version
+#endif
       if (prev == kEmpty) {
-        uint value = atomicAdd(&nBlocks, 1);
         hashValueList[slot] = value;
-        return value;
+        return true;
       }
       if (prev == key) {
-        return hashValueList[slot];
-      }
-      slot = (slot + 1) % (nBlocksMax-1);
-  }
-}
-
-__device__ u32 MultiLevelSparseGrid::hashDelete(u64 key) {
-  u32 slot = hash(key) % (nBlocksMax-1);
-  while (true) {
-      if (hashKeyList[slot] == key) {
-        hashKeyList[slot] = kEmpty;
-        u32 value = hashValueList[slot];
-        hashValueList[slot] = bEmpty;
-        atomicAdd(&nBlocks, -1);
-        return value;
-      }
-      if (hashKeyList[slot] == kEmpty) {
-        return bEmpty;
+        hashValueList[slot] = value;
+        return false;
       }
       slot = (slot + 1) % (nBlocksMax - 1);
   }
 }
 
-__device__ u32 MultiLevelSparseGrid::hashGetValue(u64 key) {
-  u32 slot = hash(key) % (nBlocksMax-1);
+__host__ __device__ MultiLevelSparseGrid::hashDelete(u64 key) {
+  u32 slot = hash(key) % (nBlocksMax - 1);
+  while (true) {
+      if (hashKeyList[slot] == key) {
+        u32 value = hashValueList[slot];
+        hashValueList[slot] = bEmpty
+        return true;
+      }
+      if (hashKeyList[slot] == kEmpty) {
+        return false;
+      }
+      slot = (slot + 1) % (nBlocksMax - 1);
+  }
+}
+
+__host__ __device__ u32 MultiLevelSparseGrid::hashGetValue(u64 key) {
+  u32 slot = hash(key) % (nBlocksMaxPow2 - 1);
   while (true) {
     if (hashKeyList[slot] == key) {
       return hashValueList[slot];
@@ -181,27 +162,14 @@ __device__ u32 MultiLevelSparseGrid::hashGetValue(u64 key) {
     if (hashKeyList[slot] == kEmpty) {
       return bEmpty;
     }
-    slot = (slot + 1) % (nBlocksMax - 1);
+    slot = (slot + 1) % (nBlocksMaxPow2 - 1);
   }
 }
 
-__device__ u32 MultiLevelSparseGrid::hashSetValue(u64 key, u32 value) {
-  u32 slot = hash(key) % (nBlocksMax-1);
-  while (true) {
-    if (hashKeyList[slot] == key) {
-      u32 v = hashValueList[slot];
-      hashValueList[slot] = value;
-      return v;
-    }
-    if (hashKeyList[slot] == kEmpty) {
-      return bEmpty;
-    }
-    slot = (slot + 1) % (nBlocksMax - 1);
-  }
-}
+
 
 // seperate bits from a given integer 3 positions apart
-__device__ u64 MultiLevelSparseGrid::split(u32 a) {
+__host__ __device__ u64 MultiLevelSparseGrid::split(u32 a) {
   u64 x = (u64)a & ((1<<20)-1); // we only look at the first 20 bits
   x = (x | x << 32) & 0x1f00000000ffff;
   x = (x | x << 16) & 0x1f0000ff0000ff;
@@ -212,21 +180,21 @@ __device__ u64 MultiLevelSparseGrid::split(u32 a) {
 }
 
 // encode ijk indices and resolution level into morton code
-__device__ u64 MultiLevelSparseGrid::mortonEncode(u64 lvl, u32 i, u32 j) {
+__host__ __device__ u64 MultiLevelSparseGrid::mortonEncode(u64 lvl, u32 i, u32 j) {
   u64 morton = 0;
   morton |= lvl << 60 | split(i) | split(j) << 1;
   return morton;
 }
 
 // encode ijk indices and resolution level into morton code
-__device__ u64 MultiLevelSparseGrid::mortonEncode(u64 lvl, u32 i, u32 j, u32 k) {
+__host__ __device__ u64 MultiLevelSparseGrid::mortonEncode(u64 lvl, u32 i, u32 j, u32 k) {
   u64 morton = 0;
   morton |= lvl << 60 | split(i) | split(j) << 1 | split(k) << 2;
   return morton;
 }
 
 // compact separated bits into into an integer
-__device__ u32 MultiLevelSparseGrid::compact(u64 w) {
+__host__ __device__ u32 MultiLevelSparseGrid::compact(u64 w) {
   w &=                  0x1249249249249249;
   w = (w ^ (w >> 2))  & 0x30c30c30c30c30c3;
   w = (w ^ (w >> 4))  & 0xf00f00f00f00f00f;
@@ -237,7 +205,7 @@ __device__ u32 MultiLevelSparseGrid::compact(u64 w) {
 }
 
 // decode morton code into ijk idx and resolution level
-__device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j) {
+__host__ __device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j) {
   lvl = u32((morton & ((u64)15 << 60)) >> 60);   // get the level stored in the last 4 bits
   morton &= ~ ((u64)15 << 60); // remove the last 4 bits
   i = compact(morton);
@@ -245,7 +213,7 @@ __device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, u32 &lvl, u32 &i,
 }
 
 // decode morton code into ijk idx and resolution level
-__device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j, u32 &k) {
+__host__ __device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j, u32 &k) {
   lvl = u32((morton & ((u64)15 << 60)) >> 60);   // get the level stored in the last 4 bits
   morton &= ~ ((u64)15 << 60); // remove the last 4 bits
   i = compact(morton);

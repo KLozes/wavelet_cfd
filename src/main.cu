@@ -11,7 +11,6 @@ int main(int argc, char* argv[]) {
   u32 nLvls = 1;
 
   CompressibleSolver *solver = new CompressibleSolver(baseSize, nLvls);
-  solver->initGrid();
   cudaDeviceSynchronize();
 	cudaDeviceReset();
 }

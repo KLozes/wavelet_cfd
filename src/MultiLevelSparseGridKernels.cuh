@@ -12,13 +12,25 @@ __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
   }
 }
 
-__global__ void updateBlockIndices(MultiLevelSparseGrid &grid) {
-  // after sorting blocks and field data, update the blockIdxList and hashValueList
-  START_BLOCK_LOOP
-  u64 key = grid.hashKeyList[bIdx];
-  grid.blockIdxList[bIdx] = bIdx;
-  grid.hashSetValue(key, bIdx);
-  END_BLOCK_LOOP
+__global__ void deleteHashTable(MultiLevelSparseGrid &grid) {
+  // delete all entries in the hashtable
+  u32 bIdx = threadIdx.x + blockIdx.x * blockDim.x;
+  while (bIdx < grid.nBlocksMaxPow2) {
+    grid.hashKeyList[bIdx] = kEmpty;
+    grid.hashValueList[bIdx] = bEmpty;
+    bIdx += gridDim.x;
+  }
+}
+
+__global__ void remakeHashTable(MultiLevelSparseGrid &grid) {
+  // delete all entries in the hashtable
+  u32 bIdx = threadIdx.x + blockIdx.x * blockDim.x;
+  while (bIdx < grid.nBlocks) {
+    
+    grid.hashKeyList[bIdx] = kEmpty;
+    grid.hashValueList[bIdx] = bEmpty;
+    bIdx += gridDim.x;
+  }
 }
 
 /*

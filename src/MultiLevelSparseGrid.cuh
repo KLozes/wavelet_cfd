@@ -17,8 +17,8 @@
 class MultiLevelSparseGrid : public Managed {
 public:
 
-  u32 baseGridSize[nDim];
-  u32 baseGridSizeB[nDim];
+  u32 baseGridSize[3] = {1,1,1};
+  u32 baseGridSizeB[3] = {1,1,1};
   u32 nLvls;
   u32 nFields;
 
@@ -45,23 +45,43 @@ public:
     }
     nLvls = nLvls_;
     nFields = nFields_;
+    nBlocks = 0;
 
-    assert(isPowerOf2(blockSize));
-    nBlocks = 0; // the empty block at index 0
-
-    cudaMallocManaged(&hashKeyList, nBlocksMax*sizeof(u64));
-    cudaMallocManaged(&hashValueList, nBlocksMax*sizeof(u32));
+    cudaMallocManaged(&hashKeyList, nBlocksMaxPow2*sizeof(u64));
+    cudaMallocManaged(&hashValueList, nBlocksMaxPow2*sizeof(u32));
     cudaMallocManaged(&blockLocList, nBlocksMax*sizeof(u64));
     cudaMallocManaged(&blockIdxList, nBlocksMax*sizeof(u32));
     cudaMallocManaged(&fieldDataList, nBlocksMax*nFields*sizeof(fieldData));
     cudaMallocManaged(&nbrDataList, nBlocksMax*sizeof(nbrData));
 
-    cudaMemset(&hashKeyList, 1, nBlocksMax*sizeof(u64));
-    cudaMemset(&hashValueList, 0, nBlocksMax*sizeof(u32));
+    cudaMemset(&hashKeyList, 1, nBlocksMaxPow2*sizeof(u64));
+    cudaMemset(&hashValueList, 0, nBlocksMaxPow2*sizeof(u32));
     cudaMemset(&blockLocList, 1, nBlocksMax*sizeof(u64));
     cudaMemset(&blockIdxList, 0, nBlocksMax*sizeof(u32));
     cudaMemset(&fieldDataList, 0, nBlocksMax*nFields*sizeof(fieldData));
     cudaMemset(&nbrDataList, 0, nBlocksMax*sizeof(nbrData));
+
+    // initialize the hashtable keys and value to bEmpty!
+    for(u32 idx = 0; idx < nBlocksMax; idx++) {
+      hashKeyList[idx] = kEmpty;
+      hashValueList[idx] = bEmpty;
+      blockLocList[idx] = kEmpty;
+      blockIdxList[idx] = bEmpty;
+    }
+
+    // initialize the blocks of the base grid level
+    for (u32 k=0; k<baseGridSizeB[2]; k++){
+      for (u32 j=0; j<baseGridSizeB[1]; j++){
+        for (u32 i=0; i<baseGridSizeB[0]; i++){
+          activateBlock(0, i, j, k);
+        }
+      }
+    }
+
+    for(u32 idx = 0; idx < nBlocks; idx++) {
+      printf("blockIdx = %d\n", blockIdxList[idx]);
+      printf("blockLoc = %llu\n", blockLocList[idx]);
+    }
 
     cudaDeviceSynchronize();
   }
@@ -82,26 +102,26 @@ public:
   void sortHashTable(void);
   virtual void sortFields(void){};
 
-  __device__ u32 getBlockIndex(u32 lvl, u32 i, u32 j=0, u32 k=0);
+  __host__ __device__ u32 getBlockIndex(u32 lvl, u32 i, u32 j=0, u32 k=0);
 
-  __device__ void activateBlock(u32 lvl, u32 i, u32 j=0, u32 k=0);
-  __device__ void deactivateBlock(u32 lvl, u32 i, u32 j=0, u32 k=0);
+  __host__ __device__ void activateBlock(u32 lvl, u32 i, u32 j=0, u32 k=0);
+  __host__ __device__ void deactivateBlock(u32 idx);
 
-  __device__ void getDijk(u32 n, u32 &di, u32 &dj);
+  __host__ __device__ void getDijk(u32 n, u32 &di, u32 &dj);
 
-  __device__ u64 hash(u64 x);
-  __device__ u32 hashInsert(u64 key);
-  __device__ u32 hashDelete(u64 key);
-  __device__ u32 hashGetValue(u64 key);
-  __device__ u32 hashSetValue(u64 key, u32 value);
+  __host__ __device__ u64 hash(u64 x);
+  __host__ __device__ u32 hashInsertKeyValue(u64 key, u32 value=0);
+  __host__ __device__ u32 hashDelete(u64 key);
+  __host__ __device__ u32 hashGetValue(u64 key);
+  __host__ __device__ u32 hashSetValue(u64 key, u32 value);
 
-  __device__ u64 split(u32 a);
-  __device__ u64 mortonEncode(u64 lvl, u32 i, u32 j);
-  __device__ u64 mortonEncode(u64 lvl, u32 i, u32 j, u32 k);
+  __host__ __device__ u64 split(u32 a);
+  __host__ __device__ u64 mortonEncode(u64 lvl, u32 i, u32 j);
+  __host__ __device__ u64 mortonEncode(u64 lvl, u32 i, u32 j, u32 k);
 
-  __device__ u32 compact(u64 w);
-  __device__ void mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j);
-  __device__ void mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j, u32 &k);
+  __host__ __device__ u32 compact(u64 w);
+  __host__ __device__ void mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j);
+  __host__ __device__ void mortonDecode(u64 morton, u32 &lvl, u32 &i, u32 &j, u32 &k);
 
   void resetBlockCounter(void);
 
