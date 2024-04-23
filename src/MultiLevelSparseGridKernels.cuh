@@ -12,14 +12,35 @@ __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
   }
 }
 
-__global__ void updateBlockIndices(MultiLevelSparseGrid &grid) {
-  // after sorting blocks and field data, update the idxList and hashValueList
+/*
+
+__global__ void updateIndices1(MultiLevelSparseGrid &grid) {
+  // update the tree connectivity
   START_BLOCK_LOOP
-  grid.idxList[bIdx] = bIdx;
+  u64 loc = grid.locList[bIdx];
+  u32 lvl, i, j, k;
+  mortonDecode(loc, lvl, i, j, k);
+
+  // find the index of my child and update its parent to my new index
+  for (u32 i=0; i<powi(2, nDim); i++) {
+    grid.prntListOld[grid.childList[bIdx][i]] = bIdx;
+  }
+
+  // find the index of my parent and update its child to my new index
+  grid.chldListOld[grid.prntList[bIdx]](i&1,j&1,k&1) = bIdx;
+
   END_BLOCK_LOOP
 }
 
-/*
+__global__ void updateIndices2(MultiLevelSparseGrid &grid) {
+  // finally sort the tree connectivity
+  START_BLOCK_LOOP
+  bIdxOld = grid.idxList[bIdx];
+  grid.idxList[bIdx] = bIdx;
+  grid.childList[bIdx] = grid.childListOld[bIdxOld];
+  grid.prntList[bIdx] = grid.prntListOld[bIdxOld];
+  END_BLOCK_LOOP
+}
 
 __global__ void copyBlockListToBlockListOld(MultiLevelSparseGrid &grid) {
   START_BLOCK_LOOP
@@ -35,8 +56,6 @@ __global__ void copyBlockListOldToBlockList(MultiLevelSparseGrid &grid) {
 }
 
 
-
-/*
 __global__ void updateBlockConnectivity(MultiLevelSparseGrid &grid)
 {
   START_BLOCK_LOOP

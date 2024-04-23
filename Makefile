@@ -28,8 +28,8 @@ OBJS += $(CU_OBJS)
 
 ## compile options
 CPPFLAGS = -O3 -Wextra -std=c++14
-NVCCFLAGS =  -std=c++14 -arch=sm_61
-NVCCLFLAGS =  -std=c++14 -arch=sm_61
+NVCCFLAGS = -std=c++14 -arch=sm_61
+NVCCLFLAGS = -std=c++14 -arch=sm_61
 
 ## Build Rules
 $(TARGET) : $(OBJS)
@@ -39,7 +39,7 @@ $(OBJ_DIR)/%.cpp.o: $(SRC_DIR)/%.cpp
 	$(CC) $(CPPFLAGS) $(INC_DIR) -c $< -o $@
 
 $(OBJ_DIR)/%.cu.o: $(SRC_DIR)/%.cu
-	$(NVCC) $(NVCCFLAGS) $(INC_DIR) -c $< -o $@
+	$(NVCC) $(NVCCFLAGS) $(INC_DIR) -c $< -o $@ -dc
 
 clean:
 	\rm obj/*.o $(TARGET)
