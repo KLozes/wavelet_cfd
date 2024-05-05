@@ -17,7 +17,7 @@ enum
   OLD_E = 6
 };
 
-__global__ void sortFieldData2D(MultiLevelSparseGrid &grid)
+__global__ void sortfieldArray2D(MultiLevelSparseGrid &grid)
 {
   START_CELL_LOOP
 
