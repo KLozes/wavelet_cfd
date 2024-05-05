@@ -5,7 +5,7 @@ CC = g++
 NVCC = nvcc
 
 # include directories
-INC_DIR = -I./src
+INC_DIR = -I./src -I./src/pngpp
 
 # source directory
 SRC_DIR = src
@@ -29,7 +29,7 @@ OBJS += $(CU_OBJS)
 ## compile options
 CPPFLAGS = -O3 -Wextra -std=c++14
 NVCCFLAGS = -std=c++14 -arch=sm_61
-NVCCLFLAGS = -std=c++14 -arch=sm_61
+NVCCLFLAGS = -std=c++14 -arch=sm_61 -lpng -lz
 
 ## Build Rules
 $(TARGET) : $(OBJS)

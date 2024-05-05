@@ -40,8 +40,8 @@ static constexpr u32 log2BlockSize = log2(blockSize);
 static constexpr u32 blockSizeTot = powi(blockSize, 2);
 static constexpr u32 blockHaloSizeTot = powi(blockSize+2*haloSize, 2);
 static constexpr u32 nBlocksPerCudaBlock = cudaBlockSize/blockSizeTot;
-static constexpr u32 nBlocksMaxPow2 = powi(2, log2(nBlocksMax)+1);
-static constexpr u32 bEmpty = nBlocksMaxPow2-1;
+static constexpr u32 hashTableSize = powi(2, log2(nBlocksMax)+1); // closest power of 2
+static constexpr u32 bEmpty = nBlocksMax-1;
 static constexpr u64 kEmpty = std::numeric_limits<u64>::max();
 
 #endif

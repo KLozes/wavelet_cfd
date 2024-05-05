@@ -1,13 +1,16 @@
+#include <thrust/sort.h>
+#include <algorithm>
 #include "HashTable.cuh"
 
+#include <inttypes.h>
+
 HashTable::HashTable(void) {
-  cudaMallocManaged(&keyList, nBlocksMaxPow2*sizeof(u64));
-  cudaMallocManaged(&valueList, nBlocksMaxPow2*sizeof(u32));
+  cudaMallocManaged(&keyList, hashTableSize*sizeof(u64));
+  cudaMallocManaged(&valueList, hashTableSize*sizeof(u32));
   reset();
 }
 
-HashTable::~HashTable(void)
-{
+HashTable::~HashTable(void) {
   cudaDeviceSynchronize();
   cudaFree(keyList);
   cudaFree(valueList);
@@ -15,8 +18,9 @@ HashTable::~HashTable(void)
 
 void HashTable::reset(void) {
   nKeys = 0;
-  cudaMemset(&keyList, 0x11111111, nBlocksMaxPow2*sizeof(u64));
-  cudaMemset(&valueList, 0, nBlocksMaxPow2*sizeof(u32));
+  cudaMemset(keyList, 0xFF, hashTableSize*sizeof(u64)); // 0xFF is one byte of kEmpty
+  cudaMemset(valueList, 0, hashTableSize*sizeof(u32));
+  cudaDeviceSynchronize();
 }
 
 __device__ u64 HashTable::hash(u64 x) {
@@ -29,24 +33,35 @@ __device__ u64 HashTable::hash(u64 x) {
   return x;
 }
 
-__device__ u32 HashTable::insert(u64 key) {
-  u32 slot = hash(key) % nBlocksMaxPow2;
+__host__ __device__ u32 HashTable::insert(u64 key) {
+  u32 slot = hash(key) % hashTableSize;
   while (true) {
-      u64 prev = atomicCAS(&keyList[slot], kEmpty, key);
-      if (prev == kEmpty) {
-        uint value = atomicAdd(&nKeys, 1);
-        valueList[slot] = value;
-        return value;
-      }
-      if (prev == key) {
-        return valueList[slot];
-      }
-      slot = (slot + 1) % nBlocksMaxPow2;
+
+#ifdef __CUDA_ARCH__
+    u64 prev = atomicCAS(&keyList[slot], kEmpty, key);
+#else
+    u64 prev = keyList[slot];
+    //printf("prev = %llu, kEmpty = %llu \n", prev, kEmpty);
+#endif
+
+    if (prev == kEmpty) {
+#ifdef __CUDA_ARCH__
+      uint value = atomicAdd(&nKeys, 1);
+#else
+      uint value = nKeys++;
+#endif
+      valueList[slot] = value;
+      return value;
+    }
+    if (prev == key) {
+      return valueList[slot];
+    }
+    slot = (slot + 1) % hashTableSize;
   }
 }
 
 __device__ u32 HashTable::getValue(u64 key) {
-  u32 slot = hash(key) % nBlocksMaxPow2;
+  u32 slot = hash(key) % hashTableSize;
   while (true) {
     if (keyList[slot] == key) {
       return valueList[slot];
@@ -54,12 +69,12 @@ __device__ u32 HashTable::getValue(u64 key) {
     if (keyList[slot] == kEmpty) {
       return bEmpty;
     }
-    slot = (slot + 1) % nBlocksMaxPow2;
+    slot = (slot + 1) % hashTableSize;
   }
 }
 
 __device__ u32 HashTable::setValue(u64 key, u32 value) {
-  u32 slot = hash(key) % nBlocksMaxPow2;
+  u32 slot = hash(key) % hashTableSize;
   while (true) {
     if (keyList[slot] == key) {
       u32 v = valueList[slot];
@@ -69,6 +84,6 @@ __device__ u32 HashTable::setValue(u64 key, u32 value) {
     if (keyList[slot] == kEmpty) {
       return bEmpty;
     }
-    slot = (slot + 1) % nBlocksMaxPow2;
+    slot = (slot + 1) % hashTableSize;
   }
 }

@@ -3,11 +3,74 @@
 
 #include "CompressibleSolver.cuh"
 
+
+__global__ void sortFieldDataKernel(MultiLevelSparseGrid &grid) {
+  dataType *Rho  = grid.getField(0);
+  dataType *RhoU = grid.getField(1);
+  dataType *RhoV = grid.getField(2);
+  dataType *RhoE = grid.getField(3);
+
+  dataType *OldRho  = grid.getField(4);
+  dataType *OldRhoU = grid.getField(5);
+  dataType *OldRhoV = grid.getField(6);
+  dataType *OldRhoE = grid.getField(7);
+
+  START_CELL_LOOP
+
+    u32 bIdxOld = grid.bIdxList[bIdx];
+    u32 cIdxOld = bIdxOld * blockSizeTot + idx;
+    
+    Rho[cIdx] = OldRho[cIdxOld];
+    RhoU[cIdx] = OldRhoU[cIdxOld];
+    RhoV[cIdx] = OldRhoV[cIdxOld];
+    RhoE[cIdx] = OldRhoE[cIdxOld];
+
+  END_CELL_LOOP
+
+}
+
+
+
+
+/*
+
+__global__ void forwardWaveletTransform(MultiLevelSparseGrid &grid)
+{
+  dataType *Rho   = grid.getField(0);
+  dataType *RhoU  = grid.getField(1);
+  dataType *RhoV  = grid.getField(2);
+  dataType *RhoEi = grid.getField(3);
+
+  START_CELL_LOOP
+  
+  i32 i,j;
+  grid.getLocalIdx(idx, i, j);
+  
+
+
+  END_CELL_LOOP
+}
+*/
+
+/*
+__global__ void forwardWaveletTransform(MultiLevelSparseGrid &grid)
+{
+  dataType *Rho   = grid.getField(0);
+  dataType *RhoU  = grid.getField(1);
+  dataType *RhoV  = grid.getField(2);
+  dataType *RhoEi = grid.getField(3);
+
+  START_CELL_LOOP
+
+  END_CELL_LOOP
+}
+*/
 /*
 __global__ void forwardWaveletTransform(MultiLevelSparseGrid &grid)
 {
   __shared__ dataType data;
 
+  dataType *Rho = grid.getFieldData(0, )
   START_CELL_LOOP
 
   u32 flags = solver.blockList[bIdx].flags;
