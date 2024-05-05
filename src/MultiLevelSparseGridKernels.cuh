@@ -29,24 +29,27 @@ __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
   START_HALO_CELL_LOOP
 
     i32 lvl, ib, jb;
-    grid.mortonDecode(grid.zLocList[bIdx], lvl, ib, jb);
-    i32 iNbr = (ib*blockSize + (i-haloSize)) / blockSize;
-    i32 jNbr = (ib*blockSize + (j-haloSize)) / blockSize;
+    u64 loc = grid.zLocList[bIdx];
+    grid.mortonDecode(loc, lvl, ib, jb);
+    i32 iNbr = ib + (i + haloSize) / blockSize - 1;
+    i32 jNbr = jb + (j + haloSize) / blockSize - 1;
 
     u64 nbrLoc = grid.mortonEncode(lvl, iNbr, jNbr);
     u32 nbrIdx = grid.hashTable.getValue(nbrLoc);
-    i32 il = (i-haloSize) % blockSize;
-    i32 jl = (j-haloSize) % blockSize;
+
+    i32 il = (i+haloSize) % blockSize;
+    i32 jl = (j+haloSize) % blockSize;
 
     if (nbrIdx == bEmpty && lvl > 0) {
+      // check lower lvl
       nbrLoc = grid.mortonEncode(lvl-1, iNbr/2, jNbr/2);
       nbrIdx = grid.hashTable.getValue(nbrLoc);
-      il = (i-haloSize)/2 % blockSize;
-      jl = (j-haloSize)/2 % blockSize;
+      il = (i+haloSize)/2 % blockSize;
+      jl = (j+haloSize)/2 % blockSize;
     }
 
     u32 lIdx = il + jl * blockSize;
-    grid.nbrIdxList[idx] = nbrIdx*blockSize + lIdx;
+    grid.nbrIdxList[cIdx] = nbrIdx*blockSizeTot + lIdx;
 
   END_HALO_CELL_LOOP
 }

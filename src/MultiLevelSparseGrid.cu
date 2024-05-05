@@ -65,7 +65,28 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   thrust::sort_by_key(thrust::device, zLocList, zLocList+nBlocks, bIdxList);
   sortFieldData();
   updateIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  updateNbrIndicesKernel<<<nBlocks*blockHaloSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
+
+  /*
+  for (u32 bIdx = 0; bIdx<nBlocks; bIdx++) {
+    u64 loc = zLocList[bIdx];
+    i32 lvl, ib, jb;
+    mortonDecode(loc, lvl, ib, jb);
+
+    printf("%d %d\n", ib, jb);
+    for (i32 j=7; j>=0; j--) {
+      for (i32 i=0; i<blockHaloSize; i++) {
+        u32 idx = nbrIdxList[bIdx*blockHaloSizeTot + j*blockHaloSize + i];
+        printf("%8d ", idx);
+      }
+      printf("\n");
+    }
+    printf("\n");
+  }
+  */
+  
+
 }
 
 __host__ __device__ void MultiLevelSparseGrid::getCellPos(i32 lvl, u32 ib, u32 jb, i32 i, i32 j, dataType *pos) {

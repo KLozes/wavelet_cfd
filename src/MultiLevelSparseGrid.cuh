@@ -78,22 +78,22 @@ public:
 */
 
 #define START_CELL_LOOP \
-  u32 bIdx = blockIdx.x * nBlocksPerCudaBlock + threadIdx.x / blockSizeTot; \
+  u32 bIdx = blockIdx.x * cudaBlockSize/blockSizeTot + threadIdx.x / blockSizeTot; \
   u32 idx = threadIdx.x % blockSizeTot; \
   u32 cIdx = bIdx * blockSizeTot + idx; \
   i32 i = idx % blockSize; \
   i32 j = idx / blockSize; \
   while (bIdx < grid.nBlocks) {
-#define END_CELL_LOOP bIdx += gridDim.x; __syncthreads();}
+#define END_CELL_LOOP bIdx += gridDim.x* cudaBlockSize/blockSizeTot; __syncthreads();}
 
 #define START_HALO_CELL_LOOP \
-  u32 bIdx = blockIdx.x * nBlocksPerCudaBlock + threadIdx.x / blockHaloSizeTot; \
+  u32 bIdx = blockIdx.x * cudaBlockSize/blockHaloSizeTot + threadIdx.x / blockHaloSizeTot; \
   u32 idx = threadIdx.x % blockHaloSizeTot; \
-  u32 cIdx = bIdx * blockHaloSizeTot + idx; \
-  i32 i = idx % (blockSize + 2*haloSize); \
-  i32 j = idx / (blockSize + 2*haloSize); \
+  u32 cIdx = blockIdx.x * cudaBlockSize + threadIdx.x; \
+  i32 i = idx % blockHaloSize; \
+  i32 j = idx / blockHaloSize; \
   while (bIdx < grid.nBlocks) {
-#define END_HALO_CELL_LOOP bIdx += gridDim.x; __syncthreads();}
+#define END_HALO_CELL_LOOP bIdx += gridDim.x * cudaBlockSize/blockHaloSizeTot; __syncthreads();}
 
 #define START_BLOCK_LOOP \
   u32 bIdx = threadIdx.x + blockIdx.x * blockDim.x; \

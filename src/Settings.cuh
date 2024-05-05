@@ -2,10 +2,10 @@
 #define SETTINGS_H
 
 // compile time simulation settings
-static constexpr uint blockSize = 4;
-static constexpr uint haloSize = 2;
-static constexpr uint cudaBlockSize = 256;
-static constexpr uint nBlocksMax = 1000000;
+static constexpr int blockSize = 4;
+static constexpr int haloSize = 2;
+static constexpr int cudaBlockSize = 256;
+static constexpr int nBlocksMax = 1000000;
 
 typedef float dataType;
 
