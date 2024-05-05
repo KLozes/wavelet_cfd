@@ -8,59 +8,114 @@ void CompressibleSolver::sortFieldData(void) {
   sortFieldDataKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
 }
 
-void CompressibleSolver::initFieldData(u32 initType) {
-
-  dataType *Rho  = getField(0);
-  dataType *RhoU = getField(1);
-  dataType *RhoV = getField(2);
-  dataType *RhoE = getField(3);
-
-  for (uint bIdx=0; bIdx < nBlocks; bIdx++) {
-    u64 loc = zLocList[bIdx];
-    i32 lvl, ib, jb;
-    mortonDecode(loc, lvl, ib, jb);
-    for (uint j = 0; j < blockSize; j++) {
-      for (uint i = 0; i < blockSize; i++) {
-        dataType pos[2];
-        getCellPos(lvl, ib, jb, i, j, pos);
-        u32 idx = i + j*blockSize + bIdx * blockSizeTot;
-        State q = getInitCondition(initType, pos);
-        Rho[idx] = q.rho;
-        RhoU[idx] = q.rhoU;
-        RhoV[idx] = q.rhoV;
-        RhoE[idx] = q.rhoE;
-      }
-    }
-  }
+void CompressibleSolver::setInitialConditions(i32 icType) {
+  setInitialConditionsKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this, icType);
+  cudaDeviceSynchronize();
 }
 
-State CompressibleSolver::getInitCondition(u32 initType, dataType *pos) {
-  if (initType == 0) {
-    // sod shock explosion
-    dataType centerX = domainSize[0]/2;
-    dataType centerY = domainSize[1]/2;
-    dataType radius = domainSize[0]/5;
+void CompressibleSolver::setBoundaryConditions(i32 bcType) {
+  setBoundaryConditionsKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this, bcType);
+}
 
-    dataType dist = sqrt((pos[0]-centerX)*(pos[0]-centerX) + (pos[1]-centerY)*(pos[1]-centerY));
-  
-    // inside
-    State q;
-    if (dist < radius) {
-      q.rho = 1.0;
-      q.rhoU = 0.0;
-      q.rhoV = 0.0;
-      q.rhoE = 1.0/(gamma-1);
-    }
-    else {
-      q.rho = 0.125;
-      q.rhoU = 0.0;
-      q.rhoV = 0.0;
-      q.rhoE = 0.1/(gamma-1);
-    }
-    return q;
-  }
-  else {
-    printf("ERROR: Ivalid initType: %d", initType);
-    exit(0);
-  }
+
+__host__ __device__ Flux CompressibleSolver::Centralflux(const dataType qL[4], const dataType qR[4], const dataType normal[2]) {
+  //
+  // Compute Central KEEP flux
+  //
+  dataType nx, ny, rL, uL, vL, vnL, pL, aL, HL, rR, uR, vR, vnR, pR, aR, HR, RT, u, v, H, a, vn, SLm, SRp;
+  nx = normal[0];
+  ny = normal[1];
+
+  // Left state
+  rL = qL[0];
+  uL = qL[1]/rL;
+  vL = qL[2]/rL;
+  vnL = uL*nx+vL*ny;
+  pL = (gam-1.0)*( qL[3] - rL*(uL*uL+vL*vL)/2.0 );
+  aL = sqrt(abs(gam*pL/rL));
+  HL = ( qL[3] + pL ) / rL;
+
+  // Right state
+  rR = qR[0];
+  uR = qR[1]/rR;
+  vR = qR[2]/rR;
+  vnR = uR*nx+vR*ny;
+  pR = (gam-1)*( qR[3] - rR*(uR*uR+vR*vR)/2.0 );
+  aR = sqrt(abs(gam*pR/rR));
+  HR = ( qR[3] + pR ) / rR;
+
+  // irst compute the Roe Averages
+  RT = sqrt(rR/rL); // r = RT*rL;
+  u = (uL+RT*uR)/(1.0+RT);
+  v = (vL+RT*vR)/(1.0+RT);
+  H = ( HL+RT* HR)/(1.0+RT);
+  a = sqrt( abs((gam-1.0)*(H-(u*u+v*v)/2.0)) );
+  vn = u*nx+v*ny;
+
+  // Wave speed estimates
+  SLm = fminf(fminf(vnL-aL, vn-a), 0);
+  SRp = fmaxf(fmaxf(vnR+aR, vn+a), 0);
+
+  // Left and Right fluxes
+  dataType FL[4] = {rL*vnL, rL*vnL*uL + pL*nx, rL*vnL*vL + pL*ny, rL*vnL*HL};
+  dataType FR[4] = {rR*vnR, rR*vnR*uR + pR*nx, rR*vnR*vR + pR*ny, rR*vnR*HR};
+
+  // Compute the HLL flux.
+  Flux F;
+  F.fRho  = ( SRp*FL[0] - SLm*FR[0] + SLm*SRp*(qR[0]-qL[0]) )/(SRp-SLm);
+  F.fRhoU = ( SRp*FL[1] - SLm*FR[1] + SLm*SRp*(qR[1]-qL[1]) )/(SRp-SLm);
+  F.fRhoV = ( SRp*FL[2] - SLm*FR[2] + SLm*SRp*(qR[2]-qL[2]) )/(SRp-SLm);
+  F.fRhoE = ( SRp*FL[3] - SLm*FR[3] + SLm*SRp*(qR[3]-qL[3]) )/(SRp-SLm);
+  return F;
+}
+
+__host__ __device__ Flux CompressibleSolver::HLLEflux(const dataType qL[4], const dataType qR[4], const dataType normal[2]) {
+  //
+  // Compute HLLE flux
+  //
+  dataType nx, ny, rL, uL, vL, vnL, pL, aL, HL, rR, uR, vR, vnR, pR, aR, HR, RT, u, v, H, a, vn, SLm, SRp;
+  nx = normal[0];
+  ny = normal[1];
+
+  // Left state
+  rL = qL[0];
+  uL = qL[1]/rL;
+  vL = qL[2]/rL;
+  vnL = uL*nx+vL*ny;
+  pL = (gam-1.0)*( qL[3] - rL*(uL*uL+vL*vL)/2.0 );
+  aL = sqrt(abs(gam*pL/rL));
+  HL = ( qL[3] + pL ) / rL;
+
+  // Right state
+  rR = qR[0];
+  uR = qR[1]/rR;
+  vR = qR[2]/rR;
+  vnR = uR*nx+vR*ny;
+  pR = (gam-1)*( qR[3] - rR*(uR*uR+vR*vR)/2.0 );
+  aR = sqrt(abs(gam*pR/rR));
+  HR = ( qR[3] + pR ) / rR;
+
+  // irst compute the Roe Averages
+  RT = sqrt(rR/rL); // r = RT*rL;
+  u = (uL+RT*uR)/(1.0+RT);
+  v = (vL+RT*vR)/(1.0+RT);
+  H = ( HL+RT* HR)/(1.0+RT);
+  a = sqrt( abs((gam-1.0)*(H-(u*u+v*v)/2.0)) );
+  vn = u*nx+v*ny;
+
+  // Wave speed estimates
+  SLm = fminf(fminf(vnL-aL, vn-a), 0);
+  SRp = fmaxf(fmaxf(vnR+aR, vn+a), 0);
+
+  // Left and Right fluxes
+  dataType FL[4] = {rL*vnL, rL*vnL*uL + pL*nx, rL*vnL*vL + pL*ny, rL*vnL*HL};
+  dataType FR[4] = {rR*vnR, rR*vnR*uR + pR*nx, rR*vnR*vR + pR*ny, rR*vnR*HR};
+
+  // Compute the HLL flux.
+  Flux F;
+  F.fRho  = ( SRp*FL[0] - SLm*FR[0] + SLm*SRp*(qR[0]-qL[0]) )/(SRp-SLm);
+  F.fRhoU = ( SRp*FL[1] - SLm*FR[1] + SLm*SRp*(qR[1]-qL[1]) )/(SRp-SLm);
+  F.fRhoV = ( SRp*FL[2] - SLm*FR[2] + SLm*SRp*(qR[2]-qL[2]) )/(SRp-SLm);
+  F.fRhoE = ( SRp*FL[3] - SLm*FR[3] + SLm*SRp*(qR[3]-qL[3]) )/(SRp-SLm);
+  return F;
 }

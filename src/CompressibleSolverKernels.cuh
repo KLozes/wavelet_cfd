@@ -4,7 +4,7 @@
 #include "CompressibleSolver.cuh"
 
 
-__global__ void sortFieldDataKernel(MultiLevelSparseGrid &grid) {
+__global__ void sortFieldDataKernel(CompressibleSolver &grid) {
   dataType *Rho  = grid.getField(0);
   dataType *RhoU = grid.getField(1);
   dataType *RhoV = grid.getField(2);
@@ -29,6 +29,50 @@ __global__ void sortFieldDataKernel(MultiLevelSparseGrid &grid) {
 
 }
 
+__global__ void setInitialConditionsKernel(CompressibleSolver &grid, i32 icType) {
+
+  dataType *Rho  = grid.getField(0);
+  dataType *RhoU = grid.getField(1);
+  dataType *RhoV = grid.getField(2);
+  dataType *RhoE = grid.getField(3);
+
+  START_CELL_LOOP
+
+    u64 loc = grid.zLocList[bIdx];
+    i32 lvl, ib, jb;
+    grid.mortonDecode(loc, lvl, ib, jb);
+    dataType pos[2];
+    grid.getCellPos(lvl, ib, jb, i, j, pos);
+
+    if (icType == 0) {
+      // sod shock explosion
+      dataType centerX = grid.domainSize[0]/2;
+      dataType centerY = grid.domainSize[1]/2;
+      dataType radius = grid.domainSize[0]/5;
+
+      dataType dist = sqrt((pos[0]-centerX)*(pos[0]-centerX) + (pos[1]-centerY)*(pos[1]-centerY));
+    
+      // inside
+      if (dist < radius) {
+        Rho[cIdx]  = 1.0;
+        RhoU[cIdx] = 0.0;
+        RhoV[cIdx] = 0.0;
+        RhoE[cIdx] = 1.0/(gam-1);
+      }
+      else {
+        Rho[cIdx]  = 0.125;
+        RhoU[cIdx] = 0.0;
+        RhoV[cIdx] = 0.0;
+        RhoE[cIdx] = 0.1/(gam-1);
+      }
+    }
+
+  END_CELL_LOOP
+}
+
+__global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 bcType) {
+
+}
 
 
 

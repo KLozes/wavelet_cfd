@@ -34,9 +34,11 @@ public:
 
   ~MultiLevelSparseGrid(void);
 
-  void initGrid(void);
-  void sortBlocks(void);
+  void initializeBaseGrid(void);
+  virtual void setInitialConditions(i32 icType) = 0;
+  virtual void setBoundaryConditions(i32 bcType) =0;
   
+  void sortBlocks(void);
   virtual void sortFieldData(void) = 0;
 
   __host__ __device__ dataType getDx(i32 lvl);
@@ -66,34 +68,27 @@ public:
 
 };
 
-/*
-#define START_CELL_LOOP \
-  u32 bIdx = blockIdx.x * nBlocksPerCudaBlock + threadIdx.x / blockSizeTot; \
-  i32 lvl, ib, jb; \
-  grid.mortonDecode(grid.blockLoc[bIdx].loc, lvl, ib, jb); \
-  u32 index = threadIdx.x % bSize; \
-  i32 i = index % blockSize; \
-  i32 j = index / blockSize; \
-  while (bIdx < grid.nBlocks) {
-*/
-
 #define START_CELL_LOOP \
   u32 bIdx = blockIdx.x * cudaBlockSize/blockSizeTot + threadIdx.x / blockSizeTot; \
   u32 idx = threadIdx.x % blockSizeTot; \
-  u32 cIdx = bIdx * blockSizeTot + idx; \
+  u32 cIdx = blockIdx.x * cudaBlockSize + threadIdx.x; \
   i32 i = idx % blockSize; \
   i32 j = idx / blockSize; \
   while (bIdx < grid.nBlocks) {
-#define END_CELL_LOOP bIdx += gridDim.x* cudaBlockSize/blockSizeTot; __syncthreads();}
+#define END_CELL_LOOP bIdx += gridDim.x* cudaBlockSize/blockSizeTot;  \
+  cIdx = bIdx * blockSizeTot + idx; \
+  __syncthreads();}
 
 #define START_HALO_CELL_LOOP \
   u32 bIdx = blockIdx.x * cudaBlockSize/blockHaloSizeTot + threadIdx.x / blockHaloSizeTot; \
   u32 idx = threadIdx.x % blockHaloSizeTot; \
-  u32 cIdx = blockIdx.x * cudaBlockSize + threadIdx.x; \
+  u32 cIdx = bIdx * blockHaloSizeTot + idx; \
   i32 i = idx % blockHaloSize; \
   i32 j = idx / blockHaloSize; \
   while (bIdx < grid.nBlocks) {
-#define END_HALO_CELL_LOOP bIdx += gridDim.x * cudaBlockSize/blockHaloSizeTot; __syncthreads();}
+#define END_HALO_CELL_LOOP bIdx += gridDim.x * cudaBlockSize/blockHaloSizeTot; \
+  cIdx = bIdx * blockHaloSizeTot + idx; \
+  __syncthreads();}
 
 #define START_BLOCK_LOOP \
   u32 bIdx = threadIdx.x + blockIdx.x * blockDim.x; \

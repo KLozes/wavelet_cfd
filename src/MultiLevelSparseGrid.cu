@@ -50,7 +50,7 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
   cudaFree(imageData);
 }
 
-void MultiLevelSparseGrid::initGrid(void) {
+void MultiLevelSparseGrid::initializeBaseGrid(void) {
   // fill the zLocList with base grid blocks
   initGridKernel<<<nBlocksMax/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
@@ -68,7 +68,6 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   updateNbrIndicesKernel<<<nBlocks*blockHaloSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
 
-  /*
   for (u32 bIdx = 0; bIdx<nBlocks; bIdx++) {
     u64 loc = zLocList[bIdx];
     i32 lvl, ib, jb;
@@ -84,8 +83,6 @@ void MultiLevelSparseGrid::sortBlocks(void) {
     }
     printf("\n");
   }
-  */
-  
 
 }
 
