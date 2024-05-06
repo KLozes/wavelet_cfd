@@ -15,15 +15,24 @@ static constexpr dataType gam = 1.4;
 class CompressibleSolver : public MultiLevelSparseGrid {
 public:
 
+  dataType deltaT;
+
   CompressibleSolver(dataType *domainSize_, u32 *baseGridSize_, u32 nLvls_) :
-    MultiLevelSparseGrid(domainSize_, baseGridSize_, nLvls_, 16) {}
+    MultiLevelSparseGrid(domainSize_, baseGridSize_, nLvls_, 9) {}
 
   void sortFieldData(void);
   void setInitialConditions(i32 icType);
   void setBoundaryConditions(i32 bcType);
 
-  __host__ __device__ Flux HLLEflux(const dataType qL[4], const dataType qR[4], const dataType normal[2]);
-  __host__ __device__ Flux Centralflux(const dataType qL[4], const dataType qR[4], const dataType normal[2]);
+  void computeDeltaT(void);
+  void computeRightHandSide(void);
+  void updateFields(i32 stage) ;
+
+
+  __host__ __device__ dataType lim(dataType r);
+  __host__ __device__ dataType tvdRec(dataType ul, dataType uc, dataType ur);
+  __host__ __device__ Vec4 centralFlux(Vec4 qL, Vec4 qR, Vec2 normal) ;
+  __host__ __device__ Vec4 hlleFlux(Vec4 qL, Vec4 qR, Vec2 normal) ;
 
 };
 

@@ -27,6 +27,7 @@ public:
   u32 *bIdxList; // block memory indices
 
   u32 *nbrIdxList;     // cell neighbor indeces
+  u32 *prntIdxList;    // cell parent indices
   dataType *fieldData; // flow field data
   dataType *imageData; // output image data
 
@@ -35,15 +36,15 @@ public:
   ~MultiLevelSparseGrid(void);
 
   void initializeBaseGrid(void);
-  virtual void setInitialConditions(i32 icType) = 0;
-  virtual void setBoundaryConditions(i32 bcType) =0;
   
   void sortBlocks(void);
   virtual void sortFieldData(void) = 0;
 
+  __host__ __device__ i32 getSize(i32 lvl);
   __host__ __device__ dataType getDx(i32 lvl);
   __host__ __device__ dataType getDy(i32 lvl);
   __host__ __device__ void getCellPos(i32 lvl, u32 ib, u32 jb, i32 i, i32 j, dataType *pos);
+  __host__ __device__ u32 getNbrIdx(u32 bIdx, i32 i, i32 j);
   __host__ __device__ bool isInteriorBlock(i32 lvl, i32 i, i32 j);
   __host__ __device__ bool isExteriorBlock(i32 lvl, i32 i, i32 j);
 

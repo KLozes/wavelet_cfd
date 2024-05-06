@@ -23,6 +23,46 @@ public:
   }
 };
 
+struct Vec2 {
+  dataType data[2];
+  __host__ __device__ Vec2(void){};
+  __host__ __device__ Vec2(dataType val0, dataType val1) {
+    data[0] = val0;
+    data[1] = val1;
+  }
+  __host__ __device__ dataType& operator[](i32 i) {
+    return data[i];
+  }
+};
+
+struct Vec3 {
+  dataType data[3];
+  __host__ __device__ Vec3(void){};
+  __host__ __device__ Vec3(dataType val0, dataType val1, dataType val2) {
+    data[0] = val0;
+    data[1] = val1;
+    data[2] = val2;
+  }
+  __host__ __device__ dataType& operator[](i32 i) {
+    return data[i];
+  }
+};
+
+struct Vec4 {
+  dataType data[4];
+  __host__ __device__ Vec4(void){};
+  __host__ __device__ Vec4(dataType val0, dataType val1, dataType val2, dataType val3) {
+    data[0] = val0;
+    data[1] = val1;
+    data[2] = val2;
+    data[3] = val3;
+  }
+  __host__ __device__ dataType& operator[](i32 i) {
+    return data[i];
+  }
+
+};
+
 __host__ __device__ constexpr u32 log2(u32 n) {
   return ((n<2) ? 1 : 1+log2(n/2));
 }

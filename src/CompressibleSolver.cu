@@ -1,4 +1,5 @@
 #include <iostream>
+#include <thrust/extrema.h>
 
 #include "CompressibleSolver.cuh"
 #include "CompressibleSolverKernels.cuh"
@@ -9,16 +10,38 @@ void CompressibleSolver::sortFieldData(void) {
 }
 
 void CompressibleSolver::setInitialConditions(i32 icType) {
-  setInitialConditionsKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this, icType);
+  setInitialConditionsKernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this, icType);
   cudaDeviceSynchronize();
 }
 
 void CompressibleSolver::setBoundaryConditions(i32 bcType) {
-  setBoundaryConditionsKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this, bcType);
+  setBoundaryConditionsKernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this, bcType);
+}
+
+void CompressibleSolver::computeDeltaT(void) {
+  computeDeltaTKernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this);
+	deltaT = *(thrust::min_element(thrust::device, getField(8), getField(8)+nBlocks*blockSize));
+}
+
+void CompressibleSolver::computeRightHandSide(void) {
+  computeRightHandSideKernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this);
+}
+
+void CompressibleSolver::updateFields(i32 stage) {
+  updateFieldsKernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this, stage);
 }
 
 
-__host__ __device__ Flux CompressibleSolver::Centralflux(const dataType qL[4], const dataType qR[4], const dataType normal[2]) {
+__host__ __device__ dataType CompressibleSolver::lim(dataType r) {
+  return ((r > 0.0 && r < 1.0) ? (2.0*r + r*r*r) / (1.0 + 2.0*r*r) : r);
+}
+
+__host__ __device__ dataType CompressibleSolver::tvdRec(dataType ul, dataType uc, dataType ur) {
+  dataType r = (uc - ul) / (copysign(1.0, ur - ul)*fmaxf(abs(ur - ul), 1e-32));
+  return ul + lim(r) * (ur - ul);
+}
+
+__host__ __device__ Vec4 CompressibleSolver::centralFlux(Vec4 qL, Vec4 qR, Vec2 normal) {
   //
   // Compute Central KEEP flux
   //
@@ -60,16 +83,15 @@ __host__ __device__ Flux CompressibleSolver::Centralflux(const dataType qL[4], c
   dataType FL[4] = {rL*vnL, rL*vnL*uL + pL*nx, rL*vnL*vL + pL*ny, rL*vnL*HL};
   dataType FR[4] = {rR*vnR, rR*vnR*uR + pR*nx, rR*vnR*vR + pR*ny, rR*vnR*HR};
 
-  // Compute the HLL flux.
-  Flux F;
-  F.fRho  = ( SRp*FL[0] - SLm*FR[0] + SLm*SRp*(qR[0]-qL[0]) )/(SRp-SLm);
-  F.fRhoU = ( SRp*FL[1] - SLm*FR[1] + SLm*SRp*(qR[1]-qL[1]) )/(SRp-SLm);
-  F.fRhoV = ( SRp*FL[2] - SLm*FR[2] + SLm*SRp*(qR[2]-qL[2]) )/(SRp-SLm);
-  F.fRhoE = ( SRp*FL[3] - SLm*FR[3] + SLm*SRp*(qR[3]-qL[3]) )/(SRp-SLm);
-  return F;
+  // Compute the HLLE flux.
+  Vec4 Flux((SRp*FL[0] - SLm*FR[0] + SLm*SRp*(qR[0]-qL[0]) )/(SRp-SLm), 
+            (SRp*FL[1] - SLm*FR[1] + SLm*SRp*(qR[1]-qL[1]) )/(SRp-SLm),
+            (SRp*FL[2] - SLm*FR[2] + SLm*SRp*(qR[2]-qL[2]) )/(SRp-SLm),
+            (SRp*FL[3] - SLm*FR[3] + SLm*SRp*(qR[3]-qL[3]) )/(SRp-SLm));
+  return Flux;
 }
 
-__host__ __device__ Flux CompressibleSolver::HLLEflux(const dataType qL[4], const dataType qR[4], const dataType normal[2]) {
+__host__ __device__ Vec4 CompressibleSolver::hlleFlux(Vec4 qL, Vec4 qR, Vec2 normal) {
   //
   // Compute HLLE flux
   //
@@ -111,11 +133,10 @@ __host__ __device__ Flux CompressibleSolver::HLLEflux(const dataType qL[4], cons
   dataType FL[4] = {rL*vnL, rL*vnL*uL + pL*nx, rL*vnL*vL + pL*ny, rL*vnL*HL};
   dataType FR[4] = {rR*vnR, rR*vnR*uR + pR*nx, rR*vnR*vR + pR*ny, rR*vnR*HR};
 
-  // Compute the HLL flux.
-  Flux F;
-  F.fRho  = ( SRp*FL[0] - SLm*FR[0] + SLm*SRp*(qR[0]-qL[0]) )/(SRp-SLm);
-  F.fRhoU = ( SRp*FL[1] - SLm*FR[1] + SLm*SRp*(qR[1]-qL[1]) )/(SRp-SLm);
-  F.fRhoV = ( SRp*FL[2] - SLm*FR[2] + SLm*SRp*(qR[2]-qL[2]) )/(SRp-SLm);
-  F.fRhoE = ( SRp*FL[3] - SLm*FR[3] + SLm*SRp*(qR[3]-qL[3]) )/(SRp-SLm);
-  return F;
+  // Compute the HLLE flux.
+  Vec4 Flux((SRp*FL[0] - SLm*FR[0] + SLm*SRp*(qR[0]-qL[0]) )/(SRp-SLm), 
+            (SRp*FL[1] - SLm*FR[1] + SLm*SRp*(qR[1]-qL[1]) )/(SRp-SLm),
+            (SRp*FL[2] - SLm*FR[2] + SLm*SRp*(qR[2]-qL[2]) )/(SRp-SLm),
+            (SRp*FL[3] - SLm*FR[3] + SLm*SRp*(qR[3]-qL[3]) )/(SRp-SLm));
+  return Flux;
 }

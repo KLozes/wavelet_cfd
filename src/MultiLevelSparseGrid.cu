@@ -1,6 +1,5 @@
 #include <thrust/sort.h>
 #include <algorithm>
-#include <thrust/execution_policy.h>
 
 #include "png.hpp"
 #include "MultiLevelSparseGrid.cuh"
@@ -25,15 +24,18 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(dataType *domainSize_, u32 *baseGridS
 
   // grid size checking
   assert(isPowerOf2(blockSize));
+  assert(baseGridSize[0]*baseGridSize[0]/blockSize/blockSize < nBlocksMax);
 
   cudaMallocManaged(&zLocList, nBlocksMax*sizeof(u64));
   cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(u32));
+  cudaMallocManaged(&prntIdxList, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&nbrIdxList, blockHaloSizeTot*nBlocksMax*sizeof(u32));
   cudaMallocManaged(&fieldData, nFields*blockSizeTot*nBlocksMax*sizeof(dataType));
   cudaMallocManaged(&imageData, blockSizeTot*nBlocksMax*sizeof(dataType));
 
   cudaMemset(zLocList, 0, nBlocksMax*sizeof(u64));
   cudaMemset(bIdxList, 0, nBlocksMax*sizeof(u32));
+  cudaMemset(prntIdxList, 0, nBlocksMax*sizeof(u32));
   cudaMemset(nbrIdxList, 0, blockHaloSizeTot*nBlocksMax*sizeof(u32));
   cudaMemset(fieldData, 0, nFields*blockSizeTot*nBlocksMax*sizeof(dataType));
   cudaMemset(imageData, 0, blockSizeTot*nBlocksMax*sizeof(dataType));
@@ -45,6 +47,7 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
   cudaDeviceSynchronize();
   cudaFree(zLocList);
   cudaFree(bIdxList);
+  cudaFree(prntIdxList);
   cudaFree(nbrIdxList);
   cudaFree(fieldData);
   cudaFree(imageData);
@@ -68,6 +71,7 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   updateNbrIndicesKernel<<<nBlocks*blockHaloSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
 
+  /*
   for (u32 bIdx = 0; bIdx<nBlocks; bIdx++) {
     u64 loc = zLocList[bIdx];
     i32 lvl, ib, jb;
@@ -83,12 +87,16 @@ void MultiLevelSparseGrid::sortBlocks(void) {
     }
     printf("\n");
   }
-
+  */
 }
 
 __host__ __device__ void MultiLevelSparseGrid::getCellPos(i32 lvl, u32 ib, u32 jb, i32 i, i32 j, dataType *pos) {
   pos[0] = (ib*blockSize + i + .5)*getDx(lvl);
   pos[1] = (jb*blockSize + j + .5)*getDy(lvl);
+}
+
+__host__ __device__ u32 MultiLevelSparseGrid::getNbrIdx(u32 bIdx, i32 i, i32 j) {
+  return nbrIdxList[bIdx*blockHaloSizeTot + (j+2)*blockHaloSize + (i+2)];
 }
 
 __host__ __device__ dataType MultiLevelSparseGrid::getDx(i32 lvl) {
