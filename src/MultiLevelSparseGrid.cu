@@ -10,7 +10,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(dataType *domainSize_, u32 *baseGridS
   domainSize[0] = domainSize_[0];
   domainSize[1] = domainSize_[1];
 
-  baseGridSize[0] = baseGridSize_[0]; // add exterior blocks for boundary conditions
+  baseGridSize[0] = baseGridSize_[0];
   baseGridSize[1] = baseGridSize_[1];
 
   nLvls = nLvls_;
@@ -24,7 +24,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(dataType *domainSize_, u32 *baseGridS
 
   // grid size checking
   assert(isPowerOf2(blockSize));
-  assert(baseGridSize[0]*baseGridSize[0]/blockSize/blockSize < nBlocksMax);
+  assert(baseGridSize[0]*baseGridSize[1]/blockSize/blockSize < nBlocksMax);
 
   cudaMallocManaged(&zLocList, nBlocksMax*sizeof(u64));
   cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(u32));
@@ -78,7 +78,7 @@ void MultiLevelSparseGrid::sortBlocks(void) {
     mortonDecode(loc, lvl, ib, jb);
 
     printf("%d %d\n", ib, jb);
-    for (i32 j=7; j>=0; j--) {
+    for (i32 j=blockHaloSize-1; j>=0; j--) {
       for (i32 i=0; i<blockHaloSize; i++) {
         u32 idx = nbrIdxList[bIdx*blockHaloSizeTot + j*blockHaloSize + i];
         printf("%8d ", idx);
@@ -88,23 +88,24 @@ void MultiLevelSparseGrid::sortBlocks(void) {
     printf("\n");
   }
   */
+  
 }
 
-__host__ __device__ void MultiLevelSparseGrid::getCellPos(i32 lvl, u32 ib, u32 jb, i32 i, i32 j, dataType *pos) {
+__host__ __device__ void MultiLevelSparseGrid::getCellPos(i32 lvl, i32 ib, i32 jb, i32 i, i32 j, dataType *pos) {
   pos[0] = (ib*blockSize + i + .5)*getDx(lvl);
   pos[1] = (jb*blockSize + j + .5)*getDy(lvl);
 }
 
 __host__ __device__ u32 MultiLevelSparseGrid::getNbrIdx(u32 bIdx, i32 i, i32 j) {
-  return nbrIdxList[bIdx*blockHaloSizeTot + (j+2)*blockHaloSize + (i+2)];
+  return nbrIdxList[bIdx*blockHaloSizeTot + (j+haloSize)*blockHaloSize + (i+haloSize)];
 }
 
 __host__ __device__ dataType MultiLevelSparseGrid::getDx(i32 lvl) {
-  return domainSize[0]/(baseGridSize[0]*powi(2,lvl));
+  return dataType(domainSize[0])/dataType(baseGridSize[0]*powi(2,lvl));
 }
 
 __host__ __device__ dataType MultiLevelSparseGrid::getDy(i32 lvl) {
-  return domainSize[1]/(baseGridSize[1]*powi(2,lvl));
+  return dataType(domainSize[1])/dataType(baseGridSize[1]*powi(2,lvl));
 }
 
 __host__ __device__ bool MultiLevelSparseGrid::isInteriorBlock(i32 lvl, i32 i, i32 j) { 
@@ -169,7 +170,7 @@ __host__ __device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, i32 &lvl
 
 void MultiLevelSparseGrid::paint() {
 
-  png::image<png::gray_pixel_16> image(imageSize[0], imageSize[1]);
+  png::image<png::gray_pixel_16> image(imageSize[1], imageSize[0]);
 
   for (u32 f=0; f<4; f++) {
     computeImageData(f);

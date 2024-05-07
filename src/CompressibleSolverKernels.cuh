@@ -56,10 +56,10 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid, i32 icType)
     
       // inside
       if (dist < radius) {
-        Rho[cIdx]  = 1.0;
+        Rho[cIdx]  = 10.0;
         U[cIdx]    = 0.0;
         V[cIdx]    = 0.0;
-        P[cIdx]    = 1.0;
+        P[cIdx]    = 10.0;
       }
       else {
         Rho[cIdx]  = 0.125;
@@ -97,10 +97,10 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 bcType
         i32 ibc = i;
         i32 jbc = j;
         if (ib < 0) {
-          ibc = 4;
+          ibc = blockSize;
         }
         if (jb < 0) {
-          jbc = 4;
+          jbc = blockSize;
         }
         if (ib >= i32(gridSize[0])) {
           ibc = -1; 
@@ -154,7 +154,7 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
     p = P[cIdx];
     a = sqrt(abs(gam*p/rho));
     vel = sqrt(u*u + v*v);
-    dx = fminf(grid.getDx(lvl), grid.getDy(lvl));
+    dx = min(grid.getDx(lvl), grid.getDy(lvl));
     DeltaT[cIdx] = dx / (a + vel + 1e-32);
 
   END_CELL_LOOP
@@ -224,11 +224,11 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
       fluxL = grid.hllcFlux(grid.prim2cons(qL), grid.prim2cons(qR), Vec2(1,0)); 
       fluxD = grid.hllcFlux(grid.prim2cons(qD), grid.prim2cons(qU), Vec2(0,1)); 
       
-      //fluxL = grid.hlleFlux(Vec4(Rho[l1Idx], U[l1Idx], V[l1Idx], P[l1Idx]),
-      //                     Vec4(Rho[cIdx], U[cIdx], V[cIdx], P[cIdx]),
+      //fluxL = grid.hllcFlux(grid.prim2cons(Vec4(Rho[l1Idx], U[l1Idx], V[l1Idx], P[l1Idx])),
+      //                     grid.prim2cons(Vec4(Rho[cIdx], U[cIdx], V[cIdx], P[cIdx])),
       //                     Vec2(1,0)); 
-      //fluxD = grid.hlleFlux(Vec4(Rho[d1Idx], U[d1Idx], V[d1Idx], P[d1Idx]),
-      //                     Vec4(Rho[cIdx], U[cIdx], V[cIdx], P[cIdx]),
+      //fluxD = grid.hllcFlux(grid.prim2cons(Vec4(Rho[d1Idx], U[d1Idx], V[d1Idx], P[d1Idx])),
+      //                     grid.prim2cons(Vec4(Rho[cIdx], U[cIdx], V[cIdx], P[cIdx])),
       //                     Vec2(0,1)); 
 
       atomicAdd(&RhsRho[cIdx],     fluxL[0] * dy / vol + fluxD[0] * dx / vol);
@@ -272,7 +272,7 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
   constexpr dataType alpha[3] = {5.0/9.0, 153.0/128.0, 0.0};
   constexpr dataType beta[3] = {1.0/3.0, 15.0/16.0, 8.0/15.0};
 
-  dataType dt = .5*grid.deltaT;
+  dataType dt = grid.deltaT;
 
   START_CELL_LOOP
 

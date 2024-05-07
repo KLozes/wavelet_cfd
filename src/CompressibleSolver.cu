@@ -10,33 +10,36 @@ void CompressibleSolver::sortFieldData(void) {
 }
 
 void CompressibleSolver::setInitialConditions(i32 icType) {
-  setInitialConditionsKernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this, icType);
+  setInitialConditionsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this, icType);
   cudaDeviceSynchronize();
 }
 
 void CompressibleSolver::setBoundaryConditions(i32 bcType) {
-  setBoundaryConditionsKernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this, bcType);
+  setBoundaryConditionsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this, bcType);
 }
 
 void CompressibleSolver::computeDeltaT(void) {
-  computeDeltaTKernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  computeDeltaTKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
 	deltaT = *(thrust::min_element(thrust::device, getField(12), getField(12)+nBlocks*blockSize));
   deltaT *= cfl;
+
 }
 
 void CompressibleSolver::computeRightHandSide(void) {
-  computeRightHandSideKernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  computeRightHandSideKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
 }
 
 void CompressibleSolver::updateFields(i32 stage) {
-  updateFieldsRK3Kernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this, stage);
+  updateFieldsRK3Kernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this, stage);
 }
 
 
 __host__ __device__ dataType CompressibleSolver::lim(dataType &r) {
   // new TVD
-  //return ((r > 0.0 && r < 1.0) ? (2.0*r + r*r*r) / (1.0 + 2.0*r*r) : r);
+  return ((r > 0.0 && r < 1.0) ? (2.0*r + r*r*r) / (1.0 + 2.0*r*r) : r);
 
+  /*
   // low dissipation tvd scheme
   dataType gam0 = 1100.0;
   dataType gam1 = 800.0;
@@ -56,6 +59,7 @@ __host__ __device__ dataType CompressibleSolver::lim(dataType &r) {
     u = min(temp0 * w1 + temp2 * (1.0 - w1), temp2);
   }
   return u;
+  */
 }
 
 __host__ __device__ dataType CompressibleSolver::tvdRec(dataType &ul, dataType &uc, dataType &ur) {
@@ -193,6 +197,7 @@ __host__ __device__ Vec4 CompressibleSolver::hllcFlux(Vec4 qL, Vec4 qR, Vec2 nor
            (SR-vnR)/(SR-SM) * (eR + (SM-vnR)*(rR*SM + pR/(SR - vnR))));
 
   /*
+  // hllm state
   aR = rR*(SR-vnR);
   aL = rL*(SL-vnL);
   dataType vtR = ny*uR + nx*vR;

@@ -5,11 +5,11 @@
 #include "CompressibleSolver.cuh"
 
 int main(int argc, char* argv[]) {
-  dataType domainSize[2] = {1.0, 1.0};
-  u32 baseGridSize[2] = {blockSize*600, blockSize*600};
+  dataType domainSize[2] = {1.0, 2.0};
+  u32 baseGridSize[2] = {blockSize*100, blockSize*2*100};
   u32 nLvls = 1;
 
-  CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls, .6);
+  CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls, .3);
   solver->initializeBaseGrid();
   solver->setInitialConditions(0);
   solver->setBoundaryConditions(0);
@@ -32,7 +32,7 @@ int main(int argc, char* argv[]) {
     t += solver->deltaT;
     n++;
 
-    if (n % 100 == 0) {
+    if (n % 50 == 0) {
       printf("n: %d, t = %f\n", n, t);
       solver->paint();
     }

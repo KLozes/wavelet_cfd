@@ -78,6 +78,7 @@ constexpr bool isPowerOf2(int v) {
 static constexpr u32 log2BlockSize = log2((u32)blockSize);
 
 static constexpr i32 blockSizeTot = powi(blockSize, 2);
+static constexpr i32 nBlocksMax = nCellsMax / blockSizeTot;
 static constexpr i32 blockHaloSize = blockSize+2*haloSize;
 static constexpr i32 blockHaloSizeTot = powi(blockHaloSize, 2);
 static constexpr i32 nBlocksPerCudaBlock = cudaBlockSize/blockSizeTot;

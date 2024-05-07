@@ -43,7 +43,7 @@ public:
   __host__ __device__ i32 getSize(i32 lvl);
   __host__ __device__ dataType getDx(i32 lvl);
   __host__ __device__ dataType getDy(i32 lvl);
-  __host__ __device__ void getCellPos(i32 lvl, u32 ib, u32 jb, i32 i, i32 j, dataType *pos);
+  __host__ __device__ void getCellPos(i32 lvl, i32 ib, i32 jb, i32 i, i32 j, dataType *pos);
   __host__ __device__ u32 getNbrIdx(u32 bIdx, i32 i, i32 j);
   __host__ __device__ bool isInteriorBlock(i32 lvl, i32 i, i32 j);
   __host__ __device__ bool isExteriorBlock(i32 lvl, i32 i, i32 j);
@@ -70,25 +70,25 @@ public:
 };
 
 #define START_CELL_LOOP \
-  u32 bIdx = blockIdx.x * cudaBlockSize/blockSizeTot + threadIdx.x / blockSizeTot; \
-  u32 idx = threadIdx.x % blockSizeTot; \
   u32 cIdx = blockIdx.x * cudaBlockSize + threadIdx.x; \
+  u32 bIdx = cIdx / blockSizeTot; \
+  u32 idx = cIdx % blockSizeTot; \
   i32 i = idx % blockSize; \
-  i32 j = idx / blockSize; \
-  while (bIdx < grid.nBlocks) {
-#define END_CELL_LOOP bIdx += gridDim.x* cudaBlockSize/blockSizeTot;  \
-  cIdx = bIdx * blockSizeTot + idx; \
+  i32 j = idx / blockSize; 
+  //while (bIdx < grid.nBlocks) {
+#define END_CELL_LOOP //cIdx += gridDim.x*cudaBlockSize; \
+  bIdx = cIdx / blockSizeTot;  \
   __syncthreads();}
 
 #define START_HALO_CELL_LOOP \
-  u32 bIdx = blockIdx.x * cudaBlockSize/blockHaloSizeTot + threadIdx.x / blockHaloSizeTot; \
-  u32 idx = threadIdx.x % blockHaloSizeTot; \
-  u32 cIdx = bIdx * blockHaloSizeTot + idx; \
+  u32 cIdx = blockIdx.x * cudaBlockSize + threadIdx.x; \
+  u32 bIdx = cIdx / blockHaloSizeTot; \
+  u32 idx = cIdx % blockHaloSizeTot; \
   i32 i = idx % blockHaloSize; \
   i32 j = idx / blockHaloSize; \
   while (bIdx < grid.nBlocks) {
-#define END_HALO_CELL_LOOP bIdx += gridDim.x * cudaBlockSize/blockHaloSizeTot; \
-  cIdx = bIdx * blockHaloSizeTot + idx; \
+#define END_HALO_CELL_LOOP cIdx += gridDim.x*cudaBlockSize; \
+  bIdx = cIdx / blockHaloSizeTot;  \
   __syncthreads();}
 
 #define START_BLOCK_LOOP \
