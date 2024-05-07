@@ -20,7 +20,8 @@ void CompressibleSolver::setBoundaryConditions(i32 bcType) {
 
 void CompressibleSolver::computeDeltaT(void) {
   computeDeltaTKernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this);
-	deltaT = *(thrust::min_element(thrust::device, getField(8), getField(8)+nBlocks*blockSize));
+	deltaT = *(thrust::min_element(thrust::device, getField(12), getField(12)+nBlocks*blockSize));
+  deltaT *= cfl;
 }
 
 void CompressibleSolver::computeRightHandSide(void) {
@@ -28,115 +29,189 @@ void CompressibleSolver::computeRightHandSide(void) {
 }
 
 void CompressibleSolver::updateFields(i32 stage) {
-  updateFieldsKernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this, stage);
+  updateFieldsRK3Kernel<<<nBlocks*blockSize/cudaBlockSize+1, cudaBlockSize>>>(*this, stage);
 }
 
 
-__host__ __device__ dataType CompressibleSolver::lim(dataType r) {
-  return ((r > 0.0 && r < 1.0) ? (2.0*r + r*r*r) / (1.0 + 2.0*r*r) : r);
+__host__ __device__ dataType CompressibleSolver::lim(dataType &r) {
+  // new TVD
+  //return ((r > 0.0 && r < 1.0) ? (2.0*r + r*r*r) / (1.0 + 2.0*r*r) : r);
+
+  // low dissipation tvd scheme
+  dataType gam0 = 1100.0;
+  dataType gam1 = 800.0;
+  dataType lam1 = .15;
+  dataType r4 = (r - .5)*(r - .5)*(r - .5)*(r - .5); // (r-.5) is a correction to the paper, which has (r-1)
+  dataType w0 = 1.0 / ((1.0 + gam0*r4)*(1.0 + gam0*r4)); 
+  dataType w1 = 1.0 / ((1.0 + gam1*r4)*(1.0 + gam1*r4));
+
+  dataType u = r;
+  dataType temp0 = 1.0/3.0 + 5.0/6.0*r;
+  dataType temp1 = 2.0*r;
+  dataType temp2 = lam1*r - lam1 + 1.0;
+  if (0 < r && r <= 0.5){
+    u = min(temp0 * w0 + temp1 * (1.0 - w0), temp1);
+  }
+  if ( 0.5 < r && r <= 1.0) {
+    u = min(temp0 * w1 + temp2 * (1.0 - w1), temp2);
+  }
+  return u;
 }
 
-__host__ __device__ dataType CompressibleSolver::tvdRec(dataType ul, dataType uc, dataType ur) {
+__host__ __device__ dataType CompressibleSolver::tvdRec(dataType &ul, dataType &uc, dataType &ur) {
   dataType r = (uc - ul) / (copysign(1.0, ur - ul)*fmaxf(abs(ur - ul), 1e-32));
   return ul + lim(r) * (ur - ul);
 }
 
-__host__ __device__ Vec4 CompressibleSolver::centralFlux(Vec4 qL, Vec4 qR, Vec2 normal) {
-  //
-  // Compute Central KEEP flux
-  //
-  dataType nx, ny, rL, uL, vL, vnL, pL, aL, HL, rR, uR, vR, vnR, pR, aR, HR, RT, u, v, H, a, vn, SLm, SRp;
-  nx = normal[0];
-  ny = normal[1];
+__host__ __device__ Vec4 CompressibleSolver::prim2cons(Vec4 prim) {
+  Vec4 cons;
+  cons[0] = prim[0];
+  cons[1] = prim[1]*prim[0];
+  cons[2] = prim[2]*prim[0];
+  cons[3] = prim[3]/(gam-1.0) + .5*prim[0]*(prim[1]*prim[1] + prim[2]*prim[2]);
+  return cons;
+}
 
-  // Left state
-  rL = qL[0];
-  uL = qL[1]/rL;
-  vL = qL[2]/rL;
-  vnL = uL*nx+vL*ny;
-  pL = (gam-1.0)*( qL[3] - rL*(uL*uL+vL*vL)/2.0 );
-  aL = sqrt(abs(gam*pL/rL));
-  HL = ( qL[3] + pL ) / rL;
-
-  // Right state
-  rR = qR[0];
-  uR = qR[1]/rR;
-  vR = qR[2]/rR;
-  vnR = uR*nx+vR*ny;
-  pR = (gam-1)*( qR[3] - rR*(uR*uR+vR*vR)/2.0 );
-  aR = sqrt(abs(gam*pR/rR));
-  HR = ( qR[3] + pR ) / rR;
-
-  // irst compute the Roe Averages
-  RT = sqrt(rR/rL); // r = RT*rL;
-  u = (uL+RT*uR)/(1.0+RT);
-  v = (vL+RT*vR)/(1.0+RT);
-  H = ( HL+RT* HR)/(1.0+RT);
-  a = sqrt( abs((gam-1.0)*(H-(u*u+v*v)/2.0)) );
-  vn = u*nx+v*ny;
-
-  // Wave speed estimates
-  SLm = fminf(fminf(vnL-aL, vn-a), 0);
-  SRp = fmaxf(fmaxf(vnR+aR, vn+a), 0);
-
-  // Left and Right fluxes
-  dataType FL[4] = {rL*vnL, rL*vnL*uL + pL*nx, rL*vnL*vL + pL*ny, rL*vnL*HL};
-  dataType FR[4] = {rR*vnR, rR*vnR*uR + pR*nx, rR*vnR*vR + pR*ny, rR*vnR*HR};
-
-  // Compute the HLLE flux.
-  Vec4 Flux((SRp*FL[0] - SLm*FR[0] + SLm*SRp*(qR[0]-qL[0]) )/(SRp-SLm), 
-            (SRp*FL[1] - SLm*FR[1] + SLm*SRp*(qR[1]-qL[1]) )/(SRp-SLm),
-            (SRp*FL[2] - SLm*FR[2] + SLm*SRp*(qR[2]-qL[2]) )/(SRp-SLm),
-            (SRp*FL[3] - SLm*FR[3] + SLm*SRp*(qR[3]-qL[3]) )/(SRp-SLm));
-  return Flux;
+__host__ __device__ Vec4 CompressibleSolver::cons2prim(Vec4 cons) {
+  Vec4 prim;
+  prim[0] = cons[0];
+  prim[1] = cons[1]/cons[0];
+  prim[2] = cons[2]/cons[0];
+  prim[3] = (gam-1.0)*(cons[3] - .5*prim[0]*(prim[1]*prim[1] + prim[2]*prim[2]));
+  return prim;
 }
 
 __host__ __device__ Vec4 CompressibleSolver::hlleFlux(Vec4 qL, Vec4 qR, Vec2 normal) {
   //
   // Compute HLLE flux
   //
-  dataType nx, ny, rL, uL, vL, vnL, pL, aL, HL, rR, uR, vR, vnR, pR, aR, HR, RT, u, v, H, a, vn, SLm, SRp;
-  nx = normal[0];
-  ny = normal[1];
+  dataType nx = normal[0];
+  dataType ny = normal[1];
 
   // Left state
-  rL = qL[0];
-  uL = qL[1]/rL;
-  vL = qL[2]/rL;
-  vnL = uL*nx+vL*ny;
-  pL = (gam-1.0)*( qL[3] - rL*(uL*uL+vL*vL)/2.0 );
-  aL = sqrt(abs(gam*pL/rL));
-  HL = ( qL[3] + pL ) / rL;
+  dataType rL = qL[0];
+  dataType sqrL = sqrt(rL);
+  dataType uL = qL[1]/qL[0];
+  dataType vL = qL[2]/qL[0];
+  dataType vnL = uL*nx+vL*ny;
+  dataType eL = qL[3];
+  dataType pL = (gam-1.0)*(eL - .5*rL*(uL*uL + vL*vL));
+  dataType hL = (eL + pL)/rL;
+  dataType aL = sqrt(abs(gam*pL/rL));
 
   // Right state
-  rR = qR[0];
-  uR = qR[1]/rR;
-  vR = qR[2]/rR;
-  vnR = uR*nx+vR*ny;
-  pR = (gam-1)*( qR[3] - rR*(uR*uR+vR*vR)/2.0 );
-  aR = sqrt(abs(gam*pR/rR));
-  HR = ( qR[3] + pR ) / rR;
+  dataType rR = qR[0];
+  dataType sqrR = sqrt(rR);
+  dataType uR = qR[1]/qR[0];
+  dataType vR = qR[2]/qR[0];
+  dataType vnR = uR*nx+vR*ny;
+  dataType eR = qR[3];
+  dataType pR = (gam-1.0)*(eR - .5*rR*(uR*uR + vR*vR));
+  dataType hR = (eR + pR)/rR;
+  dataType aR = sqrt(abs(gam*pR/rR));
 
-  // irst compute the Roe Averages
-  RT = sqrt(rR/rL); // r = RT*rL;
-  u = (uL+RT*uR)/(1.0+RT);
-  v = (vL+RT*vR)/(1.0+RT);
-  H = ( HL+RT* HR)/(1.0+RT);
-  a = sqrt( abs((gam-1.0)*(H-(u*u+v*v)/2.0)) );
-  vn = u*nx+v*ny;
+  // Roe Averages
+  dataType rSum = sqrL + sqrR;
+  dataType u = (uL*sqrL + uR*sqrR) / rSum;
+  dataType v = (vL*sqrL + vR*sqrR) / rSum;
+  dataType a2 = (aL*aL*sqrL + aR*aR*sqrR) / rSum + .5*sqrL*sqrR/(rSum*rSum)*(vnR - vnL)*(vnR - vnL);
+  dataType a = sqrt(a2);
+  dataType vn = u*nx+v*ny;
 
   // Wave speed estimates
-  SLm = fminf(fminf(vnL-aL, vn-a), 0);
-  SRp = fmaxf(fmaxf(vnR+aR, vn+a), 0);
+  dataType SL = fminf(fminf(vnL-aL, vn-a), 0);
+  dataType SR = fmaxf(fmaxf(vnR+aR, vn+a), 0);
 
   // Left and Right fluxes
-  dataType FL[4] = {rL*vnL, rL*vnL*uL + pL*nx, rL*vnL*vL + pL*ny, rL*vnL*HL};
-  dataType FR[4] = {rR*vnR, rR*vnR*uR + pR*nx, rR*vnR*vR + pR*ny, rR*vnR*HR};
+  dataType FL[4] = {rL*vnL, rL*vnL*uL + pL*nx, rL*vnL*vL + pL*ny, rL*vnL*hL};
+  dataType FR[4] = {rR*vnR, rR*vnR*uR + pR*nx, rR*vnR*vR + pR*ny, rR*vnR*hR};
 
   // Compute the HLLE flux.
-  Vec4 Flux((SRp*FL[0] - SLm*FR[0] + SLm*SRp*(qR[0]-qL[0]) )/(SRp-SLm), 
-            (SRp*FL[1] - SLm*FR[1] + SLm*SRp*(qR[1]-qL[1]) )/(SRp-SLm),
-            (SRp*FL[2] - SLm*FR[2] + SLm*SRp*(qR[2]-qL[2]) )/(SRp-SLm),
-            (SRp*FL[3] - SLm*FR[3] + SLm*SRp*(qR[3]-qL[3]) )/(SRp-SLm));
+  Vec4 Flux((SR*FL[0] - SL*FR[0] + SL*SR*(qR[0] - qL[0]) )/(SR-SL), 
+            (SR*FL[1] - SL*FR[1] + SL*SR*(qR[1] - qL[1]) )/(SR-SL),
+            (SR*FL[2] - SL*FR[2] + SL*SR*(qR[2] - qL[2]) )/(SR-SL),
+            (SR*FL[3] - SL*FR[3] + SL*SR*(qR[3] - qL[3]) )/(SR-SL));
+  return Flux;
+}
+
+
+__host__ __device__ Vec4 CompressibleSolver::hllcFlux(Vec4 qL, Vec4 qR, Vec2 normal) {
+  //
+  // Compute HLLE flux
+  //
+  dataType nx = normal[0];
+  dataType ny = normal[1];
+
+  // Left state
+  dataType rL = qL[0];
+  dataType sqrL = sqrt(rL);
+  dataType uL = qL[1]/qL[0];
+  dataType vL = qL[2]/qL[0];
+  dataType vnL = uL*nx+vL*ny;
+  dataType eL = qL[3];
+  dataType pL = (gam-1.0)*(eL - .5*rL*(uL*uL + vL*vL));
+  dataType hL = (eL + pL)/rL;
+  dataType aL = sqrt(abs(gam*pL/rL));
+
+  // Right state
+  dataType rR = qR[0];
+  dataType sqrR = sqrt(rR);
+  dataType uR = qR[1]/qR[0];
+  dataType vR = qR[2]/qR[0];
+  dataType vnR = uR*nx+vR*ny;
+  dataType eR = qR[3];
+  dataType pR = (gam-1.0)*(eR - .5*rR*(uR*uR + vR*vR));
+  dataType hR = (eR + pR)/rR;
+  dataType aR = sqrt(abs(gam*pR/rR));
+
+  // Roe Averages
+  dataType rSum = sqrL + sqrR;
+  dataType u = (uL*sqrL + uR*sqrR) / rSum;
+  dataType v = (vL*sqrL + vR*sqrR) / rSum;
+  dataType a2 = (aL*aL*sqrL + aR*aR*sqrR) / rSum + .5*sqrL*sqrR/(rSum*rSum)*(vnR - vnL)*(vnR - vnL);
+  dataType a = sqrt(a2);
+  dataType vn = u*nx+v*ny;
+
+  // Wave speed estimates
+  dataType SL = fminf(vnL-aL, vn-a);
+  dataType SR = fmaxf(vnR+aR, vn+a);
+  dataType SM = (pL-pR + rR*vnR*(SR-vnR) - rL*vnL*(SL-vnL))/(rR*(SR-vnR) - rL*(SL-vnL));
+
+  // Left and Right fluxes
+  dataType FL[4] = {rL*vnL, rL*vnL*uL + pL*nx, rL*vnL*vL + pL*ny, rL*vnL*hL};
+  dataType FR[4] = {rR*vnR, rR*vnR*uR + pR*nx, rR*vnR*vR + pR*ny, rR*vnR*hR};
+
+  // Q star
+  Vec4 qLS((SL-vnL)/(SL-SM) * rL, 
+           (SL-vnL)/(SL-SM) * rL*(nx*SM + ny*uL),
+           (SL-vnL)/(SL-SM) * rL*(ny*SM + nx*vL),
+           (SL-vnL)/(SL-SM) * (eL + (SM-vnL)*(rL*SM + pL/(SL - vnL))));
+
+  Vec4 qRS((SR-vnR)/(SR-SM) * rR, 
+           (SR-vnR)/(SR-SM) * rR*(nx*SM + ny*uR),
+           (SR-vnR)/(SR-SM) * rR*(ny*SM + nx*vR),
+           (SR-vnR)/(SR-SM) * (eR + (SM-vnR)*(rR*SM + pR/(SR - vnR))));
+
+  /*
+  aR = rR*(SR-vnR);
+  aL = rL*(SL-vnL);
+  dataType vtR = ny*uR + nx*vR;
+  dataType vtL = ny*uL + nx*vL;
+  Vec4 qLS(aL/(SL-SM) * 1, 
+           aL/(SL-SM) * (nx*SM + ny*(aR*vtR - aL*vtL)/(aR-aL)),
+           aL/(SL-SM) * (ny*SM + nx*(aR*vtR - aL*vtL)/(aR-aL)),
+           aL/(SL-SM) * (eL/rL + (SM-vnL)*(SM + pL/aL) + .5*((aR*vtR*vtR - aL*vtL*vtL)/(aR-aL) - vtL*vtL)));
+
+  Vec4 qRS(aR/(SR-SM) * 1, 
+           aR/(SR-SM) * (nx*SM + ny*(aR*vtR - aL*vtL)/(aR-aL)),
+           aR/(SR-SM) * (ny*SM + nx*(aR*vtR - aL*vtL)/(aR-aL)),
+           aR/(SR-SM) * (eR/rR + (SM-vnR)*(SM + pR/aR) + .5*((aR*vtR*vtR - aL*vtL*vtL)/(aR-aL) - vtR*vtR)));
+  */
+
+  // Compute the HLLC flux.
+  Vec4 Flux(.5*(FL[0]+FR[0]) - .5*(abs(SL)*(qLS[0]-qL[0]) + abs(SM)*(qRS[0]-qLS[0]) + abs(SR)*(qR[0]-qRS[0])), 
+            .5*(FL[1]+FR[1]) - .5*(abs(SL)*(qLS[1]-qL[1]) + abs(SM)*(qRS[1]-qLS[1]) + abs(SR)*(qR[1]-qRS[1])),
+            .5*(FL[2]+FR[2]) - .5*(abs(SL)*(qLS[2]-qL[2]) + abs(SM)*(qRS[2]-qLS[2]) + abs(SR)*(qR[2]-qRS[2])),
+            .5*(FL[3]+FR[3]) - .5*(abs(SL)*(qLS[3]-qL[3]) + abs(SM)*(qRS[3]-qLS[3]) + abs(SR)*(qR[3]-qRS[3])));
   return Flux;
 }

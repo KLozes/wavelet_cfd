@@ -3,22 +3,16 @@
 
 #include "MultiLevelSparseGrid.cuh"
 
-typedef struct Flux {
-  dataType fRho;
-  dataType fRhoU;
-  dataType fRhoV;
-  dataType fRhoE;
-} flux;
-
 static constexpr dataType gam = 1.4;
 
 class CompressibleSolver : public MultiLevelSparseGrid {
 public:
 
   dataType deltaT;
+  dataType cfl;
 
-  CompressibleSolver(dataType *domainSize_, u32 *baseGridSize_, u32 nLvls_) :
-    MultiLevelSparseGrid(domainSize_, baseGridSize_, nLvls_, 9) {}
+  CompressibleSolver(dataType *domainSize_, u32 *baseGridSize_, u32 nLvls_, dataType cfl_) :
+    MultiLevelSparseGrid(domainSize_, baseGridSize_, nLvls_, 13) {cfl = cfl_;}
 
   void sortFieldData(void);
   void setInitialConditions(i32 icType);
@@ -28,11 +22,12 @@ public:
   void computeRightHandSide(void);
   void updateFields(i32 stage) ;
 
-
-  __host__ __device__ dataType lim(dataType r);
-  __host__ __device__ dataType tvdRec(dataType ul, dataType uc, dataType ur);
-  __host__ __device__ Vec4 centralFlux(Vec4 qL, Vec4 qR, Vec2 normal) ;
+  __host__ __device__ Vec4 prim2cons(Vec4 prim);
+  __host__ __device__ Vec4 cons2prim(Vec4 cons);
+  __host__ __device__ dataType lim(dataType &r);
+  __host__ __device__ dataType tvdRec(dataType &ul, dataType &uc, dataType &ur);
   __host__ __device__ Vec4 hlleFlux(Vec4 qL, Vec4 qR, Vec2 normal) ;
+  __host__ __device__ Vec4 hllcFlux(Vec4 qL, Vec4 qR, Vec2 normal) ;
 
 };
 
