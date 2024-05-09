@@ -1,7 +1,7 @@
 #include <thrust/sort.h>
 #include <algorithm>
 
-#include "png.hpp"
+#include <png++/png.hpp>
 #include "MultiLevelSparseGrid.cuh"
 #include "MultiLevelSparseGridKernels.cuh"
 

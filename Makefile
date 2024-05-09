@@ -5,7 +5,7 @@ CC = g++
 NVCC = nvcc
 
 # include directories
-INC_DIR = -I./src -I./src/pngpp
+INC_DIR = -I./src 
 
 # source directory
 SRC_DIR = src
