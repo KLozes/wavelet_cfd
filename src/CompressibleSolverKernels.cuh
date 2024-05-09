@@ -38,7 +38,7 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid, i32 icType)
 
   START_CELL_LOOP
 
-    u64 loc = grid.zLocList[bIdx];
+    u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
     dataType pos[2];
@@ -56,10 +56,10 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid, i32 icType)
     
       // inside
       if (dist < radius) {
-        Rho[cIdx]  = 10.0;
+        Rho[cIdx]  = 1.0;
         U[cIdx]    = 0.0;
         V[cIdx]    = 0.0;
-        P[cIdx]    = 10.0;
+        P[cIdx]    = 1.0;
       }
       else {
         Rho[cIdx]  = 0.125;
@@ -81,7 +81,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 bcType
 
   START_CELL_LOOP
 
-    u64 loc = grid.zLocList[bIdx];
+    u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
 
@@ -143,7 +143,7 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
 
   START_CELL_LOOP
 
-    u64 loc = grid.zLocList[bIdx];
+    u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
 
@@ -175,7 +175,7 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
 
   START_CELL_LOOP
 
-    u64 loc = grid.zLocList[bIdx];
+    u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
 
@@ -260,14 +260,14 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
   // update fields with low storage runge kutta
   //
   dataType *Rho  = grid.getField(0);
-  dataType *U = grid.getField(1);
-  dataType *V = grid.getField(2);
-  dataType *P = grid.getField(3);
+  dataType *RhoU = grid.getField(1);
+  dataType *RhoV = grid.getField(2);
+  dataType *RhoE = grid.getField(3);
 
-  dataType *RhsRho  = grid.getField(4);
-  dataType *RhsRhoU = grid.getField(5);
-  dataType *RhsRhoV = grid.getField(6);
-  dataType *RhsRhoE = grid.getField(7);
+  dataType *RhsRho  = grid.getField(8);
+  dataType *RhsRhoU = grid.getField(9);
+  dataType *RhsRhoV = grid.getField(10);
+  dataType *RhsRhoE = grid.getField(11);
 
   constexpr dataType alpha[3] = {5.0/9.0, 153.0/128.0, 0.0};
   constexpr dataType beta[3] = {1.0/3.0, 15.0/16.0, 8.0/15.0};
@@ -276,23 +276,16 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
 
   START_CELL_LOOP
 
-    u64 loc = grid.zLocList[bIdx];
+    u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
 
-      Vec4 qCons = grid.prim2cons(Vec4(Rho[cIdx], U[cIdx], V[cIdx], P[cIdx]));
-      qCons[0] += beta[stage] * dt * RhsRho[cIdx];
-      qCons[1] += beta[stage] * dt * RhsRhoU[cIdx];
-      qCons[2] += beta[stage] * dt * RhsRhoV[cIdx];
-      qCons[3] += beta[stage] * dt * RhsRhoE[cIdx];
-
-      Vec4 qPrim = grid.cons2prim(qCons);
-      Rho[cIdx] = qPrim[0];
-      U[cIdx]   = qPrim[1];
-      V[cIdx]   = qPrim[2];
-      P[cIdx]   = qPrim[3];
+      Rho[cIdx] += beta[stage] * dt * RhsRho[cIdx];
+      RhoU[cIdx] += beta[stage] * dt * RhsRhoU[cIdx];
+      RhoV[cIdx] += beta[stage] * dt * RhsRhoV[cIdx];
+      RhoE[cIdx] += beta[stage] * dt * RhsRhoE[cIdx];
 
       RhsRho[cIdx]  *= - alpha[stage];
       RhsRhoU[cIdx] *= - alpha[stage];
@@ -309,9 +302,9 @@ __global__ void updateFieldsRK3Kernel(CompressibleSolver &grid, i32 stage) {
   // update fields with low storage runge kutta
   //
   dataType *Rho  = grid.getField(0);
-  dataType *U = grid.getField(1);
-  dataType *V = grid.getField(2);
-  dataType *P = grid.getField(3);
+  dataType *RhoU = grid.getField(1);
+  dataType *RhoV = grid.getField(2);
+  dataType *RhoE = grid.getField(3);
 
   dataType *OldRho  = grid.getField(4);
   dataType *OldRhoU = grid.getField(5);
@@ -327,50 +320,89 @@ __global__ void updateFieldsRK3Kernel(CompressibleSolver &grid, i32 stage) {
 
   START_CELL_LOOP
 
-    u64 loc = grid.zLocList[bIdx];
+    u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
 
-      Vec4 qCons = grid.prim2cons(Vec4(Rho[cIdx], U[cIdx], V[cIdx], P[cIdx]));
       if (stage == 0) {
-        OldRho[cIdx] = qCons[0];
-        OldRhoU[cIdx] = qCons[1];
-        OldRhoV[cIdx] = qCons[2];
-        OldRhoE[cIdx] = qCons[3];
+        OldRho[cIdx] = Rho[cIdx];
+        OldRhoU[cIdx] = RhoU[cIdx];
+        OldRhoV[cIdx] = RhoV[cIdx];
+        OldRhoE[cIdx] = RhoE[cIdx];
 
-        qCons[0] = qCons[0] + dt * RhsRho[cIdx];
-        qCons[1] = qCons[1] + dt * RhsRhoU[cIdx];
-        qCons[2] = qCons[2] + dt * RhsRhoV[cIdx];
-        qCons[3] = qCons[3] + dt * RhsRhoE[cIdx];
+        Rho[cIdx]  = Rho[cIdx]  + dt * RhsRho[cIdx];
+        RhoU[cIdx] = RhoU[cIdx] + dt * RhsRhoU[cIdx];
+        RhoV[cIdx] = RhoV[cIdx] + dt * RhsRhoV[cIdx];
+        RhoE[cIdx] = RhoE[cIdx] + dt * RhsRhoE[cIdx];
       }
 
       if (stage == 1) {
-        qCons[0] = 3.0/4.0*OldRho[cIdx]  + 1.0/4.0*qCons[0] + 1.0/4.0*dt* RhsRho[cIdx];
-        qCons[1] = 3.0/4.0*OldRhoU[cIdx] + 1.0/4.0*qCons[1] + 1.0/4.0*dt* RhsRhoU[cIdx];
-        qCons[2] = 3.0/4.0*OldRhoV[cIdx] + 1.0/4.0*qCons[2] + 1.0/4.0*dt* RhsRhoV[cIdx];
-        qCons[3] = 3.0/4.0*OldRhoE[cIdx] + 1.0/4.0*qCons[3] + 1.0/4.0*dt* RhsRhoE[cIdx];
+        Rho[cIdx] = 3.0/4.0*OldRho[cIdx]   + 1.0/4.0*Rho[cIdx]   + 1.0/4.0 * dt * RhsRho[cIdx];
+        RhoU[cIdx] = 3.0/4.0*OldRhoU[cIdx] + 1.0/4.0*RhoU[cIdx] + 1.0/4.0 * dt * RhsRhoU[cIdx];
+        RhoV[cIdx] = 3.0/4.0*OldRhoV[cIdx] + 1.0/4.0*RhoV[cIdx] + 1.0/4.0 * dt * RhsRhoV[cIdx];
+        RhoE[cIdx] = 3.0/4.0*OldRhoE[cIdx] + 1.0/4.0*RhoE[cIdx] + 1.0/4.0 * dt * RhsRhoE[cIdx];
       }
 
       if (stage == 2) {
-        qCons[0] = 1.0/3.0*OldRho[cIdx]  + 2.0/3.0*qCons[0] + 2.0/3.0*dt* RhsRho[cIdx];
-        qCons[1] = 1.0/3.0*OldRhoU[cIdx] + 2.0/3.0*qCons[1] + 2.0/3.0*dt* RhsRhoU[cIdx];
-        qCons[2] = 1.0/3.0*OldRhoV[cIdx] + 2.0/3.0*qCons[2] + 2.0/3.0*dt* RhsRhoV[cIdx];
-        qCons[3] = 1.0/3.0*OldRhoE[cIdx] + 2.0/3.0*qCons[3] + 2.0/3.0*dt* RhsRhoE[cIdx];
+        Rho[cIdx] = 1.0/3.0*OldRho[cIdx]   + 2.0/3.0*Rho[cIdx]  + 2.0/3.0 * dt * RhsRho[cIdx];
+        RhoU[cIdx] = 1.0/3.0*OldRhoU[cIdx] + 2.0/3.0*RhoU[cIdx] + 2.0/3.0 * dt * RhsRhoU[cIdx];
+        RhoV[cIdx] = 1.0/3.0*OldRhoV[cIdx] + 2.0/3.0*RhoV[cIdx] + 2.0/3.0 * dt * RhsRhoV[cIdx];
+        RhoE[cIdx] = 1.0/3.0*OldRhoE[cIdx] + 2.0/3.0*RhoE[cIdx] + 2.0/3.0 * dt * RhsRhoE[cIdx];
       }
-
-      Vec4 qPrim = grid.cons2prim(qCons);
-      Rho[cIdx] = qPrim[0];
-      U[cIdx]   = qPrim[1];
-      V[cIdx]   = qPrim[2];
-      P[cIdx]   = qPrim[3];
 
       RhsRho[cIdx]  = 0;
       RhsRhoU[cIdx] = 0;
       RhsRhoV[cIdx] = 0;
       RhsRhoE[cIdx] = 0;
     }
+
+  END_CELL_LOOP
+
+}
+
+__global__ void conservativeToPrimitiveKernel(CompressibleSolver &grid) {
+
+  dataType *Rho  = grid.getField(0);
+  dataType *U = grid.getField(1);
+  dataType *V = grid.getField(2);
+  dataType *P = grid.getField(3);
+
+  dataType *RhoU = grid.getField(1);
+  dataType *RhoV = grid.getField(2);
+  dataType *RhoE = grid.getField(3);
+
+  START_CELL_LOOP
+
+      Vec4 qPrim = grid.cons2prim(Vec4(Rho[cIdx], RhoU[cIdx], RhoV[cIdx], RhoE[cIdx]));
+      Rho[cIdx] = qPrim[0];
+      U[cIdx]   = qPrim[1];
+      V[cIdx]   = qPrim[2];
+      P[cIdx]   = qPrim[3];
+
+  END_CELL_LOOP
+
+}
+
+__global__ void primitiveToConservativeKernel(CompressibleSolver &grid) {
+
+  dataType *Rho  = grid.getField(0);
+  dataType *U = grid.getField(1);
+  dataType *V = grid.getField(2);
+  dataType *P = grid.getField(3);
+
+  dataType *RhoU = grid.getField(1);
+  dataType *RhoV = grid.getField(2);
+  dataType *RhoE = grid.getField(3);
+
+  START_CELL_LOOP
+
+      Vec4 qCons = grid.prim2cons(Vec4(Rho[cIdx], U[cIdx], V[cIdx], P[cIdx]));
+      Rho[cIdx]  = qCons[0];
+      RhoU[cIdx] = qCons[1];
+      RhoV[cIdx] = qCons[2];
+      RhoE[cIdx] = qCons[3];
 
   END_CELL_LOOP
 

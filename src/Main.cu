@@ -5,15 +5,22 @@
 #include "CompressibleSolver.cuh"
 
 int main(int argc, char* argv[]) {
-  dataType domainSize[2] = {1.0, 2.0};
-  u32 baseGridSize[2] = {blockSize*100, blockSize*2*100};
-  u32 nLvls = 1;
+  dataType domainSize[2] = {1.0, 1.0};
+  u32 baseGridSize[2] = {blockSize*40, blockSize*40};
+  u32 nLvls = 2;
+  dataType cfl = .3;
 
-  CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls, .3);
+  CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls, cfl);
   solver->initializeBaseGrid();
   solver->setInitialConditions(0);
   solver->setBoundaryConditions(0);
   solver->paint();
+  solver->adaptGrid();
+  solver->setInitialConditions(0);
+  solver->setBoundaryConditions(0);
+  solver->paint();
+
+  /*
 
   dataType t = 0;
   i32 n = 0;
@@ -25,7 +32,9 @@ int main(int argc, char* argv[]) {
 
     for (i32 stage = 0; stage<3; stage++) {
       solver->computeRightHandSide();
+      solver->primitiveToConservative();
       solver->updateFields(stage);
+      solver->conservativeToPrimitive();
       solver->setBoundaryConditions(0);
     }
     cudaDeviceSynchronize();
@@ -38,7 +47,7 @@ int main(int argc, char* argv[]) {
     }
 
   }
-
+  */
   cudaDeviceSynchronize();
   delete solver;
 	cudaDeviceReset();

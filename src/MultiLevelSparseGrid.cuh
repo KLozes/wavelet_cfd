@@ -8,6 +8,12 @@
 /*
 ** A multilevel sparse grid data structure
 */
+enum BLOCK_FLAGS {
+  DELETE = 0,
+  KEEP = 1,
+  REFINE = 2
+};
+
 class MultiLevelSparseGrid : public Managed {
 public:
 
@@ -23,11 +29,13 @@ public:
   u32 imageCounter;
   u32 nBlocks;
 
-  u64 *zLocList; // block morton codes
+  u64 *bLocList; // block morton codes
   u32 *bIdxList; // block memory indices
 
   u32 *nbrIdxList;     // cell neighbor indeces
-  u32 *prntIdxList;    // cell parent indices
+  u32 *prntIdxList;    // block parent indices
+  u32 *bFlagsList;     // block Flags
+
   dataType *fieldData; // flow field data
   dataType *imageData; // output image data
 
@@ -37,6 +45,7 @@ public:
 
   void initializeBaseGrid(void);
   
+  void adaptGrid(void);
   void sortBlocks(void);
   virtual void sortFieldData(void) = 0;
 
@@ -51,18 +60,12 @@ public:
   __host__ __device__ dataType *getField(u32 f);
 
   __host__ __device__ void activateBlock(i32 lvl, i32 i, i32 j);
-  __host__ __device__ void deactivateBlock(i32 lvl, i32 i, i32 j);
-  __host__ __device__ void deactivateBlock(u32 idx);
-
-  __host__ __device__ void getDijk(i32 n, i32 &di, i32 &dj);
-
+  
   __host__ __device__ u64 split(u32 a);
   __host__ __device__ u64 mortonEncode(i32 lvl, i32 i, i32 j);
 
   __host__ __device__ u32 compact(u64 w);
   __host__ __device__ void mortonDecode(u64 morton, i32 &lvl, i32 &i, i32 &j);
-
-  void resetBlockCounter(void);
 
   void paint(void);
   virtual void computeImageData(u32 f); 
@@ -70,31 +73,31 @@ public:
 };
 
 #define START_CELL_LOOP \
-  u32 cIdx = blockIdx.x * cudaBlockSize + threadIdx.x; \
+  u32 cIdx = blockIdx.x * blockDim.x + threadIdx.x; \
   u32 bIdx = cIdx / blockSizeTot; \
   u32 idx = cIdx % blockSizeTot; \
   i32 i = idx % blockSize; \
-  i32 j = idx / blockSize; 
-  //while (bIdx < grid.nBlocks) {
-#define END_CELL_LOOP //cIdx += gridDim.x*cudaBlockSize; \
+  i32 j = idx / blockSize; \
+  while (bIdx < grid.nBlocks) {
+#define END_CELL_LOOP cIdx += gridDim.x*blockDim.x; \
   bIdx = cIdx / blockSizeTot;  \
   __syncthreads();}
 
 #define START_HALO_CELL_LOOP \
-  u32 cIdx = blockIdx.x * cudaBlockSize + threadIdx.x; \
+  u32 cIdx = blockIdx.x * blockDim.x + threadIdx.x; \
   u32 bIdx = cIdx / blockHaloSizeTot; \
   u32 idx = cIdx % blockHaloSizeTot; \
   i32 i = idx % blockHaloSize; \
   i32 j = idx / blockHaloSize; \
   while (bIdx < grid.nBlocks) {
-#define END_HALO_CELL_LOOP cIdx += gridDim.x*cudaBlockSize; \
+#define END_HALO_CELL_LOOP cIdx += gridDim.x*blockDim.x; \
   bIdx = cIdx / blockHaloSizeTot;  \
   __syncthreads();}
 
 #define START_BLOCK_LOOP \
   u32 bIdx = threadIdx.x + blockIdx.x * blockDim.x; \
-  while (bIdx < grid.nBlocks) {
-#define END_BLOCK_LOOP bIdx += gridDim.x;}
+  if (bIdx < grid.nBlocks) {
+#define END_BLOCK_LOOP }// bIdx += gridDim.x*blockDim.x; __syncthreads();}
 
 #define START_DYNAMIC_BLOCK_LOOP \
   __shared__ u32 startIndex; \

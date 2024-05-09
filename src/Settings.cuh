@@ -5,7 +5,7 @@
 static constexpr int blockSize = 4;
 static constexpr int haloSize = 2;
 static constexpr int cudaBlockSize = 256;
-static constexpr int nCellsMax = 100000000;
+static constexpr int nCellsMax = 30000000;
 
 typedef float dataType;
 

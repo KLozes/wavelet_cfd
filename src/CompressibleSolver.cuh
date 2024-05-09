@@ -17,6 +17,8 @@ public:
   void sortFieldData(void);
   void setInitialConditions(i32 icType);
   void setBoundaryConditions(i32 bcType);
+  void conservativeToPrimitive(void);
+  void primitiveToConservative(void);
 
   void computeDeltaT(void);
   void computeRightHandSide(void);

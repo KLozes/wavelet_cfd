@@ -22,19 +22,22 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(dataType *domainSize_, u32 *baseGridS
   blockCounter = 0;
   imageCounter = 0;
 
+
   // grid size checking
   assert(isPowerOf2(blockSize));
   assert(baseGridSize[0]*baseGridSize[1]/blockSize/blockSize < nBlocksMax);
 
-  cudaMallocManaged(&zLocList, nBlocksMax*sizeof(u64));
+  cudaMallocManaged(&bLocList, nBlocksMax*sizeof(u64));
   cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(u32));
+  cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&prntIdxList, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&nbrIdxList, blockHaloSizeTot*nBlocksMax*sizeof(u32));
   cudaMallocManaged(&fieldData, nFields*blockSizeTot*nBlocksMax*sizeof(dataType));
   cudaMallocManaged(&imageData, blockSizeTot*nBlocksMax*sizeof(dataType));
 
-  cudaMemset(zLocList, 0, nBlocksMax*sizeof(u64));
+  cudaMemset(bLocList, 0, nBlocksMax*sizeof(u64));
   cudaMemset(bIdxList, 0, nBlocksMax*sizeof(u32));
+  cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
   cudaMemset(prntIdxList, 0, nBlocksMax*sizeof(u32));
   cudaMemset(nbrIdxList, 0, blockHaloSizeTot*nBlocksMax*sizeof(u32));
   cudaMemset(fieldData, 0, nFields*blockSizeTot*nBlocksMax*sizeof(dataType));
@@ -45,7 +48,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(dataType *domainSize_, u32 *baseGridS
 
 MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
   cudaDeviceSynchronize();
-  cudaFree(zLocList);
+  cudaFree(bLocList);
   cudaFree(bIdxList);
   cudaFree(prntIdxList);
   cudaFree(nbrIdxList);
@@ -54,26 +57,47 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
 }
 
 void MultiLevelSparseGrid::initializeBaseGrid(void) {
-  // fill the zLocList with base grid blocks
+  // fill the bLocList with base grid blocks
   initGridKernel<<<nBlocksMax/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  nBlocks = hashTable.nKeys;
+  
+  addBoundaryBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
 
   // sort the data by location code
-  sortBlocks();
+  //sortBlocks();
   cudaDeviceSynchronize();
 }
 
+void MultiLevelSparseGrid::adaptGrid(void) {
+  addFineBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  nBlocks = hashTable.nKeys;
+
+  addAdjacentBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  nBlocks = hashTable.nKeys;
+
+  //addReconstructionBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  //addBoundaryBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  nBlocks = hashTable.nKeys;
+}
+
 void MultiLevelSparseGrid::sortBlocks(void) {
-  thrust::sort_by_key(thrust::device, zLocList, zLocList+nBlocks, bIdxList);
+  thrust::sort_by_key(thrust::device, bLocList, bLocList+nBlocks, bIdxList);
   sortFieldData();
   updateIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  updatePrntIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   updateNbrIndicesKernel<<<nBlocks*blockHaloSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
 
+
   /*
   for (u32 bIdx = 0; bIdx<nBlocks; bIdx++) {
-    u64 loc = zLocList[bIdx];
+    u64 loc = bLocList[bIdx];
     i32 lvl, ib, jb;
     mortonDecode(loc, lvl, ib, jb);
 
@@ -109,8 +133,8 @@ __host__ __device__ dataType MultiLevelSparseGrid::getDy(i32 lvl) {
 }
 
 __host__ __device__ bool MultiLevelSparseGrid::isInteriorBlock(i32 lvl, i32 i, i32 j) { 
-  u32 gridSize[2] = {baseGridSize[0]/blockSize*powi(2,lvl), 
-                     baseGridSize[1]/blockSize*powi(2,lvl)};
+  i32 gridSize[2] = {i32(baseGridSize[0]/blockSize*powi(2,lvl)), 
+                     i32(baseGridSize[1]/blockSize*powi(2,lvl))};
   return i >= 0 && j >= 0 && i < gridSize[0] && j < gridSize[1];
 }
 
@@ -125,8 +149,14 @@ __host__ __device__ dataType* MultiLevelSparseGrid::getField(u32 f) {
 __host__ __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j) {
   u64 loc = mortonEncode(lvl, i, j);
   u32 idx = hashTable.insert(loc);
-  zLocList[idx] = loc;
-  bIdxList[idx] = idx;
+  if (idx != bEmpty) { 
+    // new key was inserted if not bEmpty
+    // DOT NOT SET THIS DATA AGAIN OR ELSE RISK RACE CONDITION PAINN
+    bLocList[idx] = loc;
+    bIdxList[idx] = idx;
+    bFlagsList[idx] = KEEP;
+  }
+
 }
 
 // seperate bits from a given integer 3 positions apart
@@ -143,8 +173,8 @@ __host__ __device__ u64 MultiLevelSparseGrid::split(u32 a) {
 // encode ijk indices and resolution level into morton code
 __host__ __device__ u64 MultiLevelSparseGrid::mortonEncode(i32 lvl, i32 i, i32 j) {
   u64 morton = 0;
-  i += powi(2,lvl);
-  j += powi(2,lvl);
+  i += 1; // add one so that boundary blocks are not negative
+  j += 1;
   morton |= (u64)lvl << 60 | split(i) | split(j) << 1;
   return morton;
 }
@@ -164,12 +194,13 @@ __host__ __device__ u32 MultiLevelSparseGrid::compact(u64 w) {
 __host__ __device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, i32 &lvl, i32 &i, i32 &j) {
   lvl = i32((morton & ((u64)15 << 60)) >> 60);   // get the level stored in the last 4 bits
   morton &= ~ ((u64)15 << 60); // remove the last 4 bits
-  i = compact(morton) - powi(2,lvl);
-  j = compact(morton >> 1) - powi(2, lvl);
+  i = compact(morton) - 1; 
+  j = compact(morton >> 1) - 1;
 }
 
 void MultiLevelSparseGrid::paint() {
 
+  cudaDeviceSynchronize();
   png::image<png::gray_pixel_16> image(imageSize[1], imageSize[0]);
 
   for (u32 f=0; f<4; f++) {
@@ -180,7 +211,7 @@ void MultiLevelSparseGrid::paint() {
     dataType minVal = 1e32;
 
     for (u32 bIdx = 0; bIdx < nBlocks; bIdx++) {
-      u64 loc = zLocList[bIdx];
+      u64 loc = bLocList[bIdx];
       i32 lvl, ib, jb;
       mortonDecode(loc, lvl, ib, jb);
       if (isInteriorBlock(lvl, ib, jb)) {
@@ -194,7 +225,7 @@ void MultiLevelSparseGrid::paint() {
 
     // normalize the image field data
     for (u32 bIdx = 0; bIdx < nBlocks; bIdx++) {
-      u64 loc = zLocList[bIdx];
+      u64 loc = bLocList[bIdx];
       i32 lvl, ib, jb;
       mortonDecode(loc, lvl, ib, jb);
       if (isInteriorBlock(lvl, ib, jb)) {
@@ -207,7 +238,7 @@ void MultiLevelSparseGrid::paint() {
 
     // set the pixel values 
     for (uint bIdx=0; bIdx < nBlocks; bIdx++) {
-      u64 loc = zLocList[bIdx];
+      u64 loc = bLocList[bIdx];
       i32 lvl, ib, jb;
       mortonDecode(loc, lvl, ib, jb);
       if (isInteriorBlock(lvl, ib, jb)) {
@@ -239,11 +270,10 @@ void MultiLevelSparseGrid::paint() {
 void MultiLevelSparseGrid::computeImageData(u32 f) {
   dataType *Field = getField(f);
 
+  printf("nBlocks = %d\n", hashTable.nKeys);
+
   // set image field data 
   for (u32 bIdx = 0; bIdx < nBlocks; bIdx++) {
-    u64 loc = zLocList[bIdx];
-    i32 lvl, ib, jb;
-    mortonDecode(loc, lvl, ib, jb);
     for (u32 idx = 0; idx < blockSizeTot; idx++) {
       imageData[bIdx*blockSizeTot + idx] = Field[bIdx*blockSizeTot + idx];
     }

@@ -34,27 +34,27 @@ __device__ u64 HashTable::hash(u64 x) {
 }
 
 __host__ __device__ u32 HashTable::insert(u64 key) {
-  u32 slot = hash(key) % hashTableSize;
+  u64 slot = hash(key) % hashTableSize;
   while (true) {
 
 #ifdef __CUDA_ARCH__
     u64 prev = atomicCAS(&keyList[slot], kEmpty, key);
 #else
     u64 prev = keyList[slot];
-    //printf("prev = %llu, kEmpty = %llu \n", prev, kEmpty);
 #endif
 
     if (prev == kEmpty) {
 #ifdef __CUDA_ARCH__
-      uint value = atomicAdd(&nKeys, 1);
+      i32 value = atomicAdd(&nKeys, 1);
 #else
-      uint value = nKeys++;
+      i32 value = nKeys++;
 #endif
       valueList[slot] = value;
-      return value;
-    }
-    if (prev == key) {
       return valueList[slot];
+    }
+
+    if (prev == key) {
+      return bEmpty;
     }
     slot = (slot + 1) % hashTableSize;
   }

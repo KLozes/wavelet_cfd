@@ -18,6 +18,14 @@ void CompressibleSolver::setBoundaryConditions(i32 bcType) {
   setBoundaryConditionsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this, bcType);
 }
 
+void CompressibleSolver::conservativeToPrimitive(void) {
+  conservativeToPrimitiveKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+}
+
+void CompressibleSolver::primitiveToConservative(void) {
+  primitiveToConservativeKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+}
+
 void CompressibleSolver::computeDeltaT(void) {
   computeDeltaTKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
@@ -37,9 +45,8 @@ void CompressibleSolver::updateFields(i32 stage) {
 
 __host__ __device__ dataType CompressibleSolver::lim(dataType &r) {
   // new TVD
-  return ((r > 0.0 && r < 1.0) ? (2.0*r + r*r*r) / (1.0 + 2.0*r*r) : r);
+  //return ((r > 0.0 && r < 1.0) ? (2.0*r + r*r*r) / (1.0 + 2.0*r*r) : r);
 
-  /*
   // low dissipation tvd scheme
   dataType gam0 = 1100.0;
   dataType gam1 = 800.0;
@@ -59,7 +66,6 @@ __host__ __device__ dataType CompressibleSolver::lim(dataType &r) {
     u = min(temp0 * w1 + temp2 * (1.0 - w1), temp2);
   }
   return u;
-  */
 }
 
 __host__ __device__ dataType CompressibleSolver::tvdRec(dataType &ul, dataType &uc, dataType &ur) {
