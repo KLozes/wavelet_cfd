@@ -6,7 +6,7 @@
 
 int main(int argc, char* argv[]) {
   dataType domainSize[2] = {1.0, 1.0};
-  u32 baseGridSize[2] = {blockSize*20, blockSize*20};
+  u32 baseGridSize[2] = {blockSize*4, blockSize*4};
   u32 nLvls = 7;
   dataType cfl = .3;
   dataType waveletThresh = .01;
@@ -22,7 +22,7 @@ int main(int argc, char* argv[]) {
     solver->adaptGrid();
     solver->setInitialConditions(0);
     solver->setBoundaryConditions(0);
-    //solver->paint();
+    solver->paint();
     printf("nBlocks %d\n" , solver->nBlocks);
   }
 
