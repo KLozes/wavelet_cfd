@@ -147,15 +147,20 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
 
-    dataType rho, u, v, p, a, dx, vel;
-    rho = Rho[cIdx];
-    u = U[cIdx];
-    v = V[cIdx];
-    p = P[cIdx];
-    a = sqrt(abs(gam*p/rho));
-    vel = sqrt(u*u + v*v);
-    dx = min(grid.getDx(lvl), grid.getDy(lvl));
-    DeltaT[cIdx] = dx / (a + vel + 1e-32);
+    if (grid.isInteriorBlock(lvl, ib, jb)) {
+      dataType rho, u, v, p, a, dx, vel;
+      rho = Rho[cIdx];
+      u = U[cIdx];
+      v = V[cIdx];
+      p = P[cIdx];
+      a = sqrt(abs(gam*p/rho));
+      vel = sqrt(u*u + v*v);
+      dx = min(grid.getDx(lvl), grid.getDy(lvl));
+      DeltaT[cIdx] = dx / (a + vel + 1e-32);
+    }
+    else {
+      DeltaT[cIdx] = 1e32;
+    }
 
   END_CELL_LOOP
 
@@ -362,6 +367,47 @@ __global__ void updateFieldsRK3Kernel(CompressibleSolver &grid, i32 stage) {
 
 }
 
+__global__ void copyToOldFieldsKernel(CompressibleSolver &grid) {
+  //
+  // update fields with low storage runge kutta
+  //
+  dataType *Rho  = grid.getField(0);
+  dataType *RhoU = grid.getField(1);
+  dataType *RhoV = grid.getField(2);
+  dataType *RhoE = grid.getField(3);
+
+  dataType *OldRho  = grid.getField(4);
+  dataType *OldRhoU = grid.getField(5);
+  dataType *OldRhoV = grid.getField(6);
+  dataType *OldRhoE = grid.getField(7);
+
+  START_CELL_LOOP
+
+    OldRho[cIdx] = Rho[cIdx];
+    OldRhoU[cIdx] = RhoU[cIdx];
+    OldRhoV[cIdx] = RhoV[cIdx];
+    OldRhoE[cIdx] = RhoE[cIdx];
+
+  END_CELL_LOOP
+}
+
+__global__ void computeMagRhoUKernel(CompressibleSolver &grid) {
+  //
+  // update fields with low storage runge kutta
+  //
+  dataType *RhoU = grid.getField(1);
+  dataType *RhoV = grid.getField(2);
+
+  dataType *MagRhoU = grid.getField(12);
+
+  START_CELL_LOOP
+
+    MagRhoU[cIdx] = sqrt(RhoU[cIdx]*RhoU[cIdx] + RhoV[cIdx]*RhoV[cIdx]);
+
+  END_CELL_LOOP
+}
+
+
 __global__ void conservativeToPrimitiveKernel(CompressibleSolver &grid) {
 
   dataType *Rho  = grid.getField(0);
@@ -408,25 +454,73 @@ __global__ void primitiveToConservativeKernel(CompressibleSolver &grid) {
 
 }
 
-/*
 
-__global__ void forwardWaveletTransform(MultiLevelSparseGrid &grid)
+__global__ void waveletThresholdingKernel(CompressibleSolver &grid)
 {
-  dataType *Rho   = grid.getField(0);
-  dataType *RhoU  = grid.getField(1);
-  dataType *RhoV  = grid.getField(2);
-  dataType *RhoEi = grid.getField(3);
+
+  dataType *ErrRho  = grid.getField(0);
+  dataType *ErrRhoU = grid.getField(1);
+  dataType *ErrRhoV = grid.getField(2);
+  dataType *ErrRhoE = grid.getField(3);
 
   START_CELL_LOOP
   
-  i32 i,j;
-  grid.getLocalIdx(idx, i, j);
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb;
+    grid.mortonDecode(loc, lvl, ib, jb);
+
+    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb)) {
+      // parent block memory index
+      u32 prntIdx = grid.prntIdxList[bIdx];
   
+      // always keep parent block
+      grid.bFlagsList[prntIdx] = KEEP;
+
+      // parent cell local indices
+      i32 ip = i/2 + ib%2 * blockSize / 2;
+      i32 jp = j/2 + jb%2 * blockSize / 2;
+
+      // parent and neigboring cell memory indices
+      u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp);
+      u32 lIdx = grid.getNbrIdx(prntIdx, ip-1, jp);
+      u32 rIdx = grid.getNbrIdx(prntIdx, ip+1, jp);
+      u32 dIdx = grid.getNbrIdx(prntIdx, ip, jp-1);
+      u32 uIdx = grid.getNbrIdx(prntIdx, ip, jp+1);
+      u32 ldIdx = grid.getNbrIdx(prntIdx, ip-1, jp-1);
+      u32 rdIdx = grid.getNbrIdx(prntIdx, ip-+1, jp-1);
+      u32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1);
+      u32 ruIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1);
+
+      dataType xs = 1 - 2 * (i % 2); // sign for interp weights
+      dataType ys = 1 - 2 * (j % 2);
+
+      // calculate detail coefficients for each field and set block to refine if large
+      grid.bFlagsList[bIdx] = DELETE;
+      for(i32 f=0; f<4; f++) {
+        dataType *Q  = grid.getField(f);
+        dataType detail = Q[cIdx] - (Q[pIdx] 
+                + xs * 1/8 * (Q[rIdx] - Q[lIdx]) 
+                + ys * 1/8 * (Q[uIdx] - Q[dIdx])
+                + xs * ys * 1/64 * (Q[ruIdx] - Q[luIdx] - Q[rdIdx] + Q[ldIdx])); 
+
+        dataType mag = 1e-32;
+        if (f == 0) {mag = grid.maxRho;}
+        if (f == 1 || f == 2) {mag = grid.maxMagRhoU;}
+        if (f == 3) {mag = grid.maxRhoE;}
+
+        // refine block if large wavelet detail
+        if (abs(detail/mag) > grid.waveletThresh) {
+          grid.bFlagsList[bIdx] = REFINE;
+          break;
+        }
+      }
+    }
+
+
 
 
   END_CELL_LOOP
 }
-*/
 
 /*
 __global__ void forwardWaveletTransform(MultiLevelSparseGrid &grid)

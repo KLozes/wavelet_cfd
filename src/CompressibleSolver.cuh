@@ -10,15 +10,23 @@ public:
 
   dataType deltaT;
   dataType cfl;
+  dataType maxRho;
+  dataType maxMagRhoU;
+  dataType maxRhoE;
+  dataType waveletThresh;
 
-  CompressibleSolver(dataType *domainSize_, u32 *baseGridSize_, u32 nLvls_, dataType cfl_) :
-    MultiLevelSparseGrid(domainSize_, baseGridSize_, nLvls_, 13) {cfl = cfl_;}
+  CompressibleSolver(dataType *domainSize_, u32 *baseGridSize_, u32 nLvls_, dataType cfl_, dataType waveletThresh_) :
+    MultiLevelSparseGrid(domainSize_, baseGridSize_, nLvls_, 13) {
+      cfl = cfl_;
+      waveletThresh = waveletThresh_;
+      }
 
   void sortFieldData(void);
   void setInitialConditions(i32 icType);
   void setBoundaryConditions(i32 bcType);
   void conservativeToPrimitive(void);
   void primitiveToConservative(void);
+  void waveletThresholding(void);
 
   void computeDeltaT(void);
   void computeRightHandSide(void);

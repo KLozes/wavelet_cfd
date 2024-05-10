@@ -11,7 +11,8 @@
 enum BLOCK_FLAGS {
   DELETE = 0,
   KEEP = 1,
-  REFINE = 2
+  NEW = 2,
+  REFINE = 3
 };
 
 class MultiLevelSparseGrid : public Managed {
@@ -68,7 +69,7 @@ public:
   __host__ __device__ void mortonDecode(u64 morton, i32 &lvl, i32 &i, i32 &j);
 
   void paint(void);
-  virtual void computeImageData(u32 f); 
+  virtual void computeImageData(i32 f); 
 
 };
 
@@ -96,8 +97,8 @@ public:
 
 #define START_BLOCK_LOOP \
   u32 bIdx = threadIdx.x + blockIdx.x * blockDim.x; \
-  if (bIdx < grid.nBlocks) {
-#define END_BLOCK_LOOP }// bIdx += gridDim.x*blockDim.x; __syncthreads();}
+  while (bIdx < grid.nBlocks) {
+#define END_BLOCK_LOOP bIdx += gridDim.x*blockDim.x; __syncthreads();}
 
 #define START_DYNAMIC_BLOCK_LOOP \
   __shared__ u32 startIndex; \

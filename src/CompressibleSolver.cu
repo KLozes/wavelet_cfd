@@ -26,12 +26,20 @@ void CompressibleSolver::primitiveToConservative(void) {
   primitiveToConservativeKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
 }
 
+void CompressibleSolver::waveletThresholding(void) {
+  computeMagRhoUKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
+  maxRho = *(thrust::min_element(thrust::device, getField(0), getField(0)+nBlocks*blockSize));
+  maxMagRhoU = *(thrust::min_element(thrust::device, getField(12), getField(12)+nBlocks*blockSize));
+  maxRhoE = *(thrust::min_element(thrust::device, getField(3), getField(3)+nBlocks*blockSize));
+  copyToOldFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
+  waveletThresholdingKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
+}
+
 void CompressibleSolver::computeDeltaT(void) {
   computeDeltaTKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
 	deltaT = *(thrust::min_element(thrust::device, getField(12), getField(12)+nBlocks*blockSize));
   deltaT *= cfl;
-
 }
 
 void CompressibleSolver::computeRightHandSide(void) {
@@ -39,7 +47,7 @@ void CompressibleSolver::computeRightHandSide(void) {
 }
 
 void CompressibleSolver::updateFields(i32 stage) {
-  updateFieldsRK3Kernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this, stage);
+  updateFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this, stage);
 }
 
 

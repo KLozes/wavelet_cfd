@@ -116,12 +116,11 @@ __global__ void addAdjacentBlocks(MultiLevelSparseGrid &grid) {
     grid.mortonDecode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
-      if (lvl == 0 || grid.bFlagsList[bIdx] == KEEP) {
+      if (lvl == 0 || grid.bFlagsList[bIdx] == KEEP || grid.bFlagsList[bIdx] == NEW || grid.bFlagsList[bIdx] == REFINE) {
         // add neighboring blocks
         for (i32 dj=-1; dj<=1; dj++) {
           for (i32 di=-1; di<=1; di++) {
             grid.activateBlock(lvl, ib+di, jb+dj);
-
           }
         }
       } 
@@ -132,24 +131,24 @@ __global__ void addAdjacentBlocks(MultiLevelSparseGrid &grid) {
 
 __global__ void addReconstructionBlocks(MultiLevelSparseGrid &grid) {
 
-  START_DYNAMIC_BLOCK_LOOP
+  START_BLOCK_LOOP
     i32 lvl, ib, jb;
     u64 loc = grid.bLocList[bIdx];
     grid.mortonDecode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
-      if (lvl > 1 && grid.bFlagsList[bIdx] == KEEP) {
+      if (lvl > 1 && (grid.bFlagsList[bIdx] == KEEP || grid.bFlagsList[bIdx] == REFINE || grid.bFlagsList[bIdx] == NEW)) {
         // add reconstruction blocks
         for (i32 dj=-1; dj<=1; dj++) {
           for (i32 di=-1; di<=1; di++) {
-            grid.activateBlock(lvl-1, ib/2+di ,jb/2+dj);
+            grid.activateBlock(lvl-1, ib/2+di, jb/2+dj);
             atomicMax(&(grid.nBlocks),grid.hashTable.nKeys);
           }
         }
       } 
     }
 
-  END_DYNAMIC_BLOCK_LOOP
+  END_BLOCK_LOOP
 }
 
 __global__ void deleteBlocks(MultiLevelSparseGrid &grid) {

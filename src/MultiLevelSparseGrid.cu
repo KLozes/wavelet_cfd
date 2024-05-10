@@ -67,7 +67,7 @@ void MultiLevelSparseGrid::initializeBaseGrid(void) {
   nBlocks = hashTable.nKeys;
 
   // sort the data by location code
-  //sortBlocks();
+  sortBlocks();
   cudaDeviceSynchronize();
 }
 
@@ -80,10 +80,16 @@ void MultiLevelSparseGrid::adaptGrid(void) {
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
 
-  //addReconstructionBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  //addBoundaryBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  addReconstructionBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
+
+  addBoundaryBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  nBlocks = hashTable.nKeys;
+
+  sortBlocks();
+
 }
 
 void MultiLevelSparseGrid::sortBlocks(void) {
@@ -151,10 +157,10 @@ __host__ __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32
   u32 idx = hashTable.insert(loc);
   if (idx != bEmpty) { 
     // new key was inserted if not bEmpty
-    // DOT NOT SET THIS DATA AGAIN OR ELSE RISK RACE CONDITION PAINN
+    // DOT NOT SET THIS DATA REDUNDENTLY UNLESS YOU LIKE PAIN
     bLocList[idx] = loc;
     bIdxList[idx] = idx;
-    bFlagsList[idx] = KEEP;
+    bFlagsList[idx] = NEW;
   }
 
 }
@@ -173,7 +179,7 @@ __host__ __device__ u64 MultiLevelSparseGrid::split(u32 a) {
 // encode ijk indices and resolution level into morton code
 __host__ __device__ u64 MultiLevelSparseGrid::mortonEncode(i32 lvl, i32 i, i32 j) {
   u64 morton = 0;
-  i += 1; // add one so that boundary blocks are not negative
+  i += 1; // add one so that boundary blocks are no longer negative negative
   j += 1;
   morton |= (u64)lvl << 60 | split(i) | split(j) << 1;
   return morton;
@@ -201,9 +207,11 @@ __host__ __device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, i32 &lvl
 void MultiLevelSparseGrid::paint() {
 
   cudaDeviceSynchronize();
-  png::image<png::gray_pixel_16> image(imageSize[1], imageSize[0]);
+  png::image<png::gray_pixel_16> image(imageSize[0], imageSize[1]);
 
-  for (u32 f=0; f<4; f++) {
+  bool drawGrid = false;
+
+  for (i32 f=-1; f<4; f++) {
     computeImageData(f);
 
     // find the field maximum and minimum of the image field
@@ -248,10 +256,13 @@ void MultiLevelSparseGrid::paint() {
             u32 nPixels = powi(2,(nLvls - 1 - lvl));
             for (uint jj=0; jj<nPixels; jj++) {
               for (uint ii=0; ii<nPixels; ii++) {
-                u32 nExteriorBlocks = powi(2, lvl); // the image only contains interior field data
-                u32 iPxl = ib*blockSize + i*nPixels + ii;
-                u32 jPxl = jb*blockSize + j*nPixels + jj;
-                image[iPxl][jPxl] = imageData[idx] * 65535;
+                u32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
+                u32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
+                image[jPxl][iPxl] = imageData[idx] * 65535;
+
+                if (drawGrid && (ii > 0 && jj > 0)) {
+                  image[jPxl][iPxl] = 0;
+                }
               }
             }
           }
@@ -261,21 +272,36 @@ void MultiLevelSparseGrid::paint() {
 
     // output the image to a png file
     char fileName[50];
-    sprintf(fileName, "output/image%02d_%05d.png", f, imageCounter);
+    if (f >=0) {
+      sprintf(fileName, "output/image%02d_%05d.png", f, imageCounter);
+    }
+    else {
+      sprintf(fileName, "output/grid_%05d.png", imageCounter);
+    }
     image.write(fileName);
   }
   imageCounter++;
 }
 
-void MultiLevelSparseGrid::computeImageData(u32 f) {
-  dataType *Field = getField(f);
-
-  printf("nBlocks = %d\n", hashTable.nKeys);
-
+void MultiLevelSparseGrid::computeImageData(i32 f) {
   // set image field data 
-  for (u32 bIdx = 0; bIdx < nBlocks; bIdx++) {
-    for (u32 idx = 0; idx < blockSizeTot; idx++) {
-      imageData[bIdx*blockSizeTot + idx] = Field[bIdx*blockSizeTot + idx];
+  if (f >= 0) {
+    dataType *Field = getField(f);
+    for (u32 bIdx = 0; bIdx < nBlocks; bIdx++) {
+      for (u32 idx = 0; idx < blockSizeTot; idx++) {
+        imageData[bIdx*blockSizeTot + idx] = Field[bIdx*blockSizeTot + idx];
+      }
+    }
+  }
+  else {
+    // set grid res level
+    for (u32 bIdx = 0; bIdx < nBlocks; bIdx++) {
+      u64 loc = bLocList[bIdx];
+      i32 lvl, ib, jb;
+      mortonDecode(loc, lvl, ib, jb);
+      for (u32 idx = 0; idx < blockSizeTot; idx++) {
+        imageData[bIdx*blockSizeTot + idx] = lvl+1;
+      }
     }
   }
 }
