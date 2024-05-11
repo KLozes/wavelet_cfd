@@ -16,7 +16,7 @@ __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
 __global__ void updateIndicesKernel(MultiLevelSparseGrid &grid) {
 
   START_BLOCK_LOOP
-
+  
     grid.bIdxList[bIdx] = bIdx;
     grid.hashTable.setValue(grid.bLocList[bIdx], bIdx);  
 
@@ -66,21 +66,46 @@ __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
     i32 il = i - di * blockSize - haloSize;
     i32 jl = j - dj * blockSize - haloSize;
 
-    /*
-    if (nbrIdx == bEmpty && lvl > 0) {
-      // check lower lvl
-      nbrLoc = grid.mortonEncode(lvl-1, iNbr/2, jNbr/2);
-      nbrIdx = grid.hashTable.getValue(nbrLoc);
-      il = (i+haloSize)/2 % blockSize;
-      jl = (j+haloSize)/2 % blockSize;
-    }
-    */
-
     u32 lIdx = il + jl * blockSize;
     grid.nbrIdxList[cIdx] = nbrIdx*blockSizeTot + lIdx;
 
   END_HALO_CELL_LOOP
 }
+
+__global__ void updateCellFlagsKernel(MultiLevelSparseGrid &grid) {
+
+  START_CELL_LOOP
+
+    i32 lvl, ib, jb;
+    u64 loc = grid.bLocList[bIdx];
+    grid.mortonDecode(loc, lvl, ib, jb);
+
+    if (grid.isInteriorBlock(lvl, ib, jb)) {
+
+      u32 lIdx = grid.getNbrIdx(bIdx, i-haloSize, j);
+      u32 rIdx = grid.getNbrIdx(bIdx, i+haloSize, j);
+      u32 dIdx = grid.getNbrIdx(bIdx, i, j-haloSize);
+      u32 uIdx = grid.getNbrIdx(bIdx, i, j+haloSize);
+
+      u32 ldIdx = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize);
+      u32 rdIdx = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize);
+
+      u32 luIdx = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize);
+      u32 ruIdx = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize);
+
+
+      u32 cEmpty = bEmpty * blockSizeTot;
+      grid.cFlagsList[cIdx] = ACTIVE;
+      if (lIdx >= cEmpty  || rIdx >= cEmpty  || dIdx >= cEmpty  || uIdx >= cEmpty ||
+          ldIdx >= cEmpty || rdIdx >= cEmpty || luIdx >= cEmpty || ruIdx >= cEmpty) {
+        grid.cFlagsList[cIdx] = GHOST;
+      }
+
+    }
+
+  END_CELL_LOOP
+}
+
 
 
 __global__ void addFineBlocks(MultiLevelSparseGrid &grid) {
@@ -161,6 +186,10 @@ __global__ void deleteBlocks(MultiLevelSparseGrid &grid) {
 
     if (lvl > 1 && grid.bFlagsList[bIdx] == DELETE) {
       grid.bLocList[bIdx] = kEmpty;
+      grid.bIdxList[bIdx] = bEmpty;
+    }
+    else {
+      grid.bFlagsList[bIdx] = KEEP;
     }
 
   END_BLOCK_LOOP

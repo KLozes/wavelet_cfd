@@ -32,6 +32,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(dataType *domainSize_, u32 *baseGridS
   cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&prntIdxList, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&nbrIdxList, blockHaloSizeTot*nBlocksMax*sizeof(u32));
+  cudaMallocManaged(&cFlagsList, blockSizeTot*nBlocksMax*sizeof(u32));
   cudaMallocManaged(&fieldData, nFields*blockSizeTot*nBlocksMax*sizeof(dataType));
   cudaMallocManaged(&imageData, blockSizeTot*nBlocksMax*sizeof(dataType));
 
@@ -40,6 +41,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(dataType *domainSize_, u32 *baseGridS
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
   cudaMemset(prntIdxList, 0, nBlocksMax*sizeof(u32));
   cudaMemset(nbrIdxList, 0, blockHaloSizeTot*nBlocksMax*sizeof(u32));
+  cudaMemset(cFlagsList, 0, blockSizeTot*nBlocksMax*sizeof(u32));
   cudaMemset(fieldData, 0, nFields*blockSizeTot*nBlocksMax*sizeof(dataType));
   cudaMemset(imageData, 0, blockSizeTot*nBlocksMax*sizeof(dataType));
 
@@ -52,6 +54,7 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
   cudaFree(bIdxList);
   cudaFree(prntIdxList);
   cudaFree(nbrIdxList);
+  cudaFree(cFlagsList);
   cudaFree(fieldData);
   cudaFree(imageData);
 }
@@ -98,8 +101,8 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   updateIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   updatePrntIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   updateNbrIndicesKernel<<<nBlocks*blockHaloSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  updateCellFlagsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
-
 
   /*
   for (u32 bIdx = 0; bIdx<nBlocks; bIdx++) {
@@ -303,7 +306,8 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
       i32 lvl, ib, jb;
       mortonDecode(loc, lvl, ib, jb);
       for (u32 idx = 0; idx < blockSizeTot; idx++) {
-        imageData[bIdx*blockSizeTot + idx] = lvl+1;
+        u32 flag = cFlagsList[bIdx*blockSizeTot + idx];
+        imageData[bIdx*blockSizeTot + idx] = lvl+1 - dataType(1-flag)/2.0;
       }
     }
   }

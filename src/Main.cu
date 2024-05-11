@@ -6,10 +6,11 @@
 
 int main(int argc, char* argv[]) {
   dataType domainSize[2] = {1.0, 1.0};
-  u32 baseGridSize[2] = {blockSize*4, blockSize*4};
-  u32 nLvls = 7;
+  u32 baseGridSize[2] = {blockSize*200, blockSize*200};
+  u32 nLvls = 1;
   dataType cfl = .3;
   dataType waveletThresh = .01;
+  dataType tStep = .02;
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls, cfl, waveletThresh);
   solver->initializeBaseGrid();
@@ -27,33 +28,17 @@ int main(int argc, char* argv[]) {
   }
 
 
-  /*
   dataType t = 0;
   i32 n = 0;
   while(t < 100) {
 
-    if (n % 1 == 0) {
-      solver->computeDeltaT();
-    }
+    t += solver->step(tStep);
+    n += 1;
 
-    for (i32 stage = 0; stage<3; stage++) {
-      solver->computeRightHandSide();
-      solver->primitiveToConservative();
-      solver->updateFields(stage);
-      solver->conservativeToPrimitive();
-      solver->setBoundaryConditions(0);
-    }
-    cudaDeviceSynchronize();
-    t += solver->deltaT;
-    n++;
-
-    if (n % 50 == 0) {
-      printf("n: %d, t = %f\n", n, t);
-      solver->paint();
-    }
+    solver->paint();
+    printf("n: %d, t = %f\n", n, t);
 
   }
-  */
   
   cudaDeviceSynchronize();
   delete solver;

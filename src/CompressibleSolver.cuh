@@ -21,6 +21,7 @@ public:
       waveletThresh = waveletThresh_;
       }
 
+  dataType step(dataType dt);
   void sortFieldData(void);
   void setInitialConditions(i32 icType);
   void setBoundaryConditions(i32 bcType);

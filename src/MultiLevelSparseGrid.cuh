@@ -10,9 +10,14 @@
 */
 enum BLOCK_FLAGS {
   DELETE = 0,
-  KEEP = 1,
-  NEW = 2,
-  REFINE = 3
+  KEEP = 1 << 0,
+  NEW = 1 << 1,
+  REFINE = 1 << 2,
+};
+
+enum CELL_FLAGS {
+  GHOST  = 0,
+  ACTIVE = 1 << 0,
 };
 
 class MultiLevelSparseGrid : public Managed {
@@ -36,6 +41,7 @@ public:
   u32 *nbrIdxList;     // cell neighbor indeces
   u32 *prntIdxList;    // block parent indices
   u32 *bFlagsList;     // block Flags
+  u32 *cFlagsList;     // cell Flags
 
   dataType *fieldData; // flow field data
   dataType *imageData; // output image data

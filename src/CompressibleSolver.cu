@@ -4,6 +4,31 @@
 #include "CompressibleSolver.cuh"
 #include "CompressibleSolverKernels.cuh"
 
+dataType CompressibleSolver::step(dataType tStep) {
+
+  dataType t = 0;
+  u32 n = 0;
+
+  while (t < tStep) {
+
+    if (n % 2 == 0) {
+      computeDeltaT();
+    }
+
+    for (i32 stage = 0; stage<3; stage++) {
+      computeRightHandSide();
+      primitiveToConservative();
+      updateFields(stage);
+      conservativeToPrimitive();
+      setBoundaryConditions(0);
+    }
+    cudaDeviceSynchronize();
+    t += deltaT;
+    n++;
+  }
+
+  return t;
+}
 
 void CompressibleSolver::sortFieldData(void) {
   sortFieldDataKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
