@@ -4,33 +4,65 @@
 #include "CompressibleSolver.cuh"
 #include "CompressibleSolverKernels.cuh"
 
+void CompressibleSolver::initialize(i32 icType) {
+  initializeBaseGrid();
+  setInitialConditions(icType);
+  primitiveToConservative();
+  setBoundaryConditions(0);
+  paint();
+
+  for(i32 lvl=0; lvl<nLvls+3; lvl++){
+    waveletThresholding();
+    adaptGrid();
+    setInitialConditions(icType);
+    primitiveToConservative();
+    setBoundaryConditions(0);
+    sortBlocks();
+    printf("nblocks %d\n", nBlocks);
+    paint();
+  }
+}
+
 dataType CompressibleSolver::step(dataType tStep) {
 
   dataType t = 0;
-  u32 n = 0;
 
   while (t < tStep) {
 
-    if (n % 2 == 0) {
+    u32 nBlocksPrev = nBlocks;
+    if (iter % 1 == 0) {
+      waveletThresholding();
+      adaptGrid();
+      setBoundaryConditions(0);
+      interpolateFields();
+      paint();
+      sortBlocks();
       computeDeltaT();
     }
 
     for (i32 stage = 0; stage<3; stage++) {
+      conservativeToPrimitive();
       computeRightHandSide();
       primitiveToConservative();
       updateFields(stage);
-      conservativeToPrimitive();
       setBoundaryConditions(0);
+
+      if (nLvls > 2) {
+        interpolateFields();
+      }
+      
     }
+
     cudaDeviceSynchronize();
     t += deltaT;
-    n++;
+    iter++;
   }
 
   return t;
 }
 
 void CompressibleSolver::sortFieldData(void) {
+  copyToOldFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   sortFieldDataKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
 }
 
@@ -56,7 +88,7 @@ void CompressibleSolver::waveletThresholding(void) {
   maxRho = *(thrust::min_element(thrust::device, getField(0), getField(0)+nBlocks*blockSize));
   maxMagRhoU = *(thrust::min_element(thrust::device, getField(12), getField(12)+nBlocks*blockSize));
   maxRhoE = *(thrust::min_element(thrust::device, getField(3), getField(3)+nBlocks*blockSize));
-  copyToOldFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
+  cudaMemset(bFlagsList, 0, nBlocks*sizeof(u32));
   waveletThresholdingKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
 }
 
@@ -72,9 +104,13 @@ void CompressibleSolver::computeRightHandSide(void) {
 }
 
 void CompressibleSolver::updateFields(i32 stage) {
-  updateFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this, stage);
+  updateFieldsRK3Kernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this, stage);
 }
 
+void CompressibleSolver::interpolateFields(void) {
+  restrictFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  interpolateFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+}
 
 __host__ __device__ dataType CompressibleSolver::lim(dataType &r) {
   // new TVD

@@ -10,14 +10,15 @@
 */
 enum BLOCK_FLAGS {
   DELETE = 0,
-  KEEP = 1 << 0,
-  NEW = 1 << 1,
-  REFINE = 1 << 2,
+  KEEP = 1,
+  REFINE = 2,
+  NEW = 3,
 };
 
 enum CELL_FLAGS {
   GHOST  = 0,
-  ACTIVE = 1 << 0,
+  PARENT = 1,
+  ACTIVE = 2,
 };
 
 class MultiLevelSparseGrid : public Managed {

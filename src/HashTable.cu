@@ -16,10 +16,17 @@ HashTable::~HashTable(void) {
   cudaFree(valueList);
 }
 
+__global__ void resetHashTableKernel(HashTable &hashTable) {
+  u32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < hashTableSize) {
+    hashTable.keyList[idx] = kEmpty;
+    hashTable.valueList[idx] = bEmpty;
+  }
+}
+
 void HashTable::reset(void) {
   nKeys = 0;
-  cudaMemset(keyList, 0xFF, hashTableSize*sizeof(u64)); // 0xFF is one byte of kEmpty
-  cudaMemset(valueList, 0, hashTableSize*sizeof(u32));
+  resetHashTableKernel<<<hashTableSize/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
 }
 
@@ -54,7 +61,7 @@ __host__ __device__ u32 HashTable::insert(u64 key) {
     }
 
     if (prev == key) {
-      return bEmpty;
+      return valueList[slot]; // could be bEmpty due to race condition
     }
     slot = (slot + 1) % hashTableSize;
   }

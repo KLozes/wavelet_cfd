@@ -69,15 +69,27 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid, i32 icType)
       }
     }
 
+    if (icType == 1) {
+      //
+      // gaussian explosion
+      //
+    
+      Rho[cIdx] = 10.0*exp(-3000 * ((pos[0] - .4)*(pos[0] - .4) + (pos[1] - .4)*(pos[1] - .4))) + .125;
+      P[cIdx] = 10.0*exp(-3000 * ((pos[0] - .4)*(pos[0] - .4) + (pos[1] - .4)*(pos[1] - .4))) + .1;
+      U[cIdx]    = 0.0;
+      V[cIdx]    = 0.0;
+    }
+
+
   END_CELL_LOOP
 }
 
 __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 bcType) {
 
-  dataType *Rho = grid.getField(0);
-  dataType *U   = grid.getField(1);
-  dataType *V   = grid.getField(2);
-  dataType *P   = grid.getField(3);
+  dataType *Rho  = grid.getField(0);
+  dataType *RhoU = grid.getField(1);
+  dataType *RhoV = grid.getField(2);
+  dataType *RhoE = grid.getField(3);
 
   START_CELL_LOOP
 
@@ -112,19 +124,19 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 bcType
 
         // apply boundary conditions
         Rho[cIdx] = Rho[bcIdx];
-        P[cIdx] = P[bcIdx];
+        RhoE[cIdx] = RhoE[bcIdx];
         
         if (ib < 0 || ib >= gridSize[0]) {
-          U[cIdx] = -U[bcIdx];
-          V[cIdx] =  V[bcIdx];
+          RhoU[cIdx] = -RhoU[bcIdx];
+          RhoV[cIdx] =  RhoV[bcIdx];
         }
         if (jb < 0 || jb >= gridSize[1]) {
-          U[cIdx] =  U[bcIdx];
-          V[cIdx] = -V[bcIdx];
+          RhoU[cIdx] =  RhoU[bcIdx];
+          RhoV[cIdx] = -RhoV[bcIdx];
         }
         if ((ib < 0 || ib >= gridSize[0]) && (jb < 0 || jb >= gridSize[1])) {
-          U[cIdx] = -U[bcIdx];
-          V[cIdx] = -V[bcIdx];
+          RhoU[cIdx] = -RhoU[bcIdx];
+          RhoV[cIdx] = -RhoV[bcIdx];
         }
       }
     }
@@ -135,10 +147,10 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 bcType
 
 // compute max wavespeed in each cell, will be used for CFL condition
 __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
-  dataType *Rho = grid.getField(0);
-  dataType *U   = grid.getField(1);
-  dataType *V   = grid.getField(2);
-  dataType *P   = grid.getField(3);
+  dataType *Rho  = grid.getField(0);
+  dataType *RhoU = grid.getField(1);
+  dataType *RhoV = grid.getField(2);
+  dataType *RhoE = grid.getField(3);
   dataType *DeltaT = grid.getField(12);
 
   START_CELL_LOOP
@@ -148,13 +160,10 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
     grid.mortonDecode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
-      dataType rho, u, v, p, a, dx, vel;
-      rho = Rho[cIdx];
-      u = U[cIdx];
-      v = V[cIdx];
-      p = P[cIdx];
-      a = sqrt(abs(gam*p/rho));
-      vel = sqrt(u*u + v*v);
+      dataType a, dx, vel;
+      Vec4 q = grid.cons2prim(Vec4(Rho[cIdx], RhoU[cIdx], RhoV[cIdx], RhoE[cIdx]));
+      a = sqrt(abs(gam*q[3]/q[0]));
+      vel = sqrt(q[1]*q[1] + q[2]*q[2]);
       dx = min(grid.getDx(lvl), grid.getDy(lvl));
       DeltaT[cIdx] = dx / (a + vel + 1e-32);
     }
@@ -184,19 +193,23 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
 
+    dataType dx = grid.getDx(lvl);
+    dataType dy = grid.getDy(lvl);
+    dataType vol = dx*dy;
+
+    u32 l1Idx = grid.getNbrIdx(bIdx, i-1, j);
+    u32 l2Idx = grid.getNbrIdx(bIdx, i-2, j);
+    u32 r1Idx = grid.getNbrIdx(bIdx, i+1, j);
+
+    u32 d1Idx = grid.getNbrIdx(bIdx, i, j-1);
+    u32 d2Idx = grid.getNbrIdx(bIdx, i, j-2);
+    u32 u1Idx = grid.getNbrIdx(bIdx, i, j+1);
+
+    u32 cFlag = grid.cFlagsList[cIdx];
+    u32 lFlag = grid.cFlagsList[l1Idx];
+    u32 dFlag = grid.cFlagsList[d1Idx];
+
     //if (grid.isInteriorBlock(lvl, ib, jb)) {
-
-      dataType dx = grid.getDx(lvl);
-      dataType dy = grid.getDy(lvl);
-      dataType vol = dx*dy;
-
-      u32 l1Idx = grid.getNbrIdx(bIdx, i-1, j);
-      u32 l2Idx = grid.getNbrIdx(bIdx, i-2, j);
-      u32 r1Idx = grid.getNbrIdx(bIdx, i+1, j);
-
-      u32 d1Idx = grid.getNbrIdx(bIdx, i, j-1);
-      u32 d2Idx = grid.getNbrIdx(bIdx, i, j-2);
-      u32 u1Idx = grid.getNbrIdx(bIdx, i, j+1);
       
       Vec4 fluxL;
       Vec4 fluxD;
@@ -463,12 +476,15 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
 
+    if (lvl < 2) {
+      grid.bFlagsList[bIdx] = KEEP;
+    }
+
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb)) {
       // parent block memory index
       u32 prntIdx = grid.prntIdxList[bIdx];
-  
-      // always keep parent block
-      grid.bFlagsList[prntIdx] = KEEP;
+      //grid.bFlagsList[prntIdx] = KEEP;
+      atomicMax(&(grid.bFlagsList[prntIdx]),KEEP);
 
       // parent cell local indices
       i32 ip = i/2 + ib%2 * blockSize / 2;
@@ -481,15 +497,14 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
       u32 dIdx = grid.getNbrIdx(prntIdx, ip, jp-1);
       u32 uIdx = grid.getNbrIdx(prntIdx, ip, jp+1);
       u32 ldIdx = grid.getNbrIdx(prntIdx, ip-1, jp-1);
-      u32 rdIdx = grid.getNbrIdx(prntIdx, ip-+1, jp-1);
+      u32 rdIdx = grid.getNbrIdx(prntIdx, ip+1, jp-1);
       u32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1);
-      u32 ruIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1);
+      u32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1);
 
-      dataType xs = 1 - 2 * (i % 2); // sign for interp weights
-      dataType ys = 1 - 2 * (j % 2);
+      dataType xs = 2 * (i % 2) - 1 ; // sign for interp weights
+      dataType ys = 2 * (j % 2) - 1;
 
       // calculate detail coefficients for each field and set block to refine if large
-      grid.bFlagsList[bIdx] = DELETE;
       for(i32 f=0; f<4; f++) {
         dataType *Q  = grid.getField(f);
         dataType detail = Q[cIdx] - (Q[pIdx] 
@@ -513,7 +528,7 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
   END_CELL_LOOP
 }
 
-__global__ void interpolateGhostCells(CompressibleSolver &grid) {
+__global__ void interpolateFieldsKernel(CompressibleSolver &grid) {
 
   START_CELL_LOOP
   
@@ -521,7 +536,12 @@ __global__ void interpolateGhostCells(CompressibleSolver &grid) {
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
 
-    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && grid.bFlagsList[bIdx] == NEW) {
+    u32 cFlag = grid.cFlagsList[cIdx];
+
+    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && cFlag == GHOST) {
+
+      grid.bFlagsList[bIdx] = KEEP;
+      
       // parent block memory index
       u32 prntIdx = grid.prntIdxList[bIdx];
 
@@ -536,41 +556,36 @@ __global__ void interpolateGhostCells(CompressibleSolver &grid) {
       u32 dIdx = grid.getNbrIdx(prntIdx, ip, jp-1);
       u32 uIdx = grid.getNbrIdx(prntIdx, ip, jp+1);
       u32 ldIdx = grid.getNbrIdx(prntIdx, ip-1, jp-1);
-      u32 rdIdx = grid.getNbrIdx(prntIdx, ip-+1, jp-1);
+      u32 rdIdx = grid.getNbrIdx(prntIdx, ip+1, jp-1);
       u32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1);
-      u32 ruIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1);
+      u32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1);
 
-      dataType xs = 1 - 2 * (i % 2); // sign for interp weights
-      dataType ys = 1 - 2 * (j % 2);
+      dataType xs = 2 * (i % 2) - 1 ; // sign for interp weights
+      dataType ys = 2 * (j % 2) - 1;
 
-      // calculate detail coefficients for each field and set block to refine if large
-
-      u32 cFlag = grid.cFlagsList[cIdx];
-      u32 bFlag = grid.bFlagsList[bIdx];
-
-      // if this is a ghost cell or newly created, interpolate fields
-      if (cFlag == GHOST || bFlag == NEW) {
-        for(i32 f=0; f<4; f++) {
-          dataType *Q  = grid.getField(f);
-          Q[cIdx] = Q[pIdx] 
-                  + xs * 1/8 * (Q[rIdx] - Q[lIdx]) 
-                  + ys * 1/8 * (Q[uIdx] - Q[dIdx])
-                  + xs * ys * 1/64 * (Q[ruIdx] - Q[luIdx] - Q[rdIdx] + Q[ldIdx]); 
-        }
+      // interpolate each field from lower resolustion
+      for(i32 f=0; f<4; f++) {
+        dataType *Q  = grid.getField(f);
+        Q[cIdx] = Q[pIdx]
+                + xs * 1/8 * (Q[rIdx] - Q[lIdx]) 
+                + ys * 1/8 * (Q[uIdx] - Q[dIdx])
+                + xs * ys * 1/64 * (Q[ruIdx] - Q[luIdx] - Q[rdIdx] + Q[ldIdx]); 
       }
     }
 
   END_CELL_LOOP
 }
 
-__global__ void restrictFields(CompressibleSolver &grid) {
+__global__ void restrictFieldsKernel(CompressibleSolver &grid) {
   START_CELL_LOOP
 
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
 
-    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb)) {
+    u32 cFlag = grid.cFlagsList[cIdx];
+
+    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && cFlag == ACTIVE) {
       // parent block memory index
       u32 prntIdx = grid.prntIdxList[bIdx];
 
@@ -581,7 +596,7 @@ __global__ void restrictFields(CompressibleSolver &grid) {
       // parent and neigboring cell memory indices
       u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp);
 
-      if (grid.cFlagsList[cIdx] == ACTIVE && lvl > 0) {
+      if (lvl > 0) {
         for (u32 f=0; f<4; f++){
           dataType* q = grid.getField(f);
           q[pIdx] = 0.0;
@@ -591,7 +606,7 @@ __global__ void restrictFields(CompressibleSolver &grid) {
 
     __syncthreads();
 
-    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb)) {
+    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && cFlag == ACTIVE) {
       // parent block memory index
       u32 prntIdx = grid.prntIdxList[bIdx];
 
@@ -609,7 +624,6 @@ __global__ void restrictFields(CompressibleSolver &grid) {
         }
       }
     }
-
 
   END_CELL_LOOP
 }

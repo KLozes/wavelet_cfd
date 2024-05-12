@@ -5,14 +5,14 @@
 #include "Util.cuh"
 
 /*
-** A simple CUDA friendly hashtable data structure
+** A simple GPU friendly hashtable data structure
 */
 class HashTable : public Managed {
 public:
   i32 nKeys;
 
-  u64 *keyList; // hash keys are block morton codes
-  u32 *valueList; // hash values are block memory indices
+  u64 *keyList; 
+  u32 *valueList;
 
   HashTable(void);
   ~HashTable(void);

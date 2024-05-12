@@ -6,27 +6,14 @@
 
 int main(int argc, char* argv[]) {
   dataType domainSize[2] = {1.0, 1.0};
-  u32 baseGridSize[2] = {blockSize*200, blockSize*200};
-  u32 nLvls = 1;
-  dataType cfl = .3;
+  u32 baseGridSize[2] = {blockSize*50, blockSize*50};
+  u32 nLvls = 3;
+  dataType cfl = .2;
   dataType waveletThresh = .01;
-  dataType tStep = .02;
+  dataType tStep = .001;
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls, cfl, waveletThresh);
-  solver->initializeBaseGrid();
-  solver->setInitialConditions(0);
-  solver->setBoundaryConditions(0);
-  solver->paint();
-
-  for(i32 lvl=0; lvl<nLvls; lvl++){
-    solver->waveletThresholding();
-    solver->adaptGrid();
-    solver->setInitialConditions(0);
-    solver->setBoundaryConditions(0);
-    solver->paint();
-    printf("nBlocks %d\n" , solver->nBlocks);
-  }
-
+  solver->initialize(0);
 
   dataType t = 0;
   i32 n = 0;

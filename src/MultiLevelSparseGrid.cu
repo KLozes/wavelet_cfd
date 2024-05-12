@@ -65,7 +65,7 @@ void MultiLevelSparseGrid::initializeBaseGrid(void) {
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
   
-  addBoundaryBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  addBoundaryBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
 
@@ -75,30 +75,40 @@ void MultiLevelSparseGrid::initializeBaseGrid(void) {
 }
 
 void MultiLevelSparseGrid::adaptGrid(void) {
-  addFineBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  addFineBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
 
-  addAdjacentBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  addAdjacentBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
 
-  addReconstructionBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  addReconstructionBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
 
-  addBoundaryBlocks<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  addBoundaryBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
 
-  sortBlocks();
+  deleteDataKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
 
+  updatePrntIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
 }
 
 void MultiLevelSparseGrid::sortBlocks(void) {
+
   thrust::sort_by_key(thrust::device, bLocList, bLocList+nBlocks, bIdxList);
   sortFieldData();
+  cudaDeviceSynchronize();
+
+  hashTable.reset();
+  cudaDeviceSynchronize();
   updateIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  nBlocks = hashTable.nKeys;
+
   updatePrntIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   updateNbrIndicesKernel<<<nBlocks*blockHaloSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   updateCellFlagsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
@@ -158,12 +168,12 @@ __host__ __device__ dataType* MultiLevelSparseGrid::getField(u32 f) {
 __host__ __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j) {
   u64 loc = mortonEncode(lvl, i, j);
   u32 idx = hashTable.insert(loc);
+
   if (idx != bEmpty) { 
     // new key was inserted if not bEmpty
-    // DOT NOT SET THIS DATA REDUNDENTLY UNLESS YOU LIKE PAIN
     bLocList[idx] = loc;
     bIdxList[idx] = idx;
-    bFlagsList[idx] = NEW;
+    bFlagsList[idx] = KEEP;
   }
 
 }
@@ -225,7 +235,7 @@ void MultiLevelSparseGrid::paint() {
       u64 loc = bLocList[bIdx];
       i32 lvl, ib, jb;
       mortonDecode(loc, lvl, ib, jb);
-      if (isInteriorBlock(lvl, ib, jb)) {
+      if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty) {
         for (u32 idx = 0; idx < blockSizeTot; idx++) {
           dataType val = imageData[bIdx*blockSizeTot + idx];
           maxVal = max(maxVal, val);
@@ -239,7 +249,7 @@ void MultiLevelSparseGrid::paint() {
       u64 loc = bLocList[bIdx];
       i32 lvl, ib, jb;
       mortonDecode(loc, lvl, ib, jb);
-      if (isInteriorBlock(lvl, ib, jb)) {
+      if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty) {
         for (u32 idx = 0; idx < blockSizeTot; idx++) {
           dataType val = imageData[bIdx*blockSizeTot + idx];
           imageData[bIdx*blockSizeTot + idx] = (val - minVal) / (maxVal - minVal + 1e-16);
@@ -255,7 +265,7 @@ void MultiLevelSparseGrid::paint() {
       u64 loc = bLocList[bIdx];
       i32 lvl, ib, jb;
       mortonDecode(loc, lvl, ib, jb);
-      if (isInteriorBlock(lvl, ib, jb)) {
+      if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty) {
         for (uint j = 0; j < blockSize; j++) {
           for (uint i = 0; i < blockSize; i++) {
             u32 idx = i + blockSize * j + bIdx*blockSizeTot;
@@ -307,7 +317,7 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
       mortonDecode(loc, lvl, ib, jb);
       for (u32 idx = 0; idx < blockSizeTot; idx++) {
         u32 flag = cFlagsList[bIdx*blockSizeTot + idx];
-        imageData[bIdx*blockSizeTot + idx] = lvl+1 - dataType(1-flag)/2.0;
+        imageData[bIdx*blockSizeTot + idx] = lvl+1 - (2-flag)/2;
       }
     }
   }

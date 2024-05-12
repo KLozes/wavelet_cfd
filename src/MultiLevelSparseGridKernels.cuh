@@ -17,8 +17,11 @@ __global__ void updateIndicesKernel(MultiLevelSparseGrid &grid) {
 
   START_BLOCK_LOOP
   
-    grid.bIdxList[bIdx] = bIdx;
-    grid.hashTable.setValue(grid.bLocList[bIdx], bIdx);  
+    if (grid.bLocList[bIdx] != kEmpty) {
+      grid.bIdxList[bIdx] = bIdx;
+      grid.hashTable.insert(grid.bLocList[bIdx]);
+      grid.hashTable.setValue(grid.bLocList[bIdx], bIdx);
+    }
 
   END_BLOCK_LOOP
 }
@@ -106,9 +109,7 @@ __global__ void updateCellFlagsKernel(MultiLevelSparseGrid &grid) {
   END_CELL_LOOP
 }
 
-
-
-__global__ void addFineBlocks(MultiLevelSparseGrid &grid) {
+__global__ void addFineBlocksKernel(MultiLevelSparseGrid &grid) {
 
   START_BLOCK_LOOP
 
@@ -119,6 +120,7 @@ __global__ void addFineBlocks(MultiLevelSparseGrid &grid) {
     if (grid.isInteriorBlock(lvl, ib, jb)) {
       if (lvl == 0 || grid.bFlagsList[bIdx] == REFINE) {
         // add finer blocks if not already on finest level
+        grid.bFlagsList[bIdx] = KEEP;
         if (lvl < grid.nLvls-1) {
           for (i32 dj=0; dj<=1; dj++) {
             for (i32 di=0; di<=1; di++) {
@@ -128,11 +130,12 @@ __global__ void addFineBlocks(MultiLevelSparseGrid &grid) {
         }
       } 
     }
+
   END_BLOCK_LOOP
 
 }
 
-__global__ void addAdjacentBlocks(MultiLevelSparseGrid &grid) {
+__global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid) {
 
   START_BLOCK_LOOP
 
@@ -141,7 +144,7 @@ __global__ void addAdjacentBlocks(MultiLevelSparseGrid &grid) {
     grid.mortonDecode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
-      if (lvl == 0 || grid.bFlagsList[bIdx] == KEEP || grid.bFlagsList[bIdx] == NEW || grid.bFlagsList[bIdx] == REFINE) {
+      if (lvl == 0 || grid.bFlagsList[bIdx] == KEEP ) {
         // add neighboring blocks
         for (i32 dj=-1; dj<=1; dj++) {
           for (i32 di=-1; di<=1; di++) {
@@ -154,7 +157,7 @@ __global__ void addAdjacentBlocks(MultiLevelSparseGrid &grid) {
   END_BLOCK_LOOP
 }
 
-__global__ void addReconstructionBlocks(MultiLevelSparseGrid &grid) {
+__global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
 
   START_BLOCK_LOOP
     i32 lvl, ib, jb;
@@ -162,7 +165,7 @@ __global__ void addReconstructionBlocks(MultiLevelSparseGrid &grid) {
     grid.mortonDecode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
-      if (lvl > 1 && (grid.bFlagsList[bIdx] == KEEP || grid.bFlagsList[bIdx] == REFINE || grid.bFlagsList[bIdx] == NEW)) {
+      if (lvl > 1 && grid.bFlagsList[bIdx] != DELETE) {
         // add reconstruction blocks
         for (i32 dj=-1; dj<=1; dj++) {
           for (i32 di=-1; di<=1; di++) {
@@ -176,9 +179,9 @@ __global__ void addReconstructionBlocks(MultiLevelSparseGrid &grid) {
   END_BLOCK_LOOP
 }
 
-__global__ void deleteBlocks(MultiLevelSparseGrid &grid) {
+__global__ void deleteDataKernel(MultiLevelSparseGrid &grid) {
 
-  START_BLOCK_LOOP
+  START_CELL_LOOP
 
     i32 lvl, ib, jb;
     u64 loc = grid.bLocList[bIdx];
@@ -186,16 +189,18 @@ __global__ void deleteBlocks(MultiLevelSparseGrid &grid) {
 
     if (lvl > 1 && grid.bFlagsList[bIdx] == DELETE) {
       grid.bLocList[bIdx] = kEmpty;
-      grid.bIdxList[bIdx] = bEmpty;
-    }
-    else {
-      grid.bFlagsList[bIdx] = KEEP;
+      //grid.bIdxList[bIdx] = bEmpty;
+      grid.cFlagsList[cIdx] = 0;
+      for(i32 f=0; f<grid.nFields; f++) {
+        dataType *F = grid.getField(f);
+        F[cIdx] = 0;
+      }
     }
 
-  END_BLOCK_LOOP
+  END_CELL_LOOP
 }
 
-__global__ void addBoundaryBlocks(MultiLevelSparseGrid &grid) {
+__global__ void addBoundaryBlocksKernel(MultiLevelSparseGrid &grid) {
 
   START_BLOCK_LOOP
 

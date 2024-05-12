@@ -14,13 +14,16 @@ public:
   dataType maxMagRhoU;
   dataType maxRhoE;
   dataType waveletThresh;
+  u32 iter;
 
   CompressibleSolver(dataType *domainSize_, u32 *baseGridSize_, u32 nLvls_, dataType cfl_, dataType waveletThresh_) :
     MultiLevelSparseGrid(domainSize_, baseGridSize_, nLvls_, 13) {
       cfl = cfl_;
       waveletThresh = waveletThresh_;
-      }
+      iter = 0;
+  }
 
+  void initialize(i32 icType);
   dataType step(dataType dt);
   void sortFieldData(void);
   void setInitialConditions(i32 icType);
@@ -31,7 +34,8 @@ public:
 
   void computeDeltaT(void);
   void computeRightHandSide(void);
-  void updateFields(i32 stage) ;
+  void updateFields(i32 stage);
+  void interpolateFields();
 
   __host__ __device__ Vec4 prim2cons(Vec4 prim);
   __host__ __device__ Vec4 cons2prim(Vec4 cons);
