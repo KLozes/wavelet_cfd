@@ -85,15 +85,23 @@ __global__ void updateCellFlagsKernel(MultiLevelSparseGrid &grid) {
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
 
-      u32 lIdx = grid.getNbrIdx(bIdx, -2, j);
-      u32 rIdx = grid.getNbrIdx(bIdx, 5, j);
-      u32 dIdx = grid.getNbrIdx(bIdx, i, -2);
-      u32 uIdx = grid.getNbrIdx(bIdx, i, 5);
+      //u32 lIdx = grid.getNbrIdx(bIdx, -2, j);
+      //u32 rIdx = grid.getNbrIdx(bIdx, 5, j);
+      //u32 dIdx = grid.getNbrIdx(bIdx, i, -2);
+      //u32 uIdx = grid.getNbrIdx(bIdx, i, 5);
+      //u32 ldIdx = grid.getNbrIdx(bIdx, -2, -2);
+      //u32 rdIdx = grid.getNbrIdx(bIdx, 5, -2);
+      //u32 luIdx = grid.getNbrIdx(bIdx, -2, 5);
+      //u32 ruIdx = grid.getNbrIdx(bIdx, 5, 5);
 
-      u32 ldIdx = grid.getNbrIdx(bIdx, -2, -2);
-      u32 rdIdx = grid.getNbrIdx(bIdx, 5, -2);
-      u32 luIdx = grid.getNbrIdx(bIdx, -2, 5);
-      u32 ruIdx = grid.getNbrIdx(bIdx, 5, 5);
+      u32 lIdx = grid.getNbrIdx(bIdx, i-haloSize, j);
+      u32 rIdx = grid.getNbrIdx(bIdx, i+haloSize, j);
+      u32 dIdx = grid.getNbrIdx(bIdx, i, j-haloSize);
+      u32 uIdx = grid.getNbrIdx(bIdx, i, j+haloSize);
+      u32 ldIdx = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize);
+      u32 rdIdx = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize);
+      u32 luIdx = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize);
+      u32 ruIdx = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize);
 
       u32 cEmpty = bEmpty * blockSizeTot;
       grid.cFlagsList[cIdx] = ACTIVE;

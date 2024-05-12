@@ -11,7 +11,7 @@ void CompressibleSolver::initialize(i32 icType) {
   setBoundaryConditions(0);
   paint();
 
-  for(i32 lvl=0; lvl<nLvls+3; lvl++){
+  for(i32 lvl=0; lvl<nLvls; lvl++){
     forwardWaveletTransform();
     adaptGrid();
     setInitialConditions(icType);

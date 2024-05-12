@@ -223,7 +223,7 @@ void MultiLevelSparseGrid::paint(void) {
   cudaDeviceSynchronize();
   png::image<png::gray_pixel_16> image(imageSize[0], imageSize[1]);
 
-  bool drawGrid = true;
+  bool drawGrid = false;
 
   for (i32 f=-1; f<4; f++) {
     computeImageData(f);

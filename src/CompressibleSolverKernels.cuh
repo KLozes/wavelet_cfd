@@ -521,7 +521,11 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
 
         // refine block if large wavelet detail
         if (abs(Q[cIdx]/mag) > grid.waveletThresh) {
-          grid.bFlagsList[bIdx] = REFINE;
+          //grid.bFlagsList[bIdx] = REFINE;
+          if (lvl < grid.nLvls-1) {
+            grid.activateBlock(lvl+1, 2*ib+i/2, 2*jb+j/2);
+          }
+          atomicMax(&(grid.bFlagsList[bIdx]),KEEP);
         }
       }
     }

@@ -9,7 +9,7 @@ int main(int argc, char* argv[]) {
   u32 baseGridSize[2] = {blockSize*25, blockSize*25};
   u32 nLvls = 5;
   dataType cfl = .1;
-  dataType waveletThresh = .002;
+  dataType waveletThresh = .004;
   dataType tStep = .02;
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls, cfl, waveletThresh);
