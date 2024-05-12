@@ -35,6 +35,7 @@ public:
   u32 blockCounter;
   u32 imageCounter;
   u32 nBlocks;
+  u32 nBlocksPrev;
 
   u64 *bLocList; // block morton codes
   u32 *bIdxList; // block memory indices
@@ -88,6 +89,17 @@ public:
   i32 j = idx / blockSize; \
   while (bIdx < grid.nBlocks) {
 #define END_CELL_LOOP cIdx += gridDim.x*blockDim.x; \
+  bIdx = cIdx / blockSizeTot;  \
+  __syncthreads();}
+
+#define START_XFACE_LOOP \
+  u32 cIdx = blockIdx.x * blockDim.x + threadIdx.x; \
+  u32 bIdx = cIdx / blockSizeTot; \
+  u32 idx = cIdx % blockSizeTot; \
+  i32 i = idx % blockSize; \
+  i32 j = idx / blockSize; \
+  while (bIdx < grid.nBlocks) {
+#define END_XFACE_LOOP cIdx += gridDim.x*blockDim.x; \
   bIdx = cIdx / blockSizeTot;  \
   __syncthreads();}
 

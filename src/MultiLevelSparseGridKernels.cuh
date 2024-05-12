@@ -85,17 +85,15 @@ __global__ void updateCellFlagsKernel(MultiLevelSparseGrid &grid) {
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
 
-      u32 lIdx = grid.getNbrIdx(bIdx, i-haloSize, j);
-      u32 rIdx = grid.getNbrIdx(bIdx, i+haloSize, j);
-      u32 dIdx = grid.getNbrIdx(bIdx, i, j-haloSize);
-      u32 uIdx = grid.getNbrIdx(bIdx, i, j+haloSize);
+      u32 lIdx = grid.getNbrIdx(bIdx, -2, j);
+      u32 rIdx = grid.getNbrIdx(bIdx, 5, j);
+      u32 dIdx = grid.getNbrIdx(bIdx, i, -2);
+      u32 uIdx = grid.getNbrIdx(bIdx, i, 5);
 
-      u32 ldIdx = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize);
-      u32 rdIdx = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize);
-
-      u32 luIdx = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize);
-      u32 ruIdx = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize);
-
+      u32 ldIdx = grid.getNbrIdx(bIdx, -2, -2);
+      u32 rdIdx = grid.getNbrIdx(bIdx, 5, -2);
+      u32 luIdx = grid.getNbrIdx(bIdx, -2, 5);
+      u32 ruIdx = grid.getNbrIdx(bIdx, 5, 5);
 
       u32 cEmpty = bEmpty * blockSizeTot;
       grid.cFlagsList[cIdx] = ACTIVE;
@@ -165,7 +163,7 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
     grid.mortonDecode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
-      if (lvl > 1 && grid.bFlagsList[bIdx] != DELETE) {
+      if (lvl > 1 && grid.bFlagsList[bIdx] == KEEP) {
         // add reconstruction blocks
         for (i32 dj=-1; dj<=1; dj++) {
           for (i32 di=-1; di<=1; di++) {
@@ -187,10 +185,10 @@ __global__ void deleteDataKernel(MultiLevelSparseGrid &grid) {
     u64 loc = grid.bLocList[bIdx];
     grid.mortonDecode(loc, lvl, ib, jb);
 
-    if (lvl > 1 && grid.bFlagsList[bIdx] == DELETE) {
+    if (lvl > 1 && (grid.bFlagsList[bIdx] == DELETE || grid.bLocList[bIdx] == kEmpty)) {
       grid.bLocList[bIdx] = kEmpty;
       //grid.bIdxList[bIdx] = bEmpty;
-      grid.cFlagsList[cIdx] = 0;
+      //grid.cFlagsList[cIdx] = 0;
       for(i32 f=0; f<grid.nFields; f++) {
         dataType *F = grid.getField(f);
         F[cIdx] = 0;

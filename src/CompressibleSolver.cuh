@@ -30,7 +30,8 @@ public:
   void setBoundaryConditions(i32 bcType);
   void conservativeToPrimitive(void);
   void primitiveToConservative(void);
-  void waveletThresholding(void);
+  void forwardWaveletTransform(void);
+  void inverseWaveletTransform(void);
 
   void computeDeltaT(void);
   void computeRightHandSide(void);

@@ -12,7 +12,7 @@ void CompressibleSolver::initialize(i32 icType) {
   paint();
 
   for(i32 lvl=0; lvl<nLvls+3; lvl++){
-    waveletThresholding();
+    forwardWaveletTransform();
     adaptGrid();
     setInitialConditions(icType);
     primitiveToConservative();
@@ -30,13 +30,13 @@ dataType CompressibleSolver::step(dataType tStep) {
   while (t < tStep) {
 
     u32 nBlocksPrev = nBlocks;
-    if (iter % 1 == 0) {
-      waveletThresholding();
-      adaptGrid();
-      setBoundaryConditions(0);
-      interpolateFields();
+    if (iter % 10 == 0) {
+      forwardWaveletTransform();
       paint();
+      adaptGrid();
+      inverseWaveletTransform();
       sortBlocks();
+      setBoundaryConditions(0);
       computeDeltaT();
     }
 
@@ -83,14 +83,20 @@ void CompressibleSolver::primitiveToConservative(void) {
   primitiveToConservativeKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
 }
 
-void CompressibleSolver::waveletThresholding(void) {
+void CompressibleSolver::forwardWaveletTransform(void) {
   computeMagRhoUKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
-  maxRho = *(thrust::min_element(thrust::device, getField(0), getField(0)+nBlocks*blockSize));
-  maxMagRhoU = *(thrust::min_element(thrust::device, getField(12), getField(12)+nBlocks*blockSize));
-  maxRhoE = *(thrust::min_element(thrust::device, getField(3), getField(3)+nBlocks*blockSize));
-  cudaMemset(bFlagsList, 0, nBlocks*sizeof(u32));
-  waveletThresholdingKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
+  maxRho = *(thrust::max_element(thrust::device, getField(0), getField(0)+nBlocks*blockSize));
+  maxMagRhoU = *(thrust::max_element(thrust::device, getField(12), getField(12)+nBlocks*blockSize));
+  maxRhoE = *(thrust::max_element(thrust::device, getField(3), getField(3)+nBlocks*blockSize));
+  cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
+  copyToOldFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
+  forwardWaveletTransformKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
 }
+
+void CompressibleSolver::inverseWaveletTransform(void) {
+  inverseWaveletTransformKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
+}
+
 
 void CompressibleSolver::computeDeltaT(void) {
   computeDeltaTKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);

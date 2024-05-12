@@ -75,6 +75,7 @@ void MultiLevelSparseGrid::initializeBaseGrid(void) {
 }
 
 void MultiLevelSparseGrid::adaptGrid(void) {
+
   addFineBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;

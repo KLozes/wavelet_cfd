@@ -468,7 +468,7 @@ __global__ void primitiveToConservativeKernel(CompressibleSolver &grid) {
 }
 
 
-__global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
+__global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
 
   START_CELL_LOOP
   
@@ -507,10 +507,11 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
       // calculate detail coefficients for each field and set block to refine if large
       for(i32 f=0; f<4; f++) {
         dataType *Q  = grid.getField(f);
-        dataType detail = Q[cIdx] - (Q[pIdx] 
-                + xs * 1/8 * (Q[rIdx] - Q[lIdx]) 
-                + ys * 1/8 * (Q[uIdx] - Q[dIdx])
-                + xs * ys * 1/64 * (Q[ruIdx] - Q[luIdx] - Q[rdIdx] + Q[ldIdx])); 
+        dataType *OldQ  = grid.getField(f+4);
+        Q[cIdx] = Q[cIdx] - (OldQ[pIdx] 
+                + xs * 1/8 * (OldQ[rIdx] - OldQ[lIdx]) 
+                + ys * 1/8 * (OldQ[uIdx] - OldQ[dIdx])
+                + xs * ys * 1/64 * (OldQ[ruIdx] - OldQ[luIdx] - OldQ[rdIdx] + OldQ[ldIdx])); 
 
         dataType mag = 1e-32;
         if (f == 0) {mag = grid.maxRho;}
@@ -518,10 +519,53 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
         if (f == 3) {mag = grid.maxRhoE;}
 
         // refine block if large wavelet detail
-        if (abs(detail/mag) > grid.waveletThresh) {
+        if (abs(Q[cIdx]/mag) > grid.waveletThresh) {
           grid.bFlagsList[bIdx] = REFINE;
-          break;
         }
+      }
+    }
+
+  END_CELL_LOOP
+}
+
+__global__ void inverseWaveletTransformKernel(CompressibleSolver &grid) {
+
+  START_CELL_LOOP
+  
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb;
+    grid.mortonDecode(loc, lvl, ib, jb);
+
+    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && grid.bFlagsList[bIdx] != DELETE) {
+      // parent block memory index
+      u32 prntIdx = grid.prntIdxList[bIdx];
+
+      // parent cell local indices
+      i32 ip = i/2 + ib%2 * blockSize / 2;
+      i32 jp = j/2 + jb%2 * blockSize / 2;
+
+      // parent and neigboring cell memory indices
+      u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp);
+      u32 lIdx = grid.getNbrIdx(prntIdx, ip-1, jp);
+      u32 rIdx = grid.getNbrIdx(prntIdx, ip+1, jp);
+      u32 dIdx = grid.getNbrIdx(prntIdx, ip, jp-1);
+      u32 uIdx = grid.getNbrIdx(prntIdx, ip, jp+1);
+      u32 ldIdx = grid.getNbrIdx(prntIdx, ip-1, jp-1);
+      u32 rdIdx = grid.getNbrIdx(prntIdx, ip+1, jp-1);
+      u32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1);
+      u32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1);
+
+      dataType xs = 2 * (i % 2) - 1 ; // sign for interp weights
+      dataType ys = 2 * (j % 2) - 1;
+
+      // calculate detail coefficients for each field and set block to refine if large
+      for(i32 f=0; f<4; f++) {
+        dataType *Q  = grid.getField(f);
+        dataType *OldQ  = grid.getField(f+4);
+        Q[cIdx] = Q[cIdx] + (OldQ[pIdx] 
+                + xs * 1/8 * (OldQ[rIdx] - OldQ[lIdx]) 
+                + ys * 1/8 * (OldQ[uIdx] - OldQ[dIdx])
+                + xs * ys * 1/64 * (OldQ[ruIdx] - OldQ[luIdx] - OldQ[rdIdx] + OldQ[ldIdx])); 
       }
     }
 
