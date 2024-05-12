@@ -226,7 +226,7 @@ __host__ __device__ Vec4 CompressibleSolver::hlleFlux(Vec4 qL, Vec4 qR, Vec2 nor
 
 __host__ __device__ Vec4 CompressibleSolver::hllcFlux(Vec4 qL, Vec4 qR, Vec2 normal) {
   //
-  // Compute HLLE flux
+  // Compute HLLC flux
   //
   dataType nx = normal[0];
   dataType ny = normal[1];
