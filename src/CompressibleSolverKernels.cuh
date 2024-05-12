@@ -162,7 +162,7 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
     if (grid.isInteriorBlock(lvl, ib, jb)) {
       dataType a, dx, vel;
       Vec4 q = grid.cons2prim(Vec4(Rho[cIdx], RhoU[cIdx], RhoV[cIdx], RhoE[cIdx]));
-      a = sqrt(abs(gam*q[3]/q[0]));
+      a = sqrt(abs(gam*q[3]/(q[0]+1e-32)));
       vel = sqrt(q[1]*q[1] + q[2]*q[2]);
       dx = min(grid.getDx(lvl), grid.getDy(lvl));
       DeltaT[cIdx] = dx / (a + vel + 1e-32);
@@ -370,11 +370,12 @@ __global__ void updateFieldsRK3Kernel(CompressibleSolver &grid, i32 stage) {
         RhoE[cIdx] = 1.0/3.0*OldRhoE[cIdx] + 2.0/3.0*RhoE[cIdx] + 2.0/3.0 * dt * RhsRhoE[cIdx];
       }
 
-      RhsRho[cIdx]  = 0;
-      RhsRhoU[cIdx] = 0;
-      RhsRhoV[cIdx] = 0;
-      RhsRhoE[cIdx] = 0;
     }
+
+    RhsRho[cIdx]  = 0;
+    RhsRhoU[cIdx] = 0;
+    RhsRhoV[cIdx] = 0;
+    RhsRhoE[cIdx] = 0;
 
   END_CELL_LOOP
 

@@ -32,13 +32,16 @@ dataType CompressibleSolver::step(dataType tStep) {
     u32 nBlocksPrev = nBlocks;
     if (iter % 10 == 0) {
       forwardWaveletTransform();
-      paint();
       adaptGrid();
       inverseWaveletTransform();
       sortBlocks();
       setBoundaryConditions(0);
+    }
+
+    if (iter % 2 == 0) {
       computeDeltaT();
     }
+
 
     for (i32 stage = 0; stage<3; stage++) {
       conservativeToPrimitive();
@@ -49,6 +52,7 @@ dataType CompressibleSolver::step(dataType tStep) {
 
       if (nLvls > 2) {
         interpolateFields();
+        setBoundaryConditions(0);
       }
       
     }

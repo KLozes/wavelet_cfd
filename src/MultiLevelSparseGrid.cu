@@ -218,7 +218,7 @@ __host__ __device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, i32 &lvl
   j = compact(morton >> 1) - 1;
 }
 
-void MultiLevelSparseGrid::paint() {
+void MultiLevelSparseGrid::paint(void) {
 
   cudaDeviceSynchronize();
   png::image<png::gray_pixel_16> image(imageSize[0], imageSize[1]);
