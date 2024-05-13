@@ -14,6 +14,11 @@ public:
   dataType maxMagRhoU;
   dataType maxRhoE;
   dataType waveletThresh;
+  
+  i32 immerserdBcType;
+  i32 bcType;
+  i32 icType;
+
   u32 iter;
 
   CompressibleSolver(dataType *domainSize_, u32 *baseGridSize_, u32 nLvls_, dataType cfl_, dataType waveletThresh_) :
@@ -21,13 +26,15 @@ public:
       cfl = cfl_;
       waveletThresh = waveletThresh_;
       iter = 0;
+      immerserdBcType = 0;
+      bcType = 0;
   }
 
-  void initialize(i32 icType);
+  void initialize(void);
   dataType step(dataType dt);
   void sortFieldData(void);
-  void setInitialConditions(i32 icType);
-  void setBoundaryConditions(i32 bcType);
+  void setInitialConditions(void);
+  void setBoundaryConditions(void);
   void conservativeToPrimitive(void);
   void primitiveToConservative(void);
   void forwardWaveletTransform(void);
@@ -42,8 +49,9 @@ public:
   __host__ __device__ Vec4 cons2prim(Vec4 cons);
   __host__ __device__ dataType lim(dataType &r);
   __host__ __device__ dataType tvdRec(dataType &ul, dataType &uc, dataType &ur);
-  __host__ __device__ Vec4 hlleFlux(Vec4 qL, Vec4 qR, Vec2 normal) ;
-  __host__ __device__ Vec4 hllcFlux(Vec4 qL, Vec4 qR, Vec2 normal) ;
+  __host__ __device__ Vec4 hlleFlux(Vec4 qL, Vec4 qR, Vec2 normal);
+  __host__ __device__ Vec4 hllcFlux(Vec4 qL, Vec4 qR, Vec2 normal);
+  __host__ __device__ dataType getBoundaryLevelSet(Vec2 pos);
 
 };
 

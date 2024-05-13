@@ -4,19 +4,19 @@
 #include "CompressibleSolver.cuh"
 #include "CompressibleSolverKernels.cuh"
 
-void CompressibleSolver::initialize(i32 icType) {
+void CompressibleSolver::initialize(void) {
   initializeBaseGrid();
-  setInitialConditions(icType);
+  setInitialConditions();
   primitiveToConservative();
-  setBoundaryConditions(0);
+  setBoundaryConditions();
   paint();
 
   for(i32 lvl=0; lvl<nLvls; lvl++){
     forwardWaveletTransform();
     adaptGrid();
-    setInitialConditions(icType);
+    setInitialConditions();
     primitiveToConservative();
-    setBoundaryConditions(0);
+    setBoundaryConditions();
     sortBlocks();
     printf("nblocks %d\n", nBlocks);
     paint();
@@ -35,7 +35,7 @@ dataType CompressibleSolver::step(dataType tStep) {
       adaptGrid();
       inverseWaveletTransform();
       sortBlocks();
-      setBoundaryConditions(0);
+      setBoundaryConditions();
     }
 
     if (iter % 2 == 0) {
@@ -48,11 +48,11 @@ dataType CompressibleSolver::step(dataType tStep) {
       computeRightHandSide();
       primitiveToConservative();
       updateFields(stage);
-      setBoundaryConditions(0);
+      setBoundaryConditions();
 
       if (nLvls > 2) {
         interpolateFields();
-        setBoundaryConditions(0);
+        setBoundaryConditions();
       }
       
     }
@@ -70,13 +70,13 @@ void CompressibleSolver::sortFieldData(void) {
   sortFieldDataKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
 }
 
-void CompressibleSolver::setInitialConditions(i32 icType) {
-  setInitialConditionsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this, icType);
+void CompressibleSolver::setInitialConditions(void) {
+  setInitialConditionsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
 }
 
-void CompressibleSolver::setBoundaryConditions(i32 bcType) {
-  setBoundaryConditionsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this, bcType);
+void CompressibleSolver::setBoundaryConditions(void) {
+  setBoundaryConditionsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
 }
 
 void CompressibleSolver::conservativeToPrimitive(void) {
@@ -169,6 +169,20 @@ __host__ __device__ Vec4 CompressibleSolver::cons2prim(Vec4 cons) {
   prim[3] = (gam-1.0)*(cons[3] - .5*prim[0]*(prim[1]*prim[1] + prim[2]*prim[2]));
   return prim;
 }
+
+__host__ __device__ dataType CompressibleSolver::getBoundaryLevelSet(Vec2 pos) {
+
+  if (immerserdBcType == 1) {
+    // circle
+    dataType radius = .1;
+    dataType center[2] = {1.0, .5};
+    return radius - sqrt((pos[0]-center[0])*(pos[0]-center[0]) + (pos[1]-center[1])*(pos[1]-center[1]));
+  }
+  else {
+    return 1e32;
+  }
+
+} 
 
 __host__ __device__ Vec4 CompressibleSolver::hlleFlux(Vec4 qL, Vec4 qR, Vec2 normal) {
   //

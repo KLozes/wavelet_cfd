@@ -5,15 +5,18 @@
 #include "CompressibleSolver.cuh"
 
 int main(int argc, char* argv[]) {
-  dataType domainSize[2] = {1.0, 1.0};
-  u32 baseGridSize[2] = {blockSize*25, blockSize*25};
-  u32 nLvls = 5;
+  dataType domainSize[2] = {4.0, 1.0};
+  u32 baseGridSize[2] = {blockSize*100, blockSize*25};
+  u32 nLvls = 4;
   dataType cfl = .1;
   dataType waveletThresh = .004;
   dataType tStep = .02;
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls, cfl, waveletThresh);
-  solver->initialize(0);
+  solver->icType = 0;
+  solver->bcType = 0;
+  solver->immerserdBcType = 0;
+  solver->initialize();
 
   dataType t = 0;
   i32 n = 0;

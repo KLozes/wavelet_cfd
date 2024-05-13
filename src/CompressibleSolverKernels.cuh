@@ -29,7 +29,7 @@ __global__ void sortFieldDataKernel(CompressibleSolver &grid) {
 
 }
 
-__global__ void setInitialConditionsKernel(CompressibleSolver &grid, i32 icType) {
+__global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
 
   dataType *Rho  = grid.getField(0);
   dataType *U    = grid.getField(1);
@@ -44,13 +44,13 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid, i32 icType)
     dataType pos[2];
     grid.getCellPos(lvl, ib, jb, i, j, pos);
 
-    if (icType == 0) {
+    if (grid.icType == 0) {
       //
       // sod shock explosion
       //
       dataType centerX = grid.domainSize[0]/2;
       dataType centerY = grid.domainSize[1]/2;
-      dataType radius = grid.domainSize[0]/5;
+      dataType radius = min(grid.domainSize[0], grid.domainSize[0])/5;
 
       dataType dist = sqrt((pos[0]-centerX)*(pos[0]-centerX) + (pos[1]-centerY)*(pos[1]-centerY));
     
@@ -69,7 +69,7 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid, i32 icType)
       }
     }
 
-    if (icType == 1) {
+    if (grid.icType == 1) {
       //
       // gaussian explosion
       //
@@ -80,11 +80,22 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid, i32 icType)
       V[cIdx]    = 0.0;
     }
 
+    if (grid.icType == 2) {
+      //
+      // wind tunnel
+      //
+      Rho[cIdx] = 1.0;
+      P[cIdx]   = 1.0;
+      U[cIdx]   = 3.0;
+      V[cIdx]   = 0.0;
+    }
+
+
 
   END_CELL_LOOP
 }
 
-__global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 bcType) {
+__global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
 
   dataType *Rho  = grid.getField(0);
   dataType *RhoU = grid.getField(1);
@@ -100,7 +111,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 bcType
     if (grid.isExteriorBlock(lvl, ib, jb)) {
       u32 gridSize[2] = {grid.baseGridSize[0]*powi(2, lvl)/blockSize, 
                          grid.baseGridSize[1]*powi(2, lvl)/blockSize};
-      if (bcType == 0) {
+      if (grid.bcType == 0) {
         //
         // slip wall
         //
@@ -138,6 +149,54 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 bcType
           RhoU[cIdx] = -RhoU[bcIdx];
           RhoV[cIdx] = -RhoV[bcIdx];
         }
+      }
+
+      if (grid.bcType == 1) {
+        //
+        // wind tunnel
+        //
+
+        // figure out internal cell for neuman boundary conditions
+        i32 ibc = i;
+        i32 jbc = j;
+        if (ib < 0) {
+          ibc = blockSize;
+        }
+        if (jb < 0) {
+          jbc = blockSize;
+        }
+        if (ib >= i32(gridSize[0])) {
+          ibc = -1; 
+        }
+        if (jb >= i32(gridSize[1])) {
+          jbc = -1;
+        }
+        u32 bcIdx = grid.getNbrIdx(bIdx, ibc, jbc); 
+
+        // apply boundary conditions
+        Rho[cIdx] = Rho[bcIdx];
+        RhoE[cIdx] = RhoE[bcIdx];
+        
+        // left wall
+        if (ib < 0) {
+          RhoU[cIdx] = 3.0;
+          RhoV[cIdx] = 0.0;
+          Rho[cIdx] = 1.0;
+          RhoE[cIdx] = 1.0/(gam-1) + .5*(3.0*3.0);
+        }
+
+        // right wall
+        if (ib >= gridSize[0]) {
+          RhoU[cIdx] = RhoU[bcIdx];
+          RhoV[cIdx] = RhoV[bcIdx];
+        }
+
+        // top and bottom wall
+        if (jb >= gridSize[1] || jb < 0) {
+          RhoU[cIdx] = RhoU[bcIdx];
+          RhoV[cIdx] =  -RhoV[bcIdx];
+        }
+
       }
     }
 
@@ -481,6 +540,11 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
       grid.bFlagsList[bIdx] = KEEP;
     }
 
+    dataType pos[2];
+    grid.getCellPos(lvl, ib, jb, i, j, pos);
+    dataType dx = min(grid.getDx(lvl), grid.getDy(lvl)) ;
+    dataType ls = grid.getBoundaryLevelSet(Vec2(pos[0], pos[1]));
+
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb)) {
       // parent block memory index
       u32 prntIdx = grid.prntIdxList[bIdx];
@@ -520,7 +584,7 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
         if (f == 3) {mag = grid.maxRhoE;}
 
         // refine block if large wavelet detail
-        if (abs(Q[cIdx]/mag) > grid.waveletThresh) {
+        if (abs(Q[cIdx]/mag) > grid.waveletThresh || abs(ls) < dx) {
           //grid.bFlagsList[bIdx] = REFINE;
           if (lvl < grid.nLvls-1) {
             grid.activateBlock(lvl+1, 2*ib+i/2, 2*jb+j/2);
