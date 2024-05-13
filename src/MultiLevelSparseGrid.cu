@@ -277,7 +277,7 @@ void MultiLevelSparseGrid::paint(void) {
                 u32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
                 image[jPxl][iPxl] = imageData[idx] * 65535;
 
-                if (drawGrid && (ii > 0 && jj > 0)) {
+                if (f == -1 && (ii > 0 && jj > 0)) {
                   image[jPxl][iPxl] = 0;
                 }
               }
