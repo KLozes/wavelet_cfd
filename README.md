@@ -1,4 +1,4 @@
-# A simple wavelet finite volume solver in CUDA for the compressible Navier-stokes equations
+# A dynamically adaptive wavelet finite volume solver written in CUDA for the compressible Navier-stokes equations
 
 please wait for gifs to load...
 
