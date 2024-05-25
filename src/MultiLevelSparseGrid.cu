@@ -84,6 +84,7 @@ void MultiLevelSparseGrid::adaptGrid(void) {
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
 
+  blockCounter = 0;
   addReconstructionBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;

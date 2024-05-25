@@ -165,7 +165,7 @@ __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid) {
 
 __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
 
-  START_BLOCK_LOOP
+  START_DYNAMIC_BLOCK_LOOP
     i32 lvl, ib, jb;
     u64 loc = grid.bLocList[bIdx];
     grid.mortonDecode(loc, lvl, ib, jb);
@@ -182,7 +182,7 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
       } 
     }
 
-  END_BLOCK_LOOP
+  END_DYNAMIC_BLOCK_LOOP
 }
 
 __global__ void deleteDataKernel(MultiLevelSparseGrid &grid) {

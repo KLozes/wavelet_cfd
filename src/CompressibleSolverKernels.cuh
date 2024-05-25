@@ -279,24 +279,24 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
 
       // left flux
       qL[0] = grid.tvdRec(Rho[l2Idx], Rho[l1Idx], Rho[cIdx]);
-      qR[0] = grid.tvdRec(Rho[r1Idx], Rho[cIdx], Rho[l1Idx]);
+      qR[0] = grid.tvdRec(Rho[r1Idx], Rho[cIdx],  Rho[l1Idx]);
       qD[0] = grid.tvdRec(Rho[d2Idx], Rho[d1Idx], Rho[cIdx]);
-      qU[0] = grid.tvdRec(Rho[u1Idx], Rho[cIdx], Rho[d1Idx]);
+      qU[0] = grid.tvdRec(Rho[u1Idx], Rho[cIdx],  Rho[d1Idx]);
 
       qL[1] = grid.tvdRec(U[l2Idx], U[l1Idx], U[cIdx]);
-      qR[1] = grid.tvdRec(U[r1Idx], U[cIdx], U[l1Idx]);
+      qR[1] = grid.tvdRec(U[r1Idx], U[cIdx],  U[l1Idx]);
       qD[1] = grid.tvdRec(U[d2Idx], U[d1Idx], U[cIdx]);
-      qU[1] = grid.tvdRec(U[u1Idx], U[cIdx], U[d1Idx]);
+      qU[1] = grid.tvdRec(U[u1Idx], U[cIdx],  U[d1Idx]);
 
       qL[2] = grid.tvdRec(V[l2Idx], V[l1Idx], V[cIdx]);
-      qR[2] = grid.tvdRec(V[r1Idx], V[cIdx], V[l1Idx]);
+      qR[2] = grid.tvdRec(V[r1Idx], V[cIdx],  V[l1Idx]);
       qD[2] = grid.tvdRec(V[d2Idx], V[d1Idx], V[cIdx]);
-      qU[2] = grid.tvdRec(V[u1Idx], V[cIdx], V[d1Idx]);
+      qU[2] = grid.tvdRec(V[u1Idx], V[cIdx],  V[d1Idx]);
 
       qL[3] = grid.tvdRec(P[l2Idx], P[l1Idx], P[cIdx]);
-      qR[3] = grid.tvdRec(P[r1Idx], P[cIdx], P[l1Idx]);
+      qR[3] = grid.tvdRec(P[r1Idx], P[cIdx],  P[l1Idx]);
       qD[3] = grid.tvdRec(P[d2Idx], P[d1Idx], P[cIdx]);
-      qU[3] = grid.tvdRec(P[u1Idx], P[cIdx], P[d1Idx]);
+      qU[3] = grid.tvdRec(P[u1Idx], P[cIdx],  P[d1Idx]);
 
       fluxL = grid.hllcFlux(grid.prim2cons(qL), grid.prim2cons(qR), Vec2(1,0)); 
       fluxD = grid.hllcFlux(grid.prim2cons(qD), grid.prim2cons(qU), Vec2(0,1)); 
@@ -376,7 +376,7 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
 
 __global__ void updateFieldsRK3Kernel(CompressibleSolver &grid, i32 stage) {
   //
-  // update fields with low storage runge kutta
+  // update fields with tvd runge kutta 3
   //
   dataType *Rho  = grid.getField(0);
   dataType *RhoU = grid.getField(1);
@@ -416,14 +416,14 @@ __global__ void updateFieldsRK3Kernel(CompressibleSolver &grid, i32 stage) {
       }
 
       if (stage == 1) {
-        Rho[cIdx] = 3.0/4.0*OldRho[cIdx]   + 1.0/4.0*Rho[cIdx]   + 1.0/4.0 * dt * RhsRho[cIdx];
+        Rho[cIdx]  = 3.0/4.0*OldRho[cIdx]  + 1.0/4.0*Rho[cIdx]  + 1.0/4.0 * dt * RhsRho[cIdx];
         RhoU[cIdx] = 3.0/4.0*OldRhoU[cIdx] + 1.0/4.0*RhoU[cIdx] + 1.0/4.0 * dt * RhsRhoU[cIdx];
         RhoV[cIdx] = 3.0/4.0*OldRhoV[cIdx] + 1.0/4.0*RhoV[cIdx] + 1.0/4.0 * dt * RhsRhoV[cIdx];
         RhoE[cIdx] = 3.0/4.0*OldRhoE[cIdx] + 1.0/4.0*RhoE[cIdx] + 1.0/4.0 * dt * RhsRhoE[cIdx];
       }
 
       if (stage == 2) {
-        Rho[cIdx] = 1.0/3.0*OldRho[cIdx]   + 2.0/3.0*Rho[cIdx]  + 2.0/3.0 * dt * RhsRho[cIdx];
+        Rho[cIdx]  = 1.0/3.0*OldRho[cIdx]  + 2.0/3.0*Rho[cIdx]  + 2.0/3.0 * dt * RhsRho[cIdx];
         RhoU[cIdx] = 1.0/3.0*OldRhoU[cIdx] + 2.0/3.0*RhoU[cIdx] + 2.0/3.0 * dt * RhsRhoU[cIdx];
         RhoV[cIdx] = 1.0/3.0*OldRhoV[cIdx] + 2.0/3.0*RhoV[cIdx] + 2.0/3.0 * dt * RhsRhoV[cIdx];
         RhoE[cIdx] = 1.0/3.0*OldRhoE[cIdx] + 2.0/3.0*RhoE[cIdx] + 2.0/3.0 * dt * RhsRhoE[cIdx];
@@ -709,11 +709,9 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
       // parent and neigboring cell memory indices
       u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp);
 
-      if (lvl > 0) {
-        for (u32 f=0; f<4; f++){
-          dataType* q = grid.getField(f);
-          q[pIdx] = 0.0;
-        }
+      for (u32 f=0; f<4; f++) {
+        dataType* q = grid.getField(f);
+        q[pIdx] = 0.0;
       }
     }
 
@@ -730,11 +728,9 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
       // parent cell memory indices
       u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp);
 
-      if (grid.cFlagsList[cIdx] == ACTIVE && lvl > 0) {
-        for (u32 f=0; f<4; f++){
-          dataType *q = grid.getField(f);
-          atomicAdd(&q[pIdx], q[cIdx]/4);
-        }
+      for (u32 f=0; f<4; f++){
+        dataType *q = grid.getField(f);
+        atomicAdd(&q[pIdx], q[cIdx]/4);
       }
     }
 
