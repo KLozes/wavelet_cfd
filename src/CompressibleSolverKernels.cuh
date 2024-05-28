@@ -548,8 +548,8 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb)) {
       // parent block memory index
       u32 prntIdx = grid.prntIdxList[bIdx];
-      //grid.bFlagsList[prntIdx] = KEEP;
-      atomicMax(&(grid.bFlagsList[prntIdx]),KEEP);
+      grid.bFlagsList[prntIdx] = KEEP;
+      //atomicMax(&(grid.bFlagsList[prntIdx]),KEEP);
 
       // parent cell local indices
       i32 ip = i/2 + ib%2 * blockSize / 2;
@@ -585,7 +585,6 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
 
         // refine block if large wavelet detail
         if (abs(Q[cIdx]/mag) > grid.waveletThresh || abs(ls) < dx) {
-          //grid.bFlagsList[bIdx] = REFINE;
           if (lvl < grid.nLvls-1) {
             grid.activateBlock(lvl+1, 2*ib+i/2, 2*jb+j/2);
           }
@@ -687,36 +686,6 @@ __global__ void interpolateFieldsKernel(CompressibleSolver &grid) {
   END_CELL_LOOP
 }
 
-__global__ void restrictFieldsKernel0(CompressibleSolver &grid) {
-
-  START_CELL_LOOP
-
-    u64 loc = grid.bLocList[bIdx];
-    i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
-
-    u32 cFlag = grid.cFlagsList[cIdx];
-
-    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && cFlag == ACTIVE) {
-      // parent block memory index
-      u32 prntIdx = grid.prntIdxList[bIdx];
-
-      // parent cell local indices
-      i32 ip = i/2 + ib%2 * blockSize / 2;
-      i32 jp = j/2 + jb%2 * blockSize / 2;
-
-      // parent cell memory index
-      u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp);
-
-      for (u32 f=0; f<4; f++) {
-        dataType* q = grid.getField(f);
-        q[pIdx] = 0.0;
-      }
-    }
-
-  END_CELL_LOOP
-}
-
 __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
 
   START_CELL_LOOP
@@ -727,28 +696,12 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
 
     u32 cFlag = grid.cFlagsList[cIdx];
 
-    /*
-    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && cFlag == ACTIVE) {
-      // parent block memory index
-      u32 prntIdx = grid.prntIdxList[bIdx];
+    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && cFlag == ACTIVE && i%2==0 && j%2==0) {
+      // sister cell indices
+      i32 rIdx = cIdx + 1;
+      i32 uIdx = cIdx + blockSize;
+      i32 ruIdx = cIdx + blockSize + 1;
 
-      // parent cell local indices
-      i32 ip = i/2 + ib%2 * blockSize / 2;
-      i32 jp = j/2 + jb%2 * blockSize / 2;
-
-      // parent and neigboring cell memory indices
-      u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp);
-
-      for (u32 f=0; f<4; f++) {
-        dataType* q = grid.getField(f);
-        q[pIdx] = 0.0;
-      }
-    }
-
-    __syncthreads();
-    */
-
-    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && cFlag == ACTIVE) {
       // parent block memory index
       u32 prntIdx = grid.prntIdxList[bIdx];
 
@@ -761,7 +714,7 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
 
       for (u32 f=0; f<4; f++){
         dataType *q = grid.getField(f);
-        atomicAdd(&q[pIdx], q[cIdx]/4.0);
+        q[pIdx] = (q[cIdx] + q[rIdx] + q[uIdx] + q[ruIdx])/4.0;
       }
     }
 

@@ -43,6 +43,8 @@ public:
   void computeDeltaT(void);
   void computeRightHandSide(void);
   void updateFields(i32 stage);
+
+  void restrictFields();
   void interpolateFields();
 
   __host__ __device__ Vec4 prim2cons(Vec4 prim);

@@ -75,7 +75,7 @@ __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
   END_HALO_CELL_LOOP
 }
 
-__global__ void updateCellFlagsKernel(MultiLevelSparseGrid &grid) {
+__global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid) {
 
   START_CELL_LOOP
 
@@ -84,15 +84,6 @@ __global__ void updateCellFlagsKernel(MultiLevelSparseGrid &grid) {
     grid.mortonDecode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
-
-      //u32 lIdx = grid.getNbrIdx(bIdx, -2, j);
-      //u32 rIdx = grid.getNbrIdx(bIdx, 5, j);
-      //u32 dIdx = grid.getNbrIdx(bIdx, i, -2);
-      //u32 uIdx = grid.getNbrIdx(bIdx, i, 5);
-      //u32 ldIdx = grid.getNbrIdx(bIdx, -2, -2);
-      //u32 rdIdx = grid.getNbrIdx(bIdx, 5, -2);
-      //u32 luIdx = grid.getNbrIdx(bIdx, -2, 5);
-      //u32 ruIdx = grid.getNbrIdx(bIdx, 5, 5);
 
       u32 lIdx = grid.getNbrIdx(bIdx, i-haloSize, j);
       u32 rIdx = grid.getNbrIdx(bIdx, i+haloSize, j);
@@ -109,6 +100,35 @@ __global__ void updateCellFlagsKernel(MultiLevelSparseGrid &grid) {
           ldIdx >= cEmpty || rdIdx >= cEmpty || luIdx >= cEmpty || ruIdx >= cEmpty) {
         grid.cFlagsList[cIdx] = GHOST;
       }
+
+    }
+
+  END_CELL_LOOP
+}
+
+__global__ void flagParentCellsKernel(MultiLevelSparseGrid &grid) {
+
+  START_CELL_LOOP
+
+    i32 lvl, ib, jb;
+    u64 loc = grid.bLocList[bIdx];
+    grid.mortonDecode(loc, lvl, ib, jb);
+
+    i32 cFlag = grid.cFlagsList[cIdx];
+
+    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && (cFlag == ACTIVE || cFlag == PARENT)) {
+
+      // parent block memory index
+      u32 prntIdx = grid.prntIdxList[bIdx];
+
+      // parent cell local indices
+      i32 ip = i/2 + ib%2 * blockSize / 2;
+      i32 jp = j/2 + jb%2 * blockSize / 2;
+
+      // parent cell memory index
+      u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp);
+
+      grid.cFlagsList[pIdx] = PARENT;
 
     }
 

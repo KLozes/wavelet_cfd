@@ -115,7 +115,7 @@ void MultiLevelSparseGrid::sortBlocks(void) {
 
   updatePrntIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   updateNbrIndicesKernel<<<nBlocks*blockHaloSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  updateCellFlagsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  flagActiveCellsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
 
   /*
@@ -269,7 +269,7 @@ void MultiLevelSparseGrid::paint(void) {
       u64 loc = bLocList[bIdx];
       i32 lvl, ib, jb;
       mortonDecode(loc, lvl, ib, jb);
-      if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty && lvl == 0) {
+      if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty) {
         for (uint j = 0; j < blockSize; j++) {
           for (uint i = 0; i < blockSize; i++) {
             u32 idx = i + blockSize * j + bIdx*blockSizeTot;
