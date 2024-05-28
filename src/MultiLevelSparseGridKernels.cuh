@@ -195,8 +195,8 @@ __global__ void deleteDataKernel(MultiLevelSparseGrid &grid) {
 
     if (lvl > 1 && (grid.bFlagsList[bIdx] == DELETE || grid.bLocList[bIdx] == kEmpty)) {
       grid.bLocList[bIdx] = kEmpty;
-      //grid.bIdxList[bIdx] = bEmpty;
-      //grid.cFlagsList[cIdx] = 0;
+      grid.bIdxList[bIdx] = bEmpty;
+      grid.cFlagsList[cIdx] = 0;
       for(i32 f=0; f<grid.nFields; f++) {
         dataType *F = grid.getField(f);
         F[cIdx] = 0;

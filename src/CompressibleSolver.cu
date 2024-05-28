@@ -30,33 +30,41 @@ dataType CompressibleSolver::step(dataType tStep) {
   while (t < tStep) {
 
     u32 nBlocksPrev = nBlocks;
-    if (iter % 4 == 0 && nLvls > 1) {
+    /*
+    if (iter % 1 == 0 && nLvls > 1) {
       forwardWaveletTransform();
       adaptGrid();
       inverseWaveletTransform();
       sortBlocks();
       setBoundaryConditions();
     }
+    */
 
     if (iter % 2 == 0) {
       computeDeltaT();
     }
 
-
+    
     for (i32 stage = 0; stage<3; stage++) {
-      paint();
-      conservativeToPrimitive();
-      computeRightHandSide();
-      primitiveToConservative();
-      updateFields(stage);
-      setBoundaryConditions();
+      //paint();
+      //conservativeToPrimitive();
+      //computeRightHandSide();
+      //primitiveToConservative();
+      //updateFields(stage);
+      //setBoundaryConditions();
 
-      if (nLvls > 2) {
-        interpolateFields();
-        setBoundaryConditions();
+      if (nLvls > 1) {
+        
+        //interpolateFields();
+        //setBoundaryConditions();
       }
       
+      
     }
+
+    paint();
+    interpolateFields();
+    paint();
 
     cudaDeviceSynchronize();
     t += deltaT;
@@ -119,6 +127,7 @@ void CompressibleSolver::updateFields(i32 stage) {
 }
 
 void CompressibleSolver::interpolateFields(void) {
+  restrictFieldsKernel0<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   restrictFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   interpolateFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
 }

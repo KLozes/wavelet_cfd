@@ -48,6 +48,8 @@ public:
   dataType *fieldData; // flow field data
   dataType *imageData; // output image data
 
+  int lock;
+
   MultiLevelSparseGrid(dataType *domainSize, u32 *baseGridSize_, u32 nLvls_, u32 nFields_);
 
   ~MultiLevelSparseGrid(void);
@@ -123,8 +125,10 @@ public:
   __shared__ u32 endIndex; \
   while (grid.blockCounter < grid.nBlocks) { \
     if (threadIdx.x == 0) { \
+      while(atomicCAS(&(grid.lock), 0, 1) != 0); \
       startIndex = atomicAdd(&(grid.blockCounter), blockDim.x); \
       endIndex = atomicMin(&(grid.blockCounter), grid.nBlocks); \
+      atomicExch(&(grid.lock), 0); \
     } \
     __syncthreads(); \
     u32 bIdx = startIndex + threadIdx.x; \

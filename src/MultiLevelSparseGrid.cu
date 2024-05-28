@@ -22,6 +22,8 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(dataType *domainSize_, u32 *baseGridS
   blockCounter = 0;
   imageCounter = 0;
 
+  lock = 0;
+
 
   // grid size checking
   assert(isPowerOf2(blockSize));
@@ -267,7 +269,7 @@ void MultiLevelSparseGrid::paint(void) {
       u64 loc = bLocList[bIdx];
       i32 lvl, ib, jb;
       mortonDecode(loc, lvl, ib, jb);
-      if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty) {
+      if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty && lvl == 0) {
         for (uint j = 0; j < blockSize; j++) {
           for (uint i = 0; i < blockSize; i++) {
             u32 idx = i + blockSize * j + bIdx*blockSizeTot;
