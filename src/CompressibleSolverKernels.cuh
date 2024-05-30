@@ -56,10 +56,10 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
     
       // inside
       if (dist < radius) {
-        Rho[cIdx]  = 1.0;
+        Rho[cIdx]  = 10.0;
         U[cIdx]    = 0.0;
         V[cIdx]    = 0.0;
-        P[cIdx]    = 1.0;
+        P[cIdx]    = 10.0;
       }
       else {
         Rho[cIdx]  = 0.125;
@@ -696,7 +696,7 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
 
     u32 cFlag = grid.cFlagsList[cIdx];
 
-    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && cFlag == ACTIVE && i%2==0 && j%2==0) {
+    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && cFlag != GHOST && i%2==0 && j%2==0) {
       // sister cell indices
       i32 rIdx = cIdx + 1;
       i32 uIdx = cIdx + blockSize;

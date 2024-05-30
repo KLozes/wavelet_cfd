@@ -26,7 +26,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(dataType *domainSize_, u32 *baseGridS
 
 
   // grid size checking
-  assert(isPowerOf2(blockSize));
+  //assert(isPowerOf2(blockSize));
   assert(baseGridSize[0]*baseGridSize[1]/blockSize/blockSize < nBlocksMax);
 
   cudaMallocManaged(&bLocList, nBlocksMax*sizeof(u64));

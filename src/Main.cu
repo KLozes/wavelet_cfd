@@ -7,10 +7,10 @@
 int main(int argc, char* argv[]) {
   dataType domainSize[2] = {1.0, 1.0};
   u32 baseGridSize[2] = {blockSize*10, blockSize*10};
-  u32 nLvls = 6;
-  dataType cfl = .8;
-  dataType waveletThresh = .01;
-  dataType tStep = .005;
+  u32 nLvls = 8;
+  dataType cfl = .6;
+  dataType waveletThresh = .005;
+  dataType tStep = .01;
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls, cfl, waveletThresh);
   solver->icType = 0;
@@ -25,7 +25,7 @@ int main(int argc, char* argv[]) {
     t += solver->step(tStep);
     n += 1;
 
-    solver->paint();
+    //solver->paint();
     printf("n: %d, t = %f\n", n, t);
 
   }

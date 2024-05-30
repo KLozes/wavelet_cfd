@@ -38,9 +38,7 @@ dataType CompressibleSolver::step(dataType tStep) {
       setBoundaryConditions();
     }
 
-    if (iter % 2 == 0) {
-      computeDeltaT();
-    }
+    computeDeltaT();
 
     for (i32 stage = 0; stage<3; stage++) {
       conservativeToPrimitive();
