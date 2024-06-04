@@ -19,7 +19,7 @@ void CompressibleSolver::initialize(void) {
     setBoundaryConditions();
     sortBlocks();
     printf("nblocks %d\n", nBlocks);
-    paint();
+    //paint();
   }
 }
 

@@ -9,10 +9,10 @@
 ** A multilevel sparse grid data structure
 */
 enum BLOCK_FLAGS {
-  DELETE = 0,
-  KEEP = 1,
-  REFINE = 2,
-  NEW = 3,
+  NEW = 0,
+  DELETE = 1,
+  KEEP = 2,
+  REFINE = 3,
 };
 
 enum CELL_FLAGS {
@@ -47,6 +47,8 @@ public:
 
   dataType *fieldData; // flow field data
   dataType *imageData; // output image data
+  dataType *imageData; // output image data
+
 
   int lock;
 
@@ -128,6 +130,7 @@ public:
       while(atomicCAS(&(grid.lock), 0, 1) != 0); \
       startIndex = atomicAdd(&(grid.blockCounter), blockDim.x); \
       endIndex = atomicMin(&(grid.blockCounter), grid.nBlocks); \
+      endIndex = grid.blockCounter; \
       atomicExch(&(grid.lock), 0); \
     } \
     __syncthreads(); \
@@ -137,3 +140,9 @@ public:
 #define END_DYNAMIC_BLOCK_LOOP }__syncthreads();}
 
 #endif
+
+
+     // printf("nBlocks: %d\n", grid.nBlocks); 
+     // printf("blockCounter: %d\n", grid.blockCounter); 
+     // printf("start: %d\n", startIndex); 
+     // printf("end: %d\n\n", endIndex); 

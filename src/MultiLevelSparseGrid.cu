@@ -116,25 +116,8 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   updatePrntIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   updateNbrIndicesKernel<<<nBlocks*blockHaloSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   flagActiveCellsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  flagParentCellsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
-
-  /*
-  for (u32 bIdx = 0; bIdx<nBlocks; bIdx++) {
-    u64 loc = bLocList[bIdx];
-    i32 lvl, ib, jb;
-    mortonDecode(loc, lvl, ib, jb);
-
-    printf("%d %d\n", ib, jb);
-    for (i32 j=blockHaloSize-1; j>=0; j--) {
-      for (i32 i=0; i<blockHaloSize; i++) {
-        u32 idx = nbrIdxList[bIdx*blockHaloSizeTot + j*blockHaloSize + i];
-        printf("%8d ", idx);
-      }
-      printf("\n");
-    }
-    printf("\n");
-  }
-  */
   
 }
 
@@ -280,9 +263,9 @@ void MultiLevelSparseGrid::paint(void) {
                 u32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
                 image[jPxl][iPxl] = imageData[idx] * 65535;
 
-                if (f == -1 && (ii > 0 && jj > 0)) {
-                  image[jPxl][iPxl] = 0;
-                }
+                //if (f == -1 && (ii > 0 && jj > 0)) {
+                //  image[jPxl][iPxl] = 0;
+                //}
               }
             }
           }

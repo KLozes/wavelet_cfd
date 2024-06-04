@@ -186,17 +186,22 @@ __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid) {
 __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
 
   START_DYNAMIC_BLOCK_LOOP
+
+    // spin while new block is being initialized
+    // 
+    while (grid.bFlagsList[bIdx] == NEW);
+
+    // activate parents and neghbors needed for wavelet transform
     i32 lvl, ib, jb;
     u64 loc = grid.bLocList[bIdx];
     grid.mortonDecode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
       if (lvl > 1 && grid.bFlagsList[bIdx] == KEEP) {
-        // add reconstruction blocks
         for (i32 dj=-1; dj<=1; dj++) {
           for (i32 di=-1; di<=1; di++) {
             grid.activateBlock(lvl-1, ib/2+di, jb/2+dj);
-            atomicMax(&(grid.nBlocks),grid.hashTable.nKeys);
+            atomicMax(&(grid.nBlocks), grid.hashTable.nKeys);
           }
         }
       } 
@@ -213,7 +218,8 @@ __global__ void deleteDataKernel(MultiLevelSparseGrid &grid) {
     u64 loc = grid.bLocList[bIdx];
     grid.mortonDecode(loc, lvl, ib, jb);
 
-    if (lvl > 1 && (grid.bFlagsList[bIdx] == DELETE || grid.bLocList[bIdx] == kEmpty)) {
+    if (lvl > 1 && (grid.bFlagsList[bIdx] == DELETE)) {
+      grid.bFlagsList[bIdx] = 0;
       grid.bLocList[bIdx] = kEmpty;
       grid.bIdxList[bIdx] = bEmpty;
       grid.cFlagsList[cIdx] = 0;

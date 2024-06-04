@@ -535,6 +535,8 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
+    
+    atomicMax(&(grid.bFlagsList[bIdx]), DELETE);
 
     if (lvl < 2) {
       grid.bFlagsList[bIdx] = KEEP;
@@ -549,7 +551,6 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
       // parent block memory index
       u32 prntIdx = grid.prntIdxList[bIdx];
       grid.bFlagsList[prntIdx] = KEEP;
-      //atomicMax(&(grid.bFlagsList[prntIdx]),KEEP);
 
       // parent cell local indices
       i32 ip = i/2 + ib%2 * blockSize / 2;
@@ -588,7 +589,7 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
           if (lvl < grid.nLvls-1) {
             grid.activateBlock(lvl+1, 2*ib+i/2, 2*jb+j/2);
           }
-          atomicMax(&(grid.bFlagsList[bIdx]),KEEP);
+          grid.bFlagsList[bIdx] = KEEP;
         }
       }
     }
