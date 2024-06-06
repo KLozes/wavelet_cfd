@@ -82,14 +82,18 @@ void MultiLevelSparseGrid::adaptGrid(void) {
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
 
+  setBlocksKeepKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+
   addAdjacentBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
 
-  blockCounter = 0;
-  addReconstructionBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  cudaDeviceSynchronize();
-  nBlocks = hashTable.nKeys;
+  for(i32 lvl=nLvls-1; lvl>2; lvl--) {
+    addReconstructionBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+    cudaDeviceSynchronize();
+    nBlocks = hashTable.nKeys;
+  }
 
   addBoundaryBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
@@ -160,7 +164,12 @@ __host__ __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32
     // new key was inserted if not bEmpty
     bLocList[idx] = loc;
     bIdxList[idx] = idx;
-    bFlagsList[idx] = KEEP;
+#ifdef __CUDA_ARCH__
+    atomicMax(&bFlagsList[idx], NEW);
+#else 
+    bFlagsList[idx] = max(bFlagsList[idx], NEW);
+#endif
+
   }
 
 }

@@ -9,9 +9,9 @@ void CompressibleSolver::initialize(void) {
   setInitialConditions();
   primitiveToConservative();
   setBoundaryConditions();
-  paint();
+  //paint();
 
-  for(i32 lvl=0; lvl<nLvls; lvl++){
+  for(i32 lvl=0; lvl<nLvls+2; lvl++){
     forwardWaveletTransform();
     adaptGrid();
     setInitialConditions();
@@ -19,7 +19,7 @@ void CompressibleSolver::initialize(void) {
     setBoundaryConditions();
     sortBlocks();
     printf("nblocks %d\n", nBlocks);
-    //paint();
+    paint();
   }
 }
 

@@ -6,11 +6,11 @@
 
 int main(int argc, char* argv[]) {
   dataType domainSize[2] = {1.0, 1.0};
-  u32 baseGridSize[2] = {blockSize*15, blockSize*15};
-  u32 nLvls = 7;
+  u32 baseGridSize[2] = {blockSize*5, blockSize*5};
+  u32 nLvls = 9;
   dataType cfl = .8;
   dataType waveletThresh = .005;
-  dataType tStep = .01;
+  dataType tStep = .05;
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls, cfl, waveletThresh);
   solver->icType = 0;
@@ -31,6 +31,7 @@ int main(int argc, char* argv[]) {
 
   }
   */
+  
   
   cudaDeviceSynchronize();
   delete solver;

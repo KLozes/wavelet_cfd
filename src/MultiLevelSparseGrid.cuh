@@ -9,8 +9,8 @@
 ** A multilevel sparse grid data structure
 */
 enum BLOCK_FLAGS {
-  NEW = 0,
-  DELETE = 1,
+  DELETE = 0,
+  NEW = 1,
   KEEP = 2,
   REFINE = 3,
 };
@@ -47,7 +47,7 @@ public:
 
   dataType *fieldData; // flow field data
   dataType *imageData; // output image data
-  dataType *imageData; // output image data
+  dataType *pixelCountData; // number of 
 
 
   int lock;
@@ -96,17 +96,6 @@ public:
   bIdx = cIdx / blockSizeTot;  \
   __syncthreads();}
 
-#define START_XFACE_LOOP \
-  u32 cIdx = blockIdx.x * blockDim.x + threadIdx.x; \
-  u32 bIdx = cIdx / blockSizeTot; \
-  u32 idx = cIdx % blockSizeTot; \
-  i32 i = idx % blockSize; \
-  i32 j = idx / blockSize; \
-  while (bIdx < grid.nBlocks) {
-#define END_XFACE_LOOP cIdx += gridDim.x*blockDim.x; \
-  bIdx = cIdx / blockSizeTot;  \
-  __syncthreads();}
-
 #define START_HALO_CELL_LOOP \
   u32 cIdx = blockIdx.x * blockDim.x + threadIdx.x; \
   u32 bIdx = cIdx / blockHaloSizeTot; \
@@ -140,9 +129,3 @@ public:
 #define END_DYNAMIC_BLOCK_LOOP }__syncthreads();}
 
 #endif
-
-
-     // printf("nBlocks: %d\n", grid.nBlocks); 
-     // printf("blockCounter: %d\n", grid.blockCounter); 
-     // printf("start: %d\n", startIndex); 
-     // printf("end: %d\n\n", endIndex); 
