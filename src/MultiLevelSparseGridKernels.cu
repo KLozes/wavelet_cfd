@@ -1,26 +1,37 @@
+
+#include <stdio.h>
 #include "MultiLevelSparseGridKernels.cuh"
 
 __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
   // initialize the blocks of the base grid level
   i32 idx = threadIdx.x + blockIdx.x*blockDim.x;
-  i32 i = idx % (grid.baseGridSize[0]/blockSize); // plus an exterior block on each side
+  i32 i = idx % (grid.baseGridSize[0]/blockSize);
 	i32 j = idx / (grid.baseGridSize[0]/blockSize);
   if (i < grid.baseGridSize[0]/blockSize && j < grid.baseGridSize[1]/blockSize) {
     grid.activateBlock(0, i, j);
   }
+
+  i = idx % (grid.baseGridSize[0]*2/blockSize);
+	j = idx / (grid.baseGridSize[0]*2/blockSize);
+  if (i < grid.baseGridSize[0]*2/blockSize && j < grid.baseGridSize[1]*2/blockSize) {
+    grid.activateBlock(1, i, j);
+  }
+
 }
 
 __global__ void updateIndicesKernel(MultiLevelSparseGrid &grid) {
-
-  START_BLOCK_LOOP
   
+  u32 bIdx = threadIdx.x + blockIdx.x * blockDim.x;
+  while (bIdx < grid.nBlocks) {
+
     if (grid.bLocList[bIdx] != kEmpty) {
       grid.bIdxList[bIdx] = bIdx;
       grid.hashTable.insert(grid.bLocList[bIdx]);
       grid.hashTable.setValue(grid.bLocList[bIdx], bIdx);
     }
 
-  END_BLOCK_LOOP
+    bIdx += gridDim.x*blockDim.x;
+  }
 }
 
 __global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid) {
@@ -162,13 +173,18 @@ __global__ void setBlocksKeepKernel(MultiLevelSparseGrid &grid) {
 
   START_BLOCK_LOOP
 
-    i32 lvl, ib, jb;
-    u64 loc = grid.bLocList[bIdx];
-    grid.mortonDecode(loc, lvl, ib, jb);
-
-    if (grid.isInteriorBlock(lvl, ib, jb) && grid.bFlagsList[bIdx] == NEW ) {
+    if (grid.bFlagsList[bIdx] == NEW ) {
       grid.bFlagsList[bIdx] = KEEP;
     }
+
+  END_BLOCK_LOOP
+}
+
+__global__ void setBlocksDeleteKernel(MultiLevelSparseGrid &grid) {
+
+  START_BLOCK_LOOP
+
+    grid.bFlagsList[bIdx] = DELETE;
 
   END_BLOCK_LOOP
 }
@@ -202,8 +218,7 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
     u64 loc = grid.bLocList[bIdx];
     grid.mortonDecode(loc, lvl, ib, jb);
 
-    if (grid.isInteriorBlock(lvl, ib, jb) && lvl > 2 && (grid.bFlagsList[bIdx] == NEW || grid.bFlagsList[bIdx] == KEEP)) {
-      grid.bFlagsList[bIdx] == KEEP;
+    if (grid.isInteriorBlock(lvl, ib, jb) && lvl > 2 && grid.bFlagsList[bIdx] == KEEP) {
       for (i32 dj=-1; dj<=1; dj++) {
         for (i32 di=-1; di<=1; di++) {
           grid.activateBlock(lvl-1, ib/2+di, jb/2+dj);
@@ -218,12 +233,7 @@ __global__ void deleteDataKernel(MultiLevelSparseGrid &grid) {
 
   START_CELL_LOOP
 
-    i32 lvl, ib, jb;
-    u64 loc = grid.bLocList[bIdx];
-    grid.mortonDecode(loc, lvl, ib, jb);
-
-
-    if (lvl > 1 && grid.bFlagsList[bIdx] == DELETE) {
+    if (grid.bFlagsList[bIdx] == DELETE) {
       grid.bLocList[bIdx] = kEmpty;
       grid.bIdxList[bIdx] = bEmpty;
       grid.cFlagsList[cIdx] = 0;

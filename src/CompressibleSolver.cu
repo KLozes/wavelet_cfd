@@ -1,15 +1,21 @@
 #include <iostream>
 #include <thrust/extrema.h>
 
+
 #include "CompressibleSolver.cuh"
 #include "CompressibleSolverKernels.cuh"
+#include "MultiLevelSparseGridKernels.cuh"
+
 
 void CompressibleSolver::initialize(void) {
   initializeBaseGrid();
   setInitialConditions();
   primitiveToConservative();
+  sortBlocks();
   setBoundaryConditions();
-  //paint();
+  cudaDeviceSynchronize();
+  printf("nblocks %d\n", hashTable.nKeys);
+  paint();
 
   for(i32 lvl=0; lvl<nLvls+2; lvl++){
     forwardWaveletTransform();
@@ -18,7 +24,8 @@ void CompressibleSolver::initialize(void) {
     primitiveToConservative();
     setBoundaryConditions();
     sortBlocks();
-    printf("nblocks %d\n", nBlocks);
+    cudaDeviceSynchronize();
+    printf("nblocks %d\n", hashTable.nKeys);
     paint();
   }
 }
@@ -27,9 +34,11 @@ dataType CompressibleSolver::step(dataType tStep) {
 
   dataType t = 0;
 
-  while (t < tStep) {
+  Timer<std::chrono::milliseconds, std::chrono::steady_clock> clock;
 
-    if (iter % 2 == 0 && nLvls > 1) {
+  while (t < tStep) {
+    clock.tick();
+    if (iter % 4 == 0 && nLvls > 1) {
       restrictFields();
       forwardWaveletTransform();
       adaptGrid();
@@ -37,9 +46,12 @@ dataType CompressibleSolver::step(dataType tStep) {
       sortBlocks();
       setBoundaryConditions();
     }
+    cudaDeviceSynchronize();
+    clock.tock();
+    tGrid += clock.duration().count();
 
+    clock.tick();
     computeDeltaT();
-
     for (i32 stage = 0; stage<3; stage++) {
       conservativeToPrimitive();
       computeRightHandSide();
@@ -53,6 +65,11 @@ dataType CompressibleSolver::step(dataType tStep) {
         setBoundaryConditions();
       }
     }
+    cudaDeviceSynchronize();
+    clock.tock();
+    tSolver += clock.duration().count();
+
+    tTotal += tSolver + tGrid;
 
     cudaDeviceSynchronize();
     t += deltaT;
@@ -63,63 +80,66 @@ dataType CompressibleSolver::step(dataType tStep) {
 }
 
 void CompressibleSolver::sortFieldData(void) {
-  copyToOldFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  sortFieldDataKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  copyToOldFieldsKernel<<<1000, cudaBlockSize>>>(*this);
+  sortFieldDataKernel<<<1000, cudaBlockSize>>>(*this);
 }
 
 void CompressibleSolver::setInitialConditions(void) {
-  setInitialConditionsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  setInitialConditionsKernel<<<1000, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
 }
 
 void CompressibleSolver::setBoundaryConditions(void) {
-  setBoundaryConditionsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  setBoundaryConditionsKernel<<<1000, cudaBlockSize>>>(*this);
 }
 
 void CompressibleSolver::conservativeToPrimitive(void) {
-  conservativeToPrimitiveKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  conservativeToPrimitiveKernel<<<1000, cudaBlockSize>>>(*this);
 }
 
 void CompressibleSolver::primitiveToConservative(void) {
-  primitiveToConservativeKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  primitiveToConservativeKernel<<<1000, cudaBlockSize>>>(*this);
 }
 
 void CompressibleSolver::forwardWaveletTransform(void) {
-  computeMagRhoUKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
-  maxRho = *(thrust::max_element(thrust::device, getField(0), getField(0)+nBlocks*blockSize));
-  maxMagRhoU = *(thrust::max_element(thrust::device, getField(12), getField(12)+nBlocks*blockSize));
-  maxRhoE = *(thrust::max_element(thrust::device, getField(3), getField(3)+nBlocks*blockSize));
+  computeMagRhoUKernel<<<1000, cudaBlockSize>>>(*this); 
+  maxRho = *(thrust::max_element(thrust::device, getField(0), getField(0)+hashTable.nKeys*blockSize));
+  maxMagRhoU = *(thrust::max_element(thrust::device, getField(12), getField(12)+hashTable.nKeys*blockSize));
+  maxRhoE = *(thrust::max_element(thrust::device, getField(3), getField(3)+hashTable.nKeys*blockSize));
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
-  copyToOldFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
-  forwardWaveletTransformKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
+  cudaDeviceSynchronize();
+  //setBlocksDeleteKernel<<<1000, cudaBlockSize>>>(*this);
+  copyToOldFieldsKernel<<<1000, cudaBlockSize>>>(*this); 
+  forwardWaveletTransformKernel<<<1000, cudaBlockSize>>>(*this);
+  waveletThresholdingKernel<<<1000, cudaBlockSize>>>(*this); 
 }
 
 void CompressibleSolver::inverseWaveletTransform(void) {
-  inverseWaveletTransformKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this); 
+  inverseWaveletTransformKernel<<<1000, cudaBlockSize>>>(*this); 
 }
 
 
 void CompressibleSolver::computeDeltaT(void) {
-  computeDeltaTKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  computeDeltaTKernel<<<1000, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
-	deltaT = *(thrust::min_element(thrust::device, getField(12), getField(12)+nBlocks*blockSizeTot));
+	deltaT = *(thrust::min_element(thrust::device, getField(12), getField(12)+hashTable.nKeys*blockSizeTot));
   deltaT *= cfl;
 }
 
 void CompressibleSolver::computeRightHandSide(void) {
-  computeRightHandSideKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  computeRightHandSideKernel<<<1000, cudaBlockSize>>>(*this);
 }
 
 void CompressibleSolver::updateFields(i32 stage) {
-  updateFieldsRK3Kernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this, stage);
+  updateFieldsRK3Kernel<<<1000, cudaBlockSize>>>(*this, stage);
 }
 
 void CompressibleSolver::restrictFields(void) {
-  restrictFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  restrictFieldsKernel<<<1000, cudaBlockSize>>>(*this);
 }
 
 void CompressibleSolver::interpolateFields(void) {
-  interpolateFieldsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  interpolateFieldsKernel<<<1000, cudaBlockSize>>>(*this);
 }
 
 __host__ __device__ dataType CompressibleSolver::lim(dataType &r) {

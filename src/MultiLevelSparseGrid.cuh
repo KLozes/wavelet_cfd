@@ -42,6 +42,7 @@ public:
 
   u32 *nbrIdxList;     // cell neighbor indeces
   u32 *prntIdxList;    // block parent indices
+  u32 *chldIdxList;    // block child indices
   u32 *bFlagsList;     // block Flags
   u32 *cFlagsList;     // cell Flags
 
@@ -88,44 +89,26 @@ public:
 #define START_CELL_LOOP \
   u32 cIdx = blockIdx.x * blockDim.x + threadIdx.x; \
   u32 bIdx = cIdx / blockSizeTot; \
-  u32 idx = cIdx % blockSizeTot; \
-  i32 i = idx % blockSize; \
-  i32 j = idx / blockSize; \
-  while (bIdx < grid.nBlocks) {
+  while (bIdx < grid.hashTable.nKeys) { \
+    u32 idx = cIdx % blockSizeTot; \
+    i32 i = idx % blockSize; \
+    i32 j = idx / blockSize;
 #define END_CELL_LOOP cIdx += gridDim.x*blockDim.x; \
-  bIdx = cIdx / blockSizeTot;  \
-  __syncthreads();}
+    bIdx = cIdx / blockSizeTot; }
 
 #define START_HALO_CELL_LOOP \
   u32 cIdx = blockIdx.x * blockDim.x + threadIdx.x; \
   u32 bIdx = cIdx / blockHaloSizeTot; \
-  u32 idx = cIdx % blockHaloSizeTot; \
-  i32 i = idx % blockHaloSize; \
-  i32 j = idx / blockHaloSize; \
-  while (bIdx < grid.nBlocks) {
+  while (bIdx < grid.hashTable.nKeys) { \
+    u32 idx = cIdx % blockHaloSizeTot; \
+    i32 i = idx % blockHaloSize; \
+    i32 j = idx / blockHaloSize;
 #define END_HALO_CELL_LOOP cIdx += gridDim.x*blockDim.x; \
-  bIdx = cIdx / blockHaloSizeTot;}
+    bIdx = cIdx / blockHaloSizeTot;}
 
 #define START_BLOCK_LOOP \
   u32 bIdx = threadIdx.x + blockIdx.x * blockDim.x; \
-  while (bIdx < grid.nBlocks) {
+  while (bIdx < grid.hashTable.nKeys) {
 #define END_BLOCK_LOOP bIdx += gridDim.x*blockDim.x;}
-
-#define START_DYNAMIC_BLOCK_LOOP \
-  __shared__ u32 startIndex; \
-  __shared__ u32 endIndex; \
-  while (grid.blockCounter < grid.nBlocks) { \
-    if (threadIdx.x == 0) { \
-      while(atomicCAS(&(grid.lock), 0, 1) != 0); \
-      startIndex = atomicAdd(&(grid.blockCounter), blockDim.x); \
-      endIndex = atomicMin(&(grid.blockCounter), grid.nBlocks); \
-      endIndex = grid.blockCounter; \
-      atomicExch(&(grid.lock), 0); \
-    } \
-    __syncthreads(); \
-    u32 bIdx = startIndex + threadIdx.x; \
-    if ( bIdx < endIndex ) {
-
-#define END_DYNAMIC_BLOCK_LOOP }__syncthreads();}
 
 #endif

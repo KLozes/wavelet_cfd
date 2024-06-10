@@ -14,6 +14,11 @@ public:
   dataType maxMagRhoU;
   dataType maxRhoE;
   dataType waveletThresh;
+
+  i32 tGrid;
+  i32 tSolver;
+  i32 tOutput;
+  i32 tTotal;
   
   i32 immerserdBcType;
   i32 bcType;
@@ -28,6 +33,11 @@ public:
       iter = 0;
       immerserdBcType = 0;
       bcType = 0;
+
+      tGrid = 0.0;
+      tSolver = 0.0;
+      tOutput = 0.0;
+      tTotal = 0.0;
   }
 
   void initialize(void);

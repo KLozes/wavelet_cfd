@@ -33,19 +33,21 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(dataType *domainSize_, u32 *baseGridS
   cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&prntIdxList, nBlocksMax*sizeof(u32));
+  cudaMallocManaged(&chldIdxList, 4*nBlocksMax*sizeof(u32));
   cudaMallocManaged(&nbrIdxList, blockHaloSizeTot*nBlocksMax*sizeof(u32));
   cudaMallocManaged(&cFlagsList, blockSizeTot*nBlocksMax*sizeof(u32));
   cudaMallocManaged(&fieldData, nFields*blockSizeTot*nBlocksMax*sizeof(dataType));
-  cudaMallocManaged(&imageData, blockSizeTot*nBlocksMax*sizeof(dataType));
+  cudaMallocManaged(&imageData, imageSize[0]*imageSize[1]*sizeof(dataType));
 
   cudaMemset(bLocList, 0, nBlocksMax*sizeof(u64));
   cudaMemset(bIdxList, 0, nBlocksMax*sizeof(u32));
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
   cudaMemset(prntIdxList, 0, nBlocksMax*sizeof(u32));
+  cudaMemset(chldIdxList, 0, 4*nBlocksMax*sizeof(u32));
   cudaMemset(nbrIdxList, 0, blockHaloSizeTot*nBlocksMax*sizeof(u32));
   cudaMemset(cFlagsList, 0, blockSizeTot*nBlocksMax*sizeof(u32));
   cudaMemset(fieldData, 0, nFields*blockSizeTot*nBlocksMax*sizeof(dataType));
-  cudaMemset(imageData, 0, blockSizeTot*nBlocksMax*sizeof(dataType));
+  cudaMemset(imageData, 0, imageSize[0]*imageSize[1]*sizeof(dataType));
 
   cudaDeviceSynchronize();
 }
@@ -63,13 +65,9 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
 
 void MultiLevelSparseGrid::initializeBaseGrid(void) {
   // fill the bLocList with base grid blocks
-  initGridKernel<<<nBlocksMax/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  initGridKernel<<<nBlocksMax/cudaBlockSize, cudaBlockSize>>>(*this);
+  addBoundaryBlocksKernel<<<1000, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
-  nBlocks = hashTable.nKeys;
-  
-  addBoundaryBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  cudaDeviceSynchronize();
-  nBlocks = hashTable.nKeys;
 
   // sort the data by location code
   sortBlocks();
@@ -78,51 +76,32 @@ void MultiLevelSparseGrid::initializeBaseGrid(void) {
 
 void MultiLevelSparseGrid::adaptGrid(void) {
 
-  addFineBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  cudaDeviceSynchronize();
-  nBlocks = hashTable.nKeys;
-
-  setBlocksKeepKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  cudaDeviceSynchronize();
-
-  addAdjacentBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  cudaDeviceSynchronize();
-  nBlocks = hashTable.nKeys;
-
+  addFineBlocksKernel<<<1000, cudaBlockSize>>>(*this);
+  setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
+  addAdjacentBlocksKernel<<<1000, 1>>>(*this);
   for(i32 lvl=nLvls-1; lvl>2; lvl--) {
-    addReconstructionBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
-    cudaDeviceSynchronize();
-    nBlocks = hashTable.nKeys;
+    setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
+    addReconstructionBlocksKernel<<<1000, cudaBlockSize>>>(*this);
   }
-
-  addBoundaryBlocksKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  cudaDeviceSynchronize();
-  nBlocks = hashTable.nKeys;
-
-  deleteDataKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  cudaDeviceSynchronize();
-
-  updatePrntIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  addBoundaryBlocksKernel<<<1000, cudaBlockSize>>>(*this);
+  deleteDataKernel<<<1000, cudaBlockSize>>>(*this);
+  updatePrntIndicesKernel<<<1000, cudaBlockSize>>>(*this);
 }
 
 void MultiLevelSparseGrid::sortBlocks(void) {
 
-  thrust::sort_by_key(thrust::device, bLocList, bLocList+nBlocks, bIdxList);
+  cudaDeviceSynchronize();
+  thrust::sort_by_key(thrust::device, bLocList, bLocList+hashTable.nKeys, bIdxList);
   sortFieldData();
   cudaDeviceSynchronize();
-
-  hashTable.reset();
-  cudaDeviceSynchronize();
-  updateIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
-
-  updatePrntIndicesKernel<<<nBlocks/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  updateNbrIndicesKernel<<<nBlocks*blockHaloSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  flagActiveCellsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
-  flagParentCellsKernel<<<nBlocks*blockSizeTot/cudaBlockSize+1, cudaBlockSize>>>(*this);
+  hashTable.reset();
+  updateIndicesKernel<<<1000, cudaBlockSize>>>(*this);
+  updatePrntIndicesKernel<<<1000, cudaBlockSize>>>(*this);
+  updateNbrIndicesKernel<<<1000, cudaBlockSize>>>(*this);
+  flagActiveCellsKernel<<<1000, cudaBlockSize>>>(*this);
+  flagParentCellsKernel<<<1000, cudaBlockSize>>>(*this); 
   cudaDeviceSynchronize();
-  
 }
 
 __host__ __device__ void MultiLevelSparseGrid::getCellPos(i32 lvl, i32 ib, i32 jb, i32 i, i32 j, dataType *pos) {
@@ -169,7 +148,6 @@ __host__ __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32
 #else 
     bFlagsList[idx] = max(bFlagsList[idx], NEW);
 #endif
-
   }
 
 }
@@ -223,62 +201,24 @@ void MultiLevelSparseGrid::paint(void) {
   for (i32 f=-1; f<4; f++) {
     computeImageData(f);
 
-    // find the field maximum and minimum of the image field
+    // normalize image data and fill png image
     dataType maxVal = -1e32;
     dataType minVal = 1e32;
 
-    for (u32 bIdx = 0; bIdx < nBlocks; bIdx++) {
-      u64 loc = bLocList[bIdx];
-      i32 lvl, ib, jb;
-      mortonDecode(loc, lvl, ib, jb);
-      if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty) {
-        for (u32 idx = 0; idx < blockSizeTot; idx++) {
-          dataType val = imageData[bIdx*blockSizeTot + idx];
-          maxVal = max(maxVal, val);
-          minVal = min(minVal, val);
-        }
-      }
+    for (i32 idx=0; idx<imageSize[0]*imageSize[1]; idx++) {
+      maxVal = fmax(maxVal, imageData[idx]);
+      minVal = fmin(minVal, imageData[idx]);
     }
 
-    // normalize the image field data
-    for (u32 bIdx = 0; bIdx < nBlocks; bIdx++) {
-      u64 loc = bLocList[bIdx];
-      i32 lvl, ib, jb;
-      mortonDecode(loc, lvl, ib, jb);
-      if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty) {
-        for (u32 idx = 0; idx < blockSizeTot; idx++) {
-          dataType val = imageData[bIdx*blockSizeTot + idx];
-          imageData[bIdx*blockSizeTot + idx] = (val - minVal) / (maxVal - minVal + 1e-16);
-          if (f==-1) {
-            imageData[bIdx*blockSizeTot + idx] = (val / nLvls);
-          }
-        }
-      }
+    if (f == -1) {
+      minVal = 0;
+      maxVal = nLvls;
     }
-
-    // set the pixel values 
-    for (uint bIdx=0; bIdx < nBlocks; bIdx++) {
-      u64 loc = bLocList[bIdx];
-      i32 lvl, ib, jb;
-      mortonDecode(loc, lvl, ib, jb);
-      if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty) {
-        for (uint j = 0; j < blockSize; j++) {
-          for (uint i = 0; i < blockSize; i++) {
-            u32 idx = i + blockSize * j + bIdx*blockSizeTot;
-            u32 nPixels = powi(2,(nLvls - 1 - lvl));
-            for (uint jj=0; jj<nPixels; jj++) {
-              for (uint ii=0; ii<nPixels; ii++) {
-                u32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
-                u32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
-                image[jPxl][iPxl] = imageData[idx] * 65535;
-
-                //if (f == -1 && (ii > 0 && jj > 0)) {
-                //  image[jPxl][iPxl] = 0;
-                //}
-              }
-            }
-          }
-        }
+ 
+    for (i32 j=0; j<imageSize[1]; j++) {
+      for (i32 i=0; i<imageSize[0]; i++) {
+        i32 idx = j*imageSize[1] + i;
+        image[j][i] = (imageData[idx] - minVal) / (maxVal - minVal + 1e-16) * 65535;
       }
     }
 
@@ -296,24 +236,38 @@ void MultiLevelSparseGrid::paint(void) {
 }
 
 void MultiLevelSparseGrid::computeImageData(i32 f) {
-  // set image field data 
+
+  dataType *U;
   if (f >= 0) {
-    dataType *Field = getField(f);
-    for (u32 bIdx = 0; bIdx < nBlocks; bIdx++) {
-      for (u32 idx = 0; idx < blockSizeTot; idx++) {
-        imageData[bIdx*blockSizeTot + idx] = Field[bIdx*blockSizeTot + idx];
-      }
-    }
+    U = getField(f);
   }
-  else {
-    // set grid res level
-    for (u32 bIdx = 0; bIdx < nBlocks; bIdx++) {
-      u64 loc = bLocList[bIdx];
-      i32 lvl, ib, jb;
-      mortonDecode(loc, lvl, ib, jb);
-      for (u32 idx = 0; idx < blockSizeTot; idx++) {
-        u32 flag = cFlagsList[bIdx*blockSizeTot + idx];
-        imageData[bIdx*blockSizeTot + idx] = lvl+1 - (2-flag)/2;
+
+  // set the pixel values 
+  for (uint bIdx=0; bIdx < hashTable.nKeys; bIdx++) {
+    u64 loc = bLocList[bIdx];
+    i32 lvl, ib, jb;
+    mortonDecode(loc, lvl, ib, jb);
+    if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty) {
+      for (uint j = 0; j < blockSize; j++) {
+        for (uint i = 0; i < blockSize; i++) {
+          u32 idx = i + blockSize * j + bIdx*blockSizeTot;
+          u32 nPixels = powi(2,(nLvls - 1 - lvl));
+          for (uint jj=0; jj<nPixels; jj++) {
+            for (uint ii=0; ii<nPixels; ii++) {
+              u32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
+              u32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
+              if (f >= 0) {
+                imageData[jPxl*imageSize[0] + iPxl] = U[idx];
+              }
+              else {
+                imageData[jPxl*imageSize[0] + iPxl] = lvl+1;
+                if (ii > 0 && jj > 0) {
+                  imageData[jPxl*imageSize[0] + iPxl] = 0;
+                }
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -321,6 +275,6 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
 
 /*
 void MultiLevelSparseGrid::resetBlockCounter(void) {
-  zeroBlockCounter<<<1, 1>>>(*this);
+  zeroBlockCounter<<<1000, cudaBlockSize>>>(*this);
 }
 */

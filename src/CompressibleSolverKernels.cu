@@ -527,20 +527,10 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
-    
-    if (lvl < 2) {
-      grid.bFlagsList[bIdx] = KEEP;
-    }
-
-    dataType pos[2];
-    grid.getCellPos(lvl, ib, jb, i, j, pos);
-    dataType dx = min(grid.getDx(lvl), grid.getDy(lvl)) ;
-    dataType ls = grid.getBoundaryLevelSet(Vec2(pos[0], pos[1]));
 
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb)) {
       // parent block memory index
       u32 prntIdx = grid.prntIdxList[bIdx];
-      grid.bFlagsList[prntIdx] = NEW;
 
       // parent cell local indices
       i32 ip = i/2 + ib%2 * blockSize / 2;
@@ -568,19 +558,6 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
                 + xs * 1/8 * (OldQ[rIdx] - OldQ[lIdx]) 
                 + ys * 1/8 * (OldQ[uIdx] - OldQ[dIdx])
                 + xs * ys * 1/64 * (OldQ[ruIdx] - OldQ[luIdx] - OldQ[rdIdx] + OldQ[ldIdx])); 
-
-        dataType mag = 1e-32;
-        if (f == 0) {mag = grid.maxRho;}
-        if (f == 1 || f == 2) {mag = grid.maxMagRhoU;}
-        if (f == 3) {mag = grid.maxRhoE;}
-
-        // refine block if large wavelet detail
-        if (abs(Q[cIdx]/mag) > grid.waveletThresh || abs(ls) < dx) {
-          if (lvl < grid.nLvls-1) {
-            grid.activateBlock(lvl+1, 2*ib+i/2, 2*jb+j/2);
-          }
-          grid.bFlagsList[bIdx] = KEEP;
-        }
       }
     }
 
@@ -625,6 +602,55 @@ __global__ void inverseWaveletTransformKernel(CompressibleSolver &grid) {
                 + xs * 1/8 * (OldQ[rIdx] - OldQ[lIdx]) 
                 + ys * 1/8 * (OldQ[uIdx] - OldQ[dIdx])
                 + xs * ys * 1/64 * (OldQ[ruIdx] - OldQ[luIdx] - OldQ[rdIdx] + OldQ[ldIdx])); 
+      }
+    }
+
+  END_CELL_LOOP
+}
+
+
+__global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
+
+  START_CELL_LOOP
+  
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb;
+    grid.mortonDecode(loc, lvl, ib, jb);
+    
+    if (lvl < 2) {
+      grid.bFlagsList[bIdx] = KEEP;
+    }
+
+    dataType pos[2];
+    grid.getCellPos(lvl, ib, jb, i, j, pos);
+    dataType dx = min(grid.getDx(lvl), grid.getDy(lvl)) ;
+    dataType ls = grid.getBoundaryLevelSet(Vec2(pos[0], pos[1]));
+    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb)) {
+      // parent block memory index
+      u32 prntIdx = grid.prntIdxList[bIdx];
+      grid.bFlagsList[prntIdx] = KEEP;
+
+      // parent cell local indices
+      i32 ip = i/2 + ib%2 * blockSize / 2;
+      i32 jp = j/2 + jb%2 * blockSize / 2;
+
+      // calculate detail coefficients for each field and set block to refine if large
+      for(i32 f=0; f<4; f++) {
+        dataType *Q  = grid.getField(f);
+
+        dataType mag = 1e-32;
+        if (f == 0) {mag = grid.maxRho;}
+        if (f == 1 || f == 2) {mag = grid.maxMagRhoU;}
+        if (f == 3) {mag = grid.maxRhoE;}
+
+        // refine block if large wavelet detail
+        if (abs(Q[cIdx]/mag) > grid.waveletThresh || abs(ls) < dx) {
+          if (lvl < grid.nLvls-1) {
+            i32 bSize = blockSize/2;
+            grid.activateBlock(lvl+1, 2*ib+i/bSize, 2*jb+j/bSize);
+          }
+          grid.bFlagsList[bIdx] = KEEP;
+        }
       }
     }
 

@@ -19,6 +19,8 @@ __global__ void addFineBlocksKernel(MultiLevelSparseGrid &grid);
 
 __global__ void setBlocksKeepKernel(MultiLevelSparseGrid &grid);
 
+__global__ void setBlocksDeleteKernel(MultiLevelSparseGrid &grid);
+
 __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid);
 
 __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid);

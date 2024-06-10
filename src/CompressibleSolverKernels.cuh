@@ -29,6 +29,8 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid);
 
 __global__ void inverseWaveletTransformKernel(CompressibleSolver &grid);
 
+__global__ void waveletThresholdingKernel(CompressibleSolver &grid);
+
 __global__ void interpolateFieldsKernel(CompressibleSolver &grid);
 
 __global__ void restrictFieldsKernel(CompressibleSolver &grid);
