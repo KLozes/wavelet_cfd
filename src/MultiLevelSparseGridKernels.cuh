@@ -31,4 +31,6 @@ __global__ void setFlagsToDelete(MultiLevelSparseGrid &grid);
 
 __global__ void addBoundaryBlocksKernel(MultiLevelSparseGrid &grid);
 
+__global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f);
+
 #endif

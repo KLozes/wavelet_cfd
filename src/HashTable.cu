@@ -40,7 +40,7 @@ __device__ u64 HashTable::hash(u64 x) {
   return x;
 }
 
-__host__ __device__ u32 HashTable::insert(u64 key) {
+__device__ u32 HashTable::insert(u64 key) {
   u64 slot = hash(key) % hashTableSize;
   while (true) {
 

@@ -238,7 +238,7 @@ __global__ void deleteDataKernel(MultiLevelSparseGrid &grid) {
       grid.bIdxList[bIdx] = bEmpty;
       grid.cFlagsList[cIdx] = 0;
       for(i32 f=0; f<grid.nFields; f++) {
-        dataType *F = grid.getField(f);
+        real *F = grid.getField(f);
         F[cIdx] = 0;
       }
     }
@@ -268,4 +268,42 @@ __global__ void addBoundaryBlocksKernel(MultiLevelSparseGrid &grid) {
     }
 
   END_BLOCK_LOOP
+}
+
+__global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f) {
+
+  bool gridOn = true;
+
+  real *U;
+  if (f >= 0) {
+    U = grid.getField(f);
+  }
+
+  START_CELL_LOOP
+
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb;
+    grid.mortonDecode(loc, lvl, ib, jb);
+
+    if (grid.isInteriorBlock(lvl, ib, jb) && loc != kEmpty && grid.cFlagsList[cIdx] == ACTIVE) {
+      u32 idx = i + blockSize * j + bIdx*blockSizeTot;
+      u32 nPixels = powi(2,(grid.nLvls - 1 - lvl));
+      for (uint jj=0; jj<nPixels; jj++) {
+        for (uint ii=0; ii<nPixels; ii++) {
+          u32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
+          u32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
+          if (f >= 0) {
+            grid.imageData[jPxl*grid.imageSize[0] + iPxl] = U[idx];
+          }
+          else {
+            grid.imageData[jPxl*grid.imageSize[0] + iPxl] = lvl+1;
+          }
+          if (gridOn && ii > 0 && jj > 0) {
+            grid.imageData[jPxl*grid.imageSize[0] + iPxl] = 0;
+          }
+        }
+      }
+    }
+
+  END_CELL_LOOP
 }

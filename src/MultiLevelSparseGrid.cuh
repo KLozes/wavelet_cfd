@@ -26,7 +26,7 @@ public:
 
   HashTable hashTable;
 
-  dataType domainSize[2] = {1.0, 1.0};
+  real domainSize[2] = {1.0, 1.0};
   u32 baseGridSize[2] = {1,1};
   u32 nLvls;
   u32 nFields;
@@ -46,14 +46,14 @@ public:
   u32 *bFlagsList;     // block Flags
   u32 *cFlagsList;     // cell Flags
 
-  dataType *fieldData; // flow field data
-  dataType *imageData; // output image data
-  dataType *pixelCountData; // number of 
+  real *fieldData; // flow field data
+  real *imageData; // output image data
+  real *pixelCountData; // number of 
 
 
   int lock;
 
-  MultiLevelSparseGrid(dataType *domainSize, u32 *baseGridSize_, u32 nLvls_, u32 nFields_);
+  MultiLevelSparseGrid(real *domainSize, u32 *baseGridSize_, u32 nLvls_, u32 nFields_);
 
   ~MultiLevelSparseGrid(void);
 
@@ -63,26 +63,26 @@ public:
   void sortBlocks(void);
   virtual void sortFieldData(void) = 0;
 
-  __host__ __device__ i32 getSize(i32 lvl);
-  __host__ __device__ dataType getDx(i32 lvl);
-  __host__ __device__ dataType getDy(i32 lvl);
-  __host__ __device__ void getCellPos(i32 lvl, i32 ib, i32 jb, i32 i, i32 j, dataType *pos);
-  __host__ __device__ u32 getNbrIdx(u32 bIdx, i32 i, i32 j);
-  __host__ __device__ bool isInteriorBlock(i32 lvl, i32 i, i32 j);
-  __host__ __device__ bool isExteriorBlock(i32 lvl, i32 i, i32 j);
+  __device__ i32 getSize(i32 lvl);
+  __device__ real getDx(i32 lvl);
+  __device__ real getDy(i32 lvl);
+  __device__ void getCellPos(i32 lvl, i32 ib, i32 jb, i32 i, i32 j, real *pos);
+  __device__ u32 getNbrIdx(u32 bIdx, i32 i, i32 j);
+  __device__ bool isInteriorBlock(i32 lvl, i32 i, i32 j);
+  __device__ bool isExteriorBlock(i32 lvl, i32 i, i32 j);
 
-  __host__ __device__ dataType *getField(u32 f);
+  __host__ __device__ real *getField(u32 f);
 
-  __host__ __device__ void activateBlock(i32 lvl, i32 i, i32 j);
+  __device__ void activateBlock(i32 lvl, i32 i, i32 j);
   
-  __host__ __device__ u64 split(u32 a);
-  __host__ __device__ u64 mortonEncode(i32 lvl, i32 i, i32 j);
+  __device__ u64 split(u32 a);
+  __device__ u64 mortonEncode(i32 lvl, i32 i, i32 j);
 
-  __host__ __device__ u32 compact(u64 w);
-  __host__ __device__ void mortonDecode(u64 morton, i32 &lvl, i32 &i, i32 &j);
+  __device__ u32 compact(u64 w);
+  __device__ void mortonDecode(u64 morton, i32 &lvl, i32 &i, i32 &j);
 
   void paint(void);
-  virtual void computeImageData(i32 f); 
+  //virtual void computeImageData(i32 f); 
 
 };
 

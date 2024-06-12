@@ -1,15 +1,15 @@
 #include "CompressibleSolverKernels.cuh"
 
 __global__ void sortFieldDataKernel(CompressibleSolver &grid) {
-  dataType *Rho  = grid.getField(0);
-  dataType *RhoU = grid.getField(1);
-  dataType *RhoV = grid.getField(2);
-  dataType *RhoE = grid.getField(3);
+  real *Rho  = grid.getField(0);
+  real *RhoU = grid.getField(1);
+  real *RhoV = grid.getField(2);
+  real *RhoE = grid.getField(3);
 
-  dataType *OldRho  = grid.getField(4);
-  dataType *OldRhoU = grid.getField(5);
-  dataType *OldRhoV = grid.getField(6);
-  dataType *OldRhoE = grid.getField(7);
+  real *OldRho  = grid.getField(4);
+  real *OldRhoU = grid.getField(5);
+  real *OldRhoV = grid.getField(6);
+  real *OldRhoE = grid.getField(7);
 
   START_CELL_LOOP
 
@@ -20,6 +20,7 @@ __global__ void sortFieldDataKernel(CompressibleSolver &grid) {
     RhoU[cIdx] = OldRhoU[cIdxOld];
     RhoV[cIdx] = OldRhoV[cIdxOld];
     RhoE[cIdx] = OldRhoE[cIdxOld];
+    grid.bFlagsList[bIdxOld] = DELETE;
 
   END_CELL_LOOP
 
@@ -27,28 +28,28 @@ __global__ void sortFieldDataKernel(CompressibleSolver &grid) {
 
 __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
 
-  dataType *Rho  = grid.getField(0);
-  dataType *U    = grid.getField(1);
-  dataType *V    = grid.getField(2);
-  dataType *P    = grid.getField(3);
+  real *Rho  = grid.getField(0);
+  real *U    = grid.getField(1);
+  real *V    = grid.getField(2);
+  real *P    = grid.getField(3);
 
   START_CELL_LOOP
 
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
-    dataType pos[2];
+    real pos[2];
     grid.getCellPos(lvl, ib, jb, i, j, pos);
 
     if (grid.icType == 0) {
       //
       // sod shock explosion
       //
-      dataType centerX = grid.domainSize[0]/2;
-      dataType centerY = grid.domainSize[1]/2;
-      dataType radius = min(grid.domainSize[0], grid.domainSize[0])/5;
+      real centerX = grid.domainSize[0]/2;
+      real centerY = grid.domainSize[1]/2;
+      real radius = min(grid.domainSize[0], grid.domainSize[0])/5;
 
-      dataType dist = sqrt((pos[0]-centerX)*(pos[0]-centerX) + (pos[1]-centerY)*(pos[1]-centerY));
+      real dist = sqrt((pos[0]-centerX)*(pos[0]-centerX) + (pos[1]-centerY)*(pos[1]-centerY));
     
       // inside
       if (dist < radius) {
@@ -93,10 +94,10 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
 
 __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
 
-  dataType *Rho  = grid.getField(0);
-  dataType *RhoU = grid.getField(1);
-  dataType *RhoV = grid.getField(2);
-  dataType *RhoE = grid.getField(3);
+  real *Rho  = grid.getField(0);
+  real *RhoU = grid.getField(1);
+  real *RhoV = grid.getField(2);
+  real *RhoE = grid.getField(3);
 
   START_CELL_LOOP
 
@@ -202,11 +203,11 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
 
 // compute max wavespeed in each cell, will be used for CFL condition
 __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
-  dataType *Rho  = grid.getField(0);
-  dataType *RhoU = grid.getField(1);
-  dataType *RhoV = grid.getField(2);
-  dataType *RhoE = grid.getField(3);
-  dataType *DeltaT = grid.getField(12);
+  real *Rho  = grid.getField(0);
+  real *RhoU = grid.getField(1);
+  real *RhoV = grid.getField(2);
+  real *RhoE = grid.getField(3);
+  real *DeltaT = grid.getField(12);
 
   START_CELL_LOOP
 
@@ -215,7 +216,7 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
     grid.mortonDecode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
-      dataType a, dx, vel;
+      real a, dx, vel;
       Vec4 q = grid.cons2prim(Vec4(Rho[cIdx], RhoU[cIdx], RhoV[cIdx], RhoE[cIdx]));
       a = sqrt(abs(gam*q[3]/(q[0]+1e-32)));
       vel = sqrt(q[1]*q[1] + q[2]*q[2]);
@@ -232,15 +233,15 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
 
 
 __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
-  dataType *Rho = grid.getField(0);
-  dataType *U   = grid.getField(1);
-  dataType *V   = grid.getField(2);
-  dataType *P   = grid.getField(3);
+  real *Rho = grid.getField(0);
+  real *U   = grid.getField(1);
+  real *V   = grid.getField(2);
+  real *P   = grid.getField(3);
 
-  dataType *RhsRho  = grid.getField(8);
-  dataType *RhsRhoU = grid.getField(9);
-  dataType *RhsRhoV = grid.getField(10);
-  dataType *RhsRhoE = grid.getField(11);
+  real *RhsRho  = grid.getField(8);
+  real *RhsRhoU = grid.getField(9);
+  real *RhsRhoV = grid.getField(10);
+  real *RhsRhoE = grid.getField(11);
 
   START_CELL_LOOP
 
@@ -248,9 +249,9 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     i32 lvl, ib, jb;
     grid.mortonDecode(loc, lvl, ib, jb);
 
-    dataType dx = grid.getDx(lvl);
-    dataType dy = grid.getDy(lvl);
-    dataType vol = dx*dy;
+    real dx = grid.getDx(lvl);
+    real dy = grid.getDy(lvl);
+    real vol = dx*dy;
 
     u32 l1Idx = grid.getNbrIdx(bIdx, i-1, j);
     u32 l2Idx = grid.getNbrIdx(bIdx, i-2, j);
@@ -260,9 +261,9 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     u32 d2Idx = grid.getNbrIdx(bIdx, i, j-2);
     u32 u1Idx = grid.getNbrIdx(bIdx, i, j+1);
 
-    u32 cFlag = grid.cFlagsList[cIdx];
-    u32 lFlag = grid.cFlagsList[l1Idx];
-    u32 dFlag = grid.cFlagsList[d1Idx];
+    //u32 cFlag = grid.cFlagsList[cIdx];
+    //u32 lFlag = grid.cFlagsList[l1Idx];
+    //u32 dFlag = grid.cFlagsList[d1Idx];
 
     //if (grid.isInteriorBlock(lvl, ib, jb)) {
       
@@ -332,20 +333,20 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
   //
   // update fields with low storage runge kutta
   //
-  dataType *Rho  = grid.getField(0);
-  dataType *RhoU = grid.getField(1);
-  dataType *RhoV = grid.getField(2);
-  dataType *RhoE = grid.getField(3);
+  real *Rho  = grid.getField(0);
+  real *RhoU = grid.getField(1);
+  real *RhoV = grid.getField(2);
+  real *RhoE = grid.getField(3);
 
-  dataType *RhsRho  = grid.getField(8);
-  dataType *RhsRhoU = grid.getField(9);
-  dataType *RhsRhoV = grid.getField(10);
-  dataType *RhsRhoE = grid.getField(11);
+  real *RhsRho  = grid.getField(8);
+  real *RhsRhoU = grid.getField(9);
+  real *RhsRhoV = grid.getField(10);
+  real *RhsRhoE = grid.getField(11);
 
-  constexpr dataType alpha[3] = {5.0/9.0, 153.0/128.0, 0.0};
-  constexpr dataType beta[3] = {1.0/3.0, 15.0/16.0, 8.0/15.0};
+  constexpr real alpha[3] = {5.0/9.0, 153.0/128.0, 0.0};
+  constexpr real beta[3] = {1.0/3.0, 15.0/16.0, 8.0/15.0};
 
-  dataType dt = grid.deltaT;
+  real dt = grid.deltaT;
 
   START_CELL_LOOP
 
@@ -374,22 +375,22 @@ __global__ void updateFieldsRK3Kernel(CompressibleSolver &grid, i32 stage) {
   //
   // update fields with tvd runge kutta 3
   //
-  dataType *Rho  = grid.getField(0);
-  dataType *RhoU = grid.getField(1);
-  dataType *RhoV = grid.getField(2);
-  dataType *RhoE = grid.getField(3);
+  real *Rho  = grid.getField(0);
+  real *RhoU = grid.getField(1);
+  real *RhoV = grid.getField(2);
+  real *RhoE = grid.getField(3);
 
-  dataType *OldRho  = grid.getField(4);
-  dataType *OldRhoU = grid.getField(5);
-  dataType *OldRhoV = grid.getField(6);
-  dataType *OldRhoE = grid.getField(7);
+  real *OldRho  = grid.getField(4);
+  real *OldRhoU = grid.getField(5);
+  real *OldRhoV = grid.getField(6);
+  real *OldRhoE = grid.getField(7);
 
-  dataType *RhsRho  = grid.getField(8);
-  dataType *RhsRhoU = grid.getField(9);
-  dataType *RhsRhoV = grid.getField(10);
-  dataType *RhsRhoE = grid.getField(11);
+  real *RhsRho  = grid.getField(8);
+  real *RhsRhoU = grid.getField(9);
+  real *RhsRhoV = grid.getField(10);
+  real *RhsRhoE = grid.getField(11);
 
-  dataType dt = grid.deltaT;
+  real dt = grid.deltaT;
 
   START_CELL_LOOP
 
@@ -440,15 +441,15 @@ __global__ void copyToOldFieldsKernel(CompressibleSolver &grid) {
   //
   // update fields with low storage runge kutta
   //
-  dataType *Rho  = grid.getField(0);
-  dataType *RhoU = grid.getField(1);
-  dataType *RhoV = grid.getField(2);
-  dataType *RhoE = grid.getField(3);
+  real *Rho  = grid.getField(0);
+  real *RhoU = grid.getField(1);
+  real *RhoV = grid.getField(2);
+  real *RhoE = grid.getField(3);
 
-  dataType *OldRho  = grid.getField(4);
-  dataType *OldRhoU = grid.getField(5);
-  dataType *OldRhoV = grid.getField(6);
-  dataType *OldRhoE = grid.getField(7);
+  real *OldRho  = grid.getField(4);
+  real *OldRhoU = grid.getField(5);
+  real *OldRhoV = grid.getField(6);
+  real *OldRhoE = grid.getField(7);
 
   START_CELL_LOOP
 
@@ -461,10 +462,10 @@ __global__ void copyToOldFieldsKernel(CompressibleSolver &grid) {
 }
 
 __global__ void computeMagRhoUKernel(CompressibleSolver &grid) {
-  dataType *RhoU = grid.getField(1);
-  dataType *RhoV = grid.getField(2);
+  real *RhoU = grid.getField(1);
+  real *RhoV = grid.getField(2);
 
-  dataType *MagRhoU = grid.getField(12);
+  real *MagRhoU = grid.getField(12);
 
   START_CELL_LOOP
 
@@ -475,14 +476,14 @@ __global__ void computeMagRhoUKernel(CompressibleSolver &grid) {
 
 __global__ void conservativeToPrimitiveKernel(CompressibleSolver &grid) {
 
-  dataType *Rho  = grid.getField(0);
-  dataType *U = grid.getField(1);
-  dataType *V = grid.getField(2);
-  dataType *P = grid.getField(3);
+  real *Rho  = grid.getField(0);
+  real *U = grid.getField(1);
+  real *V = grid.getField(2);
+  real *P = grid.getField(3);
 
-  dataType *RhoU = grid.getField(1);
-  dataType *RhoV = grid.getField(2);
-  dataType *RhoE = grid.getField(3);
+  real *RhoU = grid.getField(1);
+  real *RhoV = grid.getField(2);
+  real *RhoE = grid.getField(3);
 
   START_CELL_LOOP
 
@@ -498,14 +499,14 @@ __global__ void conservativeToPrimitiveKernel(CompressibleSolver &grid) {
 
 __global__ void primitiveToConservativeKernel(CompressibleSolver &grid) {
 
-  dataType *Rho  = grid.getField(0);
-  dataType *U = grid.getField(1);
-  dataType *V = grid.getField(2);
-  dataType *P = grid.getField(3);
+  real *Rho  = grid.getField(0);
+  real *U = grid.getField(1);
+  real *V = grid.getField(2);
+  real *P = grid.getField(3);
 
-  dataType *RhoU = grid.getField(1);
-  dataType *RhoV = grid.getField(2);
-  dataType *RhoE = grid.getField(3);
+  real *RhoU = grid.getField(1);
+  real *RhoV = grid.getField(2);
+  real *RhoE = grid.getField(3);
 
   START_CELL_LOOP
 
@@ -547,13 +548,13 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
       u32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1);
       u32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1);
 
-      dataType xs = 2 * (i % 2) - 1 ; // sign for interp weights
-      dataType ys = 2 * (j % 2) - 1;
+      real xs = 2 * (i % 2) - 1 ; // sign for interp weights
+      real ys = 2 * (j % 2) - 1;
 
       // calculate detail coefficients for each field and set block to refine if large
       for(i32 f=0; f<4; f++) {
-        dataType *Q  = grid.getField(f);
-        dataType *OldQ  = grid.getField(f+4);
+        real *Q  = grid.getField(f);
+        real *OldQ  = grid.getField(f+4);
         Q[cIdx] = Q[cIdx] - (OldQ[pIdx] 
                 + xs * 1/8 * (OldQ[rIdx] - OldQ[lIdx]) 
                 + ys * 1/8 * (OldQ[uIdx] - OldQ[dIdx])
@@ -591,13 +592,13 @@ __global__ void inverseWaveletTransformKernel(CompressibleSolver &grid) {
       u32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1);
       u32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1);
 
-      dataType xs = 2 * (i % 2) - 1 ; // sign for interp weights
-      dataType ys = 2 * (j % 2) - 1;
+      real xs = 2 * (i % 2) - 1 ; // sign for interp weights
+      real ys = 2 * (j % 2) - 1;
 
       // calculate detail coefficients for each field and set block to refine if large
       for(i32 f=0; f<4; f++) {
-        dataType *Q  = grid.getField(f);
-        dataType *OldQ  = grid.getField(f+4);
+        real *Q  = grid.getField(f);
+        real *OldQ  = grid.getField(f+4);
         Q[cIdx] = Q[cIdx] + (OldQ[pIdx] 
                 + xs * 1/8 * (OldQ[rIdx] - OldQ[lIdx]) 
                 + ys * 1/8 * (OldQ[uIdx] - OldQ[dIdx])
@@ -621,31 +622,27 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
       grid.bFlagsList[bIdx] = KEEP;
     }
 
-    dataType pos[2];
+    real pos[2];
     grid.getCellPos(lvl, ib, jb, i, j, pos);
-    dataType dx = min(grid.getDx(lvl), grid.getDy(lvl)) ;
-    dataType ls = grid.getBoundaryLevelSet(Vec2(pos[0], pos[1]));
+    real dx = min(grid.getDx(lvl), grid.getDy(lvl)) ;
+    real ls = grid.getBoundaryLevelSet(Vec2(pos[0], pos[1]));
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb)) {
       // parent block memory index
       u32 prntIdx = grid.prntIdxList[bIdx];
       grid.bFlagsList[prntIdx] = KEEP;
 
-      // parent cell local indices
-      i32 ip = i/2 + ib%2 * blockSize / 2;
-      i32 jp = j/2 + jb%2 * blockSize / 2;
-
       // calculate detail coefficients for each field and set block to refine if large
       for(i32 f=0; f<4; f++) {
-        dataType *Q  = grid.getField(f);
+        real *Q  = grid.getField(f);
 
-        dataType mag = 1e-32;
+        real mag = 1e-32;
         if (f == 0) {mag = grid.maxRho;}
         if (f == 1 || f == 2) {mag = grid.maxMagRhoU;}
         if (f == 3) {mag = grid.maxRhoE;}
 
         // refine block if large wavelet detail
         if (abs(Q[cIdx]/mag) > grid.waveletThresh || abs(ls) < dx) {
-          if (lvl < grid.nLvls-1) {
+          if (lvl < grid.nLvls-1 && abs(Q[cIdx]/mag) > grid.waveletThresh*2 || abs(ls) < dx) {
             i32 bSize = blockSize/2;
             grid.activateBlock(lvl+1, 2*ib+i/bSize, 2*jb+j/bSize);
           }
@@ -687,12 +684,12 @@ __global__ void interpolateFieldsKernel(CompressibleSolver &grid) {
       u32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1);
       u32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1);
 
-      dataType xs = 2 * (i % 2) - 1 ; // sign for interp weights
-      dataType ys = 2 * (j % 2) - 1;
+      real xs = 2 * (i % 2) - 1 ; // sign for interp weights
+      real ys = 2 * (j % 2) - 1;
 
       // interpolate each field from lower resolustion
       for(i32 f=0; f<4; f++) {
-        dataType *Q  = grid.getField(f);
+        real *Q  = grid.getField(f);
         Q[cIdx] = Q[pIdx]
                 + xs * 1/8 * (Q[rIdx] - Q[lIdx]) 
                 + ys * 1/8 * (Q[uIdx] - Q[dIdx])
@@ -730,7 +727,7 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
       u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp);
 
       for (u32 f=0; f<4; f++){
-        dataType *q = grid.getField(f);
+        real *q = grid.getField(f);
         q[pIdx] = (q[cIdx] + q[rIdx] + q[uIdx] + q[ruIdx])/4.0;
       }
     }
