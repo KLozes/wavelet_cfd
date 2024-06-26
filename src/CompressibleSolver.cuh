@@ -26,10 +26,10 @@ public:
 
   u32 iter;
 
-  CompressibleSolver(real *domainSize_, u32 *baseGridSize_, u32 nLvls_, real cfl_, real waveletThresh_) :
+  CompressibleSolver(real *domainSize_, u32 *baseGridSize_, u32 nLvls_) :
     MultiLevelSparseGrid(domainSize_, baseGridSize_, nLvls_, 13) {
-      cfl = cfl_;
-      waveletThresh = waveletThresh_;
+      cfl = .5;
+      waveletThresh = .005;
       iter = 0;
       immerserdBcType = 0;
       bcType = 0;

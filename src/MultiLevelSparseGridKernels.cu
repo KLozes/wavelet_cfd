@@ -11,11 +11,14 @@ __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
     grid.activateBlock(0, i, j);
   }
 
-  i = idx % (grid.baseGridSize[0]*2/blockSize);
-	j = idx / (grid.baseGridSize[0]*2/blockSize);
-  if (i < grid.baseGridSize[0]*2/blockSize && j < grid.baseGridSize[1]*2/blockSize) {
-    grid.activateBlock(1, i, j);
+  if (grid.nLvls > 1) {
+    i = idx % (grid.baseGridSize[0]*2/blockSize);
+    j = idx / (grid.baseGridSize[0]*2/blockSize);
+    if (i < grid.baseGridSize[0]*2/blockSize && j < grid.baseGridSize[1]*2/blockSize) {
+      grid.activateBlock(1, i, j);
+    }
   }
+
 
 }
 
@@ -40,10 +43,10 @@ __global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid) {
 
     i32 lvl, ib, jb;
     u64 loc = grid.bLocList[bIdx];
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     if (lvl > 0) {
-      u64 pLoc = grid.mortonEncode(lvl-1, ib/2, jb/2);
+      u64 pLoc = grid.encode(lvl-1, ib/2, jb/2);
       u32 prntIdx = grid.hashTable.getValue(pLoc);  
       grid.prntIdxList[bIdx] = prntIdx;
     }
@@ -54,47 +57,16 @@ __global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid) {
 
 __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
 
-  /*
-  START_HALO_CELL_LOOP
-
-    i32 lvl, ib, jb;
-    u64 loc = grid.bLocList[bIdx];
-    grid.mortonDecode(loc, lvl, ib, jb);
-
-    i32 di = 0;
-    if (i < haloSize) {di = -1;}
-    if (i >= blockSize + haloSize) {di = 1;}
-
-    i32 dj = 0;
-    if (j < haloSize) {dj = -1;}
-    if (j >= blockSize + haloSize) {dj = 1;}
-
-    i32 iNbr = ib + di;
-    i32 jNbr = jb + dj;
-
-    u64 nbrLoc = grid.mortonEncode(lvl, iNbr, jNbr);
-    u32 nbrIdx = grid.hashTable.getValue(nbrLoc);
-
-    i32 il = i - di * blockSize - haloSize;
-    i32 jl = j - dj * blockSize - haloSize;
-
-    u32 lIdx = il + jl * blockSize;
-    grid.nbrIdxList[cIdx] = nbrIdx*blockSizeTot + lIdx;
-
-  END_HALO_CELL_LOOP
-  */
-
-
   START_BLOCK_LOOP
 
     i32 lvl, ib, jb;
     u64 loc = grid.bLocList[bIdx];
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     u32 idx = 0;
     for(int dj=-1; dj<2; dj++) {
       for(int di=-1; di<2; di++) {
-        u64 nbrLoc = grid.mortonEncode(lvl, ib+di, jb+dj);
+        u64 nbrLoc = grid.encode(lvl, ib+di, jb+dj);
         grid.nbrIdxList[bIdx*9+idx] = grid.hashTable.getValue(nbrLoc);
         idx++;
       }
@@ -110,7 +82,7 @@ __global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid) {
 
     i32 lvl, ib, jb;
     u64 loc = grid.bLocList[bIdx];
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
 
@@ -141,7 +113,7 @@ __global__ void flagParentCellsKernel(MultiLevelSparseGrid &grid) {
 
     i32 lvl, ib, jb;
     u64 loc = grid.bLocList[bIdx];
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     i32 cFlag = grid.cFlagsList[cIdx];
 
@@ -170,7 +142,7 @@ __global__ void addFineBlocksKernel(MultiLevelSparseGrid &grid) {
 
     i32 lvl, ib, jb;
     u64 loc = grid.bLocList[bIdx];
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
       if (lvl == 0 || grid.bFlagsList[bIdx] == REFINE) {
@@ -216,7 +188,7 @@ __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid) {
 
     i32 lvl, ib, jb;
     u64 loc = grid.bLocList[bIdx];
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb) && grid.bFlagsList[bIdx] == KEEP) {
       // add neighboring blocks
@@ -237,7 +209,7 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
     // activate parents and neghbors needed for wavelet transform
     i32 lvl, ib, jb;
     u64 loc = grid.bLocList[bIdx];
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb) && lvl > 2 && grid.bFlagsList[bIdx] == KEEP) {
       for (i32 dj=-1; dj<=1; dj++) {
@@ -273,7 +245,7 @@ __global__ void addBoundaryBlocksKernel(MultiLevelSparseGrid &grid) {
 
     i32 lvl, ib, jb;
     u64 loc = grid.bLocList[bIdx];
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb) && 
        (ib == 0 || ib == grid.baseGridSize[0]/blockSize*powi(2,lvl)-1 ||
@@ -304,7 +276,7 @@ __global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f) {
 
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb) && loc != kEmpty && grid.cFlagsList[cIdx] == ACTIVE) {
       u32 idx = i + blockSize * j + bIdx*blockSizeTot;

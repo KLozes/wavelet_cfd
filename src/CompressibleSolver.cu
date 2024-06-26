@@ -16,6 +16,7 @@ void CompressibleSolver::initialize(void) {
   cudaDeviceSynchronize();
   printf("nblocks %d\n", hashTable.nKeys);
   paint();
+  printf("hi");
 
   for(i32 lvl=0; lvl<nLvls; lvl++){
     forwardWaveletTransform();
@@ -102,12 +103,13 @@ void CompressibleSolver::primitiveToConservative(void) {
 }
 
 void CompressibleSolver::forwardWaveletTransform(void) {
+  cudaDeviceSynchronize();
   computeMagRhoUKernel<<<1000, cudaBlockSize>>>(*this); 
   maxRho = *(thrust::max_element(thrust::device, getField(0), getField(0)+hashTable.nKeys*blockSize));
   maxMagRhoU = *(thrust::max_element(thrust::device, getField(12), getField(12)+hashTable.nKeys*blockSize));
   maxRhoE = *(thrust::max_element(thrust::device, getField(3), getField(3)+hashTable.nKeys*blockSize));
   cudaDeviceSynchronize();
-  setBlocksDeleteKernel<<<1000, cudaBlockSize>>>(*this);
+  cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
   copyToOldFieldsKernel<<<1000, cudaBlockSize>>>(*this); 
   forwardWaveletTransformKernel<<<1000, cudaBlockSize>>>(*this);
   waveletThresholdingKernel<<<1000, cudaBlockSize>>>(*this); 

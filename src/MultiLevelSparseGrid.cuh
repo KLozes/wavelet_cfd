@@ -76,10 +76,10 @@ public:
   __device__ void activateBlock(i32 lvl, i32 i, i32 j);
   
   __device__ u64 split(u32 a);
-  __device__ u64 mortonEncode(i32 lvl, i32 i, i32 j);
+  __device__ u64 encode(i32 lvl, i32 i, i32 j);
 
   __device__ u32 compact(u64 w);
-  __device__ void mortonDecode(u64 morton, i32 &lvl, i32 &i, i32 &j);
+  __device__ void decode(u64 morton, i32 &lvl, i32 &i, i32 &j);
 
   void paint(void);
   //virtual void computeImageData(i32 f); 
@@ -95,16 +95,6 @@ public:
     i32 j = idx / blockSize;
 #define END_CELL_LOOP cIdx += gridDim.x*blockDim.x; \
     bIdx = cIdx / blockSizeTot; }
-
-#define START_HALO_CELL_LOOP \
-  u32 cIdx = blockIdx.x * blockDim.x + threadIdx.x; \
-  u32 bIdx = cIdx / blockHaloSizeTot; \
-  while (bIdx < grid.hashTable.nKeys) { \
-    u32 idx = cIdx % blockHaloSizeTot; \
-    i32 i = idx % blockHaloSize; \
-    i32 j = idx / blockHaloSize;
-#define END_HALO_CELL_LOOP cIdx += gridDim.x*blockDim.x; \
-    bIdx = cIdx / blockHaloSizeTot;}
 
 #define START_BLOCK_LOOP \
   u32 bIdx = threadIdx.x + blockIdx.x * blockDim.x; \

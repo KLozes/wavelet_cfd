@@ -26,7 +26,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, u32 *baseGridSize_
 
 
   // grid size checking
-  //assert(isPowerOf2(blockSize));
+  assert(isPowerOf2(blockSize));
   assert(baseGridSize[0]*baseGridSize[1]/blockSize/blockSize < nBlocksMax);
 
   cudaMallocManaged(&bLocList, nBlocksMax*sizeof(u64));
@@ -76,16 +76,19 @@ void MultiLevelSparseGrid::initializeBaseGrid(void) {
 
 void MultiLevelSparseGrid::adaptGrid(void) {
 
-  addFineBlocksKernel<<<1000, cudaBlockSize>>>(*this);
-  setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
-  addAdjacentBlocksKernel<<<1000, cudaBlockSize>>>(*this);
-  for(i32 lvl=nLvls-1; lvl>2; lvl--) {
+  if (nLvls > 1) {
+    addFineBlocksKernel<<<1000, cudaBlockSize>>>(*this);
     setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
-    addReconstructionBlocksKernel<<<1000, cudaBlockSize>>>(*this);
+    addAdjacentBlocksKernel<<<1000, cudaBlockSize>>>(*this);
+    for(i32 lvl=nLvls-1; lvl>0; lvl--) {
+      setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
+      addReconstructionBlocksKernel<<<1000, cudaBlockSize>>>(*this);
+    }
+    addBoundaryBlocksKernel<<<1000, cudaBlockSize>>>(*this);
+    setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
+    deleteDataKernel<<<1000, cudaBlockSize>>>(*this);
+    updatePrntIndicesKernel<<<1000, cudaBlockSize>>>(*this);
   }
-  addBoundaryBlocksKernel<<<1000, cudaBlockSize>>>(*this);
-  deleteDataKernel<<<1000, cudaBlockSize>>>(*this);
-  updatePrntIndicesKernel<<<1000, cudaBlockSize>>>(*this);
 }
 
 void MultiLevelSparseGrid::sortBlocks(void) {
@@ -141,9 +144,8 @@ __host__ __device__ real* MultiLevelSparseGrid::getField(u32 f) {
 }
 
 __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j) {
-  u64 loc = mortonEncode(lvl, i, j);
+  u64 loc = encode(lvl, i, j);
   u32 idx = hashTable.insert(loc);
-
   if (idx != bEmpty) { 
     // new key was inserted if not bEmpty
     bLocList[idx] = loc;
@@ -151,8 +153,45 @@ __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j) {
     atomicMax(&bFlagsList[idx], NEW);
   }
 
+  /*
+  u64 loc = encode(lvl, i, j);
+
+  // start at the base grid level
+  i32 iBase = i / powi(2,lvl);
+  i32 jBase = j / powi(2,lvl);
+  i32 prntIdx = iBase + jBase * baseGridSize[0];
+
+  for(i32 l = 1; l <= lvl; l++) {
+    i32 ib = i / powi(2, lvl-l);
+    i32 jb = j / powi(2, lvl-l);
+    u64 locb = encode(l, ib, jb);
+    u32* chld = &(chldIdxList[4*prntIdx + 2*(jb%2) + ib%2]);
+
+    // swap in a temp index if it is empty
+    uint prev = atomicCAS(chld, bEmpty, 0);
+
+    // wait until temp index changes to a real index
+    while(*chld == 0) {
+      // if the previous value of the atomicCAS was empty,
+      // increment the nBlocks counter create the child block
+      if (prev == bEmpty) {
+        uint idx = atomicAdd(&nBlocks, 1);
+        bIdxList[idx] = idx;
+        bLocList[idx] = locb;
+        prntIdxList[idx] = prntIdx;
+        chldIdxList[4*idx] = bEmpty;
+        chldIdxList[4*idx+1] = bEmpty;
+        chldIdxList[4*idx+2] = bEmpty;
+        chldIdxList[4*idx+3] = bEmpty;
+        *chld = atomicCAS(chld, 0, idx);
+      }
+    }
+    prntIdx = *chld;
+  }
+  */
 }
 
+/*
 // seperate bits from a given integer 3 positions apart
 __device__ u64 MultiLevelSparseGrid::split(u32 a) {
   u64 x = (u64)a & ((1<<20)-1); // we only look at the first 20 bits
@@ -165,7 +204,7 @@ __device__ u64 MultiLevelSparseGrid::split(u32 a) {
 }
 
 // encode ijk indices and resolution level into morton code
-__device__ u64 MultiLevelSparseGrid::mortonEncode(i32 lvl, i32 i, i32 j) {
+__device__ u64 MultiLevelSparseGrid::encode(i32 lvl, i32 i, i32 j) {
   u64 morton = 0;
   i += 1; // add one so that boundary blocks are no longer negative negative
   j += 1;
@@ -185,11 +224,29 @@ __device__ u32 MultiLevelSparseGrid::compact(u64 w) {
 }
 
 // decode morton code into ij idx and resolution level
-__device__ void MultiLevelSparseGrid::mortonDecode(u64 morton, i32 &lvl, i32 &i, i32 &j) {
+__device__ void MultiLevelSparseGrid::decode(u64 morton, i32 &lvl, i32 &i, i32 &j) {
   lvl = i32((morton & ((u64)15 << 60)) >> 60);   // get the level stored in the last 4 bits
   morton &= ~ ((u64)15 << 60); // remove the last 4 bits
   i = compact(morton) - 1; 
   j = compact(morton >> 1) - 1;
+}
+
+*/
+
+// encode ijk indices and resolution level into locational code
+__device__ u64 MultiLevelSparseGrid::encode(i32 lvl, i32 i, i32 j) {
+  i += 1; // add one so that boundary blocks are no longer negative negative
+  j += 1;
+  u64 loc = 0;
+  loc |= (u64)lvl << 60 | (u64)j << 20 | (u64)i;
+  return loc;
+}
+
+// decode locational code into ij idx and resolution level
+__device__ void MultiLevelSparseGrid::decode(u64 loc, i32 &lvl, i32 &i, i32 &j) {
+  lvl = loc >> 60;
+  j = ((loc >> 20) & ((1 << 20)-1)) - 1;
+  i = (loc & ((1 << 20)-1)) - 1;
 }
 
 void MultiLevelSparseGrid::paint(void) {
@@ -198,7 +255,6 @@ void MultiLevelSparseGrid::paint(void) {
   png::image<png::gray_pixel_16> image(imageSize[0], imageSize[1]);
 
   for (i32 f=-1; f<4; f++) {
-    //computeImageData(f);
     computeImageDataKernel<<<1000, cudaBlockSize>>>(*this, f);
     cudaDeviceSynchronize();
 
@@ -250,7 +306,7 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
   for (uint bIdx=0; bIdx < hashTable.nKeys; bIdx++) {
     u64 loc = bLocList[bIdx];
     i32 lvl, ib, jb;
-    mortonDecode(loc, lvl, ib, jb);
+    decode(loc, lvl, ib, jb);
     if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty) {
       for (uint j = 0; j < blockSize; j++) {
         for (uint i = 0; i < blockSize; i++) {

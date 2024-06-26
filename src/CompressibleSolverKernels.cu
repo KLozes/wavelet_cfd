@@ -37,7 +37,7 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
 
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
     real pos[2];
     grid.getCellPos(lvl, ib, jb, i, j, pos);
 
@@ -103,7 +103,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
 
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     if (grid.isExteriorBlock(lvl, ib, jb)) {
       u32 gridSize[2] = {grid.baseGridSize[0]*powi(2, lvl)/blockSize, 
@@ -213,7 +213,7 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
 
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
       real a, dx, vel;
@@ -247,7 +247,7 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
 
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     real dx = grid.getDx(lvl);
     real dy = grid.getDy(lvl);
@@ -352,7 +352,7 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
 
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
 
@@ -396,7 +396,7 @@ __global__ void updateFieldsRK3Kernel(CompressibleSolver &grid, i32 stage) {
 
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     if (grid.isInteriorBlock(lvl, ib, jb)) {
 
@@ -527,9 +527,10 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
   
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
-    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb)) {
+    u32 cFlag = grid.cFlagsList[cIdx];
+    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && cFlag != GHOST) {
       // parent block memory index
       u32 prntIdx = grid.prntIdxList[bIdx];
 
@@ -560,6 +561,12 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
                 + ys * 1/8 * (OldQ[uIdx] - OldQ[dIdx])
                 + xs * ys * 1/64 * (OldQ[ruIdx] - OldQ[luIdx] - OldQ[rdIdx] + OldQ[ldIdx])); 
       }
+    } 
+    else if (cFlag == GHOST) {
+      for(i32 f=0; f<4; f++) {
+        real *Q = grid.getField(f);
+        Q[cIdx] = 0.0; 
+      }
     }
 
   END_CELL_LOOP
@@ -571,7 +578,7 @@ __global__ void inverseWaveletTransformKernel(CompressibleSolver &grid) {
   
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb) && grid.bFlagsList[bIdx] != DELETE) {
       // parent block memory index
@@ -616,9 +623,10 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
   
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
     
-    if (lvl < 2) {
+    u32 cFlag = grid.cFlagsList[cIdx];
+    if (lvl < 2 || cFlag == PARENT) {
       grid.bFlagsList[bIdx] = KEEP;
     }
 
@@ -660,7 +668,7 @@ __global__ void interpolateFieldsKernel(CompressibleSolver &grid) {
   
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     u32 cFlag = grid.cFlagsList[cIdx];
 
@@ -706,7 +714,7 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
 
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
-    grid.mortonDecode(loc, lvl, ib, jb);
+    grid.decode(loc, lvl, ib, jb);
 
     u32 cFlag = grid.cFlagsList[cIdx];
 

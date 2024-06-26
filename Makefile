@@ -27,9 +27,9 @@ OBJS =  $(CPP_OBJS)
 OBJS += $(CU_OBJS)
 
 ## compile options
-CPPFLAGS = -O3 -Wextra -std=c++14
-NVCCFLAGS = -std=c++14 -arch=sm_61
-NVCCLFLAGS = -std=c++14 -arch=sm_61 -lpng -lz
+CPPFLAGS = -O2 -Wextra -std=c++14
+NVCCFLAGS = -O2 -std=c++14 -arch=sm_61
+NVCCLFLAGS = -O2 -std=c++14 -arch=sm_61 -lpng -lz
 
 ## Build Rules
 $(TARGET) : $(OBJS)
