@@ -95,7 +95,7 @@ __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
     for(int dj=-1; dj<2; dj++) {
       for(int di=-1; di<2; di++) {
         u64 nbrLoc = grid.mortonEncode(lvl, ib+di, jb+dj);
-        grid.nbrIdxList[bIdx*9+idx] = grid.hashTable.getValue(nbrLoc);;
+        grid.nbrIdxList[bIdx*9+idx] = grid.hashTable.getValue(nbrLoc);
         idx++;
       }
     }

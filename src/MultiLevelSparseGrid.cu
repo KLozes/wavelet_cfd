@@ -114,7 +114,7 @@ __device__ u32 MultiLevelSparseGrid::getNbrIdx(u32 bIdx, i32 i, i32 j) {
   j += blockSize;
   i32 ib = i / blockSize;
   i32 jb = j / blockSize;
-  i32 nbrIdx = nbrIdxList[bIdx + ib + 3*jb];
+  i32 nbrIdx = nbrIdxList[9*bIdx + ib + 3*jb];
   return blockSizeTot*nbrIdx + (i%blockSize) + (j%blockSize)*blockSize;
 }
 
