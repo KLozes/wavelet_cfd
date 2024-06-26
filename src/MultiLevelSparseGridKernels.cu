@@ -54,6 +54,7 @@ __global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid) {
 
 __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
 
+  /*
   START_HALO_CELL_LOOP
 
     i32 lvl, ib, jb;
@@ -81,6 +82,26 @@ __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
     grid.nbrIdxList[cIdx] = nbrIdx*blockSizeTot + lIdx;
 
   END_HALO_CELL_LOOP
+  */
+
+
+  START_BLOCK_LOOP
+
+    i32 lvl, ib, jb;
+    u64 loc = grid.bLocList[bIdx];
+    grid.mortonDecode(loc, lvl, ib, jb);
+
+    u32 idx = 0;
+    for(int dj=-1; dj<2; dj++) {
+      for(int di=-1; di<2; di++) {
+        u64 nbrLoc = grid.mortonEncode(lvl, ib+di, jb+dj);
+        grid.nbrIdxList[bIdx*9+idx] = grid.hashTable.getValue(nbrLoc);;
+        idx++;
+      }
+    }
+
+  END_BLOCK_LOOP
+
 }
 
 __global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid) {

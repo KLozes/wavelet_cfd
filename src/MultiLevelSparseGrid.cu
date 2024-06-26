@@ -34,7 +34,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, u32 *baseGridSize_
   cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&prntIdxList, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&chldIdxList, 4*nBlocksMax*sizeof(u32));
-  cudaMallocManaged(&nbrIdxList, blockHaloSizeTot*nBlocksMax*sizeof(u32));
+  cudaMallocManaged(&nbrIdxList, 9*nBlocksMax*sizeof(u32));
   cudaMallocManaged(&cFlagsList, blockSizeTot*nBlocksMax*sizeof(u32));
   cudaMallocManaged(&fieldData, nFields*blockSizeTot*nBlocksMax*sizeof(real));
   cudaMallocManaged(&imageData, imageSize[0]*imageSize[1]*sizeof(real));
@@ -44,7 +44,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, u32 *baseGridSize_
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
   cudaMemset(prntIdxList, 0, nBlocksMax*sizeof(u32));
   cudaMemset(chldIdxList, 0, 4*nBlocksMax*sizeof(u32));
-  cudaMemset(nbrIdxList, 0, blockHaloSizeTot*nBlocksMax*sizeof(u32));
+  cudaMemset(nbrIdxList, 0, 9*nBlocksMax*sizeof(u32));
   cudaMemset(cFlagsList, 0, blockSizeTot*nBlocksMax*sizeof(u32));
   cudaMemset(fieldData, 0, nFields*blockSizeTot*nBlocksMax*sizeof(real));
   cudaMemset(imageData, 0, imageSize[0]*imageSize[1]*sizeof(real));
@@ -110,7 +110,12 @@ __device__ void MultiLevelSparseGrid::getCellPos(i32 lvl, i32 ib, i32 jb, i32 i,
 }
 
 __device__ u32 MultiLevelSparseGrid::getNbrIdx(u32 bIdx, i32 i, i32 j) {
-  return nbrIdxList[bIdx*blockHaloSizeTot + (j+haloSize)*blockHaloSize + (i+haloSize)];
+  i += blockSize;
+  j += blockSize;
+  i32 ib = i / blockSize;
+  i32 jb = j / blockSize;
+  i32 nbrIdx = nbrIdxList[bIdx + ib + 3*jb];
+  return blockSizeTot*nbrIdx + (i%blockSize) + (j%blockSize)*blockSize;
 }
 
 __device__ real MultiLevelSparseGrid::getDx(i32 lvl) {
