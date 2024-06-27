@@ -625,8 +625,7 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
     i32 lvl, ib, jb;
     grid.decode(loc, lvl, ib, jb);
     
-    u32 cFlag = grid.cFlagsList[cIdx];
-    if (lvl < 2 || cFlag == PARENT) {
+    if (lvl < 2) {
       grid.bFlagsList[bIdx] = KEEP;
     }
 

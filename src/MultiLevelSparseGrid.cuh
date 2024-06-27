@@ -68,21 +68,21 @@ public:
   __device__ real getDy(i32 lvl);
   __device__ void getCellPos(i32 lvl, i32 ib, i32 jb, i32 i, i32 j, real *pos);
   __device__ u32 getNbrIdx(u32 bIdx, i32 i, i32 j);
-  __device__ bool isInteriorBlock(i32 lvl, i32 i, i32 j);
-  __device__ bool isExteriorBlock(i32 lvl, i32 i, i32 j);
+  __host__ __device__ bool isInteriorBlock(i32 lvl, i32 i, i32 j);
+  __host__ __device__ bool isExteriorBlock(i32 lvl, i32 i, i32 j);
 
   __host__ __device__ real *getField(u32 f);
 
   __device__ void activateBlock(i32 lvl, i32 i, i32 j);
   
-  __device__ u64 split(u32 a);
-  __device__ u64 encode(i32 lvl, i32 i, i32 j);
+  //__device__ u64 split(u32 a);
+  __host__ __device__ u64 encode(i32 lvl, i32 i, i32 j);
 
-  __device__ u32 compact(u64 w);
-  __device__ void decode(u64 morton, i32 &lvl, i32 &i, i32 &j);
+  //__device__ u32 compact(u64 w);
+  __host__ __device__ void decode(u64 morton, i32 &lvl, i32 &i, i32 &j);
 
   void paint(void);
-  //virtual void computeImageData(i32 f); 
+  virtual void computeImageData(i32 f); 
 
 };
 

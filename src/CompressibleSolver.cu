@@ -16,7 +16,6 @@ void CompressibleSolver::initialize(void) {
   cudaDeviceSynchronize();
   printf("nblocks %d\n", hashTable.nKeys);
   paint();
-  printf("hi");
 
   for(i32 lvl=0; lvl<nLvls; lvl++){
     forwardWaveletTransform();

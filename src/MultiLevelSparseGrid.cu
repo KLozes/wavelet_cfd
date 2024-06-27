@@ -255,6 +255,7 @@ void MultiLevelSparseGrid::paint(void) {
   png::image<png::gray_pixel_16> image(imageSize[0], imageSize[1]);
 
   for (i32 f=-1; f<4; f++) {
+    //computeImageData(f);
     computeImageDataKernel<<<1000, cudaBlockSize>>>(*this, f);
     cudaDeviceSynchronize();
 
@@ -292,7 +293,6 @@ void MultiLevelSparseGrid::paint(void) {
   imageCounter++;
 }
 
-/*
 void MultiLevelSparseGrid::computeImageData(i32 f) {
 
   real *U;
@@ -333,7 +333,7 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
     }
   }
 }
-*/
+
 /*
 void MultiLevelSparseGrid::resetBlockCounter(void) {
   zeroBlockCounter<<<1000, cudaBlockSize>>>(*this);

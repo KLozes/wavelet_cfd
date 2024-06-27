@@ -7,10 +7,10 @@
 int main(int argc, char* argv[]) {
   real domainSize[2] = {1.0, 1.0};
   u32 baseGridSize[2] = {blockSize*10, blockSize*10};
-  u32 nLvls = 7;
+  u32 nLvls = 6;
   real cfl = .80;
-  real waveletThresh = .0025;
-  real tStep = .01;
+  real waveletThresh = .005;
+  real tStep = .02;
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls);
   solver->cfl = cfl;

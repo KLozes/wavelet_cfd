@@ -45,7 +45,7 @@ __device__ u32 HashTable::insert(u64 key) {
   while (true) {
 
 #ifdef __CUDA_ARCH__
-    u64 prev = atomicCAS(&keyList[slot], kEmpty, key);
+    u64 prev = atomicCAS(&keyList[slot], kEmpty, key); // swap in temp key while first thread sets val
 #else
     u64 prev = keyList[slot];
 #endif
@@ -57,14 +57,15 @@ __device__ u32 HashTable::insert(u64 key) {
       i32 value = nKeys++;
 #endif
       valueList[slot] = value;
-      return valueList[slot];
+      break;
     }
 
     if (prev == key) {
-      return valueList[slot]; // could be bEmpty due to race condition
+      break;
     }
     slot = (slot + 1) % hashTableSize;
   }
+  return valueList[slot];
 }
 
 __device__ u32 HashTable::getValue(u64 key) {
