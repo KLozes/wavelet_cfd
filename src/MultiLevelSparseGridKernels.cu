@@ -2,6 +2,25 @@
 #include <stdio.h>
 #include "MultiLevelSparseGridKernels.cuh"
 
+
+__global__ void initTreeKernel(MultiLevelSparseGrid &grid) {
+  u32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < nBlocksMax) {
+    grid.bLocList[idx] = kEmpty;
+    grid.bIdxList[idx] = bEmpty;
+    grid.prntIdxList[idx] = bEmpty;
+    grid.prntIdxListOld[idx] = bEmpty;
+    grid.chldIdxList[4*idx] = bEmpty;
+    grid.chldIdxList[4*idx+1] = bEmpty;
+    grid.chldIdxList[4*idx+2] = bEmpty;
+    grid.chldIdxList[4*idx+3] = bEmpty;
+    grid.chldIdxListOld[4*idx] = bEmpty;
+    grid.chldIdxListOld[4*idx+1] = bEmpty;
+    grid.chldIdxListOld[4*idx+2] = bEmpty;
+    grid.chldIdxListOld[4*idx+3] = bEmpty;
+  }
+}
+
 __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
   // initialize the blocks of the base grid level
   i32 idx = threadIdx.x + blockIdx.x*blockDim.x;
@@ -22,34 +41,44 @@ __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
 
 }
 
-__global__ void updateIndicesKernel(MultiLevelSparseGrid &grid) {
-  
-  u32 bIdx = threadIdx.x + blockIdx.x * blockDim.x;
-  while (bIdx < grid.nBlocks) {
-
-    if (grid.bLocList[bIdx] != kEmpty) {
-      grid.bIdxList[bIdx] = bIdx;
-      grid.hashTable.insert(grid.bLocList[bIdx]);
-      grid.hashTable.setValue(grid.bLocList[bIdx], bIdx);
-    }
-
-    bIdx += gridDim.x*blockDim.x;
-  }
-}
-
-__global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid) {
-
+__global__ void updateTreeIndicesKernel(MultiLevelSparseGrid &grid)
+{
   START_BLOCK_LOOP
 
-    i32 lvl, ib, jb;
-    u64 loc = grid.bLocList[bIdx];
-    grid.decode(loc, lvl, ib, jb);
+    u32 oldIdx = grid.bIdxList[bIdx];
 
-    if (lvl > 0) {
-      u64 pLoc = grid.encode(lvl-1, ib/2, jb/2);
-      u32 prntIdx = grid.hashTable.getValue(pLoc);  
-      grid.prntIdxList[bIdx] = prntIdx;
+    // update the child index of this block's parent to bIdx
+    i32 lvl, i, j;
+    grid.decode(grid.bLocList[bIdx], lvl,  i, j);
+    u32 pIdx = grid.prntIdxList[oldIdx];
+    if (pIdx != bEmpty) {
+      grid.chldIdxListOld[4*pIdx + i%2 + 2*(j%2)] = bIdx;
     }
+
+    // update the parent index of each of this blocks children
+    for(i32 idx=0; idx<4; idx++) {
+      u32 cIdx = grid.chldIdxList[4*oldIdx + idx];
+      if (cIdx != bEmpty) {
+        grid.prntIdxListOld[cIdx] = bIdx;
+      }
+    }
+
+  END_BLOCK_LOOP
+}
+
+__global__ void copyTreeIndicesKernel(MultiLevelSparseGrid &grid)
+{
+  START_BLOCK_LOOP
+
+    u32 oldIdx = grid.bIdxList[bIdx];
+    grid.bIdxList[bIdx] = bIdx;
+
+    grid.prntIdxList[bIdx] = grid.prntIdxListOld[oldIdx];
+
+    grid.chldIdxList[4*bIdx + 0] = grid.chldIdxListOld[4*oldIdx + 0];
+    grid.chldIdxList[4*bIdx + 1] = grid.chldIdxListOld[4*oldIdx + 1];
+    grid.chldIdxList[4*bIdx + 2] = grid.chldIdxListOld[4*oldIdx + 2];
+    grid.chldIdxList[4*bIdx + 3] = grid.chldIdxListOld[4*oldIdx + 3];
 
   END_BLOCK_LOOP
 }
@@ -66,8 +95,7 @@ __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
     u32 idx = 0;
     for(int dj=-1; dj<2; dj++) {
       for(int di=-1; di<2; di++) {
-        u64 nbrLoc = grid.encode(lvl, ib+di, jb+dj);
-        grid.nbrIdxList[bIdx*9+idx] = grid.hashTable.getValue(nbrLoc);
+        grid.nbrIdxList[bIdx*9+idx] = grid.getBlockIdx(lvl, ib+di, jb+dj);
         idx++;
       }
     }

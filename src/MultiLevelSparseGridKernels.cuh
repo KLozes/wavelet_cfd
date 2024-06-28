@@ -3,11 +3,17 @@
 
 #include "MultiLevelSparseGrid.cuh"
 
+__global__ void initTreeKernel(MultiLevelSparseGrid &grid);
+ 
 __global__ void initGridKernel(MultiLevelSparseGrid &grid);
 
 __global__ void updateIndicesKernel(MultiLevelSparseGrid &grid);
 
 __global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid);
+
+__global__ void updateTreeIndicesKernel(MultiLevelSparseGrid &grid);
+
+__global__ void copyTreeIndicesKernel(MultiLevelSparseGrid &grid);
 
 __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid);
 

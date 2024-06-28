@@ -20,7 +20,6 @@ __global__ void sortFieldDataKernel(CompressibleSolver &grid) {
     RhoU[cIdx] = OldRhoU[cIdxOld];
     RhoV[cIdx] = OldRhoV[cIdxOld];
     RhoE[cIdx] = OldRhoE[cIdxOld];
-    grid.bFlagsList[bIdxOld] = DELETE;
 
   END_CELL_LOOP
 

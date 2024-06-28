@@ -27,10 +27,10 @@ public:
   HashTable hashTable;
 
   real domainSize[2] = {1.0, 1.0};
-  u32 baseGridSize[2] = {1,1};
-  u32 nLvls;
-  u32 nFields;
-  u32 imageSize[2] = {1,1};
+  i32 baseGridSize[2] = {1,1};
+  i32 nLvls;
+  i32 nFields;
+  i32 imageSize[2] = {1,1};
 
   u32 blockCounter;
   u32 imageCounter;
@@ -43,6 +43,9 @@ public:
   u32 *nbrIdxList;     // cell neighbor indeces
   u32 *prntIdxList;    // block parent indices
   u32 *chldIdxList;    // block child indices
+  u32 *prntIdxListOld; // old block parent indices
+  u32 *chldIdxListOld; // old block child indices
+
   u32 *bFlagsList;     // block Flags
   u32 *cFlagsList;     // cell Flags
 
@@ -74,6 +77,8 @@ public:
   __host__ __device__ real *getField(u32 f);
 
   __device__ void activateBlock(i32 lvl, i32 i, i32 j);
+__device__ u32 getBlockIdx(i32 lvl, i32 i, i32 j);
+
   
   //__device__ u64 split(u32 a);
   __host__ __device__ u64 encode(i32 lvl, i32 i, i32 j);
@@ -89,7 +94,7 @@ public:
 #define START_CELL_LOOP \
   u32 cIdx = blockIdx.x * blockDim.x + threadIdx.x; \
   u32 bIdx = cIdx / blockSizeTot; \
-  while (bIdx < grid.hashTable.nKeys) { \
+  while (bIdx < grid.nBlocks) { \
     u32 idx = cIdx % blockSizeTot; \
     i32 i = idx % blockSize; \
     i32 j = idx / blockSize;
@@ -98,7 +103,7 @@ public:
 
 #define START_BLOCK_LOOP \
   u32 bIdx = threadIdx.x + blockIdx.x * blockDim.x; \
-  while (bIdx < grid.hashTable.nKeys) {
+  while (bIdx < grid.nBlocks) {
 #define END_BLOCK_LOOP bIdx += gridDim.x*blockDim.x;}
 
 #endif

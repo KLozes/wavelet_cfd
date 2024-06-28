@@ -14,10 +14,10 @@ void CompressibleSolver::initialize(void) {
   sortBlocks();
   setBoundaryConditions();
   cudaDeviceSynchronize();
-  printf("nblocks %d\n", hashTable.nKeys);
+  printf("nblocks %d\n", nBlocks);
   paint();
 
-  for(i32 lvl=0; lvl<nLvls; lvl++){
+  for(i32 lvl=0; lvl<1; lvl++){
     forwardWaveletTransform();
     adaptGrid();
     setInitialConditions();
@@ -25,7 +25,7 @@ void CompressibleSolver::initialize(void) {
     setBoundaryConditions();
     sortBlocks();
     cudaDeviceSynchronize();
-    printf("nblocks %d\n", hashTable.nKeys);
+    printf("nblocks %d\n", nBlocks);
     paint();
   }
 }
@@ -104,9 +104,9 @@ void CompressibleSolver::primitiveToConservative(void) {
 void CompressibleSolver::forwardWaveletTransform(void) {
   cudaDeviceSynchronize();
   computeMagRhoUKernel<<<1000, cudaBlockSize>>>(*this); 
-  maxRho = *(thrust::max_element(thrust::device, getField(0), getField(0)+hashTable.nKeys*blockSize));
-  maxMagRhoU = *(thrust::max_element(thrust::device, getField(12), getField(12)+hashTable.nKeys*blockSize));
-  maxRhoE = *(thrust::max_element(thrust::device, getField(3), getField(3)+hashTable.nKeys*blockSize));
+  maxRho = *(thrust::max_element(thrust::device, getField(0), getField(0)+nBlocks*blockSize));
+  maxMagRhoU = *(thrust::max_element(thrust::device, getField(12), getField(12)+nBlocks*blockSize));
+  maxRhoE = *(thrust::max_element(thrust::device, getField(3), getField(3)+nBlocks*blockSize));
   cudaDeviceSynchronize();
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
   copyToOldFieldsKernel<<<1000, cudaBlockSize>>>(*this); 
@@ -122,7 +122,7 @@ void CompressibleSolver::inverseWaveletTransform(void) {
 void CompressibleSolver::computeDeltaT(void) {
   computeDeltaTKernel<<<1000, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
-	deltaT = *(thrust::min_element(thrust::device, getField(12), getField(12)+hashTable.nKeys*blockSizeTot));
+	deltaT = *(thrust::min_element(thrust::device, getField(12), getField(12)+nBlocks*blockSizeTot));
   deltaT *= cfl;
 }
 

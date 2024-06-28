@@ -19,11 +19,9 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, u32 *baseGridSize_
   imageSize[0] = (baseGridSize[0])*powi(2,nLvls-1);  // image size is the max resolution not including boundary condition blocks
   imageSize[1] = (baseGridSize[1])*powi(2,nLvls-1);
 
+  nBlocks = 0;
   blockCounter = 0;
   imageCounter = 0;
-
-  lock = 0;
-
 
   // grid size checking
   assert(isPowerOf2(blockSize));
@@ -31,21 +29,31 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, u32 *baseGridSize_
 
   cudaMallocManaged(&bLocList, nBlocksMax*sizeof(u64));
   cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(u32));
-  cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(u32));
+
   cudaMallocManaged(&prntIdxList, nBlocksMax*sizeof(u32));
+  cudaMallocManaged(&prntIdxListOld, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&chldIdxList, 4*nBlocksMax*sizeof(u32));
+  cudaMallocManaged(&chldIdxListOld, 4*nBlocksMax*sizeof(u32));
   cudaMallocManaged(&nbrIdxList, 9*nBlocksMax*sizeof(u32));
+
+  cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&cFlagsList, blockSizeTot*nBlocksMax*sizeof(u32));
+
   cudaMallocManaged(&fieldData, nFields*blockSizeTot*nBlocksMax*sizeof(real));
   cudaMallocManaged(&imageData, imageSize[0]*imageSize[1]*sizeof(real));
 
   cudaMemset(bLocList, 0, nBlocksMax*sizeof(u64));
   cudaMemset(bIdxList, 0, nBlocksMax*sizeof(u32));
-  cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
+
   cudaMemset(prntIdxList, 0, nBlocksMax*sizeof(u32));
+  cudaMemset(prntIdxListOld, 0, nBlocksMax*sizeof(u32));
   cudaMemset(chldIdxList, 0, 4*nBlocksMax*sizeof(u32));
+  cudaMemset(chldIdxListOld, 0, 4*nBlocksMax*sizeof(u32));
   cudaMemset(nbrIdxList, 0, 9*nBlocksMax*sizeof(u32));
+
+  cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
   cudaMemset(cFlagsList, 0, blockSizeTot*nBlocksMax*sizeof(u32));
+
   cudaMemset(fieldData, 0, nFields*blockSizeTot*nBlocksMax*sizeof(real));
   cudaMemset(imageData, 0, imageSize[0]*imageSize[1]*sizeof(real));
 
@@ -64,14 +72,19 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
 }
 
 void MultiLevelSparseGrid::initializeBaseGrid(void) {
-  // fill the bLocList with base grid blocks
-  initGridKernel<<<nBlocksMax/cudaBlockSize, cudaBlockSize>>>(*this);
-  addBoundaryBlocksKernel<<<1000, cudaBlockSize>>>(*this);
+
+  initTreeKernel<<<nBlocksMax/cudaBlockSize+1, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
 
-  // sort the data by location code
-  sortBlocks();
-  cudaDeviceSynchronize();
+  // fill tree with base grid blocks
+  nBlocks = 0;
+  for(i32 j=-1; j<baseGridSize[1]/blockSize+1; j++) {
+    for (i32 i=-1; i<baseGridSize[0]/blockSize+1; i++) {
+      bLocList[nBlocks] = encode(0,i,j);
+      bIdxList[nBlocks] = nBlocks;
+      nBlocks++; 
+    }
+  }
 }
 
 void MultiLevelSparseGrid::adaptGrid(void) {
@@ -79,28 +92,24 @@ void MultiLevelSparseGrid::adaptGrid(void) {
   if (nLvls > 1) {
     addFineBlocksKernel<<<1000, cudaBlockSize>>>(*this);
     setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
-    addAdjacentBlocksKernel<<<1000, cudaBlockSize>>>(*this);
-    for(i32 lvl=nLvls-1; lvl>0; lvl--) {
-      setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
-      addReconstructionBlocksKernel<<<1000, cudaBlockSize>>>(*this);
-    }
+    //addAdjacentBlocksKernel<<<1000, cudaBlockSize>>>(*this);
+    //for(i32 lvl=nLvls-1; lvl>0; lvl--) {
+    //  setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
+    //  addReconstructionBlocksKernel<<<1000, cudaBlockSize>>>(*this);
+    //}
     addBoundaryBlocksKernel<<<1000, cudaBlockSize>>>(*this);
     setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
     deleteDataKernel<<<1000, cudaBlockSize>>>(*this);
-    updatePrntIndicesKernel<<<1000, cudaBlockSize>>>(*this);
   }
 }
 
 void MultiLevelSparseGrid::sortBlocks(void) {
 
   cudaDeviceSynchronize();
-  thrust::sort_by_key(thrust::device, bLocList, bLocList+hashTable.nKeys, bIdxList);
+  thrust::sort_by_key(thrust::device, bLocList, bLocList+nBlocks, bIdxList);
   sortFieldData();
-  cudaDeviceSynchronize();
-  nBlocks = hashTable.nKeys;
-  hashTable.reset();
-  updateIndicesKernel<<<1000, cudaBlockSize>>>(*this);
-  updatePrntIndicesKernel<<<1000, cudaBlockSize>>>(*this);
+  updateTreeIndicesKernel<<<1000, cudaBlockSize>>>(*this);
+  copyTreeIndicesKernel<<<1000, cudaBlockSize>>>(*this);
   updateNbrIndicesKernel<<<1000, cudaBlockSize>>>(*this);
   flagActiveCellsKernel<<<1000, cudaBlockSize>>>(*this);
   flagParentCellsKernel<<<1000, cudaBlockSize>>>(*this); 
@@ -144,38 +153,29 @@ __host__ __device__ real* MultiLevelSparseGrid::getField(u32 f) {
 }
 
 __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j) {
-  u64 loc = encode(lvl, i, j);
-  u32 idx = hashTable.insert(loc);
-  if (idx != bEmpty) { 
-    // new key was inserted if not bEmpty
-    bLocList[idx] = loc;
-    bIdxList[idx] = idx;
-    atomicMax(&bFlagsList[idx], NEW);
-  }
 
-  /*
   u64 loc = encode(lvl, i, j);
 
-  // start at the base grid level
-  i32 iBase = i / powi(2,lvl);
-  i32 jBase = j / powi(2,lvl);
-  i32 prntIdx = iBase + jBase * baseGridSize[0];
+  // start at the base grid level accounting for boundary blocks
+  i32 iBase = i / powi(2,lvl) + 1; 
+  i32 jBase = j / powi(2,lvl) + 1;
+  i32 prntIdx = iBase + jBase * (baseGridSize[0]+2);
 
   for(i32 l = 1; l <= lvl; l++) {
     i32 ib = i / powi(2, lvl-l);
     i32 jb = j / powi(2, lvl-l);
     u64 locb = encode(l, ib, jb);
-    u32* chld = &(chldIdxList[4*prntIdx + 2*(jb%2) + ib%2]);
+    u32 cIdx = 4*prntIdx + 2*((jb+2)%2) + (ib+2)%2;
 
     // swap in a temp index if it is empty
-    uint prev = atomicCAS(chld, bEmpty, 0);
+    uint prev = atomicCAS(&chldIdxList[cIdx], bEmpty, bEmpty-1);
 
     // wait until temp index changes to a real index
-    while(*chld == 0) {
+    while(chldIdxList[cIdx] == bEmpty-1) {
       // if the previous value of the atomicCAS was empty,
       // increment the nBlocks counter create the child block
       if (prev == bEmpty) {
-        uint idx = atomicAdd(&nBlocks, 1);
+        u32 idx = atomicAdd(&nBlocks, 1);
         bIdxList[idx] = idx;
         bLocList[idx] = locb;
         prntIdxList[idx] = prntIdx;
@@ -183,12 +183,34 @@ __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j) {
         chldIdxList[4*idx+1] = bEmpty;
         chldIdxList[4*idx+2] = bEmpty;
         chldIdxList[4*idx+3] = bEmpty;
-        *chld = atomicCAS(chld, 0, idx);
+        bFlagsList[idx] = NEW;
+        chldIdxList[cIdx] = idx;
       }
     }
-    prntIdx = *chld;
+    prntIdx = chldIdxList[cIdx] ;
   }
-  */
+}
+
+__device__ u32 MultiLevelSparseGrid::getBlockIdx(i32 lvl, i32 i, i32 j) {
+
+  u64 loc = encode(lvl, i, j);
+
+  // search up the tree starting from the base
+  i32 iBase = i / powi(2,lvl) + 1; 
+  i32 jBase = j / powi(2,lvl) + 1;
+  i32 prntIdx = iBase + jBase * (baseGridSize[0]+2);
+  
+  for(i32 l = 1; l <= lvl; l++) {
+    i32 ib = i / powi(2, lvl-l);
+    i32 jb = j / powi(2, lvl-l);
+    u64 locb = encode(l, ib, jb);
+    u32 chldIdx = chldIdxList[4*prntIdx + 2*(jb%2) + ib%2];
+    prntIdx = chldIdx;
+    if (prntIdx == bEmpty) {
+      break;
+    }
+  }
+  return prntIdx;
 }
 
 /*
@@ -303,7 +325,7 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
   bool gridOn = true;
 
   // set the pixel values 
-  for (uint bIdx=0; bIdx < hashTable.nKeys; bIdx++) {
+  for (uint bIdx=0; bIdx < nBlocks; bIdx++) {
     u64 loc = bLocList[bIdx];
     i32 lvl, ib, jb;
     decode(loc, lvl, ib, jb);

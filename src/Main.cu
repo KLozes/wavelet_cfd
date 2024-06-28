@@ -7,10 +7,10 @@
 int main(int argc, char* argv[]) {
   real domainSize[2] = {1.0, 1.0};
   u32 baseGridSize[2] = {blockSize*10, blockSize*10};
-  u32 nLvls = 6;
+  u32 nLvls = 5;
   real cfl = .80;
-  real waveletThresh = .005;
-  real tStep = .02;
+  real waveletThresh = .003;
+  real tStep = .005;
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls);
   solver->cfl = cfl;
@@ -20,16 +20,17 @@ int main(int argc, char* argv[]) {
   solver->immerserdBcType = 0;
   solver->initialize();
 
+  /*
   real t = 0;
   while(t < 100) {
 
     t += solver->step(tStep);
 
     solver->paint();
-    printf("n: %d, t = %f, tSolver = %d, tGrid = %d, nBlocks = %d\n", solver->imageCounter, t, solver->tSolver , solver->tGrid, solver->hashTable.nKeys);
+    printf("n: %d, t = %f, tSolver = %d, tGrid = %d, nBlocks = %d\n", solver->imageCounter, t, solver->tSolver , solver->tGrid, solver->nBlocks);
 
   }
-  
+  */
   cudaDeviceSynchronize();
   delete solver;
 	cudaDeviceReset();
