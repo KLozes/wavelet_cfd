@@ -27,6 +27,7 @@ void CompressibleSolver::initialize(void) {
     cudaDeviceSynchronize();
     printf("nblocks %d\n", nBlocks);
     paint();
+    printf("nblocks %d\n", nBlocks);
   }
 }
 

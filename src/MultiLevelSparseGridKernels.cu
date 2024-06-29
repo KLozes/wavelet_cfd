@@ -255,6 +255,7 @@ __global__ void deleteDataKernel(MultiLevelSparseGrid &grid) {
   START_CELL_LOOP
 
     if (grid.bFlagsList[bIdx] == DELETE) {
+      printf("%d delete\n", bIdx);
       grid.bLocList[bIdx] = kEmpty;
       grid.bIdxList[bIdx] = bEmpty;
       grid.cFlagsList[cIdx] = 0;
@@ -305,6 +306,8 @@ __global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f) {
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
     grid.decode(loc, lvl, ib, jb);
+
+    printf("%d ", bIdx);
 
     if (grid.isInteriorBlock(lvl, ib, jb) && loc != kEmpty && grid.cFlagsList[cIdx] == ACTIVE) {
       u32 nPixels = powi(2,(grid.nLvls - 1 - lvl));
