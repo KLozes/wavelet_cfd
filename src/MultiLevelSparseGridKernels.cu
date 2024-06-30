@@ -290,7 +290,7 @@ __global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f) {
           else {
             grid.imageData[jPxl*grid.imageSize[0] + iPxl] = (lvl+1);
           }
-          if (gridOn && ii > 0 && jj > 0) {
+          if (f < 0 && gridOn && ii > 0 && jj > 0) {
             grid.imageData[jPxl*grid.imageSize[0] + iPxl] = 0;
           }
         }

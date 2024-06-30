@@ -47,7 +47,7 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
       //
       real centerX = grid.domainSize[0]/2;
       real centerY = grid.domainSize[1]/2;
-      real radius = min(grid.domainSize[0], grid.domainSize[0])/5;
+      real radius = min(grid.domainSize[0], grid.domainSize[1])/5;
 
       real dist = sqrt((pos[0]-centerX)*(pos[0]-centerX) + (pos[1]-centerY)*(pos[1]-centerY));
     
@@ -649,7 +649,7 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
 
         // refine block if large wavelet detail
         if (abs(Q[cIdx]/mag) > grid.waveletThresh || abs(ls) < dx) {
-          if (lvl < grid.nLvls-1 && abs(Q[cIdx]/mag) > grid.waveletThresh*2 || abs(ls) < dx) {
+          if (lvl < grid.nLvls-1 && (abs(Q[cIdx]/mag) > grid.waveletThresh*2 || abs(ls) < dx)) {
             i32 bSize = blockSize/2;
             grid.activateBlock(lvl+1, 2*ib+i/bSize, 2*jb+j/bSize);
           }

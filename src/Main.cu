@@ -5,9 +5,9 @@
 #include "CompressibleSolver.cuh"
 
 int main(int argc, char* argv[]) {
-  real domainSize[2] = {1.0, 1.0};
-  u32 baseGridSize[2] = {blockSize*10, blockSize*10};
-  u32 nLvls = 6;
+  real domainSize[2] = {2.0, 1.0};
+  u32 baseGridSize[2] = {blockSize*10, blockSize*5};
+  u32 nLvls = 7;
   real cfl = .80;
   real waveletThresh = .005;
   real tStep = .02;
@@ -17,7 +17,7 @@ int main(int argc, char* argv[]) {
   solver->waveletThresh = waveletThresh;
   solver->icType = 0;
   solver->bcType = 0;
-  solver->immerserdBcType = 0;
+  solver->immerserdBcType = 1;
   solver->initialize();
 
   real t = 0;

@@ -25,6 +25,8 @@ __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid);
 
 __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid);
 
+__global__ void activateParentBlocksKernel(MultiLevelSparseGrid &grid, i32 lvl, i32 i, i32 j);
+
 __global__ void deleteDataKernel(MultiLevelSparseGrid &grid);
 
 __global__ void setFlagsToDelete(MultiLevelSparseGrid &grid);

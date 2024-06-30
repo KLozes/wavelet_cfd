@@ -195,7 +195,7 @@ __device__ real CompressibleSolver::getBoundaryLevelSet(Vec2 pos) {
   if (immerserdBcType == 1) {
     // circle
     real radius = .1;
-    real center[2] = {1.0, .5};
+    real center[2] = {.5, .5};
     return radius - sqrt((pos[0]-center[0])*(pos[0]-center[0]) + (pos[1]-center[1])*(pos[1]-center[1]));
   }
   else {

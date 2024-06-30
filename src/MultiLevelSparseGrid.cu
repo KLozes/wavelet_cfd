@@ -80,7 +80,7 @@ void MultiLevelSparseGrid::adaptGrid(void) {
     addFineBlocksKernel<<<1000, cudaBlockSize>>>(*this);
     setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
     addAdjacentBlocksKernel<<<1000, cudaBlockSize>>>(*this);
-    for(i32 lvl=nLvls-1; lvl>0; lvl--) {
+    for(i32 lvl=nLvls-1; lvl>2; lvl--) {
       setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
       addReconstructionBlocksKernel<<<1000, cudaBlockSize>>>(*this);
     }
@@ -152,86 +152,7 @@ __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j) {
     bIdxList[idx] = idx;
     atomicMax(&bFlagsList[idx], NEW);
   }
-
-  /*
-  u64 loc = encode(lvl, i, j);
-
-  // start at the base grid level
-  i32 iBase = i / powi(2,lvl);
-  i32 jBase = j / powi(2,lvl);
-  i32 prntIdx = iBase + jBase * baseGridSize[0];
-
-  for(i32 l = 1; l <= lvl; l++) {
-    i32 ib = i / powi(2, lvl-l);
-    i32 jb = j / powi(2, lvl-l);
-    u64 locb = encode(l, ib, jb);
-    u32* chld = &(chldIdxList[4*prntIdx + 2*(jb%2) + ib%2]);
-
-    // swap in a temp index if it is empty
-    uint prev = atomicCAS(chld, bEmpty, 0);
-
-    // wait until temp index changes to a real index
-    while(*chld == 0) {
-      // if the previous value of the atomicCAS was empty,
-      // increment the nBlocks counter create the child block
-      if (prev == bEmpty) {
-        uint idx = atomicAdd(&nBlocks, 1);
-        bIdxList[idx] = idx;
-        bLocList[idx] = locb;
-        prntIdxList[idx] = prntIdx;
-        chldIdxList[4*idx] = bEmpty;
-        chldIdxList[4*idx+1] = bEmpty;
-        chldIdxList[4*idx+2] = bEmpty;
-        chldIdxList[4*idx+3] = bEmpty;
-        *chld = atomicCAS(chld, 0, idx);
-      }
-    }
-    prntIdx = *chld;
-  }
-  */
 }
-
-/*
-// seperate bits from a given integer 3 positions apart
-__device__ u64 MultiLevelSparseGrid::split(u32 a) {
-  u64 x = (u64)a & ((1<<20)-1); // we only look at the first 20 bits
-  x = (x | x << 32) & 0x1f00000000ffff;
-  x = (x | x << 16) & 0x1f0000ff0000ff;
-  x = (x | x << 8) & 0x100f00f00f00f00f;
-  x = (x | x << 4) & 0x10c30c30c30c30c3;
-  x = (x | x << 2) & 0x1249249249249249;
-  return x;
-}
-
-// encode ijk indices and resolution level into morton code
-__device__ u64 MultiLevelSparseGrid::encode(i32 lvl, i32 i, i32 j) {
-  u64 morton = 0;
-  i += 1; // add one so that boundary blocks are no longer negative negative
-  j += 1;
-  morton |= (u64)lvl << 60 | split(i) | split(j) << 1;
-  return morton;
-}
-
-// compact separated bits into into an integer
-__device__ u32 MultiLevelSparseGrid::compact(u64 w) {
-  w &=                  0x1249249249249249;
-  w = (w ^ (w >> 2))  & 0x30c30c30c30c30c3;
-  w = (w ^ (w >> 4))  & 0xf00f00f00f00f00f;
-  w = (w ^ (w >> 8))  & 0x00ff0000ff0000ff;
-  w = (w ^ (w >> 16)) & 0x00ff00000000ffff;
-  w = (w ^ (w >> 32)) & 0x00000000001fffff;
-  return (u32)w;
-}
-
-// decode morton code into ij idx and resolution level
-__device__ void MultiLevelSparseGrid::decode(u64 morton, i32 &lvl, i32 &i, i32 &j) {
-  lvl = i32((morton & ((u64)15 << 60)) >> 60);   // get the level stored in the last 4 bits
-  morton &= ~ ((u64)15 << 60); // remove the last 4 bits
-  i = compact(morton) - 1; 
-  j = compact(morton >> 1) - 1;
-}
-
-*/
 
 // encode ijk indices and resolution level into locational code
 __device__ u64 MultiLevelSparseGrid::encode(i32 lvl, i32 i, i32 j) {
@@ -275,7 +196,7 @@ void MultiLevelSparseGrid::paint(void) {
  
     for (i32 j=0; j<imageSize[1]; j++) {
       for (i32 i=0; i<imageSize[0]; i++) {
-        i32 idx = j*imageSize[1] + i;
+        i32 idx = j*imageSize[0] + i;
         image[j][i] = (imageData[idx] - minVal) / (maxVal - minVal + 1e-16) * 65535;
       }
     }
@@ -323,7 +244,7 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
                 u32 cFlag = cFlagsList[idx];
                 imageData[jPxl*imageSize[0] + iPxl] = lvl+1 - (2-cFlag)/2;
               }
-              if (gridOn && ii > 0 && jj > 0) {
+              if (gridOn && ii < 1 || jj < 1) {
                   imageData[jPxl*imageSize[0] + iPxl] = 0;
               }
             }
