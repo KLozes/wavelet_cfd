@@ -66,7 +66,7 @@ public:
   __device__ i32 getSize(i32 lvl);
   __device__ real getDx(i32 lvl);
   __device__ real getDy(i32 lvl);
-  __device__ void getCellPos(i32 lvl, i32 ib, i32 jb, i32 i, i32 j, real *pos);
+  __device__ Vec2 getCellPos(i32 lvl, i32 ib, i32 jb, i32 i, i32 j);
   __device__ u32 getNbrIdx(u32 bIdx, i32 i, i32 j);
   __host__ __device__ bool isInteriorBlock(i32 lvl, i32 i, i32 j);
   __host__ __device__ bool isExteriorBlock(i32 lvl, i32 i, i32 j);

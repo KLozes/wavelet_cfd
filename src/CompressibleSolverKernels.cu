@@ -38,8 +38,7 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb;
     grid.decode(loc, lvl, ib, jb);
-    real pos[2];
-    grid.getCellPos(lvl, ib, jb, i, j, pos);
+    Vec2 pos = grid.getCellPos(lvl, ib, jb, i, j);
 
     if (grid.icType == 0) {
       //
@@ -321,6 +320,15 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
       atomicAdd(&RhsRhoE[l1Idx], - fluxL[3] * dy / vol);
       atomicAdd(&RhsRhoE[d1Idx], - fluxD[3] * dx / vol);
  
+
+    // immersed boundary
+    Vec2 pos = grid.getCellPos(lvl, ib, jb, i, j);
+    real phi = grid.getBoundaryLevelSet(pos);
+    real X = grid.calcIbMask(phi);
+
+    real dt = grid.deltaT;
+    atomicAdd(&RhsRhoU[cIdx], 1.5*X/dt*Rho[cIdx]*(0.0 - U[cIdx]));
+    atomicAdd(&RhsRhoV[cIdx], 1.5*X/dt*Rho[cIdx]*(0.0 - V[cIdx]));
 
     //}
 
@@ -629,8 +637,7 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
       grid.bFlagsList[bIdx] = KEEP;
     }
 
-    real pos[2];
-    grid.getCellPos(lvl, ib, jb, i, j, pos);
+    Vec2 pos = grid.getCellPos(lvl, ib, jb, i, j);
     real dx = min(grid.getDx(lvl), grid.getDy(lvl)) ;
     real ls = grid.getBoundaryLevelSet(Vec2(pos[0], pos[1]));
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb)) {

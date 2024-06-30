@@ -107,9 +107,8 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   cudaDeviceSynchronize();
 }
 
-__device__ void MultiLevelSparseGrid::getCellPos(i32 lvl, i32 ib, i32 jb, i32 i, i32 j, real *pos) {
-  pos[0] = (ib*blockSize + i + .5)*getDx(lvl);
-  pos[1] = (jb*blockSize + j + .5)*getDy(lvl);
+__device__ Vec2 MultiLevelSparseGrid::getCellPos(i32 lvl, i32 ib, i32 jb, i32 i, i32 j) {
+  return Vec2((ib*blockSize + i + .5)*getDx(lvl),  (jb*blockSize + j + .5)*getDy(lvl));
 }
 
 __device__ u32 MultiLevelSparseGrid::getNbrIdx(u32 bIdx, i32 i, i32 j) {

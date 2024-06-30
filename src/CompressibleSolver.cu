@@ -194,7 +194,7 @@ __device__ real CompressibleSolver::getBoundaryLevelSet(Vec2 pos) {
 
   if (immerserdBcType == 1) {
     // circle
-    real radius = .1;
+    real radius = .05;
     real center[2] = {.5, .5};
     return radius - sqrt((pos[0]-center[0])*(pos[0]-center[0]) + (pos[1]-center[1])*(pos[1]-center[1]));
   }
@@ -315,27 +315,17 @@ __device__ Vec4 CompressibleSolver::hllcFlux(Vec4 qL, Vec4 qR, Vec2 normal) {
            (SR-vnR)/(SR-SM) * rR*(ny*SM + nx*vR),
            (SR-vnR)/(SR-SM) * (eR + (SM-vnR)*(rR*SM + pR/(SR - vnR))));
 
-  /*
-  // hllm state
-  aR = rR*(SR-vnR);
-  aL = rL*(SL-vnL);
-  real vtR = ny*uR + nx*vR;
-  real vtL = ny*uL + nx*vL;
-  Vec4 qLS(aL/(SL-SM) * 1, 
-           aL/(SL-SM) * (nx*SM + ny*(aR*vtR - aL*vtL)/(aR-aL)),
-           aL/(SL-SM) * (ny*SM + nx*(aR*vtR - aL*vtL)/(aR-aL)),
-           aL/(SL-SM) * (eL/rL + (SM-vnL)*(SM + pL/aL) + .5*((aR*vtR*vtR - aL*vtL*vtL)/(aR-aL) - vtL*vtL)));
-
-  Vec4 qRS(aR/(SR-SM) * 1, 
-           aR/(SR-SM) * (nx*SM + ny*(aR*vtR - aL*vtL)/(aR-aL)),
-           aR/(SR-SM) * (ny*SM + nx*(aR*vtR - aL*vtL)/(aR-aL)),
-           aR/(SR-SM) * (eR/rR + (SM-vnR)*(SM + pR/aR) + .5*((aR*vtR*vtR - aL*vtL*vtL)/(aR-aL) - vtR*vtR)));
-  */
-
   // Compute the HLLC flux.
   Vec4 Flux(.5*(FL[0]+FR[0]) - .5*(abs(SL)*(qLS[0]-qL[0]) + abs(SM)*(qRS[0]-qLS[0]) + abs(SR)*(qR[0]-qRS[0])), 
             .5*(FL[1]+FR[1]) - .5*(abs(SL)*(qLS[1]-qL[1]) + abs(SM)*(qRS[1]-qLS[1]) + abs(SR)*(qR[1]-qRS[1])),
             .5*(FL[2]+FR[2]) - .5*(abs(SL)*(qLS[2]-qL[2]) + abs(SM)*(qRS[2]-qLS[2]) + abs(SR)*(qR[2]-qRS[2])),
             .5*(FL[3]+FR[3]) - .5*(abs(SL)*(qLS[3]-qL[3]) + abs(SM)*(qRS[3]-qLS[3]) + abs(SR)*(qR[3]-qRS[3])));
   return Flux;
+}
+
+
+__device__ real CompressibleSolver::calcIbMask(real phi) {
+  real dx = min(getDx(nLvls-1), getDy(nLvls-1));
+  real eps = .5;
+  return (.5 * (1 + tanh(phi / (2 * eps * dx))));
 }
