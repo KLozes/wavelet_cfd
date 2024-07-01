@@ -279,15 +279,15 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
       qD[0] = grid.tvdRec(Rho[d2Idx], Rho[d1Idx], Rho[cIdx]);
       qU[0] = grid.tvdRec(Rho[u1Idx], Rho[cIdx],  Rho[d1Idx]);
 
-      qL[1] = grid.tvdRec(U[l2Idx], U[l1Idx], U[cIdx]);
-      qR[1] = grid.tvdRec(U[r1Idx], U[cIdx],  U[l1Idx]);
-      qD[1] = grid.tvdRec(U[d2Idx], U[d1Idx], U[cIdx]);
-      qU[1] = grid.tvdRec(U[u1Idx], U[cIdx],  U[d1Idx]);
+      qL[1] = grid.tvdRecU(U[l2Idx], U[l1Idx], U[cIdx]);
+      qR[1] = grid.tvdRecU(U[r1Idx], U[cIdx],  U[l1Idx]);
+      qD[1] = grid.tvdRecU(U[d2Idx], U[d1Idx], U[cIdx]);
+      qU[1] = grid.tvdRecU(U[u1Idx], U[cIdx],  U[d1Idx]);
 
-      qL[2] = grid.tvdRec(V[l2Idx], V[l1Idx], V[cIdx]);
-      qR[2] = grid.tvdRec(V[r1Idx], V[cIdx],  V[l1Idx]);
-      qD[2] = grid.tvdRec(V[d2Idx], V[d1Idx], V[cIdx]);
-      qU[2] = grid.tvdRec(V[u1Idx], V[cIdx],  V[d1Idx]);
+      qL[2] = grid.tvdRecU(V[l2Idx], V[l1Idx], V[cIdx]);
+      qR[2] = grid.tvdRecU(V[r1Idx], V[cIdx],  V[l1Idx]);
+      qD[2] = grid.tvdRecU(V[d2Idx], V[d1Idx], V[cIdx]);
+      qU[2] = grid.tvdRecU(V[u1Idx], V[cIdx],  V[d1Idx]);
 
       qL[3] = grid.tvdRec(P[l2Idx], P[l1Idx], P[cIdx]);
       qR[3] = grid.tvdRec(P[r1Idx], P[cIdx],  P[l1Idx]);

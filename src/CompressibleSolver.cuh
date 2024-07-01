@@ -59,7 +59,9 @@ public:
 
   __device__ Vec4 prim2cons(Vec4 prim);
   __device__ Vec4 cons2prim(Vec4 cons);
+  __device__ real limU(real &r);
   __device__ real lim(real &r);
+  __device__ real tvdRecU(real &ul, real &uc, real &ur);
   __device__ real tvdRec(real &ul, real &uc, real &ur);
   __device__ Vec4 hlleFlux(Vec4 qL, Vec4 qR, Vec2 normal);
   __device__ Vec4 hllcFlux(Vec4 qL, Vec4 qR, Vec2 normal);

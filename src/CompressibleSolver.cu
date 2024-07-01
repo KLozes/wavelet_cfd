@@ -142,7 +142,7 @@ void CompressibleSolver::interpolateFields(void) {
   interpolateFieldsKernel<<<1000, cudaBlockSize>>>(*this);
 }
 
-__device__ real CompressibleSolver::lim(real &r) {
+__device__ real CompressibleSolver::limU(real &r) {
   // new TVD
   //return ((r > 0.0 && r < 1.0) ? (2.0*r + r*r*r) / (1.0 + 2.0*r*r) : r);
 
@@ -165,6 +165,16 @@ __device__ real CompressibleSolver::lim(real &r) {
     u = min(temp0 * w1 + temp2 * (1.0 - w1), temp2);
   }
   return u;
+}
+
+__device__ real CompressibleSolver::lim(real &r) {
+  // new TVD
+  return ((r > 0.0 && r < 1.0) ? (2.0*r + r*r*r) / (1.0 + 2.0*r*r) : r);
+}
+
+__device__ real CompressibleSolver::tvdRecU(real &ul, real &uc, real &ur) {
+  real r = (uc - ul) / (copysign(1.0, ur - ul)*fmaxf(abs(ur - ul), 1e-32));
+  return ul + limU(r) * (ur - ul);
 }
 
 __device__ real CompressibleSolver::tvdRec(real &ul, real &uc, real &ur) {

@@ -7,16 +7,16 @@
 int main(int argc, char* argv[]) {
   real domainSize[2] = {2.0, 1.0};
   u32 baseGridSize[2] = {blockSize*10, blockSize*5};
-  u32 nLvls = 8;
+  u32 nLvls = 9;
   real cfl = .80;
-  real waveletThresh = .005;
+  real waveletThresh = .002;
   real tStep = .02;
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls);
   solver->cfl = cfl;
   solver->waveletThresh = waveletThresh;
-  solver->icType = 0;
-  solver->bcType = 0;
+  solver->icType = 2;
+  solver->bcType = 1;
   solver->immerserdBcType = 1;
   solver->initialize();
 
@@ -26,7 +26,11 @@ int main(int argc, char* argv[]) {
     t += solver->step(tStep);
 
     solver->paint();
-    printf("n: %d, t = %f, tSolver = %d, tGrid = %d, nBlocks = %d\n", solver->imageCounter, t, solver->tSolver , solver->tGrid, solver->hashTable.nKeys);
+    real tTotal = solver->tSolver + solver->tGrid;
+    real tSolver = real(solver->tSolver) / tTotal;
+    real tGrid = real(solver->tGrid) / tTotal;
+    real comp = real(solver->hashTable.nKeys) / ((baseGridSize[0])*(baseGridSize[1])*powi(2,nLvls-1)*powi(2,nLvls-1)/16);
+    printf("n: %d, t = %f, tSolver = %f, tGrid = %f, compression = %f\n", solver->imageCounter, t, tSolver , tGrid, comp);
 
   }
   
