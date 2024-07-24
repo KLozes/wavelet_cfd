@@ -220,7 +220,7 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
     U = getField(f);
   }
 
-  bool gridOn = true;
+  bool gridOn = false;
 
   // set the pixel values 
   for (uint bIdx=0; bIdx < hashTable.nKeys; bIdx++) {
@@ -243,7 +243,7 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
                 u32 cFlag = cFlagsList[idx];
                 imageData[jPxl*imageSize[0] + iPxl] = lvl+1 - (2-cFlag)/2;
               }
-              if (gridOn && ii < 1 || jj < 1) {
+              if (gridOn && ii > 0 && jj > 0) {
                   imageData[jPxl*imageSize[0] + iPxl] = 0;
               }
             }
