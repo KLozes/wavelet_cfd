@@ -41,7 +41,20 @@ __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
 
 }
 
-__global__ void updateTreeIndicesKernel(MultiLevelSparseGrid &grid)
+__global__ void resetOldTreeKernel(MultiLevelSparseGrid &grid)
+{
+  START_BLOCK_LOOP
+
+    grid.prntIdxListOld[bIdx] = bEmpty;
+    grid.chldIdxListOld[4*bIdx + 0] = bEmpty;
+    grid.chldIdxListOld[4*bIdx + 1] = bEmpty;
+    grid.chldIdxListOld[4*bIdx + 2] = bEmpty;
+    grid.chldIdxListOld[4*bIdx + 3] = bEmpty;
+
+  END_BLOCK_LOOP
+}
+
+__global__ void updateOldTreeKernel(MultiLevelSparseGrid &grid)
 {
   START_BLOCK_LOOP
 
@@ -52,7 +65,7 @@ __global__ void updateTreeIndicesKernel(MultiLevelSparseGrid &grid)
     grid.decode(grid.bLocList[bIdx], lvl,  i, j);
     u32 pIdx = grid.prntIdxList[oldIdx];
     if (pIdx != bEmpty) {
-      grid.chldIdxListOld[4*pIdx + i%2 + 2*(j%2)] = bIdx;
+      grid.chldIdxListOld[4*pIdx + 2*(j%2) + i%2] = bIdx;
     }
 
     // update the parent index of each of this blocks children
@@ -66,7 +79,7 @@ __global__ void updateTreeIndicesKernel(MultiLevelSparseGrid &grid)
   END_BLOCK_LOOP
 }
 
-__global__ void copyTreeIndicesKernel(MultiLevelSparseGrid &grid)
+__global__ void copyTreeFromOldKernel(MultiLevelSparseGrid &grid)
 {
   START_BLOCK_LOOP
 
@@ -255,9 +268,16 @@ __global__ void deleteDataKernel(MultiLevelSparseGrid &grid) {
   START_CELL_LOOP
 
     if (grid.bFlagsList[bIdx] == DELETE) {
-      printf("%d delete\n", bIdx);
-      grid.bLocList[bIdx] = kEmpty;
-      grid.bIdxList[bIdx] = bEmpty;
+      if (cIdx % blockSizeTot == 0) {
+        grid.bLocList[bIdx] = kEmpty;
+        grid.bIdxList[bIdx] = bEmpty;
+        grid.prntIdxList[bIdx] = bEmpty;
+        grid.chldIdxList[4*bIdx] = bEmpty;
+        grid.chldIdxList[4*bIdx+1] = bEmpty;
+        grid.chldIdxList[4*bIdx+2] = bEmpty;
+        grid.chldIdxList[4*bIdx+3] = bEmpty;
+        atomicAdd(&(grid.nBlocksNew), -1);
+      }
       grid.cFlagsList[cIdx] = 0;
       for(i32 f=0; f<grid.nFields; f++) {
         real *F = grid.getField(f);
@@ -307,14 +327,14 @@ __global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f) {
     i32 lvl, ib, jb;
     grid.decode(loc, lvl, ib, jb);
 
-    printf("%d ", bIdx);
-
     if (grid.isInteriorBlock(lvl, ib, jb) && loc != kEmpty && grid.cFlagsList[cIdx] == ACTIVE) {
       u32 nPixels = powi(2,(grid.nLvls - 1 - lvl));
+      i32 ibb = ib - powi(2,lvl);
+      i32 jbb = jb - powi(2,lvl);
       for (uint jj=0; jj<nPixels; jj++) {
         for (uint ii=0; ii<nPixels; ii++) {
-          u32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
-          u32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
+          u32 iPxl = ibb*blockSize*nPixels + i*nPixels + ii;
+          u32 jPxl = jbb*blockSize*nPixels + j*nPixels + jj;
           if (f >= 0) {
             grid.imageData[jPxl*grid.imageSize[0] + iPxl] = U[cIdx];
           }

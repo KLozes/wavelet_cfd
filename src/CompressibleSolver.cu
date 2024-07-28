@@ -17,7 +17,7 @@ void CompressibleSolver::initialize(void) {
   printf("nblocks %d\n", nBlocks);
   paint();
 
-  for(i32 lvl=0; lvl<1; lvl++){
+  for(i32 lvl=0; lvl<nLvls; lvl++){
     forwardWaveletTransform();
     adaptGrid();
     setInitialConditions();
@@ -25,7 +25,6 @@ void CompressibleSolver::initialize(void) {
     setBoundaryConditions();
     sortBlocks();
     cudaDeviceSynchronize();
-    printf("nblocks %d\n", nBlocks);
     paint();
     printf("nblocks %d\n", nBlocks);
   }

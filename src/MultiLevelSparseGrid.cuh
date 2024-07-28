@@ -3,7 +3,6 @@
 
 #include "Settings.cuh"
 #include "Util.cuh"
-#include "HashTable.cuh"
 
 /*
 ** A multilevel sparse grid data structure
@@ -24,8 +23,6 @@ enum CELL_FLAGS {
 class MultiLevelSparseGrid : public Managed {
 public:
 
-  HashTable hashTable;
-
   real domainSize[2] = {1.0, 1.0};
   i32 baseGridSize[2] = {1,1};
   i32 nLvls;
@@ -34,27 +31,24 @@ public:
 
   u32 blockCounter;
   u32 imageCounter;
-  u32 nBlocks;
-  u32 nBlocksPrev;
+  i32 nBlocks;
+  i32 nBlocksNew;
 
-  u64 *bLocList; // block morton codes
-  u32 *bIdxList; // block memory indices
+  u64 *bLocList;        // block morton codes
+  u32 *bIdxList;        // block memory indices
 
-  u32 *nbrIdxList;     // cell neighbor indeces
-  u32 *prntIdxList;    // block parent indices
-  u32 *chldIdxList;    // block child indices
-  u32 *prntIdxListOld; // old block parent indices
-  u32 *chldIdxListOld; // old block child indices
+  u32 *nbrIdxList;      // block neighbor indeces
+  u32 *prntIdxList;     // block parent indices
+  u32 *chldIdxList;     // block child indices
+  u32 *prntIdxListOld;  // old block parent indices
+  u32 *chldIdxListOld;  // old block child indices
 
-  u32 *bFlagsList;     // block Flags
-  u32 *cFlagsList;     // cell Flags
+  u32 *bFlagsList;      // block Flags
+  u32 *cFlagsList;      // cell Flags
 
-  real *fieldData; // flow field data
-  real *imageData; // output image data
+  real *fieldData;      // flow field data
+  real *imageData;      // output image data
   real *pixelCountData; // number of 
-
-
-  int lock;
 
   MultiLevelSparseGrid(real *domainSize, u32 *baseGridSize_, u32 nLvls_, u32 nFields_);
 
@@ -77,7 +71,7 @@ public:
   __host__ __device__ real *getField(u32 f);
 
   __device__ void activateBlock(i32 lvl, i32 i, i32 j);
-__device__ u32 getBlockIdx(i32 lvl, i32 i, i32 j);
+  __device__ u32 getBlockIdx(i32 lvl, i32 i, i32 j);
 
   
   //__device__ u64 split(u32 a);
