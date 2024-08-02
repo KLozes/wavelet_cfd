@@ -276,7 +276,7 @@ __global__ void deleteDataKernel(MultiLevelSparseGrid &grid) {
         grid.chldIdxList[4*bIdx+1] = bEmpty;
         grid.chldIdxList[4*bIdx+2] = bEmpty;
         grid.chldIdxList[4*bIdx+3] = bEmpty;
-        atomicAdd(&(grid.nBlocksNew), -1);
+        //atomicAdd(&(grid.nBlocksNew), -1);
       }
       grid.cFlagsList[cIdx] = 0;
       for(i32 f=0; f<grid.nFields; f++) {

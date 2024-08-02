@@ -112,11 +112,12 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   thrust::sort_by_key(thrust::device, bLocList, bLocList+nBlocks, bIdxList);
   sortFieldData();
   resetOldTreeKernel<<<1000,cudaBlockSize>>>(*this);
-  updateOldTreeKernel<<<1000, cudaBlockSize>>>(*this);
-  copyTreeFromOldKernel<<<1000, cudaBlockSize>>>(*this);
-  updateNbrIndicesKernel<<<1000, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = nBlocksNew;
+  updateOldTreeKernel<<<1000, cudaBlockSize>>>(*this);
+  copyTreeFromOldKernel<<<1000, cudaBlockSize>>>(*this);
+  nBlocks = nBlocksNew;
+  updateNbrIndicesKernel<<<1000, cudaBlockSize>>>(*this);
   flagActiveCellsKernel<<<1000, cudaBlockSize>>>(*this);
   flagParentCellsKernel<<<1000, cudaBlockSize>>>(*this); 
   cudaDeviceSynchronize();
@@ -243,8 +244,8 @@ void MultiLevelSparseGrid::paint(void) {
   png::image<png::gray_pixel_16> image(imageSize[0], imageSize[1]);
 
   for (i32 f=-1; f<4; f++) {
-    computeImageData(f);
-    //computeImageDataKernel<<<1000, cudaBlockSize>>>(*this, f);
+    //computeImageData(f);
+    computeImageDataKernel<<<1000, cudaBlockSize>>>(*this, f);
     cudaDeviceSynchronize();
 
     // normalize image data and fill png image
@@ -288,14 +289,14 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
     U = getField(f);
   }
 
-  bool gridOn = true;
+  bool gridOn = false;
 
   // set the pixel values 
   for (uint bIdx=0; bIdx < nBlocks; bIdx++) {
     u64 loc = bLocList[bIdx];
     i32 lvl, ib, jb;
     decode(loc, lvl, ib, jb);
-    if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty) {
+    if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty ) {
       ib -= powi(2, lvl);
       jb -= powi(2, lvl);
       for (uint j = 0; j < blockSize; j++) {

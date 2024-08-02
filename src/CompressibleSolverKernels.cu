@@ -105,7 +105,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
     grid.decode(loc, lvl, ib, jb);
 
     if (grid.isExteriorBlock(lvl, ib, jb)) {
-      u32 gridSize[2] = {grid.baseGridSize[0]*powi(2, lvl)/blockSize, 
+      i32 gridSize[2] = {grid.baseGridSize[0]*powi(2, lvl)/blockSize, 
                          grid.baseGridSize[1]*powi(2, lvl)/blockSize};
       if (grid.bcType == 0) {
         //
@@ -115,16 +115,16 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
         // figure out internal cell for neuman boundary conditions
         i32 ibc = i;
         i32 jbc = j;
-        if (ib < 0) {
-          ibc = blockSize;
+        if (ib < powi(2,lvl)) {
+          ibc = blockSize; // TODO fix BC
         }
-        if (jb < 0) {
+        if (jb < powi(2,lvl)) {
           jbc = blockSize;
         }
-        if (ib >= i32(gridSize[0])) {
+        if (ib > gridSize[0]) {
           ibc = -1; 
         }
-        if (jb >= i32(gridSize[1])) {
+        if (jb > gridSize[1]) {
           jbc = -1;
         }
         u32 bcIdx = grid.getNbrIdx(bIdx, ibc, jbc); 
@@ -133,15 +133,15 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
         Rho[cIdx] = Rho[bcIdx];
         RhoE[cIdx] = RhoE[bcIdx];
         
-        if (ib < 0 || ib >= gridSize[0]) {
+        if (ib < powi(2,lvl) || ib > gridSize[0]) {
           RhoU[cIdx] = -RhoU[bcIdx];
           RhoV[cIdx] =  RhoV[bcIdx];
         }
-        if (jb < 0 || jb >= gridSize[1]) {
+        if (jb < powi(2,lvl) || jb > gridSize[1]) {
           RhoU[cIdx] =  RhoU[bcIdx];
           RhoV[cIdx] = -RhoV[bcIdx];
         }
-        if ((ib < 0 || ib >= gridSize[0]) && (jb < 0 || jb >= gridSize[1])) {
+        if ((ib < powi(2,lvl) || ib > gridSize[0]) && (jb < powi(2,lvl)|| jb > gridSize[1])) {
           RhoU[cIdx] = -RhoU[bcIdx];
           RhoV[cIdx] = -RhoV[bcIdx];
         }

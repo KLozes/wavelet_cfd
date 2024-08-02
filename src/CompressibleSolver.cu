@@ -41,6 +41,7 @@ real CompressibleSolver::step(real tStep) {
     if (iter % 4 == 0 && nLvls > 1) {
       restrictFields();
       forwardWaveletTransform();
+      cudaDeviceSynchronize();
       adaptGrid();
       inverseWaveletTransform();
       sortBlocks();
@@ -104,9 +105,9 @@ void CompressibleSolver::primitiveToConservative(void) {
 void CompressibleSolver::forwardWaveletTransform(void) {
   cudaDeviceSynchronize();
   computeMagRhoUKernel<<<1000, cudaBlockSize>>>(*this); 
-  maxRho = *(thrust::max_element(thrust::device, getField(0), getField(0)+nBlocks*blockSize));
-  maxMagRhoU = *(thrust::max_element(thrust::device, getField(12), getField(12)+nBlocks*blockSize));
-  maxRhoE = *(thrust::max_element(thrust::device, getField(3), getField(3)+nBlocks*blockSize));
+  maxRho = *(thrust::max_element(thrust::device, getField(0), getField(0)+nBlocks*blockSizeTot));
+  maxMagRhoU = *(thrust::max_element(thrust::device, getField(12), getField(12)+nBlocks*blockSizeTot));
+  maxRhoE = *(thrust::max_element(thrust::device, getField(3), getField(3)+nBlocks*blockSizeTot));
   cudaDeviceSynchronize();
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
   copyToOldFieldsKernel<<<1000, cudaBlockSize>>>(*this); 
