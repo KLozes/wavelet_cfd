@@ -24,17 +24,14 @@ __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
 
 __global__ void updateIndicesKernel(MultiLevelSparseGrid &grid) {
   
-  u32 bIdx = threadIdx.x + blockIdx.x * blockDim.x;
-  while (bIdx < grid.nBlocks) {
+  START_BLOCK_LOOP
 
     if (grid.bLocList[bIdx] != kEmpty) {
       grid.bIdxList[bIdx] = bIdx;
-      grid.hashTable.insert(grid.bLocList[bIdx]);
-      grid.hashTable.setValue(grid.bLocList[bIdx], bIdx);
+      grid.hashTable.insertValue(grid.bLocList[bIdx], bIdx);
     }
 
-    bIdx += gridDim.x*blockDim.x;
-  }
+  END_BLOCK_LOOP
 }
 
 __global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid) {
@@ -227,8 +224,11 @@ __global__ void deleteDataKernel(MultiLevelSparseGrid &grid) {
   START_CELL_LOOP
 
     if (grid.bFlagsList[bIdx] == DELETE) {
-      grid.bLocList[bIdx] = kEmpty;
-      grid.bIdxList[bIdx] = bEmpty;
+      if (cIdx % blockSizeTot == 0) {
+        grid.bLocList[bIdx] = kEmpty;
+        grid.bIdxList[bIdx] = bEmpty;
+        atomicAdd(&(grid.nBlocks), -1);
+      }
       grid.cFlagsList[cIdx] = 0;
       for(i32 f=0; f<grid.nFields; f++) {
         real *F = grid.getField(f);

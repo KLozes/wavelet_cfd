@@ -24,7 +24,6 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, u32 *baseGridSize_
 
   lock = 0;
 
-
   // grid size checking
   assert(isPowerOf2(blockSize));
   assert(baseGridSize[0]*baseGridSize[1]/blockSize/blockSize < nBlocksMax);
@@ -68,6 +67,7 @@ void MultiLevelSparseGrid::initializeBaseGrid(void) {
   initGridKernel<<<nBlocksMax/cudaBlockSize, cudaBlockSize>>>(*this);
   addBoundaryBlocksKernel<<<1000, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
+  nBlocks = hashTable.nKeys;
 
   // sort the data by location code
   sortBlocks();
@@ -86,6 +86,8 @@ void MultiLevelSparseGrid::adaptGrid(void) {
     }
     addBoundaryBlocksKernel<<<1000, cudaBlockSize>>>(*this);
     setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
+    cudaDeviceSynchronize();
+    nBlocks = hashTable.nKeys;
     deleteDataKernel<<<1000, cudaBlockSize>>>(*this);
     updatePrntIndicesKernel<<<1000, cudaBlockSize>>>(*this);
   }
@@ -97,8 +99,8 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   thrust::sort_by_key(thrust::device, bLocList, bLocList+hashTable.nKeys, bIdxList);
   sortFieldData();
   cudaDeviceSynchronize();
-  nBlocks = hashTable.nKeys;
   hashTable.reset();
+  hashTable.nKeys = nBlocks;
   updateIndicesKernel<<<1000, cudaBlockSize>>>(*this);
   updatePrntIndicesKernel<<<1000, cudaBlockSize>>>(*this);
   updateNbrIndicesKernel<<<1000, cudaBlockSize>>>(*this);
