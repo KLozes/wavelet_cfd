@@ -65,7 +65,7 @@ public:
   __device__ real tvdRec(real &ul, real &uc, real &ur);
   __device__ Vec4 hlleFlux(Vec4 qL, Vec4 qR, Vec2 normal);
   __device__ Vec4 hllcFlux(Vec4 qL, Vec4 qR, Vec2 normal);
-  __device__ real getBoundaryLevelSet(Vec2 pos);
+  __device__ real getBoundaryLevelSet(Vec3 pos);
   __device__ real calcIbMask(real phi);
 
 };

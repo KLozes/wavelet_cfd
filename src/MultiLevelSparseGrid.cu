@@ -9,9 +9,11 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, u32 *baseGridSize_
 
   domainSize[0] = domainSize_[0];
   domainSize[1] = domainSize_[1];
+  domainSize[2] = domainSize_[2];
 
   baseGridSize[0] = baseGridSize_[0];
   baseGridSize[1] = baseGridSize_[1];
+  baseGridSize[2] = baseGridSize_[2];
 
   nLvls = nLvls_;
   nFields = nFields_;
@@ -19,21 +21,17 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, u32 *baseGridSize_
   imageSize[0] = (baseGridSize[0])*powi(2,nLvls-1);  // image size is the max resolution not including boundary condition blocks
   imageSize[1] = (baseGridSize[1])*powi(2,nLvls-1);
 
-  blockCounter = 0;
   imageCounter = 0;
-
-  lock = 0;
 
   // grid size checking
   assert(isPowerOf2(blockSize));
-  assert(baseGridSize[0]*baseGridSize[1]/blockSize/blockSize < nBlocksMax);
+  assert(baseGridSize[0]*baseGridSize[1]*baseGridSize[2]/blockSizeTot < nBlocksMax);
 
   cudaMallocManaged(&bLocList, nBlocksMax*sizeof(u64));
   cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(u32));
   cudaMallocManaged(&prntIdxList, nBlocksMax*sizeof(u32));
-  cudaMallocManaged(&chldIdxList, 4*nBlocksMax*sizeof(u32));
-  cudaMallocManaged(&nbrIdxList, 9*nBlocksMax*sizeof(u32));
+  cudaMallocManaged(&nbrIdxList, 27*nBlocksMax*sizeof(u32));
   cudaMallocManaged(&cFlagsList, blockSizeTot*nBlocksMax*sizeof(u32));
   cudaMallocManaged(&fieldData, nFields*blockSizeTot*nBlocksMax*sizeof(real));
   cudaMallocManaged(&imageData, imageSize[0]*imageSize[1]*sizeof(real));
@@ -42,8 +40,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, u32 *baseGridSize_
   cudaMemset(bIdxList, 0, nBlocksMax*sizeof(u32));
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
   cudaMemset(prntIdxList, 0, nBlocksMax*sizeof(u32));
-  cudaMemset(chldIdxList, 0, 4*nBlocksMax*sizeof(u32));
-  cudaMemset(nbrIdxList, 0, 9*nBlocksMax*sizeof(u32));
+  cudaMemset(nbrIdxList, 0, 27*nBlocksMax*sizeof(u32));
   cudaMemset(cFlagsList, 0, blockSizeTot*nBlocksMax*sizeof(u32));
   cudaMemset(fieldData, 0, nFields*blockSizeTot*nBlocksMax*sizeof(real));
   cudaMemset(imageData, 0, imageSize[0]*imageSize[1]*sizeof(real));
@@ -64,7 +61,11 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
 
 void MultiLevelSparseGrid::initializeBaseGrid(void) {
   // fill the bLocList with base grid blocks
-  initGridKernel<<<nBlocksMax/cudaBlockSize, cudaBlockSize>>>(*this);
+  dim3 cudaBlockSize3(8,8,8);
+  dim3 nCudaBlocks3(baseGridSize[0]/blockSize/8+1, 
+                    baseGridSize[1]/blockSize/8+1, 
+                    baseGridSize[2]/blockSize/8+1);
+  initGridKernel<<<nCudaBlocks3, cudaBlockSize3>>>(*this);
   addBoundaryBlocksKernel<<<1000, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
@@ -109,17 +110,21 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   cudaDeviceSynchronize();
 }
 
-__device__ Vec2 MultiLevelSparseGrid::getCellPos(i32 lvl, i32 ib, i32 jb, i32 i, i32 j) {
-  return Vec2((ib*blockSize + i + .5)*getDx(lvl),  (jb*blockSize + j + .5)*getDy(lvl));
+__device__ Vec3 MultiLevelSparseGrid::getCellPos(i32 lvl, i32 ib, i32 jb, i32 kb, i32 i, i32 j, i32 k) {
+  return Vec3((ib*blockSize + i + .5)*getDx(lvl),  
+              (jb*blockSize + j + .5)*getDy(lvl), 
+              (kb*blockSize + k + .5)*getDz(lvl));
 }
 
-__device__ u32 MultiLevelSparseGrid::getNbrIdx(u32 bIdx, i32 i, i32 j) {
+__device__ u32 MultiLevelSparseGrid::getNbrIdx(u32 bIdx, i32 i, i32 j, i32 k) {
   i += blockSize;
   j += blockSize;
+  k += blockSize;
   i32 ib = i / blockSize;
   i32 jb = j / blockSize;
-  i32 nbrIdx = nbrIdxList[9*bIdx + ib + 3*jb];
-  return blockSizeTot*nbrIdx + (i%blockSize) + (j%blockSize)*blockSize;
+  i32 kb = k / blockSize;
+  i32 nbrIdx = nbrIdxList[9*bIdx + ib + 3*jb + 9*kb];
+  return blockSizeTot*nbrIdx + (i%blockSize) + (j%blockSize)*blockSize + (k%blockSize)*blockSize*blockSize;
 }
 
 __device__ real MultiLevelSparseGrid::getDx(i32 lvl) {
@@ -130,22 +135,27 @@ __device__ real MultiLevelSparseGrid::getDy(i32 lvl) {
   return real(domainSize[1])/real(baseGridSize[1]*powi(2,lvl));
 }
 
-__device__ bool MultiLevelSparseGrid::isInteriorBlock(i32 lvl, i32 i, i32 j) { 
-  i32 gridSize[2] = {i32(baseGridSize[0]/blockSize*powi(2,lvl)), 
-                     i32(baseGridSize[1]/blockSize*powi(2,lvl))};
-  return i >= 0 && j >= 0 && i < gridSize[0] && j < gridSize[1];
+__device__ real MultiLevelSparseGrid::getDz(i32 lvl) {
+  return real(domainSize[2])/real(baseGridSize[2]*powi(2,lvl));
 }
 
-__device__ bool MultiLevelSparseGrid::isExteriorBlock(i32 lvl, i32 i, i32 j) {
-  return !isInteriorBlock(lvl, i, j);
+__device__ bool MultiLevelSparseGrid::isInteriorBlock(i32 lvl, i32 i, i32 j, i32 k) { 
+  i32 gridSize[3] = {i32(baseGridSize[0]/blockSize*powi(2,lvl)), 
+                     i32(baseGridSize[1]/blockSize*powi(2,lvl)),
+                     i32(baseGridSize[2]/blockSize*powi(2,lvl))};
+  return i >= 0 && j >= 0 && k >= 0 && i < gridSize[0] && j < gridSize[1] && k < gridSize[2];
+}
+
+__device__ bool MultiLevelSparseGrid::isExteriorBlock(i32 lvl, i32 i, i32 j, i32 k) {
+  return !isInteriorBlock(lvl, i, j, k);
 }
 
 __host__ __device__ real* MultiLevelSparseGrid::getField(u32 f) {
   return &fieldData[f*nBlocksMax*blockSizeTot];
 }
 
-__device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j) {
-  u64 loc = encode(lvl, i, j);
+__device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j, i32 k) {
+  u64 loc = encode(lvl, i, j, k);
   u32 idx = hashTable.insert(loc);
   if (idx != bEmpty) { 
     // new key was inserted if not bEmpty
@@ -156,17 +166,19 @@ __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j) {
 }
 
 // encode ijk indices and resolution level into locational code
-__device__ u64 MultiLevelSparseGrid::encode(i32 lvl, i32 i, i32 j) {
+__device__ u64 MultiLevelSparseGrid::encode(i32 lvl, i32 i, i32 j, i32 k) {
   i += 1; // add one so that boundary blocks are no longer negative negative
   j += 1;
+  k += 1;
   u64 loc = 0;
-  loc |= (u64)lvl << 60 | (u64)j << 20 | (u64)i;
+  loc |= (u64)lvl << 60 | (u64) k << 40 | (u64)j << 20 | (u64)i;
   return loc;
 }
 
 // decode locational code into ij idx and resolution level
-__device__ void MultiLevelSparseGrid::decode(u64 loc, i32 &lvl, i32 &i, i32 &j) {
+__device__ void MultiLevelSparseGrid::decode(u64 loc, i32 &lvl, i32 &i, i32 &j, i32 &k) {
   lvl = loc >> 60;
+  k = ((loc >> 40) & ((1 << 20)-1)) - 1;
   j = ((loc >> 20) & ((1 << 20)-1)) - 1;
   i = (loc & ((1 << 20)-1)) - 1;
 }
@@ -227,9 +239,9 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
   // set the pixel values 
   for (uint bIdx=0; bIdx < hashTable.nKeys; bIdx++) {
     u64 loc = bLocList[bIdx];
-    i32 lvl, ib, jb;
-    decode(loc, lvl, ib, jb);
-    if (isInteriorBlock(lvl, ib, jb) && loc != kEmpty) {
+    i32 lvl, ib, jb, kb;
+    decode(loc, lvl, ib, jb, kb);
+    if (isInteriorBlock(lvl, ib, jb, kb) && loc != kEmpty) {
       for (uint j = 0; j < blockSize; j++) {
         for (uint i = 0; i < blockSize; i++) {
           u32 idx = i + blockSize * j + bIdx*blockSizeTot;

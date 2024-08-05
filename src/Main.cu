@@ -27,8 +27,8 @@ int main(int argc, char* argv[]) {
 
     solver->paint();
     real tTotal = solver->tSolver + solver->tGrid;
-    real tSolver = real(solver->tSolver) / tTotal;
-    real tGrid = real(solver->tGrid) / tTotal;
+    real tSolver = real(solver->tSolver);
+    real tGrid = real(solver->tGrid);
     real comp = real(solver->hashTable.nKeys) / ((baseGridSize[0])*(baseGridSize[1])*powi(2,nLvls-1)*powi(2,nLvls-1)/16);
     printf("n: %d, t = %f, tSolver = %f, tGrid = %f, compression = %f\n", solver->imageCounter, t, tSolver , tGrid, comp);
 

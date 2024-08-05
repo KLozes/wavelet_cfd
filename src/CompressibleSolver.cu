@@ -200,7 +200,7 @@ __device__ Vec4 CompressibleSolver::cons2prim(Vec4 cons) {
   return prim;
 }
 
-__device__ real CompressibleSolver::getBoundaryLevelSet(Vec2 pos) {
+__device__ real CompressibleSolver::getBoundaryLevelSet(Vec3 pos) {
 
   if (immerserdBcType == 1) {
     // circle
