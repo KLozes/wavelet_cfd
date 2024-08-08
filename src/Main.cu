@@ -6,8 +6,8 @@
 
 int main(int argc, char* argv[]) {
   real domainSize[2] = {1.0, 1.0};
-  u32 baseGridSize[2] = {blockSize*10, blockSize*10};
-  u32 nLvls = 7;
+  i32 baseGridSize[2] = {blockSize*10, blockSize*10};
+  i32 nLvls = 7;
   real cfl = .80;
   real waveletThresh = .002;
   real tStep = .02;

@@ -5,7 +5,7 @@
 #include "MultiLevelSparseGrid.cuh"
 #include "MultiLevelSparseGridKernels.cuh"
 
-MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, u32 *baseGridSize_, u32 nLvls_, u32 nFields_) {
+MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_, i32 nLvls_, i32 nFields_) {
 
   domainSize[0] = domainSize_[0];
   domainSize[1] = domainSize_[1];
@@ -28,20 +28,20 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, u32 *baseGridSize_
   assert(baseGridSize[0]*baseGridSize[1]*baseGridSize[2]/blockSizeTot < nBlocksMax);
 
   cudaMallocManaged(&bLocList, nBlocksMax*sizeof(u64));
-  cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(u32));
-  cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(u32));
-  cudaMallocManaged(&prntIdxList, nBlocksMax*sizeof(u32));
-  cudaMallocManaged(&nbrIdxList, 27*nBlocksMax*sizeof(u32));
-  cudaMallocManaged(&cFlagsList, blockSizeTot*nBlocksMax*sizeof(u32));
+  cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(i32));
+  cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(i32));
+  cudaMallocManaged(&prntIdxList, nBlocksMax*sizeof(i32));
+  cudaMallocManaged(&nbrIdxList, 27*nBlocksMax*sizeof(i32));
+  cudaMallocManaged(&cFlagsList, blockSizeTot*nBlocksMax*sizeof(i32));
   cudaMallocManaged(&fieldData, nFields*blockSizeTot*nBlocksMax*sizeof(real));
   cudaMallocManaged(&imageData, imageSize[0]*imageSize[1]*sizeof(real));
 
   cudaMemset(bLocList, 0, nBlocksMax*sizeof(u64));
-  cudaMemset(bIdxList, 0, nBlocksMax*sizeof(u32));
-  cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
-  cudaMemset(prntIdxList, 0, nBlocksMax*sizeof(u32));
-  cudaMemset(nbrIdxList, 0, 27*nBlocksMax*sizeof(u32));
-  cudaMemset(cFlagsList, 0, blockSizeTot*nBlocksMax*sizeof(u32));
+  cudaMemset(bIdxList, 0, nBlocksMax*sizeof(i32));
+  cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(i32));
+  cudaMemset(prntIdxList, 0, nBlocksMax*sizeof(i32));
+  cudaMemset(nbrIdxList, 0, 27*nBlocksMax*sizeof(i32));
+  cudaMemset(cFlagsList, 0, blockSizeTot*nBlocksMax*sizeof(i32));
   cudaMemset(fieldData, 0, nFields*blockSizeTot*nBlocksMax*sizeof(real));
   cudaMemset(imageData, 0, imageSize[0]*imageSize[1]*sizeof(real));
 
@@ -116,7 +116,7 @@ __device__ Vec3 MultiLevelSparseGrid::getCellPos(i32 lvl, i32 ib, i32 jb, i32 kb
               (kb*blockSize + k + .5)*getDz(lvl));
 }
 
-__device__ u32 MultiLevelSparseGrid::getNbrIdx(u32 bIdx, i32 i, i32 j, i32 k) {
+__device__ i32 MultiLevelSparseGrid::getNbrIdx(i32 bIdx, i32 i, i32 j, i32 k) {
   i += blockSize;
   j += blockSize;
   k += blockSize;
@@ -150,13 +150,13 @@ __device__ bool MultiLevelSparseGrid::isExteriorBlock(i32 lvl, i32 i, i32 j, i32
   return !isInteriorBlock(lvl, i, j, k);
 }
 
-__host__ __device__ real* MultiLevelSparseGrid::getField(u32 f) {
+__host__ __device__ real* MultiLevelSparseGrid::getField(i32 f) {
   return &fieldData[f*nBlocksMax*blockSizeTot];
 }
 
 __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j, i32 k) {
   u64 loc = encode(lvl, i, j, k);
-  u32 idx = hashTable.insert(loc);
+  i32 idx = hashTable.insert(loc);
   if (idx != bEmpty) { 
     // new key was inserted if not bEmpty
     bLocList[idx] = loc;
@@ -244,17 +244,17 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
     if (isInteriorBlock(lvl, ib, jb, kb) && loc != kEmpty) {
       for (uint j = 0; j < blockSize; j++) {
         for (uint i = 0; i < blockSize; i++) {
-          u32 idx = i + blockSize * j + bIdx*blockSizeTot;
-          u32 nPixels = powi(2,(nLvls - 1 - lvl));
+          i32 idx = i + blockSize * j + bIdx*blockSizeTot;
+          i32 nPixels = powi(2,(nLvls - 1 - lvl));
           for (uint jj=0; jj<nPixels; jj++) {
             for (uint ii=0; ii<nPixels; ii++) {
-              u32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
-              u32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
+              i32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
+              i32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
               if (f >= 0) {
                 imageData[jPxl*imageSize[0] + iPxl] = U[idx];
               }
               else {
-                u32 cFlag = cFlagsList[idx];
+                i32 cFlag = cFlagsList[idx];
                 imageData[jPxl*imageSize[0] + iPxl] = lvl+1 - (2-cFlag)/2;
               }
               if (gridOn && ii > 0 && jj > 0) {

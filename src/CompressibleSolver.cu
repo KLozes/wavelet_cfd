@@ -108,7 +108,7 @@ void CompressibleSolver::forwardWaveletTransform(void) {
   maxMagRhoU = *(thrust::max_element(thrust::device, getField(12), getField(12)+hashTable.nKeys*blockSize));
   maxRhoE = *(thrust::max_element(thrust::device, getField(3), getField(3)+hashTable.nKeys*blockSize));
   cudaDeviceSynchronize();
-  cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(u32));
+  cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(i32));
   copyToOldFieldsKernel<<<1000, cudaBlockSize>>>(*this); 
   forwardWaveletTransformKernel<<<1000, cudaBlockSize>>>(*this);
   waveletThresholdingKernel<<<1000, cudaBlockSize>>>(*this); 

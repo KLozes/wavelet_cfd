@@ -6,7 +6,7 @@
 
 HashTable::HashTable(void) {
   cudaMallocManaged(&keyList, hashTableSize*sizeof(u64));
-  cudaMallocManaged(&valueList, hashTableSize*sizeof(u32));
+  cudaMallocManaged(&valueList, hashTableSize*sizeof(i32));
   reset();
 }
 
@@ -17,7 +17,7 @@ HashTable::~HashTable(void) {
 }
 
 __global__ void resetHashTableKernel(HashTable &hashTable) {
-  u32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+  i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < hashTableSize) {
     hashTable.keyList[idx] = kEmpty;
     hashTable.valueList[idx] = bEmpty;
@@ -40,7 +40,7 @@ __device__ u64 HashTable::hash(u64 x) {
   return x;
 }
 
-__device__ u32 HashTable::insert(u64 key) {
+__device__ i32 HashTable::insert(u64 key) {
   u64 slot = hash(key) % hashTableSize;
   while (true) {
 
@@ -68,7 +68,7 @@ __device__ u32 HashTable::insert(u64 key) {
   return valueList[slot];
 }
 
-__device__ u32 HashTable::insertValue(u64 key, u32 value) {
+__device__ i32 HashTable::insertValue(u64 key, i32 value) {
   u64 slot = hash(key) % hashTableSize;
   while (true) {
 
@@ -91,8 +91,8 @@ __device__ u32 HashTable::insertValue(u64 key, u32 value) {
   return valueList[slot];
 }
 
-__device__ u32 HashTable::getValue(u64 key) {
-  u32 slot = hash(key) % hashTableSize;
+__device__ i32 HashTable::getValue(u64 key) {
+  i32 slot = hash(key) % hashTableSize;
   while (true) {
     if (keyList[slot] == key) {
       return valueList[slot];
@@ -104,11 +104,11 @@ __device__ u32 HashTable::getValue(u64 key) {
   }
 }
 
-__device__ u32 HashTable::setValue(u64 key, u32 value) {
-  u32 slot = hash(key) % hashTableSize;
+__device__ i32 HashTable::setValue(u64 key, i32 value) {
+  i32 slot = hash(key) % hashTableSize;
   while (true) {
     if (keyList[slot] == key) {
-      u32 v = valueList[slot];
+      i32 v = valueList[slot];
       valueList[slot] = value;
       return v;
     }

@@ -24,9 +24,9 @@ public:
   i32 bcType;
   i32 icType;
 
-  u32 iter;
+  i32 iter;
 
-  CompressibleSolver(real *domainSize_, u32 *baseGridSize_, u32 nLvls_) :
+  CompressibleSolver(real *domainSize_, i32 *baseGridSize_, i32 nLvls_) :
     MultiLevelSparseGrid(domainSize_, baseGridSize_, nLvls_, 13) {
       cfl = .5;
       waveletThresh = .005;

@@ -13,8 +13,8 @@ __global__ void sortFieldDataKernel(CompressibleSolver &grid) {
 
   START_CELL_LOOP
 
-    u32 bIdxOld = grid.bIdxList[bIdx];
-    u32 cIdxOld = bIdxOld * blockSizeTot + cIdx%blockSizeTot;
+    i32 bIdxOld = grid.bIdxList[bIdx];
+    i32 cIdxOld = bIdxOld * blockSizeTot + cIdx%blockSizeTot;
     
     Rho[cIdx] = OldRho[cIdxOld];
     RhoU[cIdx] = OldRhoU[cIdxOld];
@@ -107,7 +107,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
     grid.decode(loc, lvl, ib, jb, kb);
 
     if (grid.isExteriorBlock(lvl, ib, jb, kb)) {
-      u32 gridSize[3] = {grid.baseGridSize[0]*powi(2, lvl)/blockSize, 
+      i32 gridSize[3] = {grid.baseGridSize[0]*powi(2, lvl)/blockSize, 
                          grid.baseGridSize[1]*powi(2, lvl)/blockSize, 
                          grid.baseGridSize[2]*powi(2, lvl)/blockSize};
       if (grid.bcType == 0) {
@@ -131,7 +131,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
         if (jb >= i32(gridSize[1])) {
           jbc = -1;
         }
-        u32 bcIdx = grid.getNbrIdx(bIdx, ibc, jbc, kbc); 
+        i32 bcIdx = grid.getNbrIdx(bIdx, ibc, jbc, kbc); 
 
         // apply boundary conditions
         Rho[cIdx] = Rho[bcIdx];
@@ -172,7 +172,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
         if (jb >= i32(gridSize[1])) {
           jbc = -1;
         }
-        u32 bcIdx = grid.getNbrIdx(bIdx, ibc, jbc, kbc); 
+        i32 bcIdx = grid.getNbrIdx(bIdx, ibc, jbc, kbc); 
 
         // apply boundary conditions
         Rho[cIdx] = Rho[bcIdx];
@@ -258,17 +258,17 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     real dy = grid.getDy(lvl);
     real vol = dx*dy;
 
-    u32 l1Idx = grid.getNbrIdx(bIdx, i-1, j, k);
-    u32 l2Idx = grid.getNbrIdx(bIdx, i-2, j, k);
-    u32 r1Idx = grid.getNbrIdx(bIdx, i+1, j, k);
+    i32 l1Idx = grid.getNbrIdx(bIdx, i-1, j, k);
+    i32 l2Idx = grid.getNbrIdx(bIdx, i-2, j, k);
+    i32 r1Idx = grid.getNbrIdx(bIdx, i+1, j, k);
 
-    u32 d1Idx = grid.getNbrIdx(bIdx, i, j-1, k);
-    u32 d2Idx = grid.getNbrIdx(bIdx, i, j-2, k);
-    u32 u1Idx = grid.getNbrIdx(bIdx, i, j+1, k);
+    i32 d1Idx = grid.getNbrIdx(bIdx, i, j-1, k);
+    i32 d2Idx = grid.getNbrIdx(bIdx, i, j-2, k);
+    i32 u1Idx = grid.getNbrIdx(bIdx, i, j+1, k);
 
-    //u32 cFlag = grid.cFlagsList[cIdx];
-    //u32 lFlag = grid.cFlagsList[l1Idx];
-    //u32 dFlag = grid.cFlagsList[d1Idx];
+    //i32 cFlag = grid.cFlagsList[cIdx];
+    //i32 lFlag = grid.cFlagsList[l1Idx];
+    //i32 dFlag = grid.cFlagsList[d1Idx];
 
     //if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
       
@@ -544,10 +544,10 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
 
-    u32 cFlag = grid.cFlagsList[cIdx];
+    i32 cFlag = grid.cFlagsList[cIdx];
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb, kb) && cFlag != GHOST) {
       // parent block memory index
-      u32 prntIdx = grid.prntIdxList[bIdx];
+      i32 prntIdx = grid.prntIdxList[bIdx];
 
       // parent cell local indices
       i32 ip = i/2 + ib%2 * blockSize / 2;
@@ -555,18 +555,18 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
       i32 kp = j/2 + kb%2 * blockSize / 2;
 
       // parent and neigboring cell memory indices
-      u32 pIdx  = grid.getNbrIdx(prntIdx,   ip,   jp, kp);
-      u32 lIdx  = grid.getNbrIdx(prntIdx, ip-1,   jp, kp);
-      u32 rIdx  = grid.getNbrIdx(prntIdx, ip+1,   jp, kp);
-      u32 dIdx  = grid.getNbrIdx(prntIdx,   ip, jp-1, kp);
-      u32 uIdx  = grid.getNbrIdx(prntIdx,   ip, jp+1, kp);
-      u32 bIdx  = grid.getNbrIdx(prntIdx,   ip, jp, kp-1);
-      u32 fIdx  = grid.getNbrIdx(prntIdx,   ip, jp, kp+1);
+      i32 pIdx  = grid.getNbrIdx(prntIdx,   ip,   jp, kp);
+      i32 lIdx  = grid.getNbrIdx(prntIdx, ip-1,   jp, kp);
+      i32 rIdx  = grid.getNbrIdx(prntIdx, ip+1,   jp, kp);
+      i32 dIdx  = grid.getNbrIdx(prntIdx,   ip, jp-1, kp);
+      i32 uIdx  = grid.getNbrIdx(prntIdx,   ip, jp+1, kp);
+      i32 bIdx  = grid.getNbrIdx(prntIdx,   ip, jp, kp-1);
+      i32 fIdx  = grid.getNbrIdx(prntIdx,   ip, jp, kp+1);
 
-      u32 ldIdx = grid.getNbrIdx(prntIdx, ip-1, jp-1, kp);
-      u32 rdIdx = grid.getNbrIdx(prntIdx, ip+1, jp-1, kp);
-      u32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1, kp);
-      u32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1, kp);
+      i32 ldIdx = grid.getNbrIdx(prntIdx, ip-1, jp-1, kp);
+      i32 rdIdx = grid.getNbrIdx(prntIdx, ip+1, jp-1, kp);
+      i32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1, kp);
+      i32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1, kp);
 
       real xs = 2 * (i % 2) - 1 ; // sign for interp weights
       real ys = 2 * (j % 2) - 1;
@@ -603,7 +603,7 @@ __global__ void inverseWaveletTransformKernel(CompressibleSolver &grid) {
 
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb, kb) && grid.bFlagsList[bIdx] != DELETE) {
       // parent block memory index
-      u32 prntIdx = grid.prntIdxList[bIdx];
+      i32 prntIdx = grid.prntIdxList[bIdx];
 
       // parent cell local indices
       i32 ip = i/2 + ib%2 * blockSize / 2;
@@ -611,15 +611,15 @@ __global__ void inverseWaveletTransformKernel(CompressibleSolver &grid) {
       i32 kp = k/2 + kb%2 * blockSize / 2;
 
       // parent and neigboring cell memory indices
-      u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp, kp);
-      u32 lIdx = grid.getNbrIdx(prntIdx, ip-1, jp, kp);
-      u32 rIdx = grid.getNbrIdx(prntIdx, ip+1, jp, kp);
-      u32 dIdx = grid.getNbrIdx(prntIdx, ip, jp-1, kp);
-      u32 uIdx = grid.getNbrIdx(prntIdx, ip, jp+1, kp);
-      u32 ldIdx = grid.getNbrIdx(prntIdx, ip-1, jp-1, kp);
-      u32 rdIdx = grid.getNbrIdx(prntIdx, ip+1, jp-1, kp);
-      u32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1, kp);
-      u32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1, kp);
+      i32 pIdx = grid.getNbrIdx(prntIdx, ip, jp, kp);
+      i32 lIdx = grid.getNbrIdx(prntIdx, ip-1, jp, kp);
+      i32 rIdx = grid.getNbrIdx(prntIdx, ip+1, jp, kp);
+      i32 dIdx = grid.getNbrIdx(prntIdx, ip, jp-1, kp);
+      i32 uIdx = grid.getNbrIdx(prntIdx, ip, jp+1, kp);
+      i32 ldIdx = grid.getNbrIdx(prntIdx, ip-1, jp-1, kp);
+      i32 rdIdx = grid.getNbrIdx(prntIdx, ip+1, jp-1, kp);
+      i32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1, kp);
+      i32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1, kp);
 
       real xs = 2 * (i % 2) - 1 ; // sign for interp weights
       real ys = 2 * (j % 2) - 1;
@@ -658,7 +658,7 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
     real ls = grid.getBoundaryLevelSet(pos);
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb, kb)) {
       // parent block memory index
-      u32 prntIdx = grid.prntIdxList[bIdx];
+      i32 prntIdx = grid.prntIdxList[bIdx];
       grid.bFlagsList[prntIdx] = KEEP;
 
       // calculate detail coefficients for each field and set block to refine if large
@@ -693,12 +693,12 @@ __global__ void interpolateFieldsKernel(CompressibleSolver &grid) {
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
 
-    u32 cFlag = grid.cFlagsList[cIdx];
+    i32 cFlag = grid.cFlagsList[cIdx];
 
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb, kb) && cFlag == GHOST) {
       
       // parent block memory index
-      u32 prntIdx = grid.prntIdxList[bIdx];
+      i32 prntIdx = grid.prntIdxList[bIdx];
 
       // parent cell local indices
       i32 ip = i/2 + ib%2 * blockSize / 2;
@@ -706,15 +706,15 @@ __global__ void interpolateFieldsKernel(CompressibleSolver &grid) {
       i32 kp = k/2 + jb%2 * blockSize / 2;
 
       // parent and neigboring cell memory indices
-      u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp, kp);
-      u32 lIdx = grid.getNbrIdx(prntIdx, ip-1, jp, kp);
-      u32 rIdx = grid.getNbrIdx(prntIdx, ip+1, jp, kp);
-      u32 dIdx = grid.getNbrIdx(prntIdx, ip, jp-1, kp);
-      u32 uIdx = grid.getNbrIdx(prntIdx, ip, jp+1, kp);
-      u32 ldIdx = grid.getNbrIdx(prntIdx, ip-1, jp-1, kp);
-      u32 rdIdx = grid.getNbrIdx(prntIdx, ip+1, jp-1, kp);
-      u32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1, kp);
-      u32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1, kp);
+      i32 pIdx = grid.getNbrIdx(prntIdx, ip, jp, kp);
+      i32 lIdx = grid.getNbrIdx(prntIdx, ip-1, jp, kp);
+      i32 rIdx = grid.getNbrIdx(prntIdx, ip+1, jp, kp);
+      i32 dIdx = grid.getNbrIdx(prntIdx, ip, jp-1, kp);
+      i32 uIdx = grid.getNbrIdx(prntIdx, ip, jp+1, kp);
+      i32 ldIdx = grid.getNbrIdx(prntIdx, ip-1, jp-1, kp);
+      i32 rdIdx = grid.getNbrIdx(prntIdx, ip+1, jp-1, kp);
+      i32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1, kp);
+      i32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1, kp);
 
       real xs = 2 * (i % 2) - 1 ; // sign for interp weights
       real ys = 2 * (j % 2) - 1;
@@ -742,7 +742,7 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
 
-    u32 cFlag = grid.cFlagsList[cIdx];
+    i32 cFlag = grid.cFlagsList[cIdx];
 
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb, kb) && cFlag != GHOST && i%2==0 && j%2==0) {
       // sister cell indices
@@ -751,7 +751,7 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
       i32 ruIdx = cIdx + blockSize + 1;
 
       // parent block memory index
-      u32 prntIdx = grid.prntIdxList[bIdx];
+      i32 prntIdx = grid.prntIdxList[bIdx];
 
       // parent cell local indices
       i32 ip = i/2 + ib%2 * blockSize / 2;
@@ -759,9 +759,9 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
       i32 kp = k/2 + kp%2 * blockSize / 2;
 
       // parent cell memory indices
-      u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp, kp);
+      i32 pIdx = grid.getNbrIdx(prntIdx, ip, jp, kp);
 
-      for (u32 f=0; f<4; f++){
+      for (i32 f=0; f<4; f++){
         real *q = grid.getField(f);
         q[pIdx] = (q[cIdx] + q[rIdx] + q[uIdx] + q[ruIdx])/4.0;
       }

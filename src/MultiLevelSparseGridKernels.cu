@@ -36,7 +36,7 @@ __global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid) {
 
     if (lvl > 0) {
       u64 pLoc = grid.encode(lvl-1, ib/2, jb/2, kb/2);
-      u32 prntIdx = grid.hashTable.getValue(pLoc);  
+      i32 prntIdx = grid.hashTable.getValue(pLoc);  
       grid.prntIdxList[bIdx] = prntIdx;
     }
 
@@ -52,7 +52,7 @@ __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
     u64 loc = grid.bLocList[bIdx];
     grid.decode(loc, lvl, ib, jb, kb);
 
-    u32 idx = 0;
+    i32 idx = 0;
     for (i32 dk=-1; dk<2; dk++) {
       for(int dj=-1; dj<2; dj++) {
         for(int di=-1; di<2; di++) {
@@ -70,6 +70,7 @@ __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
 __global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid) {
 
   START_CELL_LOOP
+    GET_CELL_INDICES
 
     i32 lvl, ib, jb, kb;
     u64 loc = grid.bLocList[bIdx];
@@ -77,16 +78,16 @@ __global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid) {
 
     if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
 
-      u32 idx000 = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize, k-haloSize);
-      u32 idx100 = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize, k-haloSize);
-      u32 idx010 = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize, k-haloSize);
-      u32 idx110 = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize, k-haloSize);
-      u32 idx001 = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize, k+haloSize);
-      u32 idx101 = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize, k+haloSize);
-      u32 idx011 = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize, k+haloSize);
-      u32 idx111 = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize, k+haloSize);
+      i32 idx000 = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize, k-haloSize);
+      i32 idx100 = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize, k-haloSize);
+      i32 idx010 = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize, k-haloSize);
+      i32 idx110 = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize, k-haloSize);
+      i32 idx001 = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize, k+haloSize);
+      i32 idx101 = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize, k+haloSize);
+      i32 idx011 = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize, k+haloSize);
+      i32 idx111 = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize, k+haloSize);
 
-      u32 cEmpty = bEmpty * blockSizeTot;
+      i32 cEmpty = bEmpty * blockSizeTot;
       grid.cFlagsList[cIdx] = ACTIVE;
       if (idx000 >= cEmpty || idx100 >= cEmpty || idx010 >= cEmpty || idx110 >= cEmpty ||
           idx001 >= cEmpty || idx101 >= cEmpty || idx011 >= cEmpty || idx111 >= cEmpty) {
@@ -101,6 +102,7 @@ __global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid) {
 __global__ void flagParentCellsKernel(MultiLevelSparseGrid &grid) {
 
   START_CELL_LOOP
+    GET_CELL_INDICES
 
     i32 lvl, ib, jb, kb;
     u64 loc = grid.bLocList[bIdx];
@@ -111,7 +113,7 @@ __global__ void flagParentCellsKernel(MultiLevelSparseGrid &grid) {
     if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb, kb) && (cFlag == ACTIVE || cFlag == PARENT)) {
 
       // parent block memory index
-      u32 prntIdx = grid.prntIdxList[bIdx];
+      i32 prntIdx = grid.prntIdxList[bIdx];
 
       // parent cell local indices
       i32 ip = i/2 + ib%2 * blockSize / 2;
@@ -119,7 +121,7 @@ __global__ void flagParentCellsKernel(MultiLevelSparseGrid &grid) {
       i32 kp = k/2 + kb%2 * blockSize / 2;
 
       // parent cell memory index
-      u32 pIdx = grid.getNbrIdx(prntIdx, ip, jp, kp);
+      i32 pIdx = grid.getNbrIdx(prntIdx, ip, jp, kp);
 
       grid.cFlagsList[pIdx] = PARENT;
 
@@ -277,17 +279,18 @@ __global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f) {
   }
 
   START_CELL_LOOP
+    GET_CELL_INDICES
 
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
 
     if (grid.isInteriorBlock(lvl, ib, jb, kb) && loc != kEmpty && grid.cFlagsList[cIdx] == ACTIVE) {
-      u32 nPixels = powi(2,(grid.nLvls - 1 - lvl));
+      i32 nPixels = powi(2,(grid.nLvls - 1 - lvl));
       for (uint jj=0; jj<nPixels; jj++) {
         for (uint ii=0; ii<nPixels; ii++) {
-          u32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
-          u32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
+          i32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
+          i32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
           if (f >= 0) {
             grid.imageData[jPxl*grid.imageSize[0] + iPxl] = U[cIdx];
           }

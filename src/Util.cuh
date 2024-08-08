@@ -84,11 +84,11 @@ struct Vec4 {
 
 };
 
-__host__ __device__ constexpr u32 log2(u32 n) {
+__host__ __device__ constexpr i32 log2(i32 n) {
   return ((n<2) ? 1 : 1+log2(n/2));
 }
 
-__host__ __device__ constexpr u32 powi(const u32 base, const u32 expnt) {
+__host__ __device__ constexpr i32 powi(const i32 base, const i32 expnt) {
     return ((expnt<=0) ? 1 : base*powi(base, expnt-1));
 }
 
@@ -96,14 +96,14 @@ constexpr bool isPowerOf2(int v) {
     return v && ((v & (v - 1)) == 0);
 }
 
-static constexpr u32 log2BlockSize = log2((u32)blockSize);
+static constexpr i32 log2BlockSize = log2((i32)blockSize);
 
 static constexpr i32 blockSizeTot = powi(blockSize, 2);
 static constexpr i32 nBlocksMax = nCellsMax / blockSizeTot;
 static constexpr i32 blockHaloSize = blockSize+2*haloSize;
 static constexpr i32 blockHaloSizeTot = powi(blockHaloSize, 2);
 static constexpr i32 nBlocksPerCudaBlock = cudaBlockSize/blockSizeTot;
-static constexpr i32 hashTableSize = powi(2, log2((u32)nBlocksMax)+1); // closest power of 2
+static constexpr i32 hashTableSize = powi(2, log2((i32)nBlocksMax)+1); // closest power of 2
 static constexpr i32 bEmpty = nBlocksMax-1;
 static constexpr u64 kEmpty = std::numeric_limits<u64>::max();
 

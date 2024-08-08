@@ -12,7 +12,7 @@ public:
   i32 nKeys;
 
   u64 *keyList; 
-  u32 *valueList;
+  i32 *valueList;
 
   HashTable(void);
   ~HashTable(void);
@@ -20,10 +20,10 @@ public:
   void reset(void);
 
   __device__ u64 hash(u64 x);
-  __device__ u32 insert(u64 key);
-  __device__ u32 insertValue(u64 key, u32 value);
-  __device__ u32 getValue(u64 key);
-  __device__ u32 setValue(u64 key, u32 value);
+  __device__ i32 insert(u64 key);
+  __device__ i32 insertValue(u64 key, i32 value);
+  __device__ i32 getValue(u64 key);
+  __device__ i32 setValue(u64 key, i32 value);
 
 };
 #endif
