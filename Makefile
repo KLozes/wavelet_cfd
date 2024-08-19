@@ -1,4 +1,4 @@
-TARGET = compEuler
+TARGET = wave3d
 
 ## compilers
 CC = g++

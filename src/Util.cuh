@@ -96,6 +96,8 @@ constexpr bool isPowerOf2(int v) {
     return v && ((v & (v - 1)) == 0);
 }
 
+static constexpr real PI = 3.141592654f;
+
 static constexpr i32 log2BlockSize = log2((i32)blockSize);
 
 static constexpr i32 blockSizeTot = powi(blockSize, 2);

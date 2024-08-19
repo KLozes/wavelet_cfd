@@ -11,6 +11,8 @@ __global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid);
 
 __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid);
 
+__global__ void updateNbrIndicesPeriodicKernel(MultiLevelSparseGrid &grid);
+
 __global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid);
 
 __global__ void flagParentCellsKernel(MultiLevelSparseGrid &grid);

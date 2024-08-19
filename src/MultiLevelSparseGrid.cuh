@@ -48,9 +48,6 @@ public:
   real *imageData; // output image data
   real *pixelCountData; // number of 
 
-
-  int lock;
-
   MultiLevelSparseGrid(real *domainSize, i32 *baseGridSize_, i32 nLvls_, i32 nFields_);
 
   ~MultiLevelSparseGrid(void);

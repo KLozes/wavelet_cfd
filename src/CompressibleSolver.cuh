@@ -10,9 +10,10 @@ public:
 
   real deltaT;
   real cfl;
+  real sos;
   real maxRho;
-  real maxMagRhoU;
-  real maxRhoE;
+  real maxMagU;
+  real maxP;
   real waveletThresh;
 
   i32 tGrid;
@@ -29,6 +30,7 @@ public:
   CompressibleSolver(real *domainSize_, i32 *baseGridSize_, i32 nLvls_) :
     MultiLevelSparseGrid(domainSize_, baseGridSize_, nLvls_, 13) {
       cfl = .5;
+      sos = 20.0;
       waveletThresh = .005;
       iter = 0;
       immerserdBcType = 0;
@@ -57,14 +59,6 @@ public:
   void restrictFields();
   void interpolateFields();
 
-  __device__ Vec4 prim2cons(Vec4 prim);
-  __device__ Vec4 cons2prim(Vec4 cons);
-  __device__ real limU(real &r);
-  __device__ real lim(real &r);
-  __device__ real tvdRecU(real &ul, real &uc, real &ur);
-  __device__ real tvdRec(real &ul, real &uc, real &ur);
-  __device__ Vec4 hlleFlux(Vec4 qL, Vec4 qR, Vec2 normal);
-  __device__ Vec4 hllcFlux(Vec4 qL, Vec4 qR, Vec2 normal);
   __device__ real getBoundaryLevelSet(Vec3 pos);
   __device__ real calcIbMask(real phi);
 

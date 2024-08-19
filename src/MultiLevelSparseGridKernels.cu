@@ -4,12 +4,12 @@
 
 __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
   // initialize the blocks of the base grid level
-  i32 i = threadIdx.x + blockIdx.x*blockDim.x;
-	i32 j = threadIdx.y + blockIdx.x*blockDim.y;
-  i32 k = threadIdx.z + blockIdx.x*blockDim.z;
-  if (i < grid.baseGridSize[0]/blockSize && 
-      j < grid.baseGridSize[1]/blockSize && 
-      k < grid.baseGridSize[2]/blockSize) {
+  i32 i = threadIdx.x + blockIdx.x*blockDim.x - 1;
+	i32 j = threadIdx.y + blockIdx.x*blockDim.y - 1;
+  i32 k = threadIdx.z + blockIdx.x*blockDim.z - 1;
+  if (i < grid.baseGridSize[0]/blockSize + 1 && 
+      j < grid.baseGridSize[1]/blockSize + 1 && 
+      k < grid.baseGridSize[2]/blockSize + 1) {
     grid.activateBlock(0, i, j, k);
   }
 }
@@ -62,6 +62,50 @@ __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
         }
       }
     }
+
+  END_BLOCK_LOOP
+
+}
+
+__global__ void updateNbrIndicesPeriodicKernel(MultiLevelSparseGrid &grid) {
+
+  START_BLOCK_LOOP
+
+    i32 lvl, ib, jb, kb;
+    u64 loc = grid.bLocList[bIdx];
+    grid.decode(loc, lvl, ib, jb, kb);
+
+    // grid size at this resolution level
+    i32 gridSize[3] = {grid.baseGridSize[0]*powi(2, lvl)/blockSize, 
+                        grid.baseGridSize[1]*powi(2, lvl)/blockSize, 
+                        grid.baseGridSize[2]*powi(2, lvl)/blockSize};
+  
+    i32 ibc = ib;
+    i32 jbc = jb;
+    i32 kbc = kb;
+    if (ib < 0) {
+      ibc = gridSize[0] - 1;
+    }
+    if (ib > gridSize[0]-1) {
+      ibc = 1;
+    }
+
+    if (jb < 0) {
+      jbc = gridSize[1] - 1;
+    }
+    if (jb > gridSize[1]-1) {
+      jbc = 1;
+    }
+
+    if (kb < 0) {
+      kbc = gridSize[2] - 1;
+    }
+    if (kb > gridSize[2]-1) {
+      kbc = 1;
+    }
+
+    u64 nbrLoc = grid.encode(lvl, ibc, jbc, kbc);
+    grid.nbrIdxList[bIdx*27+13] = grid.hashTable.getValue(nbrLoc);
 
   END_BLOCK_LOOP
 

@@ -66,7 +66,7 @@ void MultiLevelSparseGrid::initializeBaseGrid(void) {
                     baseGridSize[1]/blockSize/8+1, 
                     baseGridSize[2]/blockSize/8+1);
   initGridKernel<<<nCudaBlocks3, cudaBlockSize3>>>(*this);
-  addBoundaryBlocksKernel<<<1000, cudaBlockSize>>>(*this);
+  addBoundaryBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
 
@@ -78,19 +78,19 @@ void MultiLevelSparseGrid::initializeBaseGrid(void) {
 void MultiLevelSparseGrid::adaptGrid(void) {
 
   if (nLvls > 1) {
-    addFineBlocksKernel<<<1000, cudaBlockSize>>>(*this);
-    setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
-    addAdjacentBlocksKernel<<<1000, cudaBlockSize>>>(*this);
+    addFineBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    addAdjacentBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     for(i32 lvl=nLvls-1; lvl>2; lvl--) {
-      setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
-      addReconstructionBlocksKernel<<<1000, cudaBlockSize>>>(*this);
+      setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+      addReconstructionBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     }
-    addBoundaryBlocksKernel<<<1000, cudaBlockSize>>>(*this);
-    setBlocksKeepKernel<<<1000, cudaBlockSize>>>(*this);
+    addBoundaryBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     cudaDeviceSynchronize();
     nBlocks = hashTable.nKeys;
-    deleteDataKernel<<<1000, cudaBlockSize>>>(*this);
-    updatePrntIndicesKernel<<<1000, cudaBlockSize>>>(*this);
+    deleteDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    updatePrntIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   }
 }
 
@@ -102,11 +102,11 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   cudaDeviceSynchronize();
   hashTable.reset();
   hashTable.nKeys = nBlocks;
-  updateIndicesKernel<<<1000, cudaBlockSize>>>(*this);
-  updatePrntIndicesKernel<<<1000, cudaBlockSize>>>(*this);
-  updateNbrIndicesKernel<<<1000, cudaBlockSize>>>(*this);
-  flagActiveCellsKernel<<<1000, cudaBlockSize>>>(*this);
-  flagParentCellsKernel<<<1000, cudaBlockSize>>>(*this); 
+  updateIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  updatePrntIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  updateNbrIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  flagActiveCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  flagParentCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this); 
   cudaDeviceSynchronize();
 }
 
@@ -190,7 +190,7 @@ void MultiLevelSparseGrid::paint(void) {
 
   for (i32 f=-1; f<4; f++) {
     //computeImageData(f);
-    computeImageDataKernel<<<1000, cudaBlockSize>>>(*this, f);
+    computeImageDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this, f);
     cudaDeviceSynchronize();
 
     // normalize image data and fill png image
@@ -270,6 +270,6 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
 
 /*
 void MultiLevelSparseGrid::resetBlockCounter(void) {
-  zeroBlockCounter<<<1000, cudaBlockSize>>>(*this);
+  zeroBlockCounter<<<cudaGridSize, cudaBlockSize>>>(*this);
 }
 */
