@@ -30,23 +30,29 @@ public:
   i32 baseGridSize[3] = {1,1};
   i32 nLvls;
   i32 nFields;
-  i32 imageSize[3] = {1,1};
+  i32 imageSizeX[2] = {1,1};
+  i32 imageSizeY[2] = {1,1};
+  i32 imageSizeZ[2] = {1,1};
 
   i32 imageCounter;
   i32 nBlocks;
 
-  u64 *bLocList; // block morton codes
-  i32 *bIdxList; // block memory indices
+  u64 *bLocList;        // block morton codes
+  i32 *bIdxList;        // block memory indices
 
-  i32 *nbrIdxList;     // cell neighbor indeces
-  i32 *prntIdxList;    // block parent indices
-  i32 *chldIdxList;    // block child indices
-  i32 *bFlagsList;     // block Flags
-  i32 *cFlagsList;     // cell Flags
+  i32 *nbrIdxList;      // cell neighbor indeces
+  i32 *prntIdxList;     // block parent indices
+  i32 *chldIdxList;     // block child indices
+  i32 *bFlagsList;      // block Flags
+  i32 *cFlagsList;      // cell Flags
 
-  real *fieldData; // flow field data
-  real *imageData; // output image data
-  real *pixelCountData; // number of 
+  real *fieldData;      // flow field data
+  real *imageDataX;     // output image data
+  real *imageDataY;     // output image data
+  real *imageDataZ;     // output image data
+  i32  *imageSampleX;   // number of 
+  i32  *imageSampleY;
+  i32  *imageSampleZ;
 
   MultiLevelSparseGrid(real *domainSize, i32 *baseGridSize_, i32 nLvls_, i32 nFields_);
 
