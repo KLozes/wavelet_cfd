@@ -22,6 +22,7 @@ int main(int argc, char* argv[]) {
   solver->immerserdBcType = 0;
   solver->initialize();
 
+  /*
   real t = 0;
   while(t < 100) {
 
@@ -35,6 +36,7 @@ int main(int argc, char* argv[]) {
     printf("n: %d, t = %f, tSolver = %f, tGrid = %f, compression = %f\n", solver->imageCounter, t, tSolver , tGrid, comp);
 
   }
+  */
   
   cudaDeviceSynchronize();
   delete solver;

@@ -1,25 +1,28 @@
 #include "CompressibleSolverKernels.cuh"
 
 __global__ void sortFieldDataKernel(CompressibleSolver &grid) {
-  real *Rho = grid.getField(0);
+  real *R = grid.getField(0);
   real *U = grid.getField(1);
   real *V = grid.getField(2);
   real *W = grid.getField(3);
+  real *P = grid.getField(4);
 
-  real *OldRho = grid.getField(4);
-  real *OldU = grid.getField(5);
-  real *OldV = grid.getField(6);
-  real *OldW = grid.getField(7);
+  real *OldR = grid.getField(5);
+  real *OldU = grid.getField(6);
+  real *OldV = grid.getField(7);
+  real *OldW = grid.getField(8);
+  real *OldP = grid.getField(10);
 
   START_CELL_LOOP
 
     i32 bIdxOld = grid.bIdxList[bIdx];
     i32 cIdxOld = bIdxOld * blockSizeTot + cIdx%blockSizeTot;
     
-    Rho[cIdx] = OldRho[cIdxOld];
+    R[cIdx] = OldR[cIdxOld];
     U[cIdx] = OldU[cIdxOld];
     V[cIdx] = OldV[cIdxOld];
     W[cIdx] = OldW[cIdxOld];
+    P[cIdx] = OldP[cIdxOld];
     grid.bFlagsList[bIdxOld] = DELETE;
 
   END_CELL_LOOP
@@ -28,10 +31,11 @@ __global__ void sortFieldDataKernel(CompressibleSolver &grid) {
 
 __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
 
-  real *Rho  = grid.getField(0);
+  real *R  = grid.getField(0);
   real *U  = grid.getField(1);
   real *V  = grid.getField(2);
   real *W  = grid.getField(3);
+  real *P  = grid.getField(4);
 
   START_CELL_LOOP
    GET_CELL_INDICES
@@ -42,24 +46,25 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
     Vec3 pos = grid.getCellPos(lvl, ib, jb, kb, i, j, k);
 
     if (grid.icType == 0) { // quiescent
-      Rho[cIdx] = 0.0;
+      R[cIdx] = 0.0;
       U[cIdx] = 0.0;
       V[cIdx] = 0.0;
       W[cIdx] = 0.0;
+      P[cIdx] = 0.0;
     }
 
     if (grid.icType == 1) { // doubly periodic shear layer
-      Rho[cIdx] = 0.0;
+      R[cIdx] = 0.0;
       W[cIdx] = 0.0;
 
-      real rho = 80;
+      real R = 80;
       real delta = .04;
       U[cIdx] = 0.0;
       if (pos[1] < .5) {
-        U[cIdx] = tanh(rho * (pos[1] - .25));
+        U[cIdx] = tanh(R * (pos[1] - .25));
       }
       else {
-        U[cIdx] = tanh(rho * (.75 - pos[1]));
+        U[cIdx] = tanh(R * (.75 - pos[1]));
       }
       V[cIdx]= delta * sin(2*PI * (pos[0] - .75));
     }
@@ -68,20 +73,19 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
       //
       // wind tunnel
       //
-      Rho[cIdx] = 1.0;
+      R[cIdx] = 1.0;
       U[cIdx] = 3.0;
       V[cIdx] = 0.0;
       U[cIdx] = 0.0;
+      P[cIdx] = 1.0;
     }
-
-
 
   END_CELL_LOOP
 }
 
 __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
 
-  real *Rho  = grid.getField(0);
+  real *R = grid.getField(0);
   real *U = grid.getField(1);
   real *V = grid.getField(2);
   real *W = grid.getField(3);
@@ -129,7 +133,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
         i32 bcIdx = grid.getNbrIdx(bIdx, ibc, jbc, kbc); 
 
         // apply boundary conditions
-        Rho[cIdx] = Rho[bcIdx];
+        R[cIdx] = R[bcIdx];
         P[cIdx] = P[bcIdx];
         
         if (ib < 0 || ib >= gridSize[0]) {
@@ -197,7 +201,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
         i32 bcIdx = grid.getNbrIdx(bIdx, ibc, jbc, kbc); 
 
         // apply boundary conditions
-        Rho[cIdx] = Rho[bcIdx];
+        R[cIdx] = R[bcIdx];
         P[cIdx] = P[bcIdx];
         
         if (ib < 0 || ib >= gridSize[0]) {
@@ -239,7 +243,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
         // periodic boundary
         //
         i32 bcIdx = grid.getNbrIdx(bIdx, i, j, k); // self neigbors point to periodic value
-        Rho[cIdx] = Rho[bcIdx];
+        R[cIdx] = R[bcIdx];
         U[cIdx] = U[bcIdx];
         V[cIdx] = V[bcIdx];
         W[cIdx] = W[bcIdx];
@@ -254,7 +258,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid) {
 
 // compute max wavespeed in each cell, will be used for CFL condition
 __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
-  real *Rho  = grid.getField(0);
+  real *R = grid.getField(0);
   real *U = grid.getField(1);
   real *V = grid.getField(2);
   real *W = grid.getField(3);
@@ -269,7 +273,7 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
 
     if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
       real vel = sqrt(U[cIdx]*U[cIdx] + V[cIdx]*V[cIdx]);
-      real c = sqrt(gam*P[cIdx]/Rho[cIdx]);
+      real c = sqrt(gam*P[cIdx]/R[cIdx]);
       real dx = min(grid.getDx(lvl), min(grid.getDy(lvl), grid.getDz(lvl)));
       DeltaT[cIdx] = dx / (c + vel);
     }
@@ -283,15 +287,17 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
 
 
 __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
-  real *Rho = grid.getField(0);
+  real *R = grid.getField(0);
   real *U = grid.getField(1);
   real *V = grid.getField(2);
   real *W = grid.getField(3);
+  real *P = grid.getField(4);
 
-  real *RhsP = grid.getField(4);
-  real *RhsU = grid.getField(5);
-  real *RhsV = grid.getField(6);
-  real *RhsW = grid.getField(7);
+  real *RhsR = grid.getField(5);
+  real *RhsU = grid.getField(6);
+  real *RhsV = grid.getField(7);
+  real *RhsW = grid.getField(8);
+  real *RhsP = grid.getField(9);
 
   START_CELL_LOOP
     GET_CELL_INDICES
@@ -322,15 +328,17 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
   //
   // update fields with low storage runge kutta
   //
-  real *Rho  = grid.getField(0);
+  real *R = grid.getField(0);
   real *U = grid.getField(1);
   real *V = grid.getField(2);
   real *W = grid.getField(3);
+  real *P = grid.getField(4);
 
-  real *RhsP  = grid.getField(4);
-  real *RhsU = grid.getField(5);
-  real *RhsV = grid.getField(6);
-  real *RhsW = grid.getField(7);
+  real *RhsR = grid.getField(5);
+  real *RhsU = grid.getField(6);
+  real *RhsV = grid.getField(7);
+  real *RhsW = grid.getField(8);
+  real *RhsP = grid.getField(9);
 
   constexpr real alpha[3] = {5.0/9.0, 153.0/128.0, 0.0};
   constexpr real beta[3] = {1.0/3.0, 15.0/16.0, 8.0/15.0};
@@ -345,15 +353,17 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
 
     if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
 
-      Rho[cIdx] += beta[stage] * dt * RhsP[cIdx];
+      R[cIdx] += beta[stage] * dt * RhsR[cIdx];
       U[cIdx] += beta[stage] * dt * RhsU[cIdx];
       V[cIdx] += beta[stage] * dt * RhsV[cIdx];
       W[cIdx] += beta[stage] * dt * RhsW[cIdx];
+      P[cIdx] += beta[stage] * dt * RhsP[cIdx];
 
-      RhsP[cIdx] *= - alpha[stage];
+      RhsR[cIdx] *= - alpha[stage];
       RhsU[cIdx] *= - alpha[stage];
       RhsV[cIdx] *= - alpha[stage];
       RhsW[cIdx] *= - alpha[stage];
+      RhsP[cIdx] *= - alpha[stage];
     }
 
   END_CELL_LOOP
@@ -364,22 +374,25 @@ __global__ void copyToOldFieldsKernel(CompressibleSolver &grid) {
   //
   // copy fields to auxilary memory
   //
-  real *Rho = grid.getField(0);
+  real *R = grid.getField(0);
   real *U = grid.getField(1);
   real *V = grid.getField(2);
   real *W = grid.getField(3);
+  real *P = grid.getField(4);
 
-  real *OldRho = grid.getField(4);
-  real *OldU = grid.getField(5);
-  real *OldV = grid.getField(6);
-  real *OldW = grid.getField(7);
+  real *OldR = grid.getField(5);
+  real *OldU = grid.getField(6);
+  real *OldV = grid.getField(7);
+  real *OldW = grid.getField(8);
+  real *OldP = grid.getField(9);
 
   START_CELL_LOOP
 
-    OldRho[cIdx] = Rho[cIdx];
+    OldR[cIdx] = R[cIdx];
     OldU[cIdx] = U[cIdx];
     OldV[cIdx] = V[cIdx];
     OldW[cIdx] = W[cIdx];
+    OldP[cIdx] = P[cIdx];
 
   END_CELL_LOOP
 }
@@ -431,22 +444,22 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
       i32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1, kp);
       i32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1, kp);
 
-      real xs = 2 * (i % 2) - 1 ; // sign for interp weights
-      real ys = 2 * (j % 2) - 1;
-      real zs = 2 * (k % 2) - 1;
+      real xsgn = 2 * (i % 2) - 1 ; // sign for interp weights
+      real ysgn = 2 * (j % 2) - 1;
+      real zsgn = 2 * (k % 2) - 1;
 
       // calculate detail coefficients for each field and set block to refine if large
-      for(i32 f=0; f<4; f++) {
+      for(i32 f=0; f<5; f++) {
         real *Q  = grid.getField(f);
-        real *OldQ  = grid.getField(f+4);
+        real *OldQ  = grid.getField(f+5);
         Q[cIdx] = Q[cIdx] - (OldQ[pIdx] 
-                + xs * 1/8 * (OldQ[rIdx] - OldQ[lIdx]) 
-                + ys * 1/8 * (OldQ[uIdx] - OldQ[dIdx])
-                + xs * ys * 1/64 * (OldQ[ruIdx] - OldQ[luIdx] - OldQ[rdIdx] + OldQ[ldIdx])); 
+                + xsgn * 1/8 * (OldQ[rIdx] - OldQ[lIdx]) 
+                + ysgn * 1/8 * (OldQ[uIdx] - OldQ[dIdx])
+                + xsgn * ysgn * 1/64 * (OldQ[ruIdx] - OldQ[luIdx] - OldQ[rdIdx] + OldQ[ldIdx])); 
       }
     } 
     else if (cFlag == GHOST) {
-      for(i32 f=0; f<4; f++) {
+      for(i32 f=0; f<5; f++) {
         real *Q = grid.getField(f);
         Q[cIdx] = 0.0; 
       }
@@ -484,18 +497,18 @@ __global__ void inverseWaveletTransformKernel(CompressibleSolver &grid) {
       i32 luIdx = grid.getNbrIdx(prntIdx, ip-1, jp+1, kp);
       i32 ruIdx = grid.getNbrIdx(prntIdx, ip+1, jp+1, kp);
 
-      real xs = 2 * (i % 2) - 1 ; // sign for interp weights
-      real ys = 2 * (j % 2) - 1;
-      real zs = 2 * (k % 2) - 1;
+      real xsgn = 2 * (i % 2) - 1 ; // sign for interp weights
+      real ysgn = 2 * (j % 2) - 1;
+      real zsgn = 2 * (k % 2) - 1;
 
       // calculate detail coefficients for each field and set block to refine if large
-      for(i32 f=0; f<4; f++) {
+      for(i32 f=0; f<5; f++) {
         real *Q  = grid.getField(f);
-        real *OldQ  = grid.getField(f+4);
+        real *OldQ  = grid.getField(f+5);
         Q[cIdx] = Q[cIdx] + (OldQ[pIdx] 
-                + xs * 1/8 * (OldQ[rIdx] - OldQ[lIdx]) 
-                + ys * 1/8 * (OldQ[uIdx] - OldQ[dIdx])
-                + xs * ys * 1/64 * (OldQ[ruIdx] - OldQ[luIdx] - OldQ[rdIdx] + OldQ[ldIdx])); 
+                + xsgn * 1/8 * (OldQ[rIdx] - OldQ[lIdx]) 
+                + ysgn * 1/8 * (OldQ[uIdx] - OldQ[dIdx])
+                + xsgn * ysgn * 1/64 * (OldQ[ruIdx] - OldQ[luIdx] - OldQ[rdIdx] + OldQ[ldIdx])); 
       }
     }
 
@@ -618,7 +631,7 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
       // parent cell local indices
       i32 ip = i/2 + ib%2 * blockSize / 2;
       i32 jp = j/2 + jb%2 * blockSize / 2;
-      i32 kp = k/2 + kp%2 * blockSize / 2;
+      i32 kp = k/2 + kb%2 * blockSize / 2;
 
       // parent cell memory indices
       i32 pIdx = grid.getNbrIdx(prntIdx, ip, jp, kp);

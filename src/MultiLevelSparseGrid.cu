@@ -18,8 +18,14 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   nLvls = nLvls_;
   nFields = nFields_;
 
-  imageSize[0] = (baseGridSize[0])*powi(2,nLvls-1);  // image size is the max resolution not including boundary condition blocks
-  imageSize[1] = (baseGridSize[1])*powi(2,nLvls-1);
+  imageSizeX[0] = (baseGridSize[1])*powi(2,nLvls-1);  // image size is the max resolution not including boundary condition blocks
+  imageSizeX[1] = (baseGridSize[2])*powi(2,nLvls-1);
+
+  imageSizeY[0] = (baseGridSize[0])*powi(2,nLvls-1);  // image size is the max resolution not including boundary condition blocks
+  imageSizeY[1] = (baseGridSize[2])*powi(2,nLvls-1);
+
+  imageSizeZ[0] = (baseGridSize[0])*powi(2,nLvls-1);  // image size is the max resolution not including boundary condition blocks
+  imageSizeZ[1] = (baseGridSize[1])*powi(2,nLvls-1);
 
   imageCounter = 0;
 
@@ -34,7 +40,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   cudaMallocManaged(&nbrIdxList, 27*nBlocksMax*sizeof(i32));
   cudaMallocManaged(&cFlagsList, blockSizeTot*nBlocksMax*sizeof(i32));
   cudaMallocManaged(&fieldData, nFields*blockSizeTot*nBlocksMax*sizeof(real));
-  cudaMallocManaged(&imageData, imageSize[0]*imageSize[1]*sizeof(real));
+  cudaMallocManaged(&imageDataX, imageSizeX[0]*imageSizeX[1]*sizeof(real));
 
   cudaMemset(bLocList, 0, nBlocksMax*sizeof(u64));
   cudaMemset(bIdxList, 0, nBlocksMax*sizeof(i32));
@@ -43,7 +49,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   cudaMemset(nbrIdxList, 0, 27*nBlocksMax*sizeof(i32));
   cudaMemset(cFlagsList, 0, blockSizeTot*nBlocksMax*sizeof(i32));
   cudaMemset(fieldData, 0, nFields*blockSizeTot*nBlocksMax*sizeof(real));
-  cudaMemset(imageData, 0, imageSize[0]*imageSize[1]*sizeof(real));
+  cudaMemset(imageDataX, 0, imageSizeX[0]*imageSizeX[1]*sizeof(real));
 
   cudaDeviceSynchronize();
 }
@@ -56,7 +62,7 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
   cudaFree(nbrIdxList);
   cudaFree(cFlagsList);
   cudaFree(fieldData);
-  cudaFree(imageData);
+  cudaFree(imageDataX);
 }
 
 void MultiLevelSparseGrid::initializeBaseGrid(void) {
@@ -186,7 +192,7 @@ __device__ void MultiLevelSparseGrid::decode(u64 loc, i32 &lvl, i32 &i, i32 &j, 
 void MultiLevelSparseGrid::paint(void) {
 
   cudaDeviceSynchronize();
-  png::image<png::gray_pixel_16> image(imageSize[0], imageSize[1]);
+  png::image<png::gray_pixel_16> image(imageSizeX[0], imageSizeX[1]);
 
   for (i32 f=-1; f<4; f++) {
     //computeImageData(f);
@@ -197,9 +203,9 @@ void MultiLevelSparseGrid::paint(void) {
     real maxVal = -1e32;
     real minVal = 1e32;
 
-    for (i32 idx=0; idx<imageSize[0]*imageSize[1]; idx++) {
-      maxVal = fmax(maxVal, imageData[idx]);
-      minVal = fmin(minVal, imageData[idx]);
+    for (i32 idx=0; idx<imageSizeX[0]*imageSizeX[1]; idx++) {
+      maxVal = fmax(maxVal, imageDataX[idx]);
+      minVal = fmin(minVal, imageDataX[idx]);
     }
 
     if (f == -1) {
@@ -207,10 +213,10 @@ void MultiLevelSparseGrid::paint(void) {
       maxVal = nLvls;
     }
  
-    for (i32 j=0; j<imageSize[1]; j++) {
-      for (i32 i=0; i<imageSize[0]; i++) {
-        i32 idx = j*imageSize[0] + i;
-        image[j][i] = (imageData[idx] - minVal) / (maxVal - minVal + 1e-16) * 65535;
+    for (i32 j=0; j<imageSizeX[1]; j++) {
+      for (i32 i=0; i<imageSizeX[0]; i++) {
+        i32 idx = j*imageSizeX[0] + i;
+        image[j][i] = (imageDataX[idx] - minVal) / (maxVal - minVal + 1e-16) * 65535;
       }
     }
 
@@ -251,14 +257,14 @@ void MultiLevelSparseGrid::computeImageData(i32 f) {
               i32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
               i32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
               if (f >= 0) {
-                imageData[jPxl*imageSize[0] + iPxl] = U[idx];
+                imageDataX[jPxl*imageSizeX[0] + iPxl] = U[idx];
               }
               else {
                 i32 cFlag = cFlagsList[idx];
-                imageData[jPxl*imageSize[0] + iPxl] = lvl+1 - (2-cFlag)/2;
+                imageDataX[jPxl*imageSizeX[0] + iPxl] = lvl+1 - (2-cFlag)/2;
               }
               if (gridOn && ii > 0 && jj > 0) {
-                  imageData[jPxl*imageSize[0] + iPxl] = 0;
+                  imageDataX[jPxl*imageSizeX[0] + iPxl] = 0;
               }
             }
           }

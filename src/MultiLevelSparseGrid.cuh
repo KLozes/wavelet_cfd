@@ -26,8 +26,8 @@ public:
 
   HashTable hashTable;
 
-  real domainSize[3] = {1.0, 1.0};
-  i32 baseGridSize[3] = {1,1};
+  real domainSize[3] = {1.0, 1.0, 1.0};
+  i32 baseGridSize[3] = {1, 1, 1};
   i32 nLvls;
   i32 nFields;
   i32 imageSizeX[2] = {1,1};
@@ -37,10 +37,10 @@ public:
   i32 imageCounter;
   i32 nBlocks;
 
-  u64 *bLocList;        // block morton codes
+  u64 *bLocList;        // block location codes
   i32 *bIdxList;        // block memory indices
 
-  i32 *nbrIdxList;      // cell neighbor indeces
+  i32 *nbrIdxList;      // block neighbor indeces
   i32 *prntIdxList;     // block parent indices
   i32 *chldIdxList;     // block child indices
   i32 *bFlagsList;      // block Flags
@@ -78,7 +78,7 @@ public:
   __device__ void activateBlock(i32 lvl, i32 i, i32 j, i32 k);
   
   __host__ __device__ u64 encode(i32 lvl, i32 i, i32 j, i32 k);
-  __host__ __device__ void decode(u64 morton, i32 &lvl, i32 &i, i32 &j, i32 &k);
+  __host__ __device__ void decode(u64 loc, i32 &lvl, i32 &i, i32 &j, i32 &k);
 
   void paint(void);
   virtual void computeImageData(i32 f); 

@@ -336,13 +336,13 @@ __global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f) {
           i32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
           i32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
           if (f >= 0) {
-            grid.imageData[jPxl*grid.imageSize[0] + iPxl] = U[cIdx];
+            grid.imageDataX[jPxl*grid.imageSizeX[0] + iPxl] = U[cIdx];
           }
           else {
-            grid.imageData[jPxl*grid.imageSize[0] + iPxl] = (lvl+1);
+            grid.imageDataX[jPxl*grid.imageSizeX[0] + iPxl] = (lvl+1);
           }
           if (f < 0 && gridOn && ii > 0 && jj > 0) {
-            grid.imageData[jPxl*grid.imageSize[0] + iPxl] = 0;
+            grid.imageDataX[jPxl*grid.imageSizeX[0] + iPxl] = 0;
           }
         }
       }

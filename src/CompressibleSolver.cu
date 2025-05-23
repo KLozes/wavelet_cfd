@@ -1,11 +1,9 @@
 #include <iostream>
 #include <thrust/extrema.h>
 
-
 #include "CompressibleSolver.cuh"
 #include "CompressibleSolverKernels.cuh"
 #include "MultiLevelSparseGridKernels.cuh"
-
 
 void CompressibleSolver::initialize(void) {
   initializeBaseGrid();
