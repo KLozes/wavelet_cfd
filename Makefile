@@ -1,45 +1,58 @@
-TARGET = wave3d
+# Combined build for both solvers:
+#   wave3d        - the compressible flow solver (src/)
+#   narrowbandSDF - the narrowband signed distance field solver (sdf/)
+# Both executables are placed in this (root) directory and write to ./output.
 
-## compilers
-CC = g++
+CC   = g++
 NVCC = nvcc
 
-# include directories
-INC_DIR = -I./src 
-
-# source directory
 SRC_DIR = src
-
-# object directory
+SDF_DIR = sdf
 OBJ_DIR = obj
 
-# c++ source files
+# shared compile options (CUDA 13 / Thrust need >= c++17; sm_75 = GTX 1650)
+ARCH       = sm_75
+STD        = c++17
+CPPFLAGS   = -O2 -Wextra -std=$(STD)
+NVCCFLAGS  = -O2 -std=$(STD) -arch=$(ARCH)
+LDFLAGS    = -lpng -lz
+
+# ---- compressible solver (src/*.cu, src/*.cpp) -> wave3d --------------------
 CPP_SRCS = $(wildcard $(SRC_DIR)/*.cpp)
-
-# CUDA source files
 CU_SRCS  = $(wildcard $(SRC_DIR)/*.cu)
+SRC_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.cpp.o,$(CPP_SRCS)) \
+           $(patsubst $(SRC_DIR)/%.cu,$(OBJ_DIR)/%.cu.o,$(CU_SRCS))
 
-# objects
-CPP_OBJS := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.cpp.o,$(CPP_SRCS))
-CU_OBJS := $(patsubst $(SRC_DIR)/%.cu,$(OBJ_DIR)/%.cu.o,$(CU_SRCS))
+# ---- narrowband SDF solver (sdf/*.cu + shared HashTable) -> narrowbandSDF ---
+SDF_CU   = $(wildcard $(SDF_DIR)/*.cu)
+SDF_OBJS = $(patsubst $(SDF_DIR)/%.cu,$(OBJ_DIR)/sdf_%.cu.o,$(SDF_CU)) \
+           $(OBJ_DIR)/HashTable.cu.o
 
-OBJS =  $(CPP_OBJS)
-OBJS += $(CU_OBJS)
+# headers (no automatic dependency tracking, so rebuild on any header change)
+HDRS = $(wildcard $(SRC_DIR)/*.cuh) $(wildcard $(SDF_DIR)/*.h) $(wildcard $(SDF_DIR)/*.cuh)
 
-## compile options
-CPPFLAGS = -O2 -Wextra -std=c++14
-NVCCFLAGS = -O2 -std=c++14 -arch=sm_61
-NVCCLFLAGS = -O2 -std=c++14 -arch=sm_61 -lpng -lz
+all: narrowbandSDF wave3d
 
-## Build Rules
-$(TARGET) : $(OBJS)
-	$(NVCC) $(NVCCLFLAGS) $(OBJS) -o $(TARGET)
+wave3d: $(SRC_OBJS)
+	$(NVCC) $(NVCCFLAGS) $(SRC_OBJS) -o $@ $(LDFLAGS)
 
-$(OBJ_DIR)/%.cpp.o: $(SRC_DIR)/%.cpp
-	$(CC) $(CPPFLAGS) $(INC_DIR) -c $< -o $@
+narrowbandSDF: $(SDF_OBJS)
+	$(NVCC) $(NVCCFLAGS) $(SDF_OBJS) -o $@ $(LDFLAGS)
 
-$(OBJ_DIR)/%.cu.o: $(SRC_DIR)/%.cu
-	$(NVCC) $(NVCCFLAGS) $(INC_DIR) -c $< -o $@ -dc
+# ---- build rules -----------------------------------------------------------
+$(OBJ_DIR)/%.cpp.o: $(SRC_DIR)/%.cpp $(HDRS) | $(OBJ_DIR)
+	$(CC) $(CPPFLAGS) -I./$(SRC_DIR) -c $< -o $@
+
+$(OBJ_DIR)/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)
+	$(NVCC) $(NVCCFLAGS) -I./$(SRC_DIR) -dc $< -o $@
+
+$(OBJ_DIR)/sdf_%.cu.o: $(SDF_DIR)/%.cu $(HDRS) | $(OBJ_DIR)
+	$(NVCC) $(NVCCFLAGS) -I./$(SRC_DIR) -I./$(SDF_DIR) -dc $< -o $@
+
+$(OBJ_DIR):
+	mkdir -p $(OBJ_DIR)
 
 clean:
-	\rm obj/*.o $(TARGET)
+	rm -rf $(OBJ_DIR) wave3d narrowbandSDF
+
+.PHONY: all clean
