@@ -84,6 +84,21 @@ struct Vec4 {
 
 };
 
+struct Vec5 {
+  real data[5];
+  __device__ Vec5(void){};
+  __device__ Vec5(real val0, real val1, real val2, real val3, real val4) {
+    data[0] = val0;
+    data[1] = val1;
+    data[2] = val2;
+    data[3] = val3;
+    data[4] = val4;
+  }
+  __device__ real& operator[](i32 i) {
+    return data[i];
+  }
+};
+
 __host__ __device__ constexpr i32 log2(i32 n) {
   return ((n<2) ? 1 : 1+log2(n/2));
 }
@@ -100,10 +115,10 @@ static constexpr real PI = 3.141592654f;
 
 static constexpr i32 log2BlockSize = log2((i32)blockSize);
 
-static constexpr i32 blockSizeTot = powi(blockSize, 2);
+static constexpr i32 blockSizeTot = powi(blockSize, 3);
 static constexpr i32 nBlocksMax = nCellsMax / blockSizeTot;
 static constexpr i32 blockHaloSize = blockSize+2*haloSize;
-static constexpr i32 blockHaloSizeTot = powi(blockHaloSize, 2);
+static constexpr i32 blockHaloSizeTot = powi(blockHaloSize, 3);
 static constexpr i32 nBlocksPerCudaBlock = cudaBlockSize/blockSizeTot;
 static constexpr i32 hashTableSize = powi(2, log2((i32)nBlocksMax)+1); // closest power of 2
 static constexpr i32 bEmpty = nBlocksMax-1;

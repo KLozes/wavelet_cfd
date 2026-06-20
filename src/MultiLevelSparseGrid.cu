@@ -18,8 +18,10 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   nLvls = nLvls_;
   nFields = nFields_;
 
-  imageSizeX[0] = (baseGridSize[1])*powi(2,nLvls-1);  // image size is the max resolution not including boundary condition blocks
-  imageSizeX[1] = (baseGridSize[2])*powi(2,nLvls-1);
+  // imageDataX holds an x-y slice taken at the mid-z plane (the natural view
+  // for the pseudo-2D / quasi-1D Sod problem).
+  imageSizeX[0] = (baseGridSize[0])*powi(2,nLvls-1);  // x (width)
+  imageSizeX[1] = (baseGridSize[1])*powi(2,nLvls-1);  // y (height)
 
   imageSizeY[0] = (baseGridSize[0])*powi(2,nLvls-1);  // image size is the max resolution not including boundary condition blocks
   imageSizeY[1] = (baseGridSize[2])*powi(2,nLvls-1);
@@ -129,7 +131,7 @@ __device__ i32 MultiLevelSparseGrid::getNbrIdx(i32 bIdx, i32 i, i32 j, i32 k) {
   i32 ib = i / blockSize;
   i32 jb = j / blockSize;
   i32 kb = k / blockSize;
-  i32 nbrIdx = nbrIdxList[9*bIdx + ib + 3*jb + 9*kb];
+  i32 nbrIdx = nbrIdxList[27*bIdx + ib + 3*jb + 9*kb];
   return blockSizeTot*nbrIdx + (i%blockSize) + (j%blockSize)*blockSize + (k%blockSize)*blockSize*blockSize;
 }
 
@@ -142,13 +144,16 @@ __device__ real MultiLevelSparseGrid::getDy(i32 lvl) {
 }
 
 __device__ real MultiLevelSparseGrid::getDz(i32 lvl) {
+  // in pseudo2D the single z-block never refines, so the z-cell size is fixed
+  if (pseudo2D) return real(domainSize[2])/real(baseGridSize[2]);
   return real(domainSize[2])/real(baseGridSize[2]*powi(2,lvl));
 }
 
-__device__ bool MultiLevelSparseGrid::isInteriorBlock(i32 lvl, i32 i, i32 j, i32 k) { 
-  i32 gridSize[3] = {i32(baseGridSize[0]/blockSize*powi(2,lvl)), 
+__device__ bool MultiLevelSparseGrid::isInteriorBlock(i32 lvl, i32 i, i32 j, i32 k) {
+  i32 gridSize[3] = {i32(baseGridSize[0]/blockSize*powi(2,lvl)),
                      i32(baseGridSize[1]/blockSize*powi(2,lvl)),
-                     i32(baseGridSize[2]/blockSize*powi(2,lvl))};
+                     pseudo2D ? i32(baseGridSize[2]/blockSize)
+                              : i32(baseGridSize[2]/blockSize*powi(2,lvl))};
   return i >= 0 && j >= 0 && k >= 0 && i < gridSize[0] && j < gridSize[1] && k < gridSize[2];
 }
 
@@ -189,46 +194,41 @@ __device__ void MultiLevelSparseGrid::decode(u64 loc, i32 &lvl, i32 &i, i32 &j, 
   i = (loc & ((1 << 20)-1)) - 1;
 }
 
-void MultiLevelSparseGrid::paint(void) {
-
-  cudaDeviceSynchronize();
+// render a single field f (>=0) or the refinement-level map (f=-1) to a png
+void MultiLevelSparseGrid::paintField(i32 f, const char *fileName) {
   png::image<png::gray_pixel_16> image(imageSizeX[0], imageSizeX[1]);
+  computeImageDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this, f);
+  cudaDeviceSynchronize();
 
-  for (i32 f=-1; f<4; f++) {
-    //computeImageData(f);
-    computeImageDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this, f);
-    cudaDeviceSynchronize();
+  // normalize image data and fill png image
+  real maxVal = -1e32;
+  real minVal = 1e32;
+  for (i32 idx=0; idx<imageSizeX[0]*imageSizeX[1]; idx++) {
+    maxVal = fmax(maxVal, imageDataX[idx]);
+    minVal = fmin(minVal, imageDataX[idx]);
+  }
+  if (f == -1) {
+    minVal = 0;
+    maxVal = nLvls;
+  }
 
-    // normalize image data and fill png image
-    real maxVal = -1e32;
-    real minVal = 1e32;
+  for (i32 j=0; j<imageSizeX[1]; j++) {
+    for (i32 i=0; i<imageSizeX[0]; i++) {
+      i32 idx = j*imageSizeX[0] + i;
+      image[j][i] = (imageDataX[idx] - minVal) / (maxVal - minVal + 1e-16) * 65535;
+    }
+  }
+  image.write(fileName);
+}
 
-    for (i32 idx=0; idx<imageSizeX[0]*imageSizeX[1]; idx++) {
-      maxVal = fmax(maxVal, imageDataX[idx]);
-      minVal = fmin(minVal, imageDataX[idx]);
-    }
-
-    if (f == -1) {
-      minVal = 0;
-      maxVal = nLvls;
-    }
- 
-    for (i32 j=0; j<imageSizeX[1]; j++) {
-      for (i32 i=0; i<imageSizeX[0]; i++) {
-        i32 idx = j*imageSizeX[0] + i;
-        image[j][i] = (imageDataX[idx] - minVal) / (maxVal - minVal + 1e-16) * 65535;
-      }
-    }
-
-    // output the image to a png file
-    char fileName[50];
-    if (f >=0) {
-      sprintf(fileName, "output/image%02d_%05d.png", f, imageCounter);
-    }
-    else {
-      sprintf(fileName, "output/grid_%05d.png", imageCounter);
-    }
-    image.write(fileName);
+void MultiLevelSparseGrid::paint(void) {
+  cudaDeviceSynchronize();
+  char fileName[64];
+  // f = -1 grid, 0 Rho, 1 RhoU, 2 RhoV, 3 RhoW, 4 RhoE (total energy)
+  for (i32 f=-1; f<5; f++) {
+    if (f >= 0) sprintf(fileName, "output/image%02d_%05d.png", f, imageCounter);
+    else        sprintf(fileName, "output/grid_%05d.png", imageCounter);
+    paintField(f, fileName);
   }
   imageCounter++;
 }

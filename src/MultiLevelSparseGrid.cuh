@@ -30,6 +30,10 @@ public:
   i32 baseGridSize[3] = {1, 1, 1};
   i32 nLvls;
   i32 nFields;
+  // pseudo2D: collapse z to a single (un-refined, un-fluxed) block.  The
+  // z-direction carries blockSize uniform cells that never refine, the
+  // z-momentum is never updated, and no z fluxes/boundary blocks are created.
+  i32 pseudo2D = 0;
   i32 imageSizeX[2] = {1,1};
   i32 imageSizeY[2] = {1,1};
   i32 imageSizeZ[2] = {1,1};
@@ -81,7 +85,8 @@ public:
   __host__ __device__ void decode(u64 loc, i32 &lvl, i32 &i, i32 &j, i32 &k);
 
   void paint(void);
-  virtual void computeImageData(i32 f); 
+  void paintField(i32 f, const char *fileName);  // render one field (or grid, f=-1) to a png
+  virtual void computeImageData(i32 f);
 
 };
 

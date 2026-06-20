@@ -9,7 +9,13 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid);
 
 __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid);
 
+__global__ void conservativeToPrimitiveKernel(CompressibleSolver &grid);
+
+__global__ void primitiveToConservativeKernel(CompressibleSolver &grid);
+
 __global__ void computeMagUKernel(CompressibleSolver &grid);
+
+__global__ void computePressureKernel(CompressibleSolver &grid);
 
 __global__ void computeDeltaTKernel(CompressibleSolver &grid);
 

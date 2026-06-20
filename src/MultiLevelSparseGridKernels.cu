@@ -5,10 +5,11 @@
 __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
   // initialize the blocks of the base grid level
   i32 i = threadIdx.x + blockIdx.x*blockDim.x - 1;
-	i32 j = threadIdx.y + blockIdx.x*blockDim.y - 1;
-  i32 k = threadIdx.z + blockIdx.x*blockDim.z - 1;
-  if (i < grid.baseGridSize[0]/blockSize + 1 && 
-      j < grid.baseGridSize[1]/blockSize + 1 && 
+  i32 j = threadIdx.y + blockIdx.y*blockDim.y - 1;
+  i32 k = threadIdx.z + blockIdx.z*blockDim.z - 1;
+  if (grid.pseudo2D) k = 0;   // single z-block, no z-halo blocks
+  if (i < grid.baseGridSize[0]/blockSize + 1 &&
+      j < grid.baseGridSize[1]/blockSize + 1 &&
       k < grid.baseGridSize[2]/blockSize + 1) {
     grid.activateBlock(0, i, j, k);
   }
@@ -122,20 +123,32 @@ __global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid) {
 
     if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
 
-      i32 idx000 = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize, k-haloSize);
-      i32 idx100 = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize, k-haloSize);
-      i32 idx010 = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize, k-haloSize);
-      i32 idx110 = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize, k-haloSize);
-      i32 idx001 = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize, k+haloSize);
-      i32 idx101 = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize, k+haloSize);
-      i32 idx011 = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize, k+haloSize);
-      i32 idx111 = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize, k+haloSize);
-
       i32 cEmpty = bEmpty * blockSizeTot;
       grid.cFlagsList[cIdx] = ACTIVE;
-      if (idx000 >= cEmpty || idx100 >= cEmpty || idx010 >= cEmpty || idx110 >= cEmpty ||
-          idx001 >= cEmpty || idx101 >= cEmpty || idx011 >= cEmpty || idx111 >= cEmpty) {
-        grid.cFlagsList[cIdx] = GHOST;
+
+      if (grid.pseudo2D) {
+        // only the x-y reconstruction stencil matters (z is a single block)
+        i32 i00 = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize, k);
+        i32 i10 = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize, k);
+        i32 i01 = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize, k);
+        i32 i11 = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize, k);
+        if (i00 >= cEmpty || i10 >= cEmpty || i01 >= cEmpty || i11 >= cEmpty) {
+          grid.cFlagsList[cIdx] = GHOST;
+        }
+      }
+      else {
+        i32 idx000 = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize, k-haloSize);
+        i32 idx100 = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize, k-haloSize);
+        i32 idx010 = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize, k-haloSize);
+        i32 idx110 = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize, k-haloSize);
+        i32 idx001 = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize, k+haloSize);
+        i32 idx101 = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize, k+haloSize);
+        i32 idx011 = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize, k+haloSize);
+        i32 idx111 = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize, k+haloSize);
+        if (idx000 >= cEmpty || idx100 >= cEmpty || idx010 >= cEmpty || idx110 >= cEmpty ||
+            idx001 >= cEmpty || idx101 >= cEmpty || idx011 >= cEmpty || idx111 >= cEmpty) {
+          grid.cFlagsList[cIdx] = GHOST;
+        }
       }
 
     }
@@ -159,10 +172,10 @@ __global__ void flagParentCellsKernel(MultiLevelSparseGrid &grid) {
       // parent block memory index
       i32 prntIdx = grid.prntIdxList[bIdx];
 
-      // parent cell local indices
+      // parent cell local indices (z maps identically in pseudo2D: no z refine)
       i32 ip = i/2 + ib%2 * blockSize / 2;
       i32 jp = j/2 + jb%2 * blockSize / 2;
-      i32 kp = k/2 + kb%2 * blockSize / 2;
+      i32 kp = grid.pseudo2D ? k : (k/2 + kb%2 * blockSize / 2);
 
       // parent cell memory index
       i32 pIdx = grid.getNbrIdx(prntIdx, ip, jp, kp);
@@ -187,10 +200,12 @@ __global__ void addFineBlocksKernel(MultiLevelSparseGrid &grid) {
         // add finer blocks if not already on finest level
         grid.bFlagsList[bIdx] = KEEP;
         if (lvl < grid.nLvls-1) {
-          for (i32 dk=0; dk<=1; dk++) {
+          i32 dkMax = grid.pseudo2D ? 0 : 1;
+          for (i32 dk=0; dk<=dkMax; dk++) {
             for (i32 dj=0; dj<=1; dj++) {
               for (i32 di=0; di<=1; di++) {
-                grid.activateBlock(lvl+1, 2*ib+di, 2*jb+dj, 2*kb+dk);
+                i32 kc = grid.pseudo2D ? kb : 2*kb+dk;
+                grid.activateBlock(lvl+1, 2*ib+di, 2*jb+dj, kc);
               }
             }
           }
@@ -231,8 +246,9 @@ __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid) {
     grid.decode(loc, lvl, ib, jb, kb);
 
     if (grid.isInteriorBlock(lvl, ib, jb, kb) && grid.bFlagsList[bIdx] == KEEP) {
-      // add neighboring blocks
-      for (i32 dk=-1; dk<=1; dk++) {
+      // add neighboring blocks (x-y only in pseudo2D)
+      i32 dkLim = grid.pseudo2D ? 0 : 1;
+      for (i32 dk=-dkLim; dk<=dkLim; dk++) {
         for (i32 dj=-1; dj<=1; dj++) {
           for (i32 di=-1; di<=1; di++) {
             grid.activateBlock(lvl, ib+di, jb+dj, kb+dk);
@@ -254,7 +270,8 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
     grid.decode(loc, lvl, ib, jb, kb);
 
     if (grid.isInteriorBlock(lvl, ib, jb, kb) && lvl > 2 && grid.bFlagsList[bIdx] == KEEP) {
-      for (i32 dk=-1; dk<=1; dk++) {
+      i32 dkLim = grid.pseudo2D ? 0 : 1;
+      for (i32 dk=-dkLim; dk<=dkLim; dk++) {
         for (i32 dj=-1; dj<=1; dj++) {
           for (i32 di=-1; di<=1; di++) {
             grid.activateBlock(lvl-1, ib/2+di, jb/2+dj, kb/2+dk);
@@ -294,16 +311,19 @@ __global__ void addBoundaryBlocksKernel(MultiLevelSparseGrid &grid) {
     u64 loc = grid.bLocList[bIdx];
     grid.decode(loc, lvl, ib, jb, kb);
 
-    if (grid.isInteriorBlock(lvl, ib, jb, kb) && 
-       (ib == 0 || ib == grid.baseGridSize[0]/blockSize*powi(2,lvl)-1 ||
-        jb == 0 || jb == grid.baseGridSize[1]/blockSize*powi(2,lvl)-1 ||
-        kb == 0 || kb == grid.baseGridSize[2]/blockSize*powi(2,lvl)-1)) {
-      // add neighboring exterior blocks
-      for (i32 dk=-1; dk<=1; dk++) {
+    bool onBnd = (ib == 0 || ib == grid.baseGridSize[0]/blockSize*powi(2,lvl)-1 ||
+                  jb == 0 || jb == grid.baseGridSize[1]/blockSize*powi(2,lvl)-1);
+    if (!grid.pseudo2D) {
+      onBnd = onBnd || (kb == 0 || kb == grid.baseGridSize[2]/blockSize*powi(2,lvl)-1);
+    }
+    if (grid.isInteriorBlock(lvl, ib, jb, kb) && onBnd) {
+      // add neighboring exterior blocks (x-y only in pseudo2D)
+      i32 dkLim = grid.pseudo2D ? 0 : 1;
+      for (i32 dk=-dkLim; dk<=dkLim; dk++) {
         for (i32 dj=-1; dj<=1; dj++) {
           for (i32 di=-1; di<=1; di++) {
             if (grid.isExteriorBlock(lvl, ib+di, jb+dj, kb+dk)) {
-              grid.activateBlock(lvl, ib+di, jb+dj, kb+dk);            
+              grid.activateBlock(lvl, ib+di, jb+dj, kb+dk);
             }
           }
         }
@@ -329,7 +349,22 @@ __global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f) {
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
 
-    if (grid.isInteriorBlock(lvl, ib, jb, kb) && loc != kEmpty && grid.cFlagsList[cIdx] == ACTIVE) {
+    // only render the cells covering the mid-z plane (x-y slice).  In pseudo2D
+    // z is never refined (all blocks at kb=0, layers identical), so the level-
+    // scaled pixel test below would never match a fine cell; just pick a fixed
+    // representative z-layer instead.
+    bool onMidPlane;
+    if (grid.pseudo2D) {
+      onMidPlane = (k == blockSize/2);
+    }
+    else {
+      i32 nPixelsZ = powi(2,(grid.nLvls - 1 - lvl));
+      i32 zMid = grid.baseGridSize[2]*powi(2, grid.nLvls-1) / 2;
+      i32 kLo = (kb*blockSize + k) * nPixelsZ;
+      onMidPlane = (zMid >= kLo && zMid < kLo + nPixelsZ);
+    }
+
+    if (onMidPlane && grid.isInteriorBlock(lvl, ib, jb, kb) && loc != kEmpty && grid.cFlagsList[cIdx] == ACTIVE) {
       i32 nPixels = powi(2,(grid.nLvls - 1 - lvl));
       for (uint jj=0; jj<nPixels; jj++) {
         for (uint ii=0; ii<nPixels; ii++) {
