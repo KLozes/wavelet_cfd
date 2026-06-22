@@ -66,7 +66,8 @@ public:
   void computeSdf(void);              // pass 2: exact mesh distance for all band cells
   void sortFieldData(void);           // required MultiLevelSparseGrid override
 
-  void writeVTK(const char *fileName); // sparse active-cell unstructured grid (no dense far field)
+  void writeVTKHDF(const char *fileName);    // single ImageData in one VTKHDF (.vtkhdf) file (robust default)
+  void writeVTKHDFAmr(const char *fileName); // single-level OverlappingAMR (.vtkhdf) -- experimental
   void writeSlices(const char *prefix);                       // 3 orthogonal mid-plane cross-section PNGs
   void writeSlicePNG(const char *fileName, i32 axis, i32 sliceIdx); // one axis-aligned slice
 };

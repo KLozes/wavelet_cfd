@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include <zlib.h>
+#include <hdf5.h>
 #include <png++/png.hpp>
 
 #include "SignedDistanceSolver.cuh"
@@ -63,60 +63,64 @@ void SignedDistanceSolver::computeSdf(void) {
 void SignedDistanceSolver::sortFieldData(void) {}
 
 // ---------------------------------------------------------------------------
-//  output: compressed VTK XML ImageData (.vti) over the narrowband bbox
+//  output: single ImageData in a single VTKHDF (.vtkhdf) file
 // ---------------------------------------------------------------------------
 //
-// The narrowband data lives in regular blockSize^3 bricks, so the grid geometry
-// is fully regular: there is no need to store per-voxel points or hexahedron
-// connectivity (which dominated the old UNSTRUCTURED_GRID output at ~89% of the
-// bytes).  We instead emit a single vtkImageData whose extent is the bounding
-// box of the active blocks: geometry is implicit (origin + spacing + extent) and
-// only the per-cell scalar is stored.  Cells outside the narrowband are blanked
-// with a `vtkGhostType` HIDDENCELL mask so contour-at-0 sees no spurious shell
-// where the blank fill would otherwise cross zero.  Both arrays are zlib block-
-// compressed in VTK's appended-data format, so the constant blank fill (the bbox
-// is mostly empty for thin shells) collapses to almost nothing.
+// VTKHDF is the modern single-file HDF5 container that ParaView/VTK read
+// natively.  This emits one vtkImageData over the active-block bounding box --
+// the HDF5 analogue of the .vti above.  We deliberately do NOT use a composite
+// type (MultiBlock banded at the hand-overlapped ghost ring; OverlappingAMR
+// loaded but ParaView 6.1's representation failed to render it): a single
+// uniform grid is the most-supported, most-robust VTKHDF type, renders as one
+// piece, and contours seamlessly.  The narrowband cells carry their true signed
+// distance; the far field is sign-filled (a boundary flood fill saturates cells
+// outside the surface to +INT16_MAX and the enclosed interior to -INT16_MIN), so
+// the whole grid is a valid clamped SDF -- contour-at-0 hits only the surface,
+// no ghost mask needed.  The dense bbox is chunked + gzipped, so the saturated
+// far field collapses on disk.
+//
+// Layout:
+//   /VTKHDF                Type="ImageData", WholeExtent/Origin/Spacing/Direction
+//     /CellData/sdf        Int16 [nz,ny,nx]  (chunked + gzip; band = true dist,
+//                          far field = +-INT16 saturated by inside/outside sign)
+//     /PointData /FieldData  (empty; present so the reader's probes stay quiet)
 
-// VTK appended DataArray: zlib-compress `nbytes` of `data` as 32 KiB blocks and
-// return the on-disk payload (UInt64 header [nBlocks, blockSize, lastPartial,
-// compSize_0..] followed by the concatenated compressed blocks).
-static std::vector<uint8_t> vtkCompress(const uint8_t *data, size_t nbytes) {
-  const uint64_t blockSize = 32768;
-  uint64_t nFull   = nbytes / blockSize;
-  uint64_t partial = nbytes % blockSize;
-  uint64_t nBlocks = nFull + (partial ? 1 : 0);
-  if (nBlocks == 0) nBlocks = 1;                 // empty array: one empty block
-
-  std::vector<uint64_t> compSize;
-  std::vector<uint8_t>  payload;
-  for (uint64_t b = 0; b < nBlocks; ++b) {
-    uLong srcLen = (b < nFull) ? (uLong)blockSize : (uLong)partial;
-    uLongf bound = compressBound(srcLen);
-    std::vector<uint8_t> tmp(bound ? bound : 1);
-    uLongf destLen = (uLongf)tmp.size();
-    compress2(tmp.data(), &destLen, data + b*blockSize, srcLen, Z_DEFAULT_COMPRESSION);
-    compSize.push_back(destLen);
-    payload.insert(payload.end(), tmp.begin(), tmp.begin() + destLen);
-  }
-
-  std::vector<uint8_t> out;
-  auto put64 = [&](uint64_t v) {                 // little-endian UInt64
-    for (int i = 0; i < 8; ++i) out.push_back(uint8_t(v >> (8*i)));
-  };
-  put64(nBlocks); put64(blockSize); put64(partial);
-  for (uint64_t c : compSize) put64(c);
-  out.insert(out.end(), payload.begin(), payload.end());
-  return out;
+// scalar string attribute (Type / Scalars)
+static void h5StrAttr(hid_t loc, const char *name, const char *val) {
+  hid_t t = H5Tcopy(H5T_C_S1);
+  H5Tset_size(t, strlen(val) + 1);
+  H5Tset_strpad(t, H5T_STR_NULLTERM);
+  hid_t s = H5Screate(H5S_SCALAR);
+  hid_t a = H5Acreate2(loc, name, t, s, H5P_DEFAULT, H5P_DEFAULT);
+  H5Awrite(a, t, val);
+  H5Aclose(a); H5Sclose(s); H5Tclose(t);
 }
 
-void SignedDistanceSolver::writeVTK(const char *fileName) {
+// rank-1 integer attribute, stored as Int64LE (VTK's convention)
+static void h5IntAttr(hid_t loc, const char *name, const int *val, hsize_t n) {
+  hid_t s = H5Screate_simple(1, &n, NULL);
+  hid_t a = H5Acreate2(loc, name, H5T_STD_I64LE, s, H5P_DEFAULT, H5P_DEFAULT);
+  H5Awrite(a, H5T_NATIVE_INT, val);
+  H5Aclose(a); H5Sclose(s);
+}
+
+// rank-1 double attribute (Origin / Spacing / Direction)
+static void h5DblAttr(hid_t loc, const char *name, const double *val, hsize_t n) {
+  hid_t s = H5Screate_simple(1, &n, NULL);
+  hid_t a = H5Acreate2(loc, name, H5T_IEEE_F64LE, s, H5P_DEFAULT, H5P_DEFAULT);
+  H5Awrite(a, H5T_NATIVE_DOUBLE, val);
+  H5Aclose(a); H5Sclose(s);
+}
+
+void SignedDistanceSolver::writeVTKHDF(const char *fileName) {
   cudaDeviceSynchronize();
 
-  real dx = domainSize[0] / real(baseGridSize[0]);
+  const real dx       = domainSize[0] / real(baseGridSize[0]);
+  const i16  INTERIOR = -32768;   // INT16_MIN: far inside  (also the unfilled sentinel)
+  const i16  EXTERIOR =  32767;   // INT16_MAX: far outside
 
-  // bounding box of the active blocks, in global cell indices
-  i32 imin = INT_MAX, jmin = INT_MAX, kmin = INT_MAX;
-  i32 imax = INT_MIN, jmax = INT_MIN, kmax = INT_MIN;
+  // bounding box of the active blocks in global cell indices (same as the .vti)
+  i32 imin=INT_MAX, jmin=INT_MAX, kmin=INT_MAX, imax=INT_MIN, jmax=INT_MIN, kmax=INT_MIN;
   for (i32 b = 0; b < hashTable.nKeys; b++) {
     if (bLocList[b] == kEmpty) continue;
     i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
@@ -124,69 +128,197 @@ void SignedDistanceSolver::writeVTK(const char *fileName) {
     jmin = min(jmin, jb*blockSize); jmax = max(jmax, (jb+1)*blockSize);
     kmin = min(kmin, kb*blockSize); kmax = max(kmax, (kb+1)*blockSize);
   }
-  if (imax < imin) { imin = jmin = kmin = 0; imax = jmax = kmax = 0; }  // no blocks
+  if (imax < imin) { imin = jmin = kmin = 0; imax = jmax = kmax = 0; }
+  i32 nx = imax-imin, ny = jmax-jmin, nz = kmax-kmin;     // cells per axis
+  size_t nCell = (size_t)nx*ny*nz;
 
-  i32 nx = imax - imin, ny = jmax - jmin, nz = kmax - kmin;   // cells per axis
-  size_t nCells = (size_t)nx * ny * nz;
-
-  // dense cell arrays over the bbox: scalar (blank = +far) + hidden-cell mask
-  const i16     BLANK = 32767;                   // far positive: no zero crossing
-  const uint8_t HIDDENCELL = 32;                 // vtkDataSetAttributes::HIDDENCELL
-  std::vector<i16>     sdf(nCells, BLANK);
-  std::vector<uint8_t> ghost(nCells, HIDDENCELL);
-
+  // dense cell field over the bbox.  Active-block cells get their true signed
+  // distance; every other cell (object interior + bbox corners) starts at the
+  // INTERIOR sentinel and is signed by the flood fill below.
+  std::vector<i16> sdf(nCell, INTERIOR);
   size_t nActive = 0;
   for (i32 b = 0; b < hashTable.nKeys; b++) {
     if (bLocList[b] == kEmpty) continue;
     i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
     for (i32 c = 0; c < blockSizeTot; c++) {
-      i16 v = Sdf[b*blockSizeTot + c];
-      if (v == SDF_FAR) continue;                // unreached cell: leave blanked
-      i32 i = ib*blockSize + (c % blockSize)              - imin;
+      i16 v = Sdf[(size_t)b*blockSizeTot + c]; if (v == SDF_FAR) continue;
+      i32 i = ib*blockSize + (c % blockSize)               - imin;
       i32 j = jb*blockSize + ((c / blockSize) % blockSize) - jmin;
       i32 k = kb*blockSize + (c / blockSize / blockSize)   - kmin;
-      size_t idx = (size_t)k*ny*nx + (size_t)j*nx + i;
-      sdf[idx]   = v;
-      ghost[idx] = 0;                            // visible
-      nActive++;
+      sdf[((size_t)k*ny + j)*nx + i] = v; nActive++;
     }
   }
 
-  // zlib-compress both arrays; their appended-data offsets are sequential
-  std::vector<uint8_t> sdfBlob   = vtkCompress((const uint8_t*)sdf.data(),   nCells*sizeof(i16));
-  std::vector<uint8_t> ghostBlob = vtkCompress(ghost.data(),                 nCells);
+  // sign the far field: flood the unfilled cells (still == INTERIOR) inward from
+  // the bbox boundary, tagging everything reachable as EXTERIOR (+max).  The
+  // active band is a multi-cell-thick shell of real values, so a 6-connected
+  // flood cannot cross the surface; cells it never reaches are enclosed and stay
+  // INTERIOR (-min).  Real distances are clamped to [-32767,32767], so the -32768
+  // sentinel is unambiguous.  (Assumes a closed surface, as the SDF sign already
+  // does.)
+  if (nCell) {
+    std::vector<size_t> stack;
+    auto fill = [&](size_t idx){ if (sdf[idx] == INTERIOR) { sdf[idx] = EXTERIOR; stack.push_back(idx); } };
+    for (i32 k=0;k<nz;k++) for (i32 j=0;j<ny;j++) { fill(((size_t)k*ny+j)*nx+0); fill(((size_t)k*ny+j)*nx+(nx-1)); }
+    for (i32 k=0;k<nz;k++) for (i32 i=0;i<nx;i++) { fill(((size_t)k*ny+0)*nx+i); fill(((size_t)k*ny+(ny-1))*nx+i); }
+    for (i32 j=0;j<ny;j++) for (i32 i=0;i<nx;i++) { fill(((size_t)0*ny+j)*nx+i); fill(((size_t)(nz-1)*ny+j)*nx+i); }
+    while (!stack.empty()) {
+      size_t idx = stack.back(); stack.pop_back();
+      i32 i = idx % nx, j = (idx / nx) % ny, k = idx / nx / ny;
+      if (i>0)    fill(idx-1);          if (i<nx-1) fill(idx+1);
+      if (j>0)    fill(idx-nx);         if (j<ny-1) fill(idx+nx);
+      if (k>0)    fill(idx-(size_t)nx*ny); if (k<nz-1) fill(idx+(size_t)nx*ny);
+    }
+  }
 
-  std::ofstream os(fileName, std::ios::binary);
-  os << "<?xml version=\"1.0\"?>\n";
-  os << "<VTKFile type=\"ImageData\" version=\"1.0\" byte_order=\"LittleEndian\""
-        " header_type=\"UInt64\" compressor=\"vtkZLibDataCompressor\">\n";
-  // world distance = sdf * sdfQuantum (recorded for downstream rescaling)
-  os << "  <ImageData WholeExtent=\"" << imin << " " << imax << " "
-     << jmin << " " << jmax << " " << kmin << " " << kmax << "\""
-     << " Origin=\"" << domainOrigin[0] << " " << domainOrigin[1] << " " << domainOrigin[2] << "\""
-     << " Spacing=\"" << dx << " " << dx << " " << dx << "\">\n";
-  os << "    <FieldData>\n";
-  os << "      <DataArray type=\"Float64\" Name=\"sdf_quantum\" NumberOfTuples=\"1\""
-        " format=\"ascii\">" << sdfQuantum << "</DataArray>\n";
-  os << "    </FieldData>\n";
-  os << "    <Piece Extent=\"" << imin << " " << imax << " "
-     << jmin << " " << jmax << " " << kmin << " " << kmax << "\">\n";
-  os << "      <CellData Scalars=\"sdf\">\n";
-  os << "        <DataArray type=\"Int16\" Name=\"sdf\" format=\"appended\" offset=\"0\"/>\n";
-  os << "        <DataArray type=\"UInt8\" Name=\"vtkGhostType\" format=\"appended\""
-        " offset=\"" << sdfBlob.size() << "\"/>\n";
-  os << "      </CellData>\n";
-  os << "    </Piece>\n";
-  os << "  </ImageData>\n";
-  os << "  <AppendedData encoding=\"raw\">\n_";
-  os.write((const char*)sdfBlob.data(),   sdfBlob.size());
-  os.write((const char*)ghostBlob.data(), ghostBlob.size());
-  os << "\n  </AppendedData>\n";
-  os << "</VTKFile>\n";
+  // ---- single ImageData --------------------------------------------------
+  hid_t file = H5Fcreate(fileName, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+  hid_t root = H5Gcreate2(file, "VTKHDF", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  int ver[2] = {2, 2};                       // current VTKHDF version
+  h5IntAttr(root, "Version", ver, 2);
+  h5StrAttr(root, "Type", "ImageData");
+  int wext[6] = {0, nx, 0, ny, 0, nz};                     // extent starts at 0; Origin places it
+  h5IntAttr(root, "WholeExtent", wext, 6);
+  double origin[3]  = {domainOrigin[0] + imin*dx, domainOrigin[1] + jmin*dx, domainOrigin[2] + kmin*dx};
+  double spacing[3] = {dx, dx, dx};
+  double dir[9]     = {1,0,0, 0,1,0, 0,0,1};
+  h5DblAttr(root, "Origin", origin, 3);
+  h5DblAttr(root, "Spacing", spacing, 3);
+  h5DblAttr(root, "Direction", dir, 9);
+  double quantum = sdfQuantum;
+  h5DblAttr(root, "sdf_quantum", &quantum, 1);              // world distance per int16 step
+  // empty PointData/FieldData so the reader's probes don't spew HDF5-DIAG errors
+  H5Gclose(H5Gcreate2(root, "PointData", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+  H5Gclose(H5Gcreate2(root, "FieldData", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
 
-  printf("  vti: %zu active cells in %dx%dx%d bbox (%.2f MB raw -> %.2f MB compressed)\n",
-         nActive, nx, ny, nz,
-         (nCells*3)/1e6, (sdfBlob.size()+ghostBlob.size())/1e6);
+  { // CellData/sdf (int16), [nz,ny,nx], chunked + gzip.  No ghost mask: the far
+    // field is sign-filled, so the whole grid is a valid clamped SDF.
+    hid_t cd = H5Gcreate2(root, "CellData", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    h5StrAttr(cd, "Scalars", "sdf");
+    hsize_t dims[3]  = {(hsize_t)nz, (hsize_t)ny, (hsize_t)nx};
+    hsize_t chunk[3] = {(hsize_t)(nz<32 ? (nz?nz:1) : 32),
+                        (hsize_t)(ny<32 ? (ny?ny:1) : 32),
+                        (hsize_t)(nx<32 ? (nx?nx:1) : 32)};
+    hid_t s    = H5Screate_simple(3, dims, NULL);
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    if (nCell) { H5Pset_chunk(dcpl, 3, chunk); H5Pset_deflate(dcpl, 6); }
+    hid_t ds = H5Dcreate2(cd, "sdf", H5T_STD_I16LE, s, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+    if (nCell) H5Dwrite(ds, H5T_NATIVE_SHORT, H5S_ALL, H5S_ALL, H5P_DEFAULT, sdf.data());
+    H5Dclose(ds);
+    H5Pclose(dcpl); H5Sclose(s); H5Gclose(cd);
+  }
+
+  H5Gclose(root); H5Fclose(file);
+
+  std::ifstream fsz(fileName, std::ios::binary | std::ios::ate);
+  double fileMB = fsz ? double(fsz.tellg())/1e6 : 0.0;
+  printf("  vtkhdf: ImageData %dx%dx%d bbox, %zu band cells + sign-filled far field (%.2f MB raw -> %.2f MB file)\n",
+         nx, ny, nz, nActive, (nCell*2)/1e6, fileMB);
+}
+
+// ---------------------------------------------------------------------------
+//  output: single-level OverlappingAMR in a VTKHDF (.vtkhdf) file  (experimental)
+// ---------------------------------------------------------------------------
+//
+// Sparser alternative to the single ImageData above: every active block becomes
+// one AMR box (a row of the flat AMRBox table), so only the narrowband is stored
+// -- no dense bbox.  The file is correct -- bare VTK reads it as vtkOverlappingAMR
+// and extracts geometry / contours across every box -- but VTK cannot itself
+// *write* AMR to VTKHDF yet, and ParaView 6.1's AMR Surface representation fails
+// to render the raw AMR ("UpdateInformation invoked during another request",
+// only a few boxes draw).  Workaround in ParaView: set the AMR source to the
+// Outline representation and apply a filter (Contour, or Merge Blocks) -- the
+// filter output renders fine.  Cells an active block never reached (SDF_FAR) are
+// HIDDENCELL-masked.
+//
+// Layout:
+//   /VTKHDF              Type="OverlappingAMR", Origin=[ox,oy,oz]
+//     /Level0           Spacing=[dx,dx,dx]
+//       AMRBox          Int32 [nBox,6]  imin,imax,jmin,jmax,kmin,kmax (inclusive)
+//       /CellData/sdf            Int16 [nCell]  concatenated box-by-box (i fastest)
+//       /CellData/vtkGhostType   UInt8 [nCell]  (only when some cells are SDF_FAR)
+void SignedDistanceSolver::writeVTKHDFAmr(const char *fileName) {
+  cudaDeviceSynchronize();
+
+  const real    dx       = domainSize[0] / real(baseGridSize[0]);
+  const i32     bs       = blockSize;
+  const i16     BLANK      = 32767;          // far positive: no zero crossing
+  const uint8_t HIDDENCELL = 32;             // vtkDataSetAttributes::HIDDENCELL
+
+  // one AMR box (6 ints) + blockSizeTot cells per active block
+  std::vector<int>     amrBox;               // nBox * 6 (imin,imax,jmin,jmax,kmin,kmax)
+  std::vector<i16>     sdf;                   // nCell, concatenated box-by-box
+  std::vector<uint8_t> ghost;                 // nCell
+  amrBox.reserve((size_t)hashTable.nKeys * 6);
+  sdf.reserve((size_t)hashTable.nKeys * blockSizeTot);
+  ghost.reserve((size_t)hashTable.nKeys * blockSizeTot);
+
+  size_t nActive = 0;
+  for (i32 b = 0; b < hashTable.nKeys; b++) {
+    if (bLocList[b] == kEmpty) continue;
+    i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
+    amrBox.push_back(ib*bs); amrBox.push_back(ib*bs + bs-1);   // inclusive cell bounds
+    amrBox.push_back(jb*bs); amrBox.push_back(jb*bs + bs-1);
+    amrBox.push_back(kb*bs); amrBox.push_back(kb*bs + bs-1);
+    for (i32 c = 0; c < blockSizeTot; c++) {                   // c is i-fastest
+      i16 v = Sdf[(size_t)b*blockSizeTot + c];
+      if (v == SDF_FAR) { sdf.push_back(BLANK); ghost.push_back(HIDDENCELL); }
+      else              { sdf.push_back(v);     ghost.push_back(0); nActive++; }
+    }
+  }
+  size_t nBox = amrBox.size() / 6, nCell = sdf.size();
+
+  hid_t file = H5Fcreate(fileName, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+  hid_t root = H5Gcreate2(file, "VTKHDF", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  int ver[2] = {2, 2};
+  h5IntAttr(root, "Version", ver, 2);
+  h5StrAttr(root, "Type", "OverlappingAMR");
+  double origin[3] = {domainOrigin[0], domainOrigin[1], domainOrigin[2]};
+  h5DblAttr(root, "Origin", origin, 3);
+  double quantum = sdfQuantum;
+  h5DblAttr(root, "sdf_quantum", &quantum, 1);
+  H5Gclose(H5Gcreate2(root, "FieldData", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+
+  hid_t lvl0 = H5Gcreate2(root, "Level0", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  double spacing[3] = {dx, dx, dx};
+  h5DblAttr(lvl0, "Spacing", spacing, 3);
+  H5Gclose(H5Gcreate2(lvl0, "PointData", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+  H5Gclose(H5Gcreate2(lvl0, "FieldData", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+
+  { // AMRBox table [nBox,6]
+    hsize_t d[2] = {(hsize_t)nBox, 6};
+    hid_t s  = H5Screate_simple(2, d, NULL);
+    hid_t ds = H5Dcreate2(lvl0, "AMRBox", H5T_STD_I32LE, s, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    if (nBox) H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, amrBox.data());
+    H5Dclose(ds); H5Sclose(s);
+  }
+
+  { // CellData: sdf + vtkGhostType, 1D concatenated, chunked + gzip
+    hid_t cd = H5Gcreate2(lvl0, "CellData", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    h5StrAttr(cd, "Scalars", "sdf");
+    hsize_t d[1]     = {(hsize_t)nCell};
+    size_t  chunkN   = nCell ? nCell : 1; if (chunkN > (1u<<16)) chunkN = 1u<<16;
+    hsize_t chunk[1] = {(hsize_t)chunkN};
+    hid_t s    = H5Screate_simple(1, d, NULL);
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    if (nCell) { H5Pset_chunk(dcpl, 1, chunk); H5Pset_deflate(dcpl, 6); }
+    hid_t ds = H5Dcreate2(cd, "sdf", H5T_STD_I16LE, s, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+    if (nCell) H5Dwrite(ds, H5T_NATIVE_SHORT, H5S_ALL, H5S_ALL, H5P_DEFAULT, sdf.data());
+    H5Dclose(ds);
+    if (nActive != nCell) {                    // blanking mask only if needed
+      ds = H5Dcreate2(cd, "vtkGhostType", H5T_STD_U8LE, s, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+      H5Dwrite(ds, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, ghost.data());
+      H5Dclose(ds);
+    }
+    H5Pclose(dcpl); H5Sclose(s); H5Gclose(cd);
+  }
+
+  H5Gclose(lvl0); H5Gclose(root); H5Fclose(file);
+
+  std::ifstream fsz(fileName, std::ios::binary | std::ios::ate);
+  double fileMB = fsz ? double(fsz.tellg())/1e6 : 0.0;
+  printf("  vtkhdf: OverlappingAMR, %zu boxes, %zu active cells (%.2f MB raw -> %.2f MB file)\n",
+         nBox, nActive, (nCell*3)/1e6, fileMB);
 }
 
 // ---------------------------------------------------------------------------

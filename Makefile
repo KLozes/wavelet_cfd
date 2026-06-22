@@ -19,6 +19,12 @@ STD       = c++17
 NVCCFLAGS = -O2 -std=$(STD) -arch=$(ARCH)
 LDFLAGS   = -lpng -lz
 
+# HDF5 (serial) for the VTKHDF SDF output -- wavesdf only.  Debian/Ubuntu put the
+# headers in /usr/include/hdf5/serial (off the default path), exposed via the
+# hdf5-serial pkg-config name; fall back to plain hdf5 elsewhere.
+HDF5_CFLAGS = $(shell pkg-config --cflags hdf5-serial 2>/dev/null || pkg-config --cflags hdf5 2>/dev/null)
+HDF5_LIBS   = $(shell pkg-config --libs   hdf5-serial 2>/dev/null || pkg-config --libs   hdf5 2>/dev/null)
+
 # per-executable cell cap (blocks = NCELLS_MAX/blockSizeTot).  wave3d keeps the
 # default (8M cells ~0.5 GB at 16 fields); wavesdf is 2 fields so 64M cells
 # (~1M blocks, ~0.9 GB) fits comfortably on the 4 GB card.
@@ -41,14 +47,14 @@ wave3d: $(WAVE3D_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
 wavesdf: $(WAVESDF_OBJS)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS) $(HDF5_LIBS)
 
 # ---- build rules (one per executable, so each gets its own NCELLS_MAX) ------
 $(OBJ_DIR)/wave3d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d
 	$(NVCC) $(NVCCFLAGS) -I./$(SRC_DIR) -dc $< -o $@
 
 $(OBJ_DIR)/wavesdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavesdf
-	$(NVCC) $(NVCCFLAGS) $(WAVESDF_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+	$(NVCC) $(NVCCFLAGS) $(WAVESDF_DEFS) $(HDF5_CFLAGS) -I./$(SRC_DIR) -dc $< -o $@
 
 $(OBJ_DIR)/wave3d $(OBJ_DIR)/wavesdf:
 	mkdir -p $@

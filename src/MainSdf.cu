@@ -6,7 +6,7 @@
 // domain volume (Roosing, Strickson & Nikiforakis, CiCP 2019).  Cells outside
 // the band have no block and read as the +band far field on output.
 //
-//   usage:  ./wavesdf [file.stl] [res] [band_cells] [margin]
+//   usage:  ./wavesdf [file.stl] [res] [band_cells] [margin] [format]
 //
 //     file.stl     input mesh (default: assets/wing.stl)
 //     res          cells along the longest bounding-box axis (default 128)
@@ -15,6 +15,8 @@
 //                  axis's mesh extent (default 0.5 -> domain 2x the mesh per
 //                  axis).  The VTK output is sparse (active cells only), so it is
 //                  unaffected by the domain size; only the 2D slice PNG grows.
+//     format       .vtkhdf type: "image" (default, single ImageData) or "amr"
+//                  (single-level OverlappingAMR -- sparser, but experimental)
 
 #include <sys/stat.h>
 
@@ -41,6 +43,7 @@ int main(int argc, char *argv[]) {
   i32   res       = (argc > 2) ? std::atoi(argv[2]) : 128;
   float bandCells = (argc > 3) ? std::atof(argv[3]) : 5.0f;
   float margin    = (argc > 4) ? std::atof(argv[4]) : 0.5f;
+  std::string fmt = (argc > 5) ? argv[5] : "image";   // .vtkhdf type: "image" or "amr"
 
   // ---- read mesh ---------------------------------------------------------
   std::vector<StlTri> tris;
@@ -151,12 +154,14 @@ int main(int argc, char *argv[]) {
   mkdir("output", 0755);
   std::string name = baseName(stlPath);
 
-  // compressed ImageData output over the narrowband bbox: implicit geometry
-  // (no per-voxel points/connectivity) + zlib-compressed int16 scalar, so the
-  // file is a small fraction of the old unstructured-grid output.
-  std::string vtk = "output/" + name + "_sdf.vti";
-  solver->writeVTK(vtk.c_str());
-  printf("wrote %s\n", vtk.c_str());
+  // single-file VTKHDF output.  Default "image" is one ImageData (most robust to
+  // render); "amr" selects a single-level OverlappingAMR (sparser, experimental:
+  // the file is valid but ParaView's AMR Surface representation is buggy --
+  // render it via Outline + Contour/Merge Blocks).
+  std::string vtkhdf = "output/" + name + "_sdf.vtkhdf";
+  if (fmt == "amr") solver->writeVTKHDFAmr(vtkhdf.c_str());
+  else              solver->writeVTKHDF(vtkhdf.c_str());
+  printf("wrote %s (%s)\n", vtkhdf.c_str(), fmt.c_str());
 
   std::string slicePrefix = "output/" + name;
   solver->writeSlices(slicePrefix.c_str());   // orthogonal x-y / x-z / y-z cross sections
