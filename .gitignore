@@ -1,5 +1,13 @@
 output
 obj
 wave3d
-narrowbandSDF
+wavesdf
 *.vtk
+
+# large / downloaded meshes (re-fetchable from the internet, not committed):
+#   drivaer.stl  - DrivAerML run_1  (huggingface.co/datasets/neashton/drivaerml)
+#   ahmed.stl    - github.com/nathanrooy/ahmed-bluff-body-cfd
+#   bunny.stl    - github.com/reprap-io/reprapio_stanford_bunny
+assets/drivaer.stl
+assets/ahmed.stl
+assets/bunny.stl

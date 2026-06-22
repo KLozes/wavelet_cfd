@@ -31,9 +31,11 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
 
   imageCounter = 0;
 
-  // grid size checking
+  // grid size checking (the dense base-grid capacity is checked in
+  // initializeBaseGrid, where that grid is actually materialized -- a sparse
+  // user like the narrowband SDF never fills it and is bounded only by the
+  // number of blocks it activates).
   assert(isPowerOf2(blockSize));
-  assert(baseGridSize[0]*baseGridSize[1]*baseGridSize[2]/blockSizeTot < nBlocksMax);
 
   cudaMallocManaged(&bLocList, nBlocksMax*sizeof(u64));
   cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(i32));
@@ -41,7 +43,6 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   cudaMallocManaged(&prntIdxList, nBlocksMax*sizeof(i32));
   cudaMallocManaged(&nbrIdxList, 27*nBlocksMax*sizeof(i32));
   cudaMallocManaged(&cFlagsList, blockSizeTot*nBlocksMax*sizeof(i32));
-  cudaMallocManaged(&fieldData, nFields*blockSizeTot*nBlocksMax*sizeof(real));
   cudaMallocManaged(&imageDataX, imageSizeX[0]*imageSizeX[1]*sizeof(real));
 
   cudaMemset(bLocList, 0, nBlocksMax*sizeof(u64));
@@ -50,8 +51,15 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   cudaMemset(prntIdxList, 0, nBlocksMax*sizeof(i32));
   cudaMemset(nbrIdxList, 0, 27*nBlocksMax*sizeof(i32));
   cudaMemset(cFlagsList, 0, blockSizeTot*nBlocksMax*sizeof(i32));
-  cudaMemset(fieldData, 0, nFields*blockSizeTot*nBlocksMax*sizeof(real));
   cudaMemset(imageDataX, 0, imageSizeX[0]*imageSizeX[1]*sizeof(real));
+
+  // a solver may carry its own field storage (e.g. the SDF's int16 array) and
+  // request zero base fields, in which case fieldData is not allocated.
+  fieldData = nullptr;
+  if (nFields > 0) {
+    cudaMallocManaged(&fieldData, nFields*blockSizeTot*nBlocksMax*sizeof(real));
+    cudaMemset(fieldData, 0, nFields*blockSizeTot*nBlocksMax*sizeof(real));
+  }
 
   cudaDeviceSynchronize();
 }
@@ -68,6 +76,9 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
 }
 
 void MultiLevelSparseGrid::initializeBaseGrid(void) {
+  // the dense base grid must fit in the block pool (this path activates every
+  // base block; sparse users that skip it are not subject to this bound)
+  assert(baseGridSize[0]*baseGridSize[1]*baseGridSize[2]/blockSizeTot < nBlocksMax);
   // fill the bLocList with base grid blocks
   dim3 cudaBlockSize3(8,8,8);
   dim3 nCudaBlocks3(baseGridSize[0]/blockSize/8+1, 

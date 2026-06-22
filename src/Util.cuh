@@ -5,6 +5,7 @@
 #include <chrono>
 #include "Settings.cuh"
 
+typedef short i16;
 typedef int i32;
 typedef unsigned int u32;
 typedef long long int i64;

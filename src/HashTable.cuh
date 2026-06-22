@@ -10,8 +10,9 @@
 class HashTable : public Managed {
 public:
   i32 nKeys;
+  i32 nDropped;   // blocks refused because capacity (nBlocksMax) was reached
 
-  u64 *keyList; 
+  u64 *keyList;
   i32 *valueList;
 
   HashTable(void);

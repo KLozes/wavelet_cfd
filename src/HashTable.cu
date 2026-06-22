@@ -8,6 +8,7 @@ HashTable::HashTable(void) {
   cudaMallocManaged(&keyList, hashTableSize*sizeof(u64));
   cudaMallocManaged(&valueList, hashTableSize*sizeof(i32));
   reset();
+  nDropped = 0;   // accumulates across the whole build (not cleared by reset)
 }
 
 HashTable::~HashTable(void) {
@@ -53,8 +54,15 @@ __device__ i32 HashTable::insert(u64 key) {
     if (prev == kEmpty) {
 #ifdef __CUDA_ARCH__
       i32 value = atomicAdd(&nKeys, 1);
+      if (value >= nBlocksMax) {          // capacity exceeded: drop (no OOB write)
+        atomicSub(&nKeys, 1);
+        atomicAdd(&nDropped, 1);
+        valueList[slot] = bEmpty;
+        break;
+      }
 #else
       i32 value = nKeys++;
+      if (value >= nBlocksMax) { nKeys--; nDropped++; valueList[slot] = bEmpty; break; }
 #endif
       valueList[slot] = value;
       break;
