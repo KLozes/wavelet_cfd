@@ -117,6 +117,11 @@ static constexpr real PI = 3.141592654f;
 static constexpr i32 log2BlockSize = log2((i32)blockSize);
 
 static constexpr i32 blockSizeTot = powi(blockSize, 3);
+// nodal storage: a blockSize^3 cell block owns (blockSize+1)^3 corner NODES, so the
+// boundary nodes shared with neighbour blocks are duplicated -- but every cell's 8
+// corners are then local to its own block (no neighbour lookups).
+static constexpr i32 blockSizeNode = blockSize+1;
+static constexpr i32 nodeSizeTot   = powi(blockSizeNode, 3);
 static constexpr i32 nBlocksMax = nCellsMax / blockSizeTot;
 static constexpr i32 blockHaloSize = blockSize+2*haloSize;
 static constexpr i32 blockHaloSizeTot = powi(blockHaloSize, 3);

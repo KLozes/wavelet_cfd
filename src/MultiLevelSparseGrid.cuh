@@ -30,6 +30,10 @@ public:
   i32 baseGridSize[3] = {1, 1, 1};
   i32 nLvls;
   i32 nFields;
+  // lean mode (the narrowband SDF): skip the flow-solver-only per-block arrays
+  // (cFlagsList, nbrIdxList, prntIdxList) and the slice buffer (imageDataX), and
+  // skip the matching kernels in sortBlocks.  Cuts per-block memory ~3x.
+  bool lean = false;
   // pseudo2D: collapse z to a single (un-refined, un-fluxed) block.  The
   // z-direction carries blockSize uniform cells that never refine, the
   // z-momentum is never updated, and no z fluxes/boundary blocks are created.
@@ -58,7 +62,7 @@ public:
   i32  *imageSampleY;
   i32  *imageSampleZ;
 
-  MultiLevelSparseGrid(real *domainSize, i32 *baseGridSize_, i32 nLvls_, i32 nFields_);
+  MultiLevelSparseGrid(real *domainSize, i32 *baseGridSize_, i32 nLvls_, i32 nFields_, bool lean_ = false);
 
   ~MultiLevelSparseGrid(void);
 

@@ -5,7 +5,7 @@
 #include "MultiLevelSparseGrid.cuh"
 #include "MultiLevelSparseGridKernels.cuh"
 
-MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_, i32 nLvls_, i32 nFields_) {
+MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_, i32 nLvls_, i32 nFields_, bool lean_) {
 
   domainSize[0] = domainSize_[0];
   domainSize[1] = domainSize_[1];
@@ -17,6 +17,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
 
   nLvls = nLvls_;
   nFields = nFields_;
+  lean = lean_;
 
   // imageDataX holds an x-y slice taken at the mid-z plane (the natural view
   // for the pseudo-2D / quasi-1D Sod problem).
@@ -37,21 +38,29 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   // number of blocks it activates).
   assert(isPowerOf2(blockSize));
 
+  // always needed: block location codes / memory indices / flags (the hash table
+  // is a member with its own allocation)
   cudaMallocManaged(&bLocList, nBlocksMax*sizeof(u64));
   cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(i32));
   cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(i32));
-  cudaMallocManaged(&prntIdxList, nBlocksMax*sizeof(i32));
-  cudaMallocManaged(&nbrIdxList, 27*nBlocksMax*sizeof(i32));
-  cudaMallocManaged(&cFlagsList, blockSizeTot*nBlocksMax*sizeof(i32));
-  cudaMallocManaged(&imageDataX, imageSizeX[0]*imageSizeX[1]*sizeof(real));
-
   cudaMemset(bLocList, 0, nBlocksMax*sizeof(u64));
   cudaMemset(bIdxList, 0, nBlocksMax*sizeof(i32));
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(i32));
-  cudaMemset(prntIdxList, 0, nBlocksMax*sizeof(i32));
-  cudaMemset(nbrIdxList, 0, 27*nBlocksMax*sizeof(i32));
-  cudaMemset(cFlagsList, 0, blockSizeTot*nBlocksMax*sizeof(i32));
-  cudaMemset(imageDataX, 0, imageSizeX[0]*imageSizeX[1]*sizeof(real));
+
+  // flow-solver-only per-block arrays + the slice buffer: skipped in lean mode
+  // (the narrowband SDF needs none of them -- see the `lean` note in the header).
+  prntIdxList = nbrIdxList = cFlagsList = nullptr;
+  imageDataX  = nullptr;
+  if (!lean) {
+    cudaMallocManaged(&prntIdxList, nBlocksMax*sizeof(i32));
+    cudaMallocManaged(&nbrIdxList, 27*nBlocksMax*sizeof(i32));
+    cudaMallocManaged(&cFlagsList, blockSizeTot*nBlocksMax*sizeof(i32));
+    cudaMallocManaged(&imageDataX, imageSizeX[0]*imageSizeX[1]*sizeof(real));
+    cudaMemset(prntIdxList, 0, nBlocksMax*sizeof(i32));
+    cudaMemset(nbrIdxList, 0, 27*nBlocksMax*sizeof(i32));
+    cudaMemset(cFlagsList, 0, blockSizeTot*nBlocksMax*sizeof(i32));
+    cudaMemset(imageDataX, 0, imageSizeX[0]*imageSizeX[1]*sizeof(real));
+  }
 
   // a solver may carry its own field storage (e.g. the SDF's int16 array) and
   // request zero base fields, in which case fieldData is not allocated.
@@ -121,11 +130,13 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   cudaDeviceSynchronize();
   hashTable.reset();
   hashTable.nKeys = nBlocks;
-  updateIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-  updatePrntIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-  updateNbrIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-  flagActiveCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-  flagParentCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this); 
+  updateIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // hash-table rebuild (always)
+  if (!lean) {   // parent/neighbor indices + cell flags are flow-solver-only
+    updatePrntIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    updateNbrIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    flagActiveCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    flagParentCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  }
   cudaDeviceSynchronize();
 }
 

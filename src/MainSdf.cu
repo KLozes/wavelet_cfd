@@ -6,7 +6,10 @@
 // domain volume (Roosing, Strickson & Nikiforakis, CiCP 2019).  Cells outside
 // the band have no block and read as the +band far field on output.
 //
-//   usage:  ./wavesdf [file.stl] [res] [band_cells] [margin] [format]
+//   usage:  ./wavesdf [file.stl] [res] [band_cells] [margin]
+//
+//   `res` is the FINEST resolution; the solver builds a coarse base grid and
+//   refines a narrowband toward the surface up to that resolution (multilevel).
 //
 //     file.stl     input mesh (default: assets/wing.stl)
 //     res          cells along the longest bounding-box axis (default 128)
@@ -15,8 +18,6 @@
 //                  axis's mesh extent (default 0.5 -> domain 2x the mesh per
 //                  axis).  The VTK output is sparse (active cells only), so it is
 //                  unaffected by the domain size; only the 2D slice PNG grows.
-//     format       .vtkhdf type: "image" (default, single ImageData) or "amr"
-//                  (single-level OverlappingAMR -- sparser, but experimental)
 
 #include <sys/stat.h>
 
@@ -43,7 +44,6 @@ int main(int argc, char *argv[]) {
   i32   res       = (argc > 2) ? std::atoi(argv[2]) : 128;
   float bandCells = (argc > 3) ? std::atof(argv[3]) : 5.0f;
   float margin    = (argc > 4) ? std::atof(argv[4]) : 0.5f;
-  std::string fmt = (argc > 5) ? argv[5] : "image";   // .vtkhdf type: "image" or "amr"
 
   // ---- read mesh ---------------------------------------------------------
   std::vector<StlTri> tris;
@@ -68,30 +68,50 @@ int main(int argc, char *argv[]) {
   buildFeatures(tris, feats, nVerts, nEdges, bmin, bmax);
   printf("features: %d unique vertices, %d unique edges\n", nVerts, nEdges);
 
-  // ---- grid geometry: single level, `res` cells on the longest axis ------
+  // ---- grid geometry: multilevel.  `res` sets the FINEST resolution; we build a
+  // coarse base grid (level 0) over the whole domain and refine toward the surface
+  // up to the finest level.  nLvls is auto-picked so the coarse grid is roughly
+  // COARSE_CELLS on its long axis.
   float3 ext = bmax - bmin;
   float maxExt = fmaxf(ext.x, fmaxf(ext.y, ext.z));
-  real  dx   = maxExt / float(res);
-  real  band = bandCells * dx;
+  real  dxFine = maxExt / float(res);          // finest cell size (target)
+  real  band   = bandCells * dxFine;           // narrowband half-width at finest level
 
-  real  bminArr[3] = {bmin.x, bmin.y, bmin.z};
-  real  extArr[3]  = {ext.x, ext.y, ext.z};
-  real  padArr[3], origin[3], domainSize[3];
-  i32   baseGridSize[3];
+  // finest grid extent (cells), same construction as the old single-level path
+  real bminArr[3] = {bmin.x, bmin.y, bmin.z};
+  real extArr[3]  = {ext.x, ext.y, ext.z};
+  real padArr[3], origin[3];
+  i32  gridFine[3];
   for (i32 d = 0; d < 3; d++) {
-    // empty padding on each side: a fraction of THIS axis's extent (so the box
-    // scales uniformly instead of a thin axis ballooning), but never less than
-    // the band + one cell (mesh stays strictly interior and the band fits).
-    padArr[d] = fmaxf(margin * extArr[d], band + dx);
+    padArr[d] = fmaxf(margin * extArr[d], band + dxFine);
     origin[d] = bminArr[d] - padArr[d];
-    i32 nB = (i32)ceilf((extArr[d] + 2*padArr[d]) / dx / blockSize);
-    baseGridSize[d] = blockSize * nB;
-    domainSize[d]   = baseGridSize[d] * dx;
+    gridFine[d] = blockSize * (i32)ceilf((extArr[d] + 2*padArr[d]) / dxFine / blockSize);
+  }
+
+  // pick nLvls so the coarse long axis is ~COARSE_CELLS (level fits in 4 bits)
+  const i32 COARSE_CELLS = 16, MAX_LVLS = 10;
+  i32 maxFine = gridFine[0];
+  if (gridFine[1] > maxFine) maxFine = gridFine[1];
+  if (gridFine[2] > maxFine) maxFine = gridFine[2];
+  i32 nLvls = 1;
+  while (nLvls < MAX_LVLS && (maxFine >> nLvls) >= COARSE_CELLS) nLvls++;
+  i32 cf = 1 << (nLvls - 1);                    // coarse->fine refinement factor
+
+  // coarse base grid: round each fine axis up to a multiple of blockSize*cf so it
+  // refines evenly; coarse = fine/cf, domain spans the (rounded) fine grid
+  i32  baseGridSize[3];
+  real domainSize[3];
+  for (i32 d = 0; d < 3; d++) {
+    i32 unit  = blockSize * cf;
+    i32 fineR = ((gridFine[d] + unit - 1) / unit) * unit;
+    baseGridSize[d] = fineR / cf;
+    domainSize[d]   = fineR * dxFine;
   }
   printf("bbox: [%.4g %.4g %.4g] .. [%.4g %.4g %.4g]\n",
          bmin.x, bmin.y, bmin.z, bmax.x, bmax.y, bmax.z);
-  printf("grid: %dx%dx%d cells  dx=%.4g  band=%.4g (%.1f cells)  margin=%.2f\n",
-         baseGridSize[0], baseGridSize[1], baseGridSize[2], dx, band, bandCells, margin);
+  printf("multilevel: %d levels  coarse %dx%dx%d -> fine %dx%dx%d  dxFine=%.4g  band=%.4g (%.1f cells)\n",
+         nLvls, baseGridSize[0], baseGridSize[1], baseGridSize[2],
+         baseGridSize[0]*cf, baseGridSize[1]*cf, baseGridSize[2]*cf, dxFine, band, bandCells);
   printf("      domain %.4g x %.4g x %.4g\n",
          domainSize[0], domainSize[1], domainSize[2]);
 
@@ -105,7 +125,7 @@ int main(int argc, char *argv[]) {
   cudaMemcpy(dTris, feats.data(), nTris * sizeof(TriFeat), cudaMemcpyHostToDevice);
 
   // ---- build the narrowband SDF ------------------------------------------
-  SignedDistanceSolver *solver = new SignedDistanceSolver(domainSize, baseGridSize, 1);
+  SignedDistanceSolver *solver = new SignedDistanceSolver(domainSize, baseGridSize, nLvls);
   solver->band  = band;
   solver->dTris = dTris;
   solver->nTris = nTris;
@@ -116,52 +136,41 @@ int main(int argc, char *argv[]) {
   auto wall1 = std::chrono::steady_clock::now();
   double wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(wall1 - wall0).count();
 
-  // ---- report: blocks + compression --------------------------------------
-  i64 nGridBlocks = (i64)(baseGridSize[0]/blockSize)*(baseGridSize[1]/blockSize)
-                  * (baseGridSize[2]/blockSize);
-  printf("---- build: %d blocks in %.1f ms ----\n", solver->hashTable.nKeys, wallMs);
-  printf("  blocks: %d activated / %lld in full grid (%.2f%%)\n",
-         solver->hashTable.nKeys, (long long)nGridBlocks,
-         100.0*real(solver->hashTable.nKeys)/real(nGridBlocks));
-
-  // sdf range over active (reached) cells
-  real vmin = 1e30f, vmax = -1e30f; i64 nBandCells = 0, nActive = 0;
+  // ---- report: blocks per level + compression vs a full fine grid --------
+  i32 lvlBlocks[MAX_LVLS] = {0};
+  i64 nCells = 0;
+  real vmin = 1e30f, vmax = -1e30f;
   for (i32 b = 0; b < solver->hashTable.nKeys; b++) {
-    if (solver->bLocList[b] == kEmpty) continue;
+    u64 loc = solver->bLocList[b];
+    if (loc == kEmpty) continue;
+    i32 lvl, ib, jb, kb; solver->decode(loc, lvl, ib, jb, kb);
+    i32 sx=(baseGridSize[0]/blockSize)<<lvl, sy=(baseGridSize[1]/blockSize)<<lvl, sz=(baseGridSize[2]/blockSize)<<lvl;
+    if (ib<0||jb<0||kb<0||ib>=sx||jb>=sy||kb>=sz) continue;   // skip exterior blocks
+    if (lvl < nLvls) lvlBlocks[lvl]++;
     for (i32 c = 0; c < blockSizeTot; c++) {
-      i32 cIdx = b*blockSizeTot + c;
-      if (solver->cFlagsList[cIdx] != ACTIVE) continue;
-      real v = solver->Sdf[cIdx] * solver->sdfQuantum; nActive++;
+      real v = solver->Sdf[(size_t)b*blockSizeTot + c];
+      if (v == SDF_FAR) continue;
+      nCells++;
       vmin = fminf(vmin, v); vmax = fmaxf(vmax, v);
-      if (fabsf(v) < band) nBandCells++;
     }
   }
-  // compression of the stored narrowband (active cells) vs a dense field over
-  // (a) the full padded domain and (b) just the mesh's axis-aligned bbox.
-  i64 nDomainCells = (i64)baseGridSize[0]*baseGridSize[1]*baseGridSize[2];
-  i64 nAabbCells   = (i64)ceilf(ext.x/dx) * (i64)ceilf(ext.y/dx) * (i64)ceilf(ext.z/dx);
-  printf("  active cells: %lld (%lld within band)   sdf range [%.4g, %.4g]\n",
-         (long long)nActive, (long long)nBandCells, vmin, vmax);
-  printf("  compression (cells stored vs dense):\n");
-  printf("    full domain: %lld / %lld = %.2f%%  (%.1fx)\n",
-         (long long)nActive, (long long)nDomainCells,
-         100.0*real(nActive)/real(nDomainCells), real(nDomainCells)/real(nActive));
-  printf("    mesh AABB:   %lld / %lld = %.2f%%  (%.1fx)\n",
-         (long long)nActive, (long long)nAabbCells,
-         100.0*real(nActive)/real(nAabbCells), real(nAabbCells)/real(nActive));
+  printf("---- build: %d blocks, %d levels, %.1f ms ----\n",
+         solver->hashTable.nKeys, nLvls, wallMs);
+  for (i32 l = 0; l < nLvls; l++) printf("    level %d: %d blocks\n", l, lvlBlocks[l]);
+  i64 nFineFull = (i64)(baseGridSize[0]*cf)*(baseGridSize[1]*cf)*(baseGridSize[2]*cf);
+  printf("  cells stored: %lld / %lld fine-full = %.2f%% (%.1fx)   sdf range [%.4g, %.4g]\n",
+         (long long)nCells, (long long)nFineFull,
+         100.0*real(nCells)/real(nFineFull), real(nFineFull)/fmaxf(1.0,real(nCells)), vmin, vmax);
 
   // ---- output ------------------------------------------------------------
   mkdir("output", 0755);
   std::string name = baseName(stlPath);
 
-  // single-file VTKHDF output.  Default "image" is one ImageData (most robust to
-  // render); "amr" selects a single-level OverlappingAMR (sparser, experimental:
-  // the file is valid but ParaView's AMR Surface representation is buggy --
-  // render it via Outline + Contour/Merge Blocks).
-  std::string vtkhdf = "output/" + name + "_sdf.vtkhdf";
-  if (fmt == "amr") solver->writeVTKHDFAmr(vtkhdf.c_str());
-  else              solver->writeVTKHDF(vtkhdf.c_str());
-  printf("wrote %s (%s)\n", vtkhdf.c_str(), fmt.c_str());
+  // output the octree as a vtkHyperTreeGrid (.htg): a single connected dataset
+  // with a first-class ParaView representation -- renders + contours directly.
+  std::string htg = "output/" + name + "_sdf.htg";
+  solver->writeHtg(htg.c_str());
+  printf("wrote %s\n", htg.c_str());
 
   std::string slicePrefix = "output/" + name;
   solver->writeSlices(slicePrefix.c_str());   // orthogonal x-y / x-z / y-z cross sections

@@ -44,7 +44,8 @@ inline float cornerAngle(float3 a, float3 b, float3 c) {
 inline void buildFeatures(const std::vector<StlTri>& tris,
                           std::vector<TriFeat>& feats,
                           int& nUniqueVerts, int& nUniqueEdges,
-                          float3& bmin, float3& bmax) {
+                          float3& bmin, float3& bmax,
+                          std::vector<float3>* outVerts = nullptr) {  // welded unique vertices
   const size_t nT = tris.size();
 
   // --- bounding box -------------------------------------------------------
@@ -79,6 +80,7 @@ inline void buildFeatures(const std::vector<StlTri>& tris,
       corner[t * 3 + k] = id;
     }
   nUniqueVerts = (int)vpos.size();
+  if (outVerts) *outVerts = vpos;   // welded unique vertex positions (file coords)
 
   // --- global orientation -------------------------------------------------
   // The CSC algorithm assumes outward-pointing normals, but STL files are often

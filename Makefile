@@ -19,16 +19,17 @@ STD       = c++17
 NVCCFLAGS = -O2 -std=$(STD) -arch=$(ARCH)
 LDFLAGS   = -lpng -lz
 
-# HDF5 (serial) for the VTKHDF SDF output -- wavesdf only.  Debian/Ubuntu put the
-# headers in /usr/include/hdf5/serial (off the default path), exposed via the
-# hdf5-serial pkg-config name; fall back to plain hdf5 elsewhere.
-HDF5_CFLAGS = $(shell pkg-config --cflags hdf5-serial 2>/dev/null || pkg-config --cflags hdf5 2>/dev/null)
-HDF5_LIBS   = $(shell pkg-config --libs   hdf5-serial 2>/dev/null || pkg-config --libs   hdf5 2>/dev/null)
-
 # per-executable cell cap (blocks = NCELLS_MAX/blockSizeTot).  wave3d keeps the
-# default (8M cells ~0.5 GB at 16 fields); wavesdf is 2 fields so 64M cells
-# (~1M blocks, ~0.9 GB) fits comfortably on the 4 GB card.
-WAVESDF_DEFS = -DNCELLS_MAX=64000000
+# default (8M cells).  wavesdf runs the grid in lean mode (skips the flow solver's
+# cFlagsList/nbrIdxList/prntIdxList/imageDataX); with the fp32 Sdf that is ~310
+# B/block, so 384M cells (6M blocks, ~2.2 GB) fit on a 3 GB card -- enough for a
+# clean res 2048 (~1.9M blocks).
+WAVESDF_DEFS = -DNCELLS_MAX=384000000
+# wavewsdf (the wavelet / BVH-oracle SDF) stores the 1-jet per cell (value +
+# gradient = 16 B/cell).  Its surface-fit octree is ~1000x sparser than a
+# narrowband, so 64M cells (1M blocks, ~1 GB) is ample even at high res and fits a
+# 3 GB card.
+WAVEWSDF_DEFS = -DNCELLS_MAX=64000000
 
 # headers (no automatic dependency tracking, so rebuild on any header change)
 HDRS = $(wildcard $(SRC_DIR)/*.cuh) $(wildcard $(SRC_DIR)/*.h)
@@ -37,29 +38,38 @@ WAVE3D_SRCS  = HashTable MultiLevelSparseGrid MultiLevelSparseGridKernels \
                CompressibleSolver CompressibleSolverKernels Main
 WAVESDF_SRCS = HashTable MultiLevelSparseGrid MultiLevelSparseGridKernels \
                SignedDistanceSolver SignedDistanceSolverKernels MainSdf
+WAVEWSDF_SRCS = HashTable MultiLevelSparseGrid MultiLevelSparseGridKernels \
+               WaveletSdfSolver WaveletSdfSolverKernels DualContourGpu NodalOctree MainWaveSdf
 
 WAVE3D_OBJS  = $(patsubst %,$(OBJ_DIR)/wave3d/%.cu.o,$(WAVE3D_SRCS))
 WAVESDF_OBJS = $(patsubst %,$(OBJ_DIR)/wavesdf/%.cu.o,$(WAVESDF_SRCS))
+WAVEWSDF_OBJS = $(patsubst %,$(OBJ_DIR)/wavewsdf/%.cu.o,$(WAVEWSDF_SRCS))
 
-all: wave3d wavesdf
+all: wave3d wavesdf wavewsdf
 
 wave3d: $(WAVE3D_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
 wavesdf: $(WAVESDF_OBJS)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS) $(HDF5_LIBS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
+
+wavewsdf: $(WAVEWSDF_OBJS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
 # ---- build rules (one per executable, so each gets its own NCELLS_MAX) ------
 $(OBJ_DIR)/wave3d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d
 	$(NVCC) $(NVCCFLAGS) -I./$(SRC_DIR) -dc $< -o $@
 
 $(OBJ_DIR)/wavesdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavesdf
-	$(NVCC) $(NVCCFLAGS) $(WAVESDF_DEFS) $(HDF5_CFLAGS) -I./$(SRC_DIR) -dc $< -o $@
+	$(NVCC) $(NVCCFLAGS) $(WAVESDF_DEFS) -I./$(SRC_DIR) -dc $< -o $@
 
-$(OBJ_DIR)/wave3d $(OBJ_DIR)/wavesdf:
+$(OBJ_DIR)/wavewsdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavewsdf
+	$(NVCC) $(NVCCFLAGS) $(WAVEWSDF_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+
+$(OBJ_DIR)/wave3d $(OBJ_DIR)/wavesdf $(OBJ_DIR)/wavewsdf:
 	mkdir -p $@
 
 clean:
-	rm -rf $(OBJ_DIR) wave3d wavesdf
+	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf
 
 .PHONY: all clean

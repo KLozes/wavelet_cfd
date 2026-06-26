@@ -6,23 +6,17 @@
 // reused unchanged from the single-level narrowband solver.
 //
 
-// Keep the int16 code at `addr` with the smaller magnitude.  `val` is the fp32
-// candidate distance; it is quantized to int16 (round(val*invQ), clamped to the
-// real range [-32767, 32767]) only on store.  Because the quantum is positive,
-// comparing the integer codes' magnitudes is equivalent to comparing the fp32
-// distances' magnitudes, and the unreached sentinel INT16_MIN has magnitude
-// 32768 so it always loses to the first real candidate.  The CAS runs on the
-// underlying 16-bit word (sm_70+ supports 16-bit atomicCAS); the initial read is
-// `volatile` so strict aliasing cannot drop the cross-thread store from
+// Keep the fp32 distance at `addr` with the smaller magnitude.  The unreached
+// sentinel SDF_FAR has the largest magnitude, so it always loses to the first
+// real candidate.  The CAS runs on the underlying 32-bit word; the initial read
+// is `volatile` so strict aliasing cannot drop the cross-thread store from
 // initSdfKernel.
-__device__ inline void atomicMinMag(i16 *addr, float val, float invQ) {
-  int q = __float2int_rn(val * invQ);
-  q = max(-32767, min(32767, q));                     // leave INT16_MIN as sentinel
-  unsigned short vbits = (unsigned short)(i16)q;
-  unsigned short *p = reinterpret_cast<unsigned short*>(addr);
-  unsigned short old = *(volatile unsigned short*)p;
-  while (abs((int)(i16)old) > abs(q)) {               // current loses
-    unsigned short assumed = old;
+__device__ inline void atomicMinMag(real *addr, real val) {
+  unsigned int  vbits = __float_as_uint(val);
+  unsigned int *p     = reinterpret_cast<unsigned int*>(addr);
+  unsigned int  old   = *(volatile unsigned int*)p;
+  while (fabsf(__uint_as_float(old)) > fabsf(val)) {  // current loses
+    unsigned int assumed = old;
     old = atomicCAS(p, assumed, vbits);
     if (old == assumed) break;                        // success
   }
@@ -80,7 +74,7 @@ __device__ inline float3 selectPN(const TriFeat &T, int region) {
 // ---------------------------------------------------------------------------
 
 __global__ void initSdfKernel(SignedDistanceSolver &grid) {
-  i16 *Sdf = grid.Sdf;
+  real *Sdf = grid.Sdf;
   START_CELL_LOOP
     Sdf[cIdx] = SDF_FAR;   // sentinel; the distance sweep fills reached cells
   END_CELL_LOOP
@@ -93,25 +87,26 @@ __global__ void initSdfKernel(SignedDistanceSolver &grid) {
 // the surface area, not the domain volume (Roosing, Strickson & Nikiforakis,
 // CiCP 2019).
 //
-__global__ void registerCellsSdfKernel(SignedDistanceSolver &grid) {
+__global__ void registerCellsSdfKernel(SignedDistanceSolver &grid, i32 lvl, real band) {
   const TriFeat *tris = grid.dTris;
   i32 nTris = grid.nTris;
-  real dx = grid.getDx(0);
-  i32 gx = grid.baseGridSize[0], gy = grid.baseGridSize[1], gz = grid.baseGridSize[2];
+  real dx = grid.getDx(lvl);
+  i32 gx = grid.baseGridSize[0]*powi(2,lvl);
+  i32 gy = grid.baseGridSize[1]*powi(2,lvl);
+  i32 gz = grid.baseGridSize[2]*powi(2,lvl);
 
   for (i32 t = blockIdx.x * blockDim.x + threadIdx.x; t < nTris;
        t += gridDim.x * blockDim.x) {
     TriFeat T = tris[t];
     float3 lo = fmin3(fmin3(T.v0, T.v1), T.v2);
     float3 hi = fmax3(fmax3(T.v0, T.v1), T.v2);
-    real grow = grid.band;
 
-    i32 i0 = max(0,    (i32)floorf((lo.x - grow) / dx));
-    i32 j0 = max(0,    (i32)floorf((lo.y - grow) / dx));
-    i32 k0 = max(0,    (i32)floorf((lo.z - grow) / dx));
-    i32 i1 = min(gx-1, (i32)floorf((hi.x + grow) / dx) + 1);
-    i32 j1 = min(gy-1, (i32)floorf((hi.y + grow) / dx) + 1);
-    i32 k1 = min(gz-1, (i32)floorf((hi.z + grow) / dx) + 1);
+    i32 i0 = max(0,    (i32)floorf((lo.x - band) / dx));
+    i32 j0 = max(0,    (i32)floorf((lo.y - band) / dx));
+    i32 k0 = max(0,    (i32)floorf((lo.z - band) / dx));
+    i32 i1 = min(gx-1, (i32)floorf((hi.x + band) / dx) + 1);
+    i32 j1 = min(gy-1, (i32)floorf((hi.y + band) / dx) + 1);
+    i32 k1 = min(gz-1, (i32)floorf((hi.z + band) / dx) + 1);
 
     for (i32 k = k0; k <= k1; ++k)
       for (i32 j = j0; j <= j1; ++j)
@@ -119,8 +114,8 @@ __global__ void registerCellsSdfKernel(SignedDistanceSolver &grid) {
           float3 p = make_float3((i + 0.5f) * dx, (j + 0.5f) * dx, (k + 0.5f) * dx);
           int region;
           float3 q = closestPtTriangle(p, T.v0, T.v1, T.v2, region);
-          if (norm(p - q) <= grid.band)
-            grid.activateBlock(0, i/blockSize, j/blockSize, k/blockSize);
+          if (norm(p - q) <= band)
+            grid.activateBlock(lvl, i/blockSize, j/blockSize, k/blockSize);
         }
   }
 }
@@ -136,14 +131,15 @@ __global__ void registerCellsSdfKernel(SignedDistanceSolver &grid) {
 // filled exactly.  The hash lookup is done first so the closest-point test runs
 // only for cells that actually land in an active block.
 //
-__global__ void computeSdfKernel(SignedDistanceSolver &grid) {
-  i16 *Sdf = grid.Sdf;
-  const float invQ = grid.sdfInvQuantum;
+__global__ void computeSdfKernel(SignedDistanceSolver &grid, i32 lvl, real band) {
+  real *Sdf = grid.Sdf;
   const TriFeat *tris = grid.dTris;
   i32 nTris = grid.nTris;
-  real dx = grid.getDx(0);
-  i32 gx = grid.baseGridSize[0], gy = grid.baseGridSize[1], gz = grid.baseGridSize[2];
-  const real grow = grid.band + blockSize * dx * 1.7320508f;   // band + block diag
+  real dx = grid.getDx(lvl);
+  i32 gx = grid.baseGridSize[0]*powi(2,lvl);
+  i32 gy = grid.baseGridSize[1]*powi(2,lvl);
+  i32 gz = grid.baseGridSize[2]*powi(2,lvl);
+  const real grow = band + blockSize * dx * 1.7320508f;   // band + block diag
 
   for (i32 t = blockIdx.x * blockDim.x + threadIdx.x; t < nTris;
        t += gridDim.x * blockDim.x) {
@@ -162,7 +158,7 @@ __global__ void computeSdfKernel(SignedDistanceSolver &grid) {
       for (i32 j = j0; j <= j1; ++j)
         for (i32 i = i0; i <= i1; ++i) {
           i32 ib = i/blockSize, jb = j/blockSize, kb = k/blockSize;
-          i32 bIdx = grid.hashTable.getValue(grid.encode(0, ib, jb, kb));
+          i32 bIdx = grid.hashTable.getValue(grid.encode(lvl, ib, jb, kb));
           if (bIdx == bEmpty) continue;          // cell not in an active block
           float3 p = make_float3((i + 0.5f) * dx, (j + 0.5f) * dx, (k + 0.5f) * dx);
           int region;
@@ -173,30 +169,46 @@ __global__ void computeSdfKernel(SignedDistanceSolver &grid) {
           i32 cell = bIdx * blockSizeTot + (i - ib*blockSize)
                    + (j - jb*blockSize) * blockSize
                    + (k - kb*blockSize) * blockSize * blockSize;
-          atomicMinMag(&Sdf[cell], s * dist, invQ);
+          atomicMinMag(&Sdf[cell], s * dist);
         }
   }
 }
 
-//
-// Mark every reached cell of an interior block ACTIVE.  The narrowband fills a
-// whole block exactly (pass 2), so there is no reconstruction halo to leave as
-// GHOST; the cell-flag pass from sortBlocks would otherwise ghost band-edge
-// cells (its halo neighbors are missing).  Unreached cells (none, in practice)
-// stay GHOST so the slice image and the report only count real distances.
-//
-__global__ void flagBandCellsActiveSdfKernel(SignedDistanceSolver &grid) {
-  i16 *Sdf = grid.Sdf;
+// level-0 coarse full grid: brute force every interior level-0 cell against all
+// triangles (cell-parallel, register min-magnitude, single store).  The coarse
+// grid is small, so this gives the real far field for free; finer levels are
+// filled by the narrowband computeSdfKernel above.
+__global__ void computeSdfCoarseKernel(SignedDistanceSolver &grid) {
+  real *Sdf = grid.Sdf;
+  const TriFeat *tris = grid.dTris;
+  i32 nTris = grid.nTris;
+
   START_CELL_LOOP
+    GET_CELL_INDICES
 
-    u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb, kb;
-    grid.decode(loc, lvl, ib, jb, kb);
+    grid.decode(grid.bLocList[bIdx], lvl, ib, jb, kb);
 
-    bool reached = grid.isInteriorBlock(lvl, ib, jb, kb)
-                && Sdf[cIdx] != SDF_FAR;
-    grid.cFlagsList[cIdx] = reached ? ACTIVE : GHOST;
+    if (lvl == 0 && grid.isInteriorBlock(lvl, ib, jb, kb)) {
+      Vec3 pos = grid.getCellPos(0, ib, jb, kb, i, j, k);
+      float3 p = make_float3(pos[0], pos[1], pos[2]);
+      float best = 1e30f, bestSigned = 1e30f;
+      for (i32 t = 0; t < nTris; t++) {
+        TriFeat T = tris[t];
+        int region;
+        float3 q = closestPtTriangle(p, T.v0, T.v1, T.v2, region);
+        float3 dvec = p - q;
+        float d = norm(dvec);
+        if (d < best) {
+          best = d;
+          float s = (dot(dvec, selectPN(T, region)) >= 0.0f) ? 1.0f : -1.0f;
+          bestSigned = s * d;
+        }
+      }
+      Sdf[cIdx] = bestSigned;
+    }
 
   END_CELL_LOOP
 }
+
 
