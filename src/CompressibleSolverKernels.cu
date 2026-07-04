@@ -949,17 +949,19 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
       grid.bFlagsList[prntIdx] = KEEP;
 
       if (grid.staticGrid) {
-        // fixed radial refinement about the domain centre: nested shells, finest
-        // at the centre.  Level L occupies r < refineRadius*(nLvls-L)/(nLvls-1),
-        // so successive coarse/fine interfaces sit at shrinking radii inside the
-        // flow feature.  Independent of the solution -> the grid never changes.
+        // fixed refinement in nested shells about the domain centre, finest at the
+        // centre: level L occupies d < refineRadius*(nLvls-L)/(nLvls-1), so each
+        // coarse/fine interface sits at a shrinking distance.  staticGrid==1 uses
+        // the radial distance (a vortex core); ==2 uses |x-centre| (a planar band,
+        // for a shock crossing an x-normal interface).  Independent of the solution.
         real cx = 0.5*grid.domainSize[0], cy = 0.5*grid.domainSize[1];
-        real r  = sqrt((pos[0]-cx)*(pos[0]-cx) + (pos[1]-cy)*(pos[1]-cy));
+        real d  = (grid.staticGrid == 2) ? fabs(pos[0]-cx)
+                  : sqrt((pos[0]-cx)*(pos[0]-cx) + (pos[1]-cy)*(pos[1]-cy));
         real invN   = 1.0 / (real)(grid.nLvls - 1);
         real Rkeep  = grid.refineRadius * (real)(grid.nLvls - lvl)     * invN;
         real Rchild = grid.refineRadius * (real)(grid.nLvls - 1 - lvl) * invN;
-        if (r < Rkeep) grid.bFlagsList[bIdx] = KEEP;
-        if (lvl < grid.nLvls-1 && r < Rchild) {
+        if (d < Rkeep) grid.bFlagsList[bIdx] = KEEP;
+        if (lvl < grid.nLvls-1 && d < Rchild) {
           i32 bSize = blockSize/2;
           i32 kc = grid.pseudo2D ? kb : (2*kb + k/bSize);
           grid.activateBlock(lvl+1, 2*ib+i/bSize, 2*jb+j/bSize, kc);
@@ -1030,40 +1032,12 @@ __global__ void interpolateFieldsKernel(CompressibleSolver &grid) {
       real ys = 2*(j % 2) - 1;
       real zs = grid.pseudo2D ? 0.0 : (2*(k % 2) - 1);
 
-      if (grid.basisGhost == 2) {
-        // monotone (tri)linear ghost fill — smooth (no piecewise-constant jump)
-        // and overshoot-free (no DD ringing).  Applied to every evolved field.
-        for (i32 f = 0; f < NEVOLVE; f++)
-          grid.getField(f)[cIdx] = trilinearGhost(grid, grid.getField(f), prntIdx, ip, jp, kp, xs, ys, zs);
-      }
-      else if (grid.basisGhost == 1) {
-        // low-Mach-consistent coarse/fine ghost fill from the coarse cell's own
-        // basis: P0 (piecewise constant) for rho/E — avoids the spurious pressure
-        // fluctuations that DD interpolation injects at low Mach — and the RT0
-        // field (linear in the momentum's own axis, constant in the transverse
-        // ones) for momentum.  The momentum is thus exactly the coarse RT0
-        // representation: face-normal momentum stays continuous, and the momentum
-        // is left *constant* along the interface.  That tangential "jump" is not a
-        // defect to remove: it is the divergence-consistent RT0 structure, and
-        // forcing transverse variation in (via DD) breaks it and worsens low Mach.
-        //   slopes: coarse gradient (RT0 slope is constant across the coarse cell).
-        i32 C = grid.getNbrIdx(prntIdx, ip, jp, kp);
-        real qdxC = 0.5*grid.getDx(lvl);   // dxCoarse/4 = (2*dxFine)/4 = dxFine/2
-        real qdyC = 0.5*grid.getDy(lvl);
-        real qdzC = grid.pseudo2D ? 0.0 : 0.5*grid.getDz(lvl);
-        grid.getField(F_RHO )[cIdx] = grid.getField(F_RHO )[C];
-        grid.getField(F_RHOE)[cIdx] = grid.getField(F_RHOE)[C];
-        grid.getField(F_RHOU)[cIdx] = grid.getField(F_RHOU)[C] + xs*qdxC*grid.getField(F_GX)[C];
-        grid.getField(F_RHOV)[cIdx] = grid.getField(F_RHOV)[C] + ys*qdyC*grid.getField(F_GY)[C];
-        grid.getField(F_RHOW)[cIdx] = grid.getField(F_RHOW)[C] + zs*qdzC*grid.getField(F_GZ)[C];
-        grid.getField(F_GX)[cIdx] = grid.getField(F_GX)[C];
-        grid.getField(F_GY)[cIdx] = grid.getField(F_GY)[C];
-        grid.getField(F_GZ)[cIdx] = grid.getField(F_GZ)[C];
-      }
-      else
-      for (i32 f = 0; f < NEVOLVE; f++) {
-        grid.getField(f)[cIdx] = predictEvolvedField(grid, 0, f, prntIdx, ip, jp, kp, xs, ys, zs, lvl);
-      }
+      // monotone (tri)linear ghost fill: smooth (no piecewise-constant jump) and
+      // overshoot-free (no DD ringing), which is what keeps the coarse/fine
+      // interface low-Mach consistent (a positive-weighted average of the coarse
+      // cells cannot overshoot, so no spurious pressure is injected).
+      for (i32 f = 0; f < NEVOLVE; f++)
+        grid.getField(f)[cIdx] = trilinearGhost(grid, grid.getField(f), prntIdx, ip, jp, kp, xs, ys, zs);
     }
 
   END_CELL_LOOP

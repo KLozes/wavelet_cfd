@@ -476,6 +476,42 @@ void CompressibleSolver::computeGreshoError(void) {
   printf("-------------------------------------------------------\n");
 }
 
+//
+// Domain totals of the conserved variables (mass, x-momentum, energy), summed
+// over active interior cells with level-dependent cell volumes.  On a closed or
+// not-yet-reached-boundary problem these are exactly conserved by the physics, so
+// their drift over time measures the coarse/fine interface conservation error.
+//
+void CompressibleSolver::totalConserved(double &mass, double &momx, double &energy) {
+  cudaDeviceSynchronize();
+  real *Rho = getField(F_RHO), *RhoU = getField(F_RHOU), *RhoE = getField(F_RHOE);
+  mass = 0; momx = 0; energy = 0;
+
+  for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
+    u64 loc = bLocList[bIdx];
+    if (loc == kEmpty) continue;
+    i32 lvl = loc >> 60;
+    i32 kb  = ((loc >> 40) & ((1 << 20)-1)) - 1;
+    i32 jb  = ((loc >> 20) & ((1 << 20)-1)) - 1;
+    i32 ib  = ( loc        & ((1 << 20)-1)) - 1;
+    i32 gx = baseGridSize[0]/blockSize*powi(2,lvl);
+    i32 gy = baseGridSize[1]/blockSize*powi(2,lvl);
+    i32 gz = pseudo2D ? baseGridSize[2]/blockSize : baseGridSize[2]/blockSize*powi(2,lvl);
+    if (ib < 0 || jb < 0 || kb < 0 || ib >= gx || jb >= gy || kb >= gz) continue;
+    double dV = (double)(domainSize[0]/double(baseGridSize[0]*powi(2,lvl)))
+              * (double)(domainSize[1]/double(baseGridSize[1]*powi(2,lvl)))
+              * (double)(pseudo2D ? domainSize[2]/double(baseGridSize[2])
+                                  : domainSize[2]/double(baseGridSize[2]*powi(2,lvl)));
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      i32 cIdx = bIdx*blockSizeTot + c;
+      if (cFlagsList[cIdx] != ACTIVE) continue;
+      mass   += Rho [cIdx] * dV;
+      momx   += RhoU[cIdx] * dV;
+      energy += RhoE[cIdx] * dV;
+    }
+  }
+}
+
 void CompressibleSolver::paintPressure(const char *fileName) {
   computePressureKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();

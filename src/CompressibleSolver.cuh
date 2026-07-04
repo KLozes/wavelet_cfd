@@ -64,7 +64,6 @@ public:
   i32 staticGrid;       // 1 = fixed refinement (no dynamic wavelet adaptation)
   real refineRadius;    // static-grid: outer radius of the level-1 refinement shell (about the domain centre)
   i32 reflux;           // 1 = conservative flux correction at coarse/fine interfaces (per-dim flux-array RHS)
-  i32 basisGhost;       // 1 = fill coarse/fine ghost cells from the RT0 (momentum) / P0 (rho,E) basis instead of DD
 
   i32 tGrid;
   i32 tSolver;
@@ -92,7 +91,6 @@ public:
       staticGrid = 0;
       refineRadius = 0.4;
       reflux = 0;
-      basisGhost = 2;   // default coarse/fine ghost fill: 0=DD, 1=RT0/P0, 2=monotone trilinear
 
       tGrid = 0.0;
       tSolver = 0.0;
@@ -121,6 +119,7 @@ public:
   void printDiagnostics(void);                  // AMR-boundary spike / pseudo-2D diagnostics
   void computeVortexError(void);                // L2 error vs the exact stationary isentropic vortex
   void computeGreshoError(void);                // L2 velocity error + KE retention vs the exact Gresho vortex
+  void totalConserved(double &mass, double &momx, double &energy); // domain totals of the conserved variables
   void paintPressure(const char *fileName);     // render the pressure field to a png
 
   __device__ Vec5 prim2cons(Vec5 prim);
