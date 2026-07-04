@@ -6,21 +6,42 @@
 static constexpr real gam = 1.4;
 
 //
-// 3D compressible Euler solver (HLLC flux + TVD reconstruction + TVD-RK3).
+// 3D compressible Euler solver.  Two discretizations share the same data layout,
+// selected by `scheme`:
+//   scheme 0 : finite volume    (HLLC flux + TVD reconstruction + TVD-RK3)
+//   scheme 1 : RT0/P0 DG        (ported from ../fvStuff/rt_dg_euler_2d.cu)
+//              density ρ, energy E : P0 (cell average)
+//              momentum ρu         : RT0 (cell-average mode + per-axis slope mode)
 //
-// field layout (nFields = 16).  fields 0-4 alternate between conservative and
+// The RT0 slope DOFs are stored as the *physical* momentum gradients
+//   Gx = ∂(ρu)/∂x,  Gy = ∂(ρv)/∂y,  Gz = ∂(ρw)/∂z          (modal mxs = (dx/2)·Gx)
+// so that, being level-independent smooth fields, they ride the existing
+// interpolating-wavelet AMR machinery unchanged.  The FV scheme leaves them 0.
+//
+// field layout (nFields = 25).  fields 0-4 alternate between conservative and
 // primitive storage in place (see conservative/primitive conversion kernels):
 //
 //   0 : Rho  | Rho
-//   1 : RhoU | U
-//   2 : RhoV | V
-//   3 : RhoW | W
+//   1 : RhoU | U          (momentum cell-average mxa)
+//   2 : RhoV | V          (mya)
+//   3 : RhoW | W          (mza)
 //   4 : RhoE | P
-//   5..9   : Old{Rho,RhoU,RhoV,RhoW,RhoE}   (RK3 substep storage)
-//   10..14 : Rhs{Rho,RhoU,RhoV,RhoW,RhoE}   (right hand side accumulator)
-//   15     : DeltaT / MagRhoU               (scratch, reused)
+//   5 : Gx               RT0 x-momentum slope  (∂(ρu)/∂x)
+//   6 : Gy               RT0 y-momentum slope  (∂(ρv)/∂y)
+//   7 : Gz               RT0 z-momentum slope  (∂(ρw)/∂z)
+//   8..15  : Old{0..7}                        (RK3 substep storage)
+//   16..23 : Rhs{0..7}                        (right hand side accumulator)
+//   24     : DeltaT / MagRhoU / pressure       (scratch, reused)
 //
-static constexpr i32 nCompressibleFields = 16;
+enum CompressibleField {
+  F_RHO = 0, F_RHOU = 1, F_RHOV = 2, F_RHOW = 3, F_RHOE = 4,
+  F_GX  = 5, F_GY  = 6, F_GZ  = 7,
+  F_OLD = 8,       // Old{0..7} occupy  8..15
+  F_RHS = 16,      // Rhs{0..7} occupy 16..23
+  F_SCRATCH = 24
+};
+static constexpr i32 NEVOLVE = 8;                 // evolved DOFs (fields 0..7)
+static constexpr i32 nCompressibleFields = 25;
 
 class CompressibleSolver : public MultiLevelSparseGrid {
 public:
@@ -30,7 +51,12 @@ public:
   real maxRho;
   real maxMagRhoU;
   real maxRhoE;
+  real maxMagGrad;      // scale for thresholding the RT0 slope DOFs (Gx,Gy,Gz)
   real waveletThresh;
+
+  i32 scheme;           // 0 = finite volume (HLLC+TVD), 1 = RT0/P0 DG
+  real vortexAdvect;    // isentropic-vortex IC advection velocity (u0=v0)
+  real greshoP0;        // Gresho-vortex background pressure = 1/(gam*Ma^2) (sets Mach)
 
   i32 tGrid;
   i32 tSolver;
@@ -51,6 +77,10 @@ public:
       immerserdBcType = 0;
       bcType = 0;
       icType = 0;
+      scheme = 0;
+      maxMagGrad = 1.0;
+      vortexAdvect = 0.0;
+      greshoP0 = 0.0;
 
       tGrid = 0.0;
       tSolver = 0.0;
@@ -77,10 +107,13 @@ public:
 
   void writeLineProfile(const char *fileName); // 1D profile dump for validation
   void printDiagnostics(void);                  // AMR-boundary spike / pseudo-2D diagnostics
+  void computeVortexError(void);                // L2 error vs the exact stationary isentropic vortex
+  void computeGreshoError(void);                // L2 velocity error + KE retention vs the exact Gresho vortex
   void paintPressure(const char *fileName);     // render the pressure field to a png
 
   __device__ Vec5 prim2cons(Vec5 prim);
   __device__ Vec5 cons2prim(Vec5 cons);
+  __device__ real pressureRT(real rho, real mxa, real mya, real mza, real E);
   __device__ real lim(real &r);
   __device__ real tvdRec(real &ul, real &uc, real &ur);
   __device__ Vec5 hllcFlux(Vec5 qL, Vec5 qR, Vec3 normal);

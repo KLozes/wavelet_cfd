@@ -10,13 +10,11 @@
 #include "MultiLevelSparseGridKernels.cuh"
 
 void CompressibleSolver::initialize(void) {
+  periodic = (bcType == 2);   // enable ghost-block wrap in sortBlocks (survives re-sorts)
   initializeBaseGrid();
   setInitialConditions();
   primitiveToConservative();
   sortBlocks();
-  if (bcType == 1) {
-    updateNbrIndicesPeriodicKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-  }
   setBoundaryConditions();
   cudaDeviceSynchronize();
   printf("nblocks %d\n", hashTable.nKeys);
@@ -112,9 +110,16 @@ void CompressibleSolver::primitiveToConservative(void) {
 void CompressibleSolver::forwardWaveletTransform(void) {
   cudaDeviceSynchronize();
   computeMagUKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-  maxRho     = *(thrust::max_element(thrust::device, getField(0),  getField(0)+hashTable.nKeys*blockSizeTot));
-  maxMagRhoU = *(thrust::max_element(thrust::device, getField(15), getField(15)+hashTable.nKeys*blockSizeTot));
-  maxRhoE    = *(thrust::max_element(thrust::device, getField(4),  getField(4)+hashTable.nKeys*blockSizeTot));
+  maxRho     = *(thrust::max_element(thrust::device, getField(F_RHO),     getField(F_RHO)+hashTable.nKeys*blockSizeTot));
+  maxMagRhoU = *(thrust::max_element(thrust::device, getField(F_SCRATCH), getField(F_SCRATCH)+hashTable.nKeys*blockSizeTot));
+  maxRhoE    = *(thrust::max_element(thrust::device, getField(F_RHOE),    getField(F_RHOE)+hashTable.nKeys*blockSizeTot));
+  // scale for the RT0 slope DOFs: max |momentum-gradient| over Gx,Gy,Gz
+  if (scheme == 1) {
+    real gx = *(thrust::max_element(thrust::device, getField(F_GX), getField(F_GX)+hashTable.nKeys*blockSizeTot));
+    real gy = *(thrust::max_element(thrust::device, getField(F_GY), getField(F_GY)+hashTable.nKeys*blockSizeTot));
+    real gz = *(thrust::max_element(thrust::device, getField(F_GZ), getField(F_GZ)+hashTable.nKeys*blockSizeTot));
+    maxMagGrad = fmax(fmax(fabs(gx), fabs(gy)), fmax(fabs(gz), (real)1e-32));
+  }
 
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(i32));
   copyToOldFieldsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
@@ -129,7 +134,7 @@ void CompressibleSolver::inverseWaveletTransform(void) {
 void CompressibleSolver::computeDeltaT(void) {
   computeDeltaTKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
-  deltaT = *(thrust::min_element(thrust::device, getField(15), getField(15)+hashTable.nKeys*blockSizeTot));
+  deltaT = *(thrust::min_element(thrust::device, getField(F_SCRATCH), getField(F_SCRATCH)+hashTable.nKeys*blockSizeTot));
   deltaT *= cfl;
 }
 
@@ -312,10 +317,134 @@ void CompressibleSolver::printDiagnostics(void) {
   printf("---------------------\n");
 }
 
+//
+// L2 error of the current solution against the exact STATIONARY isentropic
+// vortex (icType 2, vortexAdvect 0), summed over active interior cells.  For a
+// stationary exact solution the error measures how well the scheme preserves the
+// equilibrium (the RT0/P0 DG's headline property); lower is better.
+//
+void CompressibleSolver::computeVortexError(void) {
+  cudaDeviceSynchronize();
+  real *Rho  = getField(F_RHO);
+  real *RhoU = getField(F_RHOU);
+  real *RhoV = getField(F_RHOV);
+  real *RhoW = getField(F_RHOW);
+  real *RhoE = getField(F_RHOE);
+
+  const double eps = 5.0, PId = 3.14159265358979323846;
+  double cx = 0.5*domainSize[0], cy = 0.5*domainSize[1];
+
+  double l2Rho = 0, l2Vel = 0, l2P = 0, area = 0;
+
+  for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
+    u64 loc = bLocList[bIdx];
+    if (loc == kEmpty) continue;
+    i32 lvl = loc >> 60;
+    i32 kb  = ((loc >> 40) & ((1 << 20)-1)) - 1;
+    i32 jb  = ((loc >> 20) & ((1 << 20)-1)) - 1;
+    i32 ib  = ( loc        & ((1 << 20)-1)) - 1;
+    // level-aware cell size + interior test (active cells live at the finest level)
+    double dxL = domainSize[0]/double(baseGridSize[0]*powi(2,lvl));
+    double dyL = domainSize[1]/double(baseGridSize[1]*powi(2,lvl));
+    i32 gx = baseGridSize[0]/blockSize*powi(2,lvl);
+    i32 gy = baseGridSize[1]/blockSize*powi(2,lvl);
+    i32 gz = pseudo2D ? baseGridSize[2]/blockSize : baseGridSize[2]/blockSize*powi(2,lvl);
+    if (ib < 0 || jb < 0 || kb < 0 || ib >= gx || jb >= gy || kb >= gz) continue;
+
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      i32 cIdx = bIdx*blockSizeTot + c;
+      if (cFlagsList[cIdx] != ACTIVE) continue;
+      i32 i = c % blockSize, j = (c/blockSize) % blockSize, k = c/blockSize/blockSize;
+      double x = (ib*blockSize + i + 0.5)*dxL;
+      double y = (jb*blockSize + j + 0.5)*dyL;
+
+      // exact stationary vortex
+      double ddx = x - cx, ddy = y - cy, r2 = ddx*ddx + ddy*ddy;
+      double f  = eps/(2.0*PId)*exp(0.5*(1.0 - r2));
+      double ue = -f*ddy, ve = f*ddx;
+      double dT = -(gam-1.0)*eps*eps/(8.0*gam*PId*PId)*exp(1.0 - r2);
+      double Te = fmax(1.0 + dT, 1e-6);
+      double re = pow(Te, 1.0/(gam-1.0)), pe = pow(Te, gam/(gam-1.0));
+
+      double r = Rho[cIdx];
+      double u = RhoU[cIdx]/r, v = RhoV[cIdx]/r, w = RhoW[cIdx]/r;
+      double p = (gam-1.0)*(RhoE[cIdx] - 0.5*r*(u*u+v*v+w*w));
+      double dvel = sqrt((u-ue)*(u-ue) + (v-ve)*(v-ve));
+      double cellA = dxL*dyL;
+      l2Rho += (r-re)*(r-re)*cellA;
+      l2Vel += dvel*dvel*cellA;
+      l2P   += (p-pe)*(p-pe)*cellA;
+      area  += cellA;
+    }
+  }
+  printf("---- vortex L2 error (vs exact stationary) ----\n");
+  printf("  scheme %d   L2(rho) = %.4e   L2(|u|) = %.4e   L2(p) = %.4e\n",
+         scheme, sqrt(l2Rho/area), sqrt(l2Vel/area), sqrt(l2P/area));
+  printf("-----------------------------------------------\n");
+}
+
+//
+// Gresho vortex diagnostic: L2 velocity error vs the exact (stationary) profile
+// and the kinetic-energy retention  KE(t)/KE(0).  The Gresho vortex is a steady
+// state, so a low-Mach-preserving scheme keeps KE(t)/KE(0) ≈ 1 and a small L2
+// error; a dissipative scheme bleeds kinetic energy (retention < 1) at a rate
+// that grows as the Mach number drops.
+//
+void CompressibleSolver::computeGreshoError(void) {
+  cudaDeviceSynchronize();
+  real *Rho  = getField(F_RHO);
+  real *RhoU = getField(F_RHOU);
+  real *RhoV = getField(F_RHOV);
+
+  double cx = 0.5*domainSize[0], cy = 0.5*domainSize[1];
+  double l2Vel = 0, keNum = 0, keExact = 0, area = 0;
+
+  for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
+    u64 loc = bLocList[bIdx];
+    if (loc == kEmpty) continue;
+    i32 lvl = loc >> 60;
+    i32 kb  = ((loc >> 40) & ((1 << 20)-1)) - 1;
+    i32 jb  = ((loc >> 20) & ((1 << 20)-1)) - 1;
+    i32 ib  = ( loc        & ((1 << 20)-1)) - 1;
+    double dxL = domainSize[0]/double(baseGridSize[0]*powi(2,lvl));
+    double dyL = domainSize[1]/double(baseGridSize[1]*powi(2,lvl));
+    i32 gx = baseGridSize[0]/blockSize*powi(2,lvl);
+    i32 gy = baseGridSize[1]/blockSize*powi(2,lvl);
+    i32 gz = pseudo2D ? baseGridSize[2]/blockSize : baseGridSize[2]/blockSize*powi(2,lvl);
+    if (ib < 0 || jb < 0 || kb < 0 || ib >= gx || jb >= gy || kb >= gz) continue;
+
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      i32 cIdx = bIdx*blockSizeTot + c;
+      if (cFlagsList[cIdx] != ACTIVE) continue;
+      i32 i = c % blockSize, j = (c/blockSize) % blockSize;
+      double x = (ib*blockSize + i + 0.5)*dxL;
+      double y = (jb*blockSize + j + 0.5)*dyL;
+
+      // exact Gresho velocity
+      double ddx = x - cx, ddy = y - cy, r = sqrt(ddx*ddx + ddy*ddy);
+      double wang = (r < 0.2) ? 5.0 : (r < 0.4 ? 2.0/r - 5.0 : 0.0);
+      double ue = -wang*ddy, ve = wang*ddx;
+
+      double rr = Rho[cIdx];
+      double u = RhoU[cIdx]/rr, v = RhoV[cIdx]/rr;
+      double cellA = dxL*dyL;
+      l2Vel   += ((u-ue)*(u-ue) + (v-ve)*(v-ve)) * cellA;
+      keNum   += 0.5*rr*(u*u + v*v) * cellA;
+      keExact += 0.5*1.0*(ue*ue + ve*ve) * cellA;
+      area    += cellA;
+    }
+  }
+  printf("---- Gresho vortex diagnostic (scheme %d, Ma=%.3g) ----\n",
+         scheme, greshoP0 > 0 ? 1.0/sqrt(gam*greshoP0) : 0.0);
+  printf("  L2(vel error) = %.4e   KE retention KE(t)/KE(0) = %.5f\n",
+         sqrt(l2Vel/area), keNum/keExact);
+  printf("-------------------------------------------------------\n");
+}
+
 void CompressibleSolver::paintPressure(const char *fileName) {
   computePressureKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
-  paintField(15, fileName);   // field 15 now holds pressure
+  paintField(F_SCRATCH, fileName);   // scratch field now holds pressure
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +479,20 @@ __device__ Vec5 CompressibleSolver::cons2prim(Vec5 cons) {
   prim[3] = cons[3]/cons[0];
   prim[4] = (gam-1.0)*(cons[4] - 0.5*prim[0]*(prim[1]*prim[1] + prim[2]*prim[2] + prim[3]*prim[3]));
   return prim;
+}
+
+//
+// Pressure from P0 density/energy and the RT0 momentum cell-averages, evaluated
+// in double precision.  At low Mach number the (E - ½ρ|u|²) subtraction cancels
+// catastrophically and single precision loses all pressure information, so the
+// internals are promoted to double (as in the reference `pressure_from_rt0`).
+//
+__device__ real CompressibleSolver::pressureRT(real rho, real mxa, real mya, real mza, real E) {
+  double u = (double)mxa / (double)rho;
+  double v = (double)mya / (double)rho;
+  double w = (double)mza / (double)rho;
+  double p = ((double)gam - 1.0) * ((double)E - 0.5 * (double)rho * (u*u + v*v + w*w));
+  return (real)p;
 }
 
 __device__ real CompressibleSolver::getBoundaryLevelSet(Vec3 pos) {

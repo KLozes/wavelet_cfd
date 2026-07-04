@@ -81,29 +81,22 @@ __global__ void updateNbrIndicesPeriodicKernel(MultiLevelSparseGrid &grid) {
                         grid.baseGridSize[1]*powi(2, lvl)/blockSize, 
                         grid.baseGridSize[2]*powi(2, lvl)/blockSize};
   
+    // Periodic image of an exterior block's center: a block one step past the
+    // right/top/front edge (idx == gridSize) wraps to the first interior block
+    // (0); one step past the left/bottom/back edge (idx == -1) wraps to the last
+    // interior block (gridSize-1).  This is the self/center slot (nbr 13) that the
+    // BC kernel reads to fill the exterior ghost cells.
     i32 ibc = ib;
     i32 jbc = jb;
     i32 kbc = kb;
-    if (ib < 0) {
-      ibc = gridSize[0] - 1;
-    }
-    if (ib > gridSize[0]-1) {
-      ibc = 1;
-    }
+    if (ib < 0)              ibc = gridSize[0] - 1;
+    if (ib > gridSize[0]-1)  ibc = 0;
 
-    if (jb < 0) {
-      jbc = gridSize[1] - 1;
-    }
-    if (jb > gridSize[1]-1) {
-      jbc = 1;
-    }
+    if (jb < 0)              jbc = gridSize[1] - 1;
+    if (jb > gridSize[1]-1)  jbc = 0;
 
-    if (kb < 0) {
-      kbc = gridSize[2] - 1;
-    }
-    if (kb > gridSize[2]-1) {
-      kbc = 1;
-    }
+    if (kb < 0)              kbc = gridSize[2] - 1;
+    if (kb > gridSize[2]-1)  kbc = 0;
 
     u64 nbrLoc = grid.encode(lvl, ibc, jbc, kbc);
     grid.nbrIdxList[bIdx*27+13] = grid.hashTable.getValue(nbrLoc);

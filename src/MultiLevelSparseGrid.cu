@@ -134,6 +134,11 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   if (!lean) {   // parent/neighbor indices + cell flags are flow-solver-only
     updatePrntIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     updateNbrIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    // periodic wrap of the ghost-block center slot must be re-applied after every
+    // re-sort, since updateNbrIndicesKernel above rebuilds it from scratch.
+    if (periodic) {
+      updateNbrIndicesPeriodicKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    }
     flagActiveCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     flagParentCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   }
@@ -153,7 +158,13 @@ __device__ i32 MultiLevelSparseGrid::getNbrIdx(i32 bIdx, i32 i, i32 j, i32 k) {
   i32 ib = i / blockSize;
   i32 jb = j / blockSize;
   i32 kb = k / blockSize;
-  i32 nbrIdx = nbrIdxList[27*bIdx + ib + 3*jb + 9*kb];
+  // A within-block offset (ib=jb=kb=1) is always this block itself; use bIdx
+  // directly rather than the center neighbor slot 13, which the periodic BC
+  // remaps to the opposite-edge image block for ghost blocks (that remap must
+  // not corrupt a ghost block's own internal cell lookups).
+  i32 nbrIdx = (ib == 1 && jb == 1 && kb == 1)
+             ? bIdx
+             : nbrIdxList[27*bIdx + ib + 3*jb + 9*kb];
   return blockSizeTot*nbrIdx + (i%blockSize) + (j%blockSize)*blockSize + (k%blockSize)*blockSize*blockSize;
 }
 
