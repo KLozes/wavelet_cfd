@@ -545,6 +545,141 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
   END_CELL_LOOP
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-dimension flux-array RHS (used when grid.reflux == 1).  One reused
+// lower-face conserved-flux vector per cell (fields F_FLUX..F_FLUX+4) serves all
+// three dimensions in turn: computeFluxDim fills it for dimension `dim`,
+// refluxDim reconciles coarse/fine faces in it, applyFluxDim scatters it to the
+// RHS.  RT0 slope terms for `dim` are done inline in computeFluxDim.
+// ─────────────────────────────────────────────────────────────────────────────
+__global__ void computeFluxDimKernel(CompressibleSolver &grid, i32 dim) {
+  real *prim[5] = {grid.getField(F_RHO), grid.getField(F_RHOU), grid.getField(F_RHOV),
+                   grid.getField(F_RHOW), grid.getField(F_RHOE)};
+  real *G    = grid.getField(F_GX + dim);          // this dim's RT0 slope (0 in FV mode)
+  real *RhsG = grid.getField(F_RHS + F_GX + dim);
+  real *Fx[5] = {grid.getField(F_FLUX+0), grid.getField(F_FLUX+1), grid.getField(F_FLUX+2),
+                 grid.getField(F_FLUX+3), grid.getField(F_FLUX+4)};
+  i32 di = (dim==0), dj = (dim==1), dk = (dim==2);
+  i32 nv = dim + 1;                                 // normal velocity component (u/v/w)
+
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    u64 loc = grid.bLocList[bIdx]; i32 lvl, ib, jb, kb; grid.decode(loc, lvl, ib, jb, kb);
+    real h = (dim==0) ? grid.getDx(lvl) : (dim==1 ? grid.getDy(lvl) : grid.getDz(lvl));
+
+    i32 lm1 = grid.getNbrIdx(bIdx, i-di,   j-dj,   k-dk);
+    i32 lm2 = grid.getNbrIdx(bIdx, i-2*di, j-2*dj, k-2*dk);
+    i32 lp1 = grid.getNbrIdx(bIdx, i+di,   j+dj,   k+dk);
+
+    // lower-face left/right states (TVD reconstruction), normal component
+    // replaced by the RT0 modal face value in DG mode
+    Vec5 qL, qR;
+    for (i32 m = 0; m < 5; m++) {
+      qL[m] = grid.tvdRec(prim[m][lm2], prim[m][lm1], prim[m][cIdx]);
+      qR[m] = grid.tvdRec(prim[m][lp1], prim[m][cIdx], prim[m][lm1]);
+    }
+    if (grid.scheme == 1) {
+      qL[nv] = prim[nv][lm1]  + 0.5*h*G[lm1] /prim[0][lm1];
+      qR[nv] = prim[nv][cIdx] - 0.5*h*G[cIdx]/prim[0][cIdx];
+    }
+    Vec5 flux = grid.hllcFlux(grid.prim2cons(qL), grid.prim2cons(qR), Vec3(di, dj, dk));
+    for (i32 n = 0; n < 5; n++) Fx[n][cIdx] = flux[n];
+
+    if (grid.scheme == 1) {   // RT0 slope DOF for this dimension (face + volume)
+      real slopeFace = -6.0*flux[nv]/(h*h);
+      atomicAdd(&RhsG[cIdx], slopeFace);
+      atomicAdd(&RhsG[lm1],  slopeFace);
+      real rc = prim[0][cIdx], mavg = rc*prim[nv][cIdx], mslope = 0.5*h*G[cIdx];
+      atomicAdd(&RhsG[cIdx], 12.0/(h*h)*((mavg*mavg + mslope*mslope/3.0)/rc + prim[4][cIdx]));
+    }
+  END_CELL_LOOP
+}
+
+// Conservative coarse/fine flux correction, done fine→coarse like restriction.
+// Every `dim`-face separating a coarse cell from finer cells has its coarse flux
+// replaced by the area-average of the finer fluxes tiling it, so both sides update
+// with the same flux (Berger-Colella refluxing).  The flux of a face is stored in
+// the cell on its +`dim` side (that cell's lower face), so a face is a coarse/fine
+// interface exactly when a cell and its lower-`dim` neighbour differ in ACTIVE vs
+// PARENT.  This handles both sides of a refined region symmetrically.
+//   phase 0 (refluxDim):      zero the stored coarse flux at every such face
+//   phase 1 (refluxAccumDim): each fine face on the interface adds its flux/nFine
+__global__ void refluxDimKernel(CompressibleSolver &grid, i32 dim) {
+  real *Fx[5] = {grid.getField(F_FLUX+0), grid.getField(F_FLUX+1), grid.getField(F_FLUX+2),
+                 grid.getField(F_FLUX+3), grid.getField(F_FLUX+4)};
+  i32 di = (dim==0), dj = (dim==1), dk = (dim==2);
+
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    i32 cf  = grid.cFlagsList[cIdx];
+    i32 lm1 = grid.getNbrIdx(bIdx, i-di, j-dj, k-dk);
+    i32 lf  = grid.cFlagsList[lm1];
+    // this cell's lower-`dim` face is a coarse/fine interface (coarse side)
+    if ((cf == PARENT && lf == ACTIVE) || (cf == ACTIVE && lf == PARENT))
+      for (i32 n = 0; n < 5; n++) Fx[n][cIdx] = 0.0;
+  END_CELL_LOOP
+}
+
+__global__ void refluxAccumDimKernel(CompressibleSolver &grid, i32 dim) {
+  real *Fx[5] = {grid.getField(F_FLUX+0), grid.getField(F_FLUX+1), grid.getField(F_FLUX+2),
+                 grid.getField(F_FLUX+3), grid.getField(F_FLUX+4)};
+  i32 di = (dim==0), dj = (dim==1), dk = (dim==2);
+  real w = 1.0 / (grid.pseudo2D ? 2.0 : 4.0);
+
+  // Each fine cell at a `dim`-edge of the refined region contributes its interface
+  // flux to the coarse cell owning that face.  (nested ifs, no `continue`: the
+  // grid-stride increment lives in END_CELL_LOOP.)
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    u64 loc = grid.bLocList[bIdx]; i32 lvl, ib, jb, kb; grid.decode(loc, lvl, ib, jb, kb);
+    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb, kb) && grid.cFlagsList[cIdx] == ACTIVE) {
+      i32 prntIdx = grid.prntIdxList[bIdx];
+      i32 ip = i/2 + ib%2 * blockSize/2;
+      i32 jp = j/2 + jb%2 * blockSize/2;
+      i32 kp = grid.pseudo2D ? k : (k/2 + kb%2 * blockSize/2);
+
+      // lower-`dim` interface: this fine cell's lower face → parent cell P (P's
+      // own lower face is the interface, stored in Fx[P])
+      i32 lm1 = grid.getNbrIdx(bIdx, i-di, j-dj, k-dk);
+      if (grid.cFlagsList[lm1] == GHOST) {
+        i32 pIdx = grid.getNbrIdx(prntIdx, ip, jp, kp);
+        for (i32 n = 0; n < 5; n++) atomicAdd(&Fx[n][pIdx], w * Fx[n][cIdx]);
+      }
+      // upper-`dim` interface: this fine cell's upper face (flux stored in the
+      // GHOST cell beyond it) → coarse cell C = parent's +`dim` neighbour (C's own
+      // lower face is the interface, stored in Fx[C])
+      i32 gp1 = grid.getNbrIdx(bIdx, i+di, j+dj, k+dk);
+      if (grid.cFlagsList[gp1] == GHOST) {
+        i32 cIdxB = grid.getNbrIdx(prntIdx, ip+di, jp+dj, kp+dk);
+        for (i32 n = 0; n < 5; n++) {
+          real fv = Fx[n][gp1];
+          if (isfinite(fv)) atomicAdd(&Fx[n][cIdxB], w * fv);
+        }
+      }
+    }
+  END_CELL_LOOP
+}
+
+__global__ void applyFluxDimKernel(CompressibleSolver &grid, i32 dim) {
+  real *Rhs[5] = {grid.getField(F_RHS+0), grid.getField(F_RHS+1), grid.getField(F_RHS+2),
+                  grid.getField(F_RHS+3), grid.getField(F_RHS+4)};
+  real *Fx[5] = {grid.getField(F_FLUX+0), grid.getField(F_FLUX+1), grid.getField(F_FLUX+2),
+                 grid.getField(F_FLUX+3), grid.getField(F_FLUX+4)};
+  i32 di = (dim==0), dj = (dim==1), dk = (dim==2);
+
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    u64 loc = grid.bLocList[bIdx]; i32 lvl, ib, jb, kb; grid.decode(loc, lvl, ib, jb, kb);
+    real h = (dim==0) ? grid.getDx(lvl) : (dim==1 ? grid.getDy(lvl) : grid.getDz(lvl));
+    real a = 1.0/h;
+    i32 lm1 = grid.getNbrIdx(bIdx, i-di, j-dj, k-dk);
+    for (i32 n = 0; n < 5; n++) {
+      atomicAdd(&Rhs[n][cIdx],  Fx[n][cIdx]*a);
+      atomicAdd(&Rhs[n][lm1],  -Fx[n][cIdx]*a);
+    }
+  END_CELL_LOOP
+}
+
 __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
   //
   // TVD Runge-Kutta 3 update of the NEVOLVE evolved DOFs
@@ -813,6 +948,24 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
       i32 prntIdx = grid.prntIdxList[bIdx];
       grid.bFlagsList[prntIdx] = KEEP;
 
+      if (grid.staticGrid) {
+        // fixed radial refinement about the domain centre: nested shells, finest
+        // at the centre.  Level L occupies r < refineRadius*(nLvls-L)/(nLvls-1),
+        // so successive coarse/fine interfaces sit at shrinking radii inside the
+        // flow feature.  Independent of the solution -> the grid never changes.
+        real cx = 0.5*grid.domainSize[0], cy = 0.5*grid.domainSize[1];
+        real r  = sqrt((pos[0]-cx)*(pos[0]-cx) + (pos[1]-cy)*(pos[1]-cy));
+        real invN   = 1.0 / (real)(grid.nLvls - 1);
+        real Rkeep  = grid.refineRadius * (real)(grid.nLvls - lvl)     * invN;
+        real Rchild = grid.refineRadius * (real)(grid.nLvls - 1 - lvl) * invN;
+        if (r < Rkeep) grid.bFlagsList[bIdx] = KEEP;
+        if (lvl < grid.nLvls-1 && r < Rchild) {
+          i32 bSize = blockSize/2;
+          i32 kc = grid.pseudo2D ? kb : (2*kb + k/bSize);
+          grid.activateBlock(lvl+1, 2*ib+i/bSize, 2*jb+j/bSize, kc);
+        }
+      }
+      else
       for (i32 f = 0; f < NEVOLVE; f++) {
         real *Q = grid.getField(f);
         real mag = 1e-32;
@@ -835,6 +988,28 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
   END_CELL_LOOP
 }
 
+// Monotone (tri)linear interpolation of a coarse field to a fine ghost cell at
+// octant (xs,ys,zs) of parent cell (ip,jp,kp).  The ghost centre sits 1/4 of the
+// way from the covering coarse cell toward its neighbour in each axis, so the
+// weights are a positive convex combination (no overshoot), unlike DD.
+__device__ real
+trilinearGhost(MultiLevelSparseGrid &grid, real *Q, i32 prntIdx,
+               i32 ip, i32 jp, i32 kp, real xs, real ys, real zs) {
+  i32 sx = xs > 0 ? 1 : -1, sy = ys > 0 ? 1 : -1;
+  i32 C   = grid.getNbrIdx(prntIdx, ip,    jp,    kp);
+  i32 Cx  = grid.getNbrIdx(prntIdx, ip+sx, jp,    kp);
+  i32 Cy  = grid.getNbrIdx(prntIdx, ip,    jp+sy, kp);
+  i32 Cxy = grid.getNbrIdx(prntIdx, ip+sx, jp+sy, kp);
+  if (grid.pseudo2D)
+    return (9.0*Q[C] + 3.0*Q[Cx] + 3.0*Q[Cy] + 1.0*Q[Cxy]) / 16.0;
+  i32 sz  = zs > 0 ? 1 : -1;
+  i32 Cz  = grid.getNbrIdx(prntIdx, ip,    jp,    kp+sz);
+  i32 Cxz = grid.getNbrIdx(prntIdx, ip+sx, jp,    kp+sz);
+  i32 Cyz = grid.getNbrIdx(prntIdx, ip,    jp+sy, kp+sz);
+  i32 Cxyz= grid.getNbrIdx(prntIdx, ip+sx, jp+sy, kp+sz);
+  return (27.0*Q[C] + 9.0*(Q[Cx]+Q[Cy]+Q[Cz]) + 3.0*(Q[Cxy]+Q[Cxz]+Q[Cyz]) + 1.0*Q[Cxyz]) / 64.0;
+}
+
 __global__ void interpolateFieldsKernel(CompressibleSolver &grid) {
 
   START_CELL_LOOP
@@ -855,6 +1030,37 @@ __global__ void interpolateFieldsKernel(CompressibleSolver &grid) {
       real ys = 2*(j % 2) - 1;
       real zs = grid.pseudo2D ? 0.0 : (2*(k % 2) - 1);
 
+      if (grid.basisGhost == 2) {
+        // monotone (tri)linear ghost fill — smooth (no piecewise-constant jump)
+        // and overshoot-free (no DD ringing).  Applied to every evolved field.
+        for (i32 f = 0; f < NEVOLVE; f++)
+          grid.getField(f)[cIdx] = trilinearGhost(grid, grid.getField(f), prntIdx, ip, jp, kp, xs, ys, zs);
+      }
+      else if (grid.basisGhost == 1) {
+        // low-Mach-consistent coarse/fine ghost fill from the coarse cell's own
+        // basis: P0 (piecewise constant) for rho/E — avoids the spurious pressure
+        // fluctuations that DD interpolation injects at low Mach — and the RT0
+        // field (linear in the momentum's own axis, constant in the transverse
+        // ones) for momentum.  The momentum is thus exactly the coarse RT0
+        // representation: face-normal momentum stays continuous, and the momentum
+        // is left *constant* along the interface.  That tangential "jump" is not a
+        // defect to remove: it is the divergence-consistent RT0 structure, and
+        // forcing transverse variation in (via DD) breaks it and worsens low Mach.
+        //   slopes: coarse gradient (RT0 slope is constant across the coarse cell).
+        i32 C = grid.getNbrIdx(prntIdx, ip, jp, kp);
+        real qdxC = 0.5*grid.getDx(lvl);   // dxCoarse/4 = (2*dxFine)/4 = dxFine/2
+        real qdyC = 0.5*grid.getDy(lvl);
+        real qdzC = grid.pseudo2D ? 0.0 : 0.5*grid.getDz(lvl);
+        grid.getField(F_RHO )[cIdx] = grid.getField(F_RHO )[C];
+        grid.getField(F_RHOE)[cIdx] = grid.getField(F_RHOE)[C];
+        grid.getField(F_RHOU)[cIdx] = grid.getField(F_RHOU)[C] + xs*qdxC*grid.getField(F_GX)[C];
+        grid.getField(F_RHOV)[cIdx] = grid.getField(F_RHOV)[C] + ys*qdyC*grid.getField(F_GY)[C];
+        grid.getField(F_RHOW)[cIdx] = grid.getField(F_RHOW)[C] + zs*qdzC*grid.getField(F_GZ)[C];
+        grid.getField(F_GX)[cIdx] = grid.getField(F_GX)[C];
+        grid.getField(F_GY)[cIdx] = grid.getField(F_GY)[C];
+        grid.getField(F_GZ)[cIdx] = grid.getField(F_GZ)[C];
+      }
+      else
       for (i32 f = 0; f < NEVOLVE; f++) {
         grid.getField(f)[cIdx] = predictEvolvedField(grid, 0, f, prntIdx, ip, jp, kp, xs, ys, zs, lvl);
       }

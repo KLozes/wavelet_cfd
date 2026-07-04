@@ -43,7 +43,8 @@ real CompressibleSolver::step(real tStep) {
   while (t < tStep) {
 
     clock.tick();
-    if (iter % 4 == 0 && nLvls > 1) {
+    // dynamic wavelet adaptation; skipped for a static (fixed) refinement grid
+    if (iter % 4 == 0 && nLvls > 1 && !staticGrid) {
       restrictFields();
       forwardWaveletTransform();
       adaptGrid();
@@ -139,7 +140,21 @@ void CompressibleSolver::computeDeltaT(void) {
 }
 
 void CompressibleSolver::computeRightHandSide(void) {
-  computeRightHandSideKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  if (!reflux) {
+    computeRightHandSideKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    return;
+  }
+  // per-dimension flux-array RHS with conservative coarse/fine refluxing: one
+  // reused lower-face flux array swept over x, y (and z in true 3D).
+  i32 ndim = pseudo2D ? 2 : 3;
+  for (i32 dim = 0; dim < ndim; dim++) {
+    computeFluxDimKernel<<<cudaGridSize, cudaBlockSize>>>(*this, dim);
+    if (nLvls > 1) {  // conservative coarse/fine flux correction
+      refluxDimKernel<<<cudaGridSize, cudaBlockSize>>>(*this, dim);        // zero coarse interface flux
+      refluxAccumDimKernel<<<cudaGridSize, cudaBlockSize>>>(*this, dim);   // += fine-face average
+    }
+    applyFluxDimKernel<<<cudaGridSize, cudaBlockSize>>>(*this, dim);
+  }
 }
 
 void CompressibleSolver::updateFields(i32 stage) {
@@ -399,6 +414,10 @@ void CompressibleSolver::computeGreshoError(void) {
   double cx = 0.5*domainSize[0], cy = 0.5*domainSize[1];
   double l2Vel = 0, keNum = 0, keExact = 0, area = 0;
 
+  // radial error bins over [0, 0.5] to localize error relative to the AMR shells
+  const i32 NBIN = 10;
+  double binErr[NBIN] = {0}, binArea[NBIN] = {0};
+
   for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
     u64 loc = bLocList[bIdx];
     if (loc == kEmpty) continue;
@@ -428,16 +447,32 @@ void CompressibleSolver::computeGreshoError(void) {
       double rr = Rho[cIdx];
       double u = RhoU[cIdx]/rr, v = RhoV[cIdx]/rr;
       double cellA = dxL*dyL;
-      l2Vel   += ((u-ue)*(u-ue) + (v-ve)*(v-ve)) * cellA;
+      double e2 = ((u-ue)*(u-ue) + (v-ve)*(v-ve)) * cellA;
+      l2Vel   += e2;
       keNum   += 0.5*rr*(u*u + v*v) * cellA;
       keExact += 0.5*1.0*(ue*ue + ve*ve) * cellA;
       area    += cellA;
+      i32 b = (i32)(r / 0.05);           // 0.05-wide radial bins
+      if (b >= 0 && b < NBIN) { binErr[b] += e2; binArea[b] += cellA; }
     }
   }
-  printf("---- Gresho vortex diagnostic (scheme %d, Ma=%.3g) ----\n",
-         scheme, greshoP0 > 0 ? 1.0/sqrt(gam*greshoP0) : 0.0);
+  printf("---- Gresho vortex diagnostic (scheme %d, Ma=%.3g, %s grid) ----\n",
+         scheme, greshoP0 > 0 ? 1.0/sqrt(gam*greshoP0) : 0.0,
+         staticGrid ? "static-AMR" : (nLvls > 1 ? "adaptive" : "uniform"));
   printf("  L2(vel error) = %.4e   KE retention KE(t)/KE(0) = %.5f\n",
          sqrt(l2Vel/area), keNum/keExact);
+  if (staticGrid) {
+    printf("  refinement shell radii R(L)=refineRadius*(nLvls-L)/(nLvls-1):");
+    for (i32 L = 1; L < nLvls; L++) printf(" R(%d)=%.3f", L, refineRadius*double(nLvls-L)/double(nLvls-1));
+    printf("\n  RMS(vel err) per radial bin (marks AMR-boundary bins):\n");
+    for (i32 b = 0; b < NBIN; b++) {
+      if (binArea[b] <= 0) continue;
+      double r0 = b*0.05, r1 = r0+0.05;
+      bool onBnd = false;
+      for (i32 L = 2; L < nLvls; L++) { double R = refineRadius*double(nLvls-L)/double(nLvls-1); if (R >= r0 && R < r1) onBnd = true; }
+      printf("    r=[%.2f,%.2f): rms=%.4e %s\n", r0, r1, sqrt(binErr[b]/binArea[b]), onBnd ? "  <-- AMR boundary" : "");
+    }
+  }
   printf("-------------------------------------------------------\n");
 }
 

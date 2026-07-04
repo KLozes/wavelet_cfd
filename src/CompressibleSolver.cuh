@@ -38,10 +38,14 @@ enum CompressibleField {
   F_GX  = 5, F_GY  = 6, F_GZ  = 7,
   F_OLD = 8,       // Old{0..7} occupy  8..15
   F_RHS = 16,      // Rhs{0..7} occupy 16..23
-  F_SCRATCH = 24
+  F_SCRATCH = 24,
+  F_FLUX = 25      // Flux{rho,rhou,rhov,rhow,rhoE} at 25..29 — one lower-face
+                   // conserved-flux vector per cell, reused for each dimension
+                   // sweep (used only on the refluxing RHS path)
 };
 static constexpr i32 NEVOLVE = 8;                 // evolved DOFs (fields 0..7)
-static constexpr i32 nCompressibleFields = 25;
+static constexpr i32 NCONS   = 5;                 // conserved vars carried by the flux array
+static constexpr i32 nCompressibleFields = 30;
 
 class CompressibleSolver : public MultiLevelSparseGrid {
 public:
@@ -57,6 +61,10 @@ public:
   i32 scheme;           // 0 = finite volume (HLLC+TVD), 1 = RT0/P0 DG
   real vortexAdvect;    // isentropic-vortex IC advection velocity (u0=v0)
   real greshoP0;        // Gresho-vortex background pressure = 1/(gam*Ma^2) (sets Mach)
+  i32 staticGrid;       // 1 = fixed refinement (no dynamic wavelet adaptation)
+  real refineRadius;    // static-grid: outer radius of the level-1 refinement shell (about the domain centre)
+  i32 reflux;           // 1 = conservative flux correction at coarse/fine interfaces (per-dim flux-array RHS)
+  i32 basisGhost;       // 1 = fill coarse/fine ghost cells from the RT0 (momentum) / P0 (rho,E) basis instead of DD
 
   i32 tGrid;
   i32 tSolver;
@@ -81,6 +89,10 @@ public:
       maxMagGrad = 1.0;
       vortexAdvect = 0.0;
       greshoP0 = 0.0;
+      staticGrid = 0;
+      refineRadius = 0.4;
+      reflux = 0;
+      basisGhost = 2;   // default coarse/fine ghost fill: 0=DD, 1=RT0/P0, 2=monotone trilinear
 
       tGrid = 0.0;
       tSolver = 0.0;

@@ -21,6 +21,12 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid);
 
 __global__ void computeRightHandSideKernel(CompressibleSolver &grid);
 
+// per-dimension flux-array RHS (refluxing path): one reused lower-face flux array
+__global__ void computeFluxDimKernel(CompressibleSolver &grid, i32 dim);
+__global__ void refluxDimKernel(CompressibleSolver &grid, i32 dim);
+__global__ void refluxAccumDimKernel(CompressibleSolver &grid, i32 dim);
+__global__ void applyFluxDimKernel(CompressibleSolver &grid, i32 dim);
+
 __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage);
 
 __global__ void copyToOldFieldsKernel(CompressibleSolver &grid);
