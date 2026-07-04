@@ -11,6 +11,9 @@
 
 void CompressibleSolver::initialize(void) {
   periodic = (bcType == 2);   // enable ghost-block wrap in sortBlocks (survives re-sorts)
+  // wavelet-normalization scales (device-side global maxima)
+  cudaMallocManaged(&globalScale, 4*sizeof(real));
+  cudaMemset(globalScale, 0, 4*sizeof(real));
   initializeBaseGrid();
   setInitialConditions();
   primitiveToConservative();
@@ -39,6 +42,7 @@ real CompressibleSolver::step(real tStep) {
   real t = 0;
 
   Timer<std::chrono::milliseconds, std::chrono::steady_clock> clock;
+  Timer<std::chrono::microseconds, std::chrono::steady_clock> sub;   // profiling sub-timer
 
   while (t < tStep) {
 
@@ -46,10 +50,14 @@ real CompressibleSolver::step(real tStep) {
     // dynamic wavelet adaptation; skipped for a static (fixed) refinement grid
     if (iter % 4 == 0 && nLvls > 1 && !staticGrid) {
       restrictFields();
+      cudaDeviceSynchronize(); sub.tick();
       forwardWaveletTransform();
+      cudaDeviceSynchronize(); sub.tock(); tForwardUs += sub.duration().count();
       adaptGrid();
       inverseWaveletTransform();
+      cudaDeviceSynchronize(); sub.tick();
       sortBlocks();
+      cudaDeviceSynchronize(); sub.tock(); tSortUs += sub.duration().count();
       setBoundaryConditions();
     }
     cudaDeviceSynchronize();
@@ -109,18 +117,10 @@ void CompressibleSolver::primitiveToConservative(void) {
 }
 
 void CompressibleSolver::forwardWaveletTransform(void) {
-  cudaDeviceSynchronize();
-  computeMagUKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-  maxRho     = *(thrust::max_element(thrust::device, getField(F_RHO),     getField(F_RHO)+hashTable.nKeys*blockSizeTot));
-  maxMagRhoU = *(thrust::max_element(thrust::device, getField(F_SCRATCH), getField(F_SCRATCH)+hashTable.nKeys*blockSizeTot));
-  maxRhoE    = *(thrust::max_element(thrust::device, getField(F_RHOE),    getField(F_RHOE)+hashTable.nKeys*blockSizeTot));
-  // scale for the RT0 slope DOFs: max |momentum-gradient| over Gx,Gy,Gz
-  if (scheme == 1) {
-    real gx = *(thrust::max_element(thrust::device, getField(F_GX), getField(F_GX)+hashTable.nKeys*blockSizeTot));
-    real gy = *(thrust::max_element(thrust::device, getField(F_GY), getField(F_GY)+hashTable.nKeys*blockSizeTot));
-    real gz = *(thrust::max_element(thrust::device, getField(F_GZ), getField(F_GZ)+hashTable.nKeys*blockSizeTot));
-    maxMagGrad = fmax(fmax(fabs(gx), fabs(gy)), fmax(fabs(gz), (real)1e-32));
-  }
+  // thresholding scales: domain maxima of {|rho|, |mom|, |rhoE|, |grad|},
+  // reduced entirely device-side and stream-ordered -- no host round-trip.
+  cudaMemset(globalScale, 0, 4*sizeof(real));
+  computeGlobalScalesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
 
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(i32));
   copyToOldFieldsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
@@ -251,6 +251,125 @@ void CompressibleSolver::writeLineProfile(const char *fileName) {
   }
   fclose(fp);
   printf("wrote %zu line samples to %s\n", rows.size(), fileName);
+}
+
+//
+// Acoustic-reflection diagnostic for the exact-simple-wave test (icType 5).
+// Uses the EXACT Riemann invariants (not linearized), measured as perturbations
+// from the uniform background J+-0 = +-2 c0/(gam-1):
+//   dJ- = (u - 2c/(gam-1)) + 2c0/(gam-1)    left-going   (0 for a pure right-runner)
+//   dJ+ = (u + 2c/(gam-1)) - 2c0/(gam-1)    right-going  (the incident/transmitted wave)
+// The simple-wave IC has dJ- == 0 exactly, so a uniform grid gives dJ- ~ 0; any
+// dJ- in the coarse half (x < cx) is a reflection off the centre interface.
+// Reflection coefficient R = max|dJ-|_coarse / max|dJ+|.  Interface at x = cx.
+//
+void CompressibleSolver::computeAcousticReflection(const char *fileName) {
+  cudaDeviceSynchronize();
+  real *Rho  = getField(F_RHO);
+  real *RhoU = getField(F_RHOU);
+  real *RhoV = getField(F_RHOV);
+  real *RhoW = getField(F_RHOW);
+  real *RhoE = getField(F_RHOE);
+
+  const real rho0 = 1.0, p0 = 1.0;
+  const real c0   = sqrt(gam*p0/rho0);
+  const real Jbg  = 2.0*c0/(gam-1.0);      // background |J+-|
+  real cx    = 0.5*domainSize[0];          // interface (staticGrid==3) at the centre
+  real yMid  = 0.5*domainSize[1];
+
+  std::vector<std::array<real,6>> rows;    // x, rho, u, p, dJ+, dJ-
+  real maxJp = 0, maxJmLeft = 0;
+
+  for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
+    u64 loc = bLocList[bIdx];
+    if (loc == kEmpty) continue;
+    i32 lvl = loc >> 60;
+    i32 kb  = ((loc >> 40) & ((1 << 20)-1)) - 1;
+    i32 jb  = ((loc >> 20) & ((1 << 20)-1)) - 1;
+    i32 ib  = ( loc        & ((1 << 20)-1)) - 1;
+    i32 gx = baseGridSize[0]*powi(2,lvl)/blockSize;
+    i32 gy = baseGridSize[1]*powi(2,lvl)/blockSize;
+    if (ib < 0 || jb < 0 || ib >= gx || jb >= gy) continue;   // interior only
+
+    real dxl = domainSize[0]/real(baseGridSize[0]*powi(2,lvl));
+    real dyl = domainSize[1]/real(baseGridSize[1]*powi(2,lvl));
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      i32 cIdx = bIdx*blockSizeTot + c;
+      if (cFlagsList[cIdx] != ACTIVE) continue;               // leaf cells only
+      i32 i =  c % blockSize;
+      i32 j = (c/blockSize) % blockSize;
+      real y = (jb*blockSize + j + 0.5)*dyl;
+      if (fabs(y - yMid) > 0.5*dyl) continue;                 // centreline row only
+
+      real r = Rho[cIdx];
+      real u = RhoU[cIdx]/r;
+      real v = RhoV[cIdx]/r, w = RhoW[cIdx]/r;
+      real p = (gam-1.0)*(RhoE[cIdx] - 0.5*r*(u*u+v*v+w*w));
+      real cc = sqrt(gam*fmax(p,(real)1e-30)/r);
+      real x  = (ib*blockSize + i + 0.5)*dxl;
+      real dJp = (u + 2.0*cc/(gam-1.0)) - Jbg;
+      real dJm = (u - 2.0*cc/(gam-1.0)) + Jbg;
+      rows.push_back({x, r, u, p, dJp, dJm});
+      maxJp = fmax(maxJp, fabs(dJp));
+      if (x < cx - 0.02*domainSize[0])                        // coarse half = reflected region
+        maxJmLeft = fmax(maxJmLeft, fabs(dJm));
+    }
+  }
+
+  std::sort(rows.begin(), rows.end(),
+            [](const std::array<real,6>&a, const std::array<real,6>&b){ return a[0] < b[0]; });
+  FILE *fp = fopen(fileName, "w");
+  fprintf(fp, "# x rho u p dJplus dJminus   (interface x=%.4f, c0=%.4f)\n", cx, c0);
+  for (auto &r : rows)
+    fprintf(fp, "%.8e %.8e %.8e %.8e %.8e %.8e\n", r[0], r[1], r[2], r[3], r[4], r[5]);
+  fclose(fp);
+
+  printf("[acoustic] interface x=%.3f  incident max|dJ+|=%.4e\n", cx, maxJp);
+  printf("[acoustic] reflected max|dJ-| (coarse half) = %.4e  ->  reflection R = %.4e (%.4f%%)\n",
+         maxJmLeft, (maxJp>0? maxJmLeft/maxJp : 0.0), (maxJp>0? 100.0*maxJmLeft/maxJp : 0.0));
+  printf("[acoustic] wrote %zu centreline samples to %s\n", rows.size(), fileName);
+}
+
+//
+// L2 velocity error for the periodic sine acoustic wave (icType 6), evaluated
+// after an integer number of periods where the exact solution equals the IC
+// u_exact = A sin(kx).  Uses the velocity (zero background) so float precision
+// scales with the wave amplitude.  Prints absolute and amplitude-relative L2 for
+// order-of-accuracy studies.
+//
+void CompressibleSolver::computeAcousticL2Error(void) {
+  cudaDeviceSynchronize();
+  real *Rho  = getField(F_RHO);
+  real *RhoU = getField(F_RHOU);
+  real A  = vortexAdvect;
+  real k  = 2.0*PI/domainSize[0];
+
+  double err2 = 0.0; long n = 0;
+  for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
+    u64 loc = bLocList[bIdx];
+    if (loc == kEmpty) continue;
+    i32 lvl = loc >> 60;
+    i32 kb  = ((loc >> 40) & ((1 << 20)-1)) - 1;
+    i32 jb  = ((loc >> 20) & ((1 << 20)-1)) - 1;
+    i32 ib  = ( loc        & ((1 << 20)-1)) - 1;
+    i32 gx = baseGridSize[0]*powi(2,lvl)/blockSize;
+    i32 gy = baseGridSize[1]*powi(2,lvl)/blockSize;
+    if (ib < 0 || jb < 0 || ib >= gx || jb >= gy) continue;
+    real dxl = domainSize[0]/real(baseGridSize[0]*powi(2,lvl));
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      i32 cIdx = bIdx*blockSizeTot + c;
+      if (cFlagsList[cIdx] != ACTIVE) continue;
+      i32 i = c % blockSize;
+      real x = (ib*blockSize + i + 0.5)*dxl;
+      real u = RhoU[cIdx]/Rho[cIdx];
+      real ue = A*sin(k*x);
+      err2 += double(u-ue)*double(u-ue);
+      n++;
+    }
+  }
+  double l2 = sqrt(err2/double(n));
+  printf("[acoustic-conv] N=%d  L2(u) = %.6e   L2(u)/A = %.6e\n",
+         baseGridSize[0], l2, l2/A);
 }
 
 //
@@ -528,8 +647,50 @@ __device__ real CompressibleSolver::lim(real &r) {
 }
 
 __device__ real CompressibleSolver::tvdRec(real &ul, real &uc, real &ur) {
-  real r = (uc - ul) / (copysign(1.0, ur - ul)*fmaxf(abs(ur - ul), 1e-32));
-  return ul + lim(r) * (ur - ul);
+  // NVD-form face reconstruction: face = ul + psi(phi)*(ur - ul), where
+  // phi = (uc-ul)/(ur-ul) is the normalised variable (== the limiter ratio r).
+  // The stencil (ul,uc,ur) is ordered upwind->downwind, so the same formula
+  // serves both sides of a face (callers pass the mirrored stencil for qR).
+  real du  = ur - ul;
+  real phi = (uc - ul) / (copysign(1.0, du)*fmax(abs(du), (real)1e-32));
+  real psi;
+  if (recon == 1) {
+    // ROUND (Huang et al. 2026, Eq. 4.1)
+    if (phi <= 0.0)
+      psi = fmax(fmin((real)0.5*phi + (real)0.5, (real)-1.5*phi - (real)1.8),
+                 (real)1.5*phi);
+    else if (phi <= 1.0)
+      psi = fmin(fmin((real)2.5*phi, (real)(1.0/3.0) + (real)(5.0/6.0)*phi),
+                 (real)(3.0/50.0)*phi + (real)(47.0/50.0));
+    else
+      psi = (real)0.5*phi + (real)0.5;
+  }
+  else if (recon == 2) {
+    // LD-ROUND (Huang et al. 2026, Eq. 4.2): ROUND blended toward the 3rd-order
+    // upwind line psi = 1/3 + (5/6)phi with quartic weights about phi = 1/2
+    if (phi <= 0.0) {
+      psi = fmax(fmin((real)0.5*phi + (real)0.5, (real)-1.5*phi - (real)1.8),
+                 (real)1.5*phi);
+    } else if (phi <= 0.5) {
+      real dp  = phi - (real)0.5;
+      real w   = (real)1.0 / ((real)1.0 + (real)180.0*dp*dp*dp*dp);
+      real hi3 = (real)(1.0/3.0) + (real)(5.0/6.0)*phi;
+      psi = fmin((real)2.5*phi, w*hi3 + ((real)1.0 - w)*(real)2.5*phi);
+    } else if (phi <= 1.0) {
+      real dp  = phi - (real)0.5;
+      real w   = (real)1.0 / ((real)1.0 + (real)600.0*dp*dp*dp*dp);
+      real hi3 = (real)(1.0/3.0) + (real)(5.0/6.0)*phi;
+      real hid = (real)(3.0/50.0)*phi + (real)(47.0/50.0);
+      psi = fmin(hid, w*hi3 + ((real)1.0 - w)*hid);
+    } else {
+      psi = (real)0.5*phi + (real)0.5;
+    }
+  }
+  else {
+    // smooth TVD limiter (default)
+    psi = lim(phi);
+  }
+  return ul + psi * du;
 }
 
 __device__ Vec5 CompressibleSolver::prim2cons(Vec5 prim) {
@@ -624,8 +785,8 @@ __device__ Vec5 CompressibleSolver::hllcFlux(Vec5 qL, Vec5 qR, Vec3 normal) {
   real vn = u*nx + v*ny + w*nz;
 
   // Wave speed estimates
-  real SL = fminf(vnL - aL, vn - a);
-  real SR = fmaxf(vnR + aR, vn + a);
+  real SL = fmin(vnL - aL, vn - a);
+  real SR = fmax(vnR + aR, vn + a);
   real SM = (pL - pR + rR*vnR*(SR-vnR) - rL*vnL*(SL-vnL))
           / (rR*(SR-vnR) - rL*(SL-vnL));
 

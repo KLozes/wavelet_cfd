@@ -52,13 +52,20 @@ public:
 
   real deltaT;
   real cfl;
-  real maxRho;
-  real maxMagRhoU;
-  real maxRhoE;
-  real maxMagGrad;      // scale for thresholding the RT0 slope DOFs (Gx,Gy,Gz)
+  // wavelet-detail normalization: domain maxima of the 4 field scales
+  // {|rho|, |momentum|, |rhoE|, max|grad|}, reduced device-side each adaptation.
+  // (Local / neighbourhood normalization was tested and is Pareto-dominated by
+  // global-with-tighter-threshold on single-feature flows; it over-refines
+  // weak-feature regions.)
+  real *globalScale;    // [4]  domain max of the 4 scales
   real waveletThresh;
 
   i32 scheme;           // 0 = finite volume (HLLC+TVD), 1 = RT0/P0 DG
+  i32 recon;            // face reconstruction of rho/p/tangential (and FV normal) velocity:
+                        // 0 = smooth TVD limiter, 1 = ROUND (default), 2 = LD-ROUND
+                        // (Huang, Deng, Matar & Ying, J.Comput.Phys. 555 (2026), Eqs. 4.1/4.2)
+                        // ROUND: 6-7x lower smooth-wave error than TVD, cleaner low-Mach,
+                        // shocks stay spike-free (soft ~1% non-TVD overshoots by design)
   real vortexAdvect;    // isentropic-vortex IC advection velocity (u0=v0)
   real greshoP0;        // Gresho-vortex background pressure = 1/(gam*Ma^2) (sets Mach)
   i32 staticGrid;       // 1 = fixed refinement (no dynamic wavelet adaptation)
@@ -69,6 +76,8 @@ public:
   i32 tSolver;
   i32 tOutput;
   i32 tTotal;
+  long tForwardUs;      // profiling: time in forwardWaveletTransform (the 6 max reductions)
+  long tSortUs;         // profiling: time in sortBlocks (hash rebuild + Morton sort)
 
   i32 immerserdBcType;
   i32 bcType;
@@ -85,7 +94,7 @@ public:
       bcType = 0;
       icType = 0;
       scheme = 0;
-      maxMagGrad = 1.0;
+      recon = 1;
       vortexAdvect = 0.0;
       greshoP0 = 0.0;
       staticGrid = 0;
@@ -96,6 +105,8 @@ public:
       tSolver = 0.0;
       tOutput = 0.0;
       tTotal = 0.0;
+      tForwardUs = 0;
+      tSortUs = 0;
   }
 
   void initialize(void);
@@ -116,6 +127,8 @@ public:
   void interpolateFields();
 
   void writeLineProfile(const char *fileName); // 1D profile dump for validation
+  void computeAcousticReflection(const char *fileName); // acoustic wave reflection at coarse/fine interface
+  void computeAcousticL2Error(void);            // L2 velocity error for the periodic sine wave (order study)
   void printDiagnostics(void);                  // AMR-boundary spike / pseudo-2D diagnostics
   void computeVortexError(void);                // L2 error vs the exact stationary isentropic vortex
   void computeGreshoError(void);                // L2 velocity error + KE retention vs the exact Gresho vortex

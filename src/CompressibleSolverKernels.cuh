@@ -13,7 +13,7 @@ __global__ void conservativeToPrimitiveKernel(CompressibleSolver &grid);
 
 __global__ void primitiveToConservativeKernel(CompressibleSolver &grid);
 
-__global__ void computeMagUKernel(CompressibleSolver &grid);
+__global__ void computeGlobalScalesKernel(CompressibleSolver &grid);
 
 __global__ void computePressureKernel(CompressibleSolver &grid);
 

@@ -72,6 +72,23 @@ __device__ void greshoExact(real x, real y, real cx, real cy, real p0,
   p   = pr;
 }
 
+//
+// Exact right-moving simple wave (Riemann): pick a velocity profile u'(x) and
+// hold J- = u - 2c/(gam-1) constant, so c = c0 + (gam-1)/2 u', with density and
+// pressure from the isentropic relations.  J- constant => no left-going wave at
+// any amplitude, so a uniform grid reflects nothing.
+//
+__device__ void simpleWaveExact(real x, real A, real x0, real wid,
+                                real &rho, real &u, real &p) {
+  const real rho0 = 1.0, p0 = 1.0;
+  const real c0 = sqrt(gam*p0/rho0);
+  real arg = (x - x0)/wid;
+  u = A*exp(-arg*arg);                          // u'(x)
+  real c = c0 + 0.5*(gam-1.0)*u;                // J- = -2 c0/(gam-1) held constant
+  rho = rho0*pow(c/c0, 2.0/(gam-1.0));          // isentropic
+  p   = p0 *pow(c/c0, 2.0*gam/(gam-1.0));
+}
+
 __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
 
   real *Rho = grid.getField(F_RHO);
@@ -172,6 +189,50 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
       Gx[cIdx] = (rR*uR - rL*uL) / dx;
       Gy[cIdx] = (rT*vT - rB*vB) / dy;
       Gz[cIdx] = 0.0;   // z-uniform
+    }
+
+    if (grid.icType == 6) {
+      //
+      // Periodic right-moving sine acoustic wave for an order-of-accuracy study.
+      // Small amplitude (linear); after an integer number of periods the exact
+      // solution returns to the IC, so the L2 velocity error there is the scheme's
+      // accumulated truncation error.  Amplitude A is carried in vortexAdvect.
+      //
+      real Lx = grid.domainSize[0];
+      real rho0 = 1.0, p0 = 1.0, c0 = sqrt(gam*p0/rho0);
+      real A  = grid.vortexAdvect;
+      real k  = 2.0*PI/Lx;
+      real up = A*sin(k*pos[0]);
+      real dup= A*k*cos(k*pos[0]);
+      Rho[cIdx] = rho0 + rho0*up/c0;
+      U[cIdx]   = up;  V[cIdx] = 0.0;  W[cIdx] = 0.0;
+      P[cIdx]   = p0 + rho0*c0*up;
+      Gx[cIdx]  = rho0*dup*(1.0 + 2.0*up/c0);   // d(rho u)/dx, rho u = rho0 up(1+up/c0)
+      Gy[cIdx]  = 0.0;  Gz[cIdx] = 0.0;
+    }
+
+    if (grid.icType == 5) {
+      //
+      // EXACT right-moving simple wave (z-uniform).  The left Riemann invariant
+      // J- = u - 2c/(gam-1) is held EXACTLY constant, so the wave is a pure
+      // right-runner to all amplitudes -- on a uniform grid it produces NO
+      // left-going wave (uniform reflection = 0, up to dispersion).  Any dJ- that
+      // appears as it crosses the static coarse/fine interface at the domain
+      // centre is a genuine numerical reflection.  Launched in the coarse-left
+      // half; amplitude A sets the (small) Mach number A/c0.
+      //
+      real Lx  = grid.domainSize[0];
+      real A   = 1.0e-3;            // pulse amplitude in u'
+      real x0  = 0.25*Lx;          // start in the coarse-left half (interface at 0.5)
+      real wid = 0.03*Lx;
+      real dx  = grid.getDx(lvl);
+      real rho, uc, p;
+      simpleWaveExact(pos[0], A, x0, wid, rho, uc, p);
+      Rho[cIdx] = rho;  U[cIdx] = uc;  V[cIdx] = 0.0;  W[cIdx] = 0.0;  P[cIdx] = p;
+      // RT0 slope Gx = d(rho u)/dx from the face-midpoint momenta (as the vortex IC)
+      real rR, uR, pR;  simpleWaveExact(pos[0]+0.5*dx, A, x0, wid, rR, uR, pR);
+      real rL, uL, pL;  simpleWaveExact(pos[0]-0.5*dx, A, x0, wid, rL, uL, pL);
+      Gx[cIdx] = (rR*uR - rL*uL)/dx;  Gy[cIdx] = 0.0;  Gz[cIdx] = 0.0;
     }
 
     if (grid.icType == 4) {
@@ -329,16 +390,64 @@ __global__ void primitiveToConservativeKernel(CompressibleSolver &grid) {
   END_CELL_LOOP
 }
 
-__global__ void computeMagUKernel(CompressibleSolver &grid) {
-  // magnitude of momentum (fields are conservative when this is called)
-  real *RhoU = grid.getField(1);
-  real *RhoV = grid.getField(2);
-  real *RhoW = grid.getField(3);
-  real *MagRhoU = grid.getField(F_SCRATCH);
+// lock-free atomic-max (IEEE ordering via integer CAS; values here are >= 0).
+// float and double overloads so the kernel builds at either precision.
+__device__ inline float atomicMaxFloat(float *addr, float val) {
+  int *ai = (int*)addr;
+  int old = *ai;
+  while (val > __int_as_float(old)) {
+    int assumed = old;
+    old = atomicCAS(ai, assumed, __float_as_int(val));
+    if (old == assumed) break;
+  }
+  return __int_as_float(old);
+}
+__device__ inline double atomicMaxFloat(double *addr, double val) {
+  unsigned long long *ai = (unsigned long long*)addr;
+  unsigned long long old = *ai;
+  while (val > __longlong_as_double(old)) {
+    unsigned long long assumed = old;
+    old = atomicCAS(ai, assumed, __double_as_longlong(val));
+    if (old == assumed) break;
+  }
+  return __longlong_as_double(old);
+}
+
+// Wavelet-thresholding scales: domain maxima of the 4 field scales
+// {|rho|, |momentum|, |rhoE|, max|grad|} into globalScale[0..3], pre-zeroed by
+// the host.  Warp-level shuffle reduction first, then one atomicMax per warp --
+// all device-side, no host round-trip.
+__global__ void computeGlobalScalesKernel(CompressibleSolver &grid) {
+  real *Rho  = grid.getField(F_RHO);
+  real *RhoU = grid.getField(F_RHOU);
+  real *RhoV = grid.getField(F_RHOV);
+  real *RhoW = grid.getField(F_RHOW);
+  real *RhoE = grid.getField(F_RHOE);
+  real *Gx   = grid.getField(F_GX);
+  real *Gy   = grid.getField(F_GY);
+  real *Gz   = grid.getField(F_GZ);
 
   START_CELL_LOOP
 
-    MagRhoU[cIdx] = sqrt(RhoU[cIdx]*RhoU[cIdx] + RhoV[cIdx]*RhoV[cIdx] + RhoW[cIdx]*RhoW[cIdx]);
+    real r = fabs(Rho[cIdx]);
+    real mu = RhoU[cIdx], mv = RhoV[cIdx], mw = RhoW[cIdx];
+    real m = sqrt(mu*mu + mv*mv + mw*mw);
+    real e = fabs(RhoE[cIdx]);
+    real g = fmax(fabs(Gx[cIdx]), fmax(fabs(Gy[cIdx]), fabs(Gz[cIdx])));
+
+    // warp shuffle reduction (grid-stride loop keeps whole warps in-range)
+    for (int off = 16; off > 0; off >>= 1) {
+      r = fmax(r, __shfl_down_sync(0xffffffff, r, off));
+      m = fmax(m, __shfl_down_sync(0xffffffff, m, off));
+      e = fmax(e, __shfl_down_sync(0xffffffff, e, off));
+      g = fmax(g, __shfl_down_sync(0xffffffff, g, off));
+    }
+    if ((threadIdx.x & 31) == 0) {
+      atomicMaxFloat(&grid.globalScale[0], r);
+      atomicMaxFloat(&grid.globalScale[1], m);
+      atomicMaxFloat(&grid.globalScale[2], e);
+      atomicMaxFloat(&grid.globalScale[3], g);
+    }
 
   END_CELL_LOOP
 }
@@ -392,6 +501,31 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
     }
 
   END_CELL_LOOP
+}
+
+// One-sided parabolic-Hermite reconstruction of the RT0 normal face velocity.
+// Builds a quadratic from cell `self`'s value+slope (the Hermite data) and the
+// neighbour `nbr`'s value, evaluated at the shared face; `sSelf` is the signed
+// linear half-cell increment toward the face (+mxs/rho on a right face, −mxs/rho
+// on a left face, i.e. exactly the term the linear RT0 state already uses).  A
+// cubic Hermite (both slopes) would be central and oscillatory at shocks; this
+// biased quadratic drops the neighbour's slope, keeping value+slope from `self`.
+// It reduces EXACTLY to the linear RT0 state uSelf+sSelf for smooth data (so the
+// left and right states agree there -> continuous normal momentum -> low-Mach),
+// and differs only across a jump by the curvature term 0.25*(uNbr−uSelf); HLLC
+// does the upwinding between the two biased states.
+// One-sided biased-parabola face state for the RT0 normal velocity (value+slope
+// from `self`, value from the neighbour).  The weights are set so the AVERAGE of
+// the two states is the c=1/6 face value
+//   u_f = (uL+uR)/2 + (dx/6)(gL - gR),
+// whose flux difference is the 4th-order-accurate divergence operator.  Each
+// state reduces exactly to the linear RT0 modal value for smooth data (qL==qR:
+// no jump -> low-Mach preserving); across a discontinuity they differ, and the
+// HLLC upwinding on that jump both captures shocks and relaxes the slope DOF
+// toward the physical derivative (measured: 3rd-order acoustics with unlimited
+// rho/p faces, and sharper shocks than the linear modal states with TVD).
+__device__ inline real parabolicFace(real uSelf, real uNbr, real sSelf) {
+  return (5.0/6.0)*uSelf + (1.0/6.0)*uNbr + (2.0/3.0)*sSelf;
 }
 
 __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
@@ -477,18 +611,17 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     qB[4] = grid.tvdRec(P[b2Idx], P[b1Idx], P[cIdx]);
     qF[4] = grid.tvdRec(P[f1Idx], P[cIdx],  P[b1Idx]);
 
-    // RT0/P0 DG: replace the limited face-normal velocity by the RT0 modal face
-    // value (unlimited, continuous-normal DOF).  ρ, pressure and the tangential
-    // velocities keep the TVD reconstruction above.  Modal slope mxs = (dx/2)·Gx,
-    // so the RT0 right-face value of a cell is  u + mxs/ρ  and its left-face value
-    // is  u − mxs/ρ.
+    // RT0/P0 DG: replace the limited face-normal velocity by the biased-parabola
+    // RT0 states (unlimited; see parabolicFace).  ρ, pressure and the tangential
+    // velocities keep the TVD reconstruction above.  Slope s = (dx/2)·G/ρ is the
+    // half-cell RT0 velocity increment toward the face.
     if (grid.scheme == 1) {
-      qL[1] = U[l1Idx] + 0.5*dx*Gx[l1Idx]/Rho[l1Idx];   // x-face normal (u)
-      qR[1] = U[cIdx]  - 0.5*dx*Gx[cIdx] /Rho[cIdx];
-      qD[2] = V[d1Idx] + 0.5*dy*Gy[d1Idx]/Rho[d1Idx];   // y-face normal (v)
-      qU[2] = V[cIdx]  - 0.5*dy*Gy[cIdx] /Rho[cIdx];
-      qB[3] = W[b1Idx] + 0.5*dz*Gz[b1Idx]/Rho[b1Idx];   // z-face normal (w)
-      qF[3] = W[cIdx]  - 0.5*dz*Gz[cIdx] /Rho[cIdx];
+      real sxL = 0.5*dx*Gx[l1Idx]/Rho[l1Idx], sxR = 0.5*dx*Gx[cIdx]/Rho[cIdx];
+      real syL = 0.5*dy*Gy[d1Idx]/Rho[d1Idx], syR = 0.5*dy*Gy[cIdx]/Rho[cIdx];
+      real szL = 0.5*dz*Gz[b1Idx]/Rho[b1Idx], szR = 0.5*dz*Gz[cIdx]/Rho[cIdx];
+      qL[1] = parabolicFace(U[l1Idx], U[cIdx],  sxL);   qR[1] = parabolicFace(U[cIdx], U[l1Idx], -sxR);
+      qD[2] = parabolicFace(V[d1Idx], V[cIdx],  syL);   qU[2] = parabolicFace(V[cIdx], V[d1Idx], -syR);
+      qB[3] = parabolicFace(W[b1Idx], W[cIdx],  szL);   qF[3] = parabolicFace(W[cIdx], W[b1Idx], -szR);
     }
 
     Vec5 fluxL = grid.hllcFlux(grid.prim2cons(qL), grid.prim2cons(qR), Vec3(1,0,0));
@@ -578,9 +711,10 @@ __global__ void computeFluxDimKernel(CompressibleSolver &grid, i32 dim) {
       qL[m] = grid.tvdRec(prim[m][lm2], prim[m][lm1], prim[m][cIdx]);
       qR[m] = grid.tvdRec(prim[m][lp1], prim[m][cIdx], prim[m][lm1]);
     }
-    if (grid.scheme == 1) {
-      qL[nv] = prim[nv][lm1]  + 0.5*h*G[lm1] /prim[0][lm1];
-      qR[nv] = prim[nv][cIdx] - 0.5*h*G[cIdx]/prim[0][cIdx];
+    if (grid.scheme == 1) {   // biased-parabola RT0 normal states; HLLC upwinds
+      real sL = 0.5*h*G[lm1]/prim[0][lm1], sR = 0.5*h*G[cIdx]/prim[0][cIdx];
+      qL[nv] = parabolicFace(prim[nv][lm1], prim[nv][cIdx],  sL);
+      qR[nv] = parabolicFace(prim[nv][cIdx], prim[nv][lm1], -sR);
     }
     Vec5 flux = grid.hllcFlux(grid.prim2cons(qL), grid.prim2cons(qR), Vec3(di, dj, dk));
     for (i32 n = 0; n < 5; n++) Fx[n][cIdx] = flux[n];
@@ -948,7 +1082,21 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
       i32 prntIdx = grid.prntIdxList[bIdx];
       grid.bFlagsList[prntIdx] = KEEP;
 
-      if (grid.staticGrid) {
+      if (grid.staticGrid == 3) {
+        // single planar interface at the domain centre: fine for x > cx, coarse
+        // for x < cx.  One clean coarse/fine face at x=cx for the acoustic-
+        // reflection test (a wave launched in the coarse half crosses it).
+        real cx = 0.5*grid.domainSize[0];
+        if (pos[0] > cx) {
+          grid.bFlagsList[bIdx] = KEEP;
+          if (lvl < grid.nLvls-1) {
+            i32 bSize = blockSize/2;
+            i32 kc = grid.pseudo2D ? kb : (2*kb + k/bSize);
+            grid.activateBlock(lvl+1, 2*ib+i/bSize, 2*jb+j/bSize, kc);
+          }
+        }
+      }
+      else if (grid.staticGrid) {
         // fixed refinement in nested shells about the domain centre, finest at the
         // centre: level L occupies d < refineRadius*(nLvls-L)/(nLvls-1), so each
         // coarse/fine interface sits at a shrinking distance.  staticGrid==1 uses
@@ -970,11 +1118,10 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
       else
       for (i32 f = 0; f < NEVOLVE; f++) {
         real *Q = grid.getField(f);
-        real mag = 1e-32;
-        if (f == F_RHO)                  mag = grid.maxRho;
-        if (f >= F_RHOU && f <= F_RHOW)  mag = grid.maxMagRhoU;
-        if (f == F_RHOE)                 mag = grid.maxRhoE;
-        if (f >= F_GX && f <= F_GZ)      mag = grid.maxMagGrad;
+        // normalize the detail by the domain max of this field's scale
+        // (computed pre-transform, device-side)
+        i32 k = (f == F_RHO) ? 0 : (f <= F_RHOW ? 1 : (f == F_RHOE ? 2 : 3));
+        real mag = fmax(grid.globalScale[k], (real)1e-32);
 
         if (abs(Q[cIdx]/mag) > grid.waveletThresh || abs(ls) < dx) {
           if (lvl < grid.nLvls-1 && (abs(Q[cIdx]/mag) > grid.waveletThresh*2 || abs(ls) < dx)) {

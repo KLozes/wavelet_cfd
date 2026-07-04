@@ -44,6 +44,10 @@ WAVEWSDF_SRCS = HashTable MultiLevelSparseGrid MultiLevelSparseGridKernels \
 WAVE3D_OBJS  = $(patsubst %,$(OBJ_DIR)/wave3d/%.cu.o,$(WAVE3D_SRCS))
 WAVESDF_OBJS = $(patsubst %,$(OBJ_DIR)/wavesdf/%.cu.o,$(WAVESDF_SRCS))
 WAVEWSDF_OBJS = $(patsubst %,$(OBJ_DIR)/wavewsdf/%.cu.o,$(WAVEWSDF_SRCS))
+# double-precision Euler build (convergence studies: float roundoff floors
+# long-time acoustic errors around 1e-5 relative)
+WAVE3D_DP_DEFS = -DUSE_DOUBLE
+WAVE3D_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_dp/%.cu.o,$(WAVE3D_SRCS))
 
 all: wave3d wavesdf wavewsdf
 
@@ -56,6 +60,9 @@ wavesdf: $(WAVESDF_OBJS)
 wavewsdf: $(WAVEWSDF_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
+wave3d_dp: $(WAVE3D_DP_OBJS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
+
 # ---- build rules (one per executable, so each gets its own NCELLS_MAX) ------
 $(OBJ_DIR)/wave3d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d
 	$(NVCC) $(NVCCFLAGS) -I./$(SRC_DIR) -dc $< -o $@
@@ -66,7 +73,10 @@ $(OBJ_DIR)/wavesdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavesdf
 $(OBJ_DIR)/wavewsdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavewsdf
 	$(NVCC) $(NVCCFLAGS) $(WAVEWSDF_DEFS) -I./$(SRC_DIR) -dc $< -o $@
 
-$(OBJ_DIR)/wave3d $(OBJ_DIR)/wavesdf $(OBJ_DIR)/wavewsdf:
+$(OBJ_DIR)/wave3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d_dp
+	$(NVCC) $(NVCCFLAGS) $(WAVE3D_DP_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+
+$(OBJ_DIR)/wave3d $(OBJ_DIR)/wavesdf $(OBJ_DIR)/wavewsdf $(OBJ_DIR)/wave3d_dp:
 	mkdir -p $@
 
 clean:

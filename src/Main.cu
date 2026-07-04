@@ -29,16 +29,19 @@ int main(int argc, char* argv[]) {
   i32 testCase = (argc > 1) ? atoi(argv[1]) : 0;
   bool gresho  = (testCase == 4 || testCase == 5);         // Gresho vortex (uniform / static-AMR)
   bool sodAmr  = (testCase == 6);                          // Sod shock on a static planar AMR grid
-  i32 nLvls    = (argc > 2) ? atoi(argv[2]) : (testCase == 1 ? 4 : (testCase == 5 ? 3 : (sodAmr ? 3 : 1)));
-  i32 nBlocksX = (argc > 3) ? atoi(argv[3]) : (testCase == 1 ? 16 : (testCase == 2 ? 40 : (testCase == 3 ? 8 : (testCase == 4 ? 40 : (testCase == 5 ? 10 : (sodAmr ? 16 : 100))))));
+  bool acoustic= (testCase == 7);                          // acoustic pulse crossing a static coarse/fine interface
+  bool acConv  = (testCase == 8);                          // periodic sine acoustic wave, order-of-accuracy study
+  i32 nLvls    = (argc > 2) ? atoi(argv[2]) : (testCase == 1 ? 4 : (testCase == 5 ? 3 : (sodAmr ? 3 : (acoustic ? 3 : 1))));
+  i32 nBlocksX = (argc > 3) ? atoi(argv[3]) : (testCase == 1 ? 16 : (testCase == 2 ? 40 : (testCase == 3 ? 8 : (testCase == 4 ? 40 : (testCase == 5 ? 10 : (sodAmr ? 16 : (acoustic ? 64 : (acConv ? 8 : 100))))))));
   real wThresh = (argc > 4) ? atof(argv[4]) : (testCase == 1 ? 0.004 : 0.01);
   i32 scheme   = (argc > 5) ? atoi(argv[5]) : (sodAmr ? 0 : (testCase >= 2 ? 1 : 0));
   real Ma      = (argc > 6) ? atof(argv[6]) : 0.1;   // Gresho Mach number
   i32 bcArg    = (argc > 7) ? atoi(argv[7]) : -1;    // bcType override (-1 = per-testCase default)
   i32 refluxA  = (argc > 8) ? atoi(argv[8]) : 0;     // 1 = conservative coarse/fine refluxing
+  i32 reconA   = (argc > 9) ? atoi(argv[9]) : 1;     // 0 = TVD limiter, 1 = ROUND (default), 2 = LD-ROUND
 
   bool cube   = (testCase == 3);
-  bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr);
+  bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv);
   i32 nBlocksY = (square || cube) ? nBlocksX : (nBlocksX + 9) / 10;
   i32 nBlocksZ = cube ? nBlocksX : 1;
 
@@ -48,22 +51,26 @@ int main(int argc, char* argv[]) {
   real domainSize[3]   = {domainLenX, dx*(nBlocksY*blockSize), dx*(nBlocksZ*blockSize)};
   i32  baseGridSize[3] = {blockSize*nBlocksX, blockSize*nBlocksY, blockSize*nBlocksZ};
 
-  real cfl  = 0.40;
-  real tEnd  = (testCase == 2) ? 1.0 : (testCase == 3 ? 0.15 : (gresho ? 1.0 : (sodAmr ? 0.15 : 0.20)));
-  real tStep = (testCase == 1) ? 0.008 : (testCase == 2 ? 0.1 : (testCase == 3 ? 0.03 : (gresho ? 0.1 : (sodAmr ? 0.02 : 0.01))));
+  // acConv: RK3's O(dt^3) global error would cap an order study at 3; scaling
+  // cfl ~ dx^(1/3) keeps dt^3 ~ dx^4, below 4th-order spatial error.
+  real cfl  = acConv ? 0.40*cbrt(4.0/nBlocksX) : 0.40;
+  real acPeriod = domainLenX / sqrt(gam);   // sound-crossing time (c0=sqrt(gam), p0=rho0=1)
+  real tEnd  = (testCase == 2) ? 1.0 : (testCase == 3 ? 0.15 : (gresho ? 1.0 : (sodAmr ? 0.15 : (acoustic ? 0.35 : (acConv ? 2.0*acPeriod : 0.20)))));
+  real tStep = (testCase == 1) ? 0.008 : (testCase == 2 ? 0.1 : (testCase == 3 ? 0.03 : (gresho ? 0.1 : (sodAmr ? 0.02 : (acoustic ? 0.02 : (acConv ? tEnd : 0.01))))));
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls);
   solver->pseudo2D        = (baseGridSize[2] == blockSize) ? 1 : 0;  // collapse z (pseudo-2D)
   solver->cfl             = cfl;
   solver->waveletThresh   = wThresh;
   solver->scheme          = scheme;
-  solver->icType          = (testCase == 1 || sodAmr) ? 1 : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : 0)));
-  solver->bcType          = (bcArg >= 0) ? bcArg : 3;   // transmissive / outflow (default), or CLI override
-  solver->vortexAdvect    = 0.0;                        // stationary vortex
+  solver->icType          = (testCase == 1 || sodAmr) ? 1 : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : 0)))));
+  solver->bcType          = (bcArg >= 0) ? bcArg : (acConv ? 2 : 3);   // periodic for the acoustic wave; else transmissive
+  solver->vortexAdvect    = acConv ? Ma : 0.0;          // acConv: reuse Ma as the wave amplitude A
   solver->greshoP0        = 1.0/(gam*Ma*Ma);            // Gresho background pressure -> Mach = Ma
-  solver->staticGrid      = (testCase == 5 || sodAmr) ? 1 : 0;   // 1=radial shells, 2=planar-x band
-  solver->refineRadius    = 0.4;                        // fine-region half-extent
+  solver->staticGrid      = acoustic ? 3 : ((testCase == 5 || sodAmr) ? 1 : 0);   // 1=radial shells, 2=planar band, 3=centre step
+  solver->refineRadius    = 0.4;                        // fine-region half-extent (unused for the step)
   solver->reflux          = refluxA;                    // conservative coarse/fine flux correction
+  solver->recon           = reconA;                     // face reconstruction (TVD / ROUND / LD-ROUND)
   solver->immerserdBcType = 0;
   solver->initialize();
 
@@ -95,6 +102,14 @@ int main(int argc, char* argv[]) {
   auto wall1 = std::chrono::steady_clock::now();
   double wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(wall1 - wall0).count();
   printf("done: t = %f after %d iters in %.1f ms\n", t, solver->iter, wallMs);
+  // adaptation (tGrid: restrict+forward/inverse wavelet+adaptGrid+sortBlocks, every
+  // 4th iter) vs solver (tSolver: deltaT + 3 RK stages, every iter)
+  double tG = solver->tGrid, tS = solver->tSolver;
+  printf("[timing] adaptation = %.0f ms, solver = %.0f ms  ->  adaptation is %.1f%% of step() time\n",
+         tG, tS, (tG + tS > 0) ? 100.0*tG/(tG + tS) : 0.0);
+  double tFwd = solver->tForwardUs/1000.0, tSrt = solver->tSortUs/1000.0;
+  printf("[adapt breakdown] forwardWavelet(6 reductions) = %.0f ms, sortBlocks = %.0f ms, rest = %.0f ms\n",
+         tFwd, tSrt, tG - tFwd - tSrt);
 
   if (testCase == 0) {
     solver->writeLineProfile("output/sod_profile.dat");
@@ -104,6 +119,12 @@ int main(int argc, char* argv[]) {
   }
   if (gresho) {
     solver->computeGreshoError();
+  }
+  if (acoustic) {
+    solver->computeAcousticReflection("output/acoustic_profile.dat");
+  }
+  if (acConv) {
+    solver->computeAcousticL2Error();
   }
   solver->printDiagnostics();
   solver->paintPressure("output/pressure_final.png");

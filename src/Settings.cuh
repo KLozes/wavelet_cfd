@@ -17,6 +17,12 @@ static constexpr int cudaGridSize = 1000;
 #endif
 static constexpr int nCellsMax = NCELLS_MAX;
 
+// solver precision: float by default; -DUSE_DOUBLE builds the wave3d_dp binary
+// (used for convergence studies where float roundoff floors the error)
+#ifdef USE_DOUBLE
+typedef double real;
+#else
 typedef float real;
+#endif
 
 #endif
