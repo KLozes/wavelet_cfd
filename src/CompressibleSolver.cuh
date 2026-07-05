@@ -62,10 +62,14 @@ public:
 
   i32 scheme;           // 0 = finite volume (HLLC+TVD), 1 = RT0/P0 DG
   i32 recon;            // face reconstruction of rho/p/tangential (and FV normal) velocity:
-                        // 0 = smooth TVD limiter, 1 = ROUND (default), 2 = LD-ROUND
-                        // (Huang, Deng, Matar & Ying, J.Comput.Phys. 555 (2026), Eqs. 4.1/4.2)
+                        // 0 = smooth TVD limiter, 1 = ROUND (default), 2 = LD-ROUND,
+                        // 3 = unlimited 3rd-order parabola (kappa=1/3; smooth tests only)
+                        // (ROUND/LD-ROUND: Huang, Deng, Matar & Ying, JCP 555 (2026), Eqs. 4.1/4.2)
                         // ROUND: 6-7x lower smooth-wave error than TVD, cleaner low-Mach,
                         // shocks stay spike-free (soft ~1% non-TVD overshoots by design)
+  i32 rt0Face;          // RT0 normal-velocity face state (scheme==1 only):
+                        // 0 = linear modal (default), 1 = c=1/6 biased parabola
+                        // (4th-order face average; see parabolicFace)
   real vortexAdvect;    // isentropic-vortex IC advection velocity (u0=v0)
   real greshoP0;        // Gresho-vortex background pressure = 1/(gam*Ma^2) (sets Mach)
   i32 staticGrid;       // 1 = fixed refinement (no dynamic wavelet adaptation)
@@ -95,6 +99,7 @@ public:
       icType = 0;
       scheme = 0;
       recon = 1;
+      rt0Face = 0;
       vortexAdvect = 0.0;
       greshoP0 = 0.0;
       staticGrid = 0;

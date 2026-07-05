@@ -135,14 +135,17 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
     if (grid.icType == 1) {
       //
       // 2D circular Sod explosion (uniform in z -> pseudo-2D).  A circular
-      // region of high-pressure gas drives a cylindrical shock outward.
+      // region of high-pressure gas drives a cylindrical shock outward.  The
+      // inner pressure is configurable (vortexAdvect, unused otherwise here):
+      // pIn = 1 is the classic 10:1 Sod ratio; pIn = 10 a strong 100:1 blast.
       //
+      real pIn = (grid.vortexAdvect > 0.0) ? grid.vortexAdvect : 1.0;
       real cx = grid.domainSize[0]/2;
       real cy = grid.domainSize[1]/2;
       real radius = min(grid.domainSize[0], grid.domainSize[1])/5;
       real dist = sqrt((pos[0]-cx)*(pos[0]-cx) + (pos[1]-cy)*(pos[1]-cy));
       if (dist < radius) {
-        Rho[cIdx] = 1.0; U[cIdx] = 0.0; V[cIdx] = 0.0; W[cIdx] = 0.0; P[cIdx] = 1.0;
+        Rho[cIdx] = 1.0; U[cIdx] = 0.0; V[cIdx] = 0.0; W[cIdx] = 0.0; P[cIdx] = pIn;
       }
       else {
         Rho[cIdx] = 0.125; U[cIdx] = 0.0; V[cIdx] = 0.0; W[cIdx] = 0.0; P[cIdx] = 0.1;
@@ -503,27 +506,16 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
   END_CELL_LOOP
 }
 
-// One-sided parabolic-Hermite reconstruction of the RT0 normal face velocity.
-// Builds a quadratic from cell `self`'s value+slope (the Hermite data) and the
-// neighbour `nbr`'s value, evaluated at the shared face; `sSelf` is the signed
-// linear half-cell increment toward the face (+mxs/rho on a right face, −mxs/rho
-// on a left face, i.e. exactly the term the linear RT0 state already uses).  A
-// cubic Hermite (both slopes) would be central and oscillatory at shocks; this
-// biased quadratic drops the neighbour's slope, keeping value+slope from `self`.
-// It reduces EXACTLY to the linear RT0 state uSelf+sSelf for smooth data (so the
-// left and right states agree there -> continuous normal momentum -> low-Mach),
-// and differs only across a jump by the curvature term 0.25*(uNbr−uSelf); HLLC
-// does the upwinding between the two biased states.
 // One-sided biased-parabola face state for the RT0 normal velocity (value+slope
-// from `self`, value from the neighbour).  The weights are set so the AVERAGE of
-// the two states is the c=1/6 face value
+// from `self`, value from the neighbour); selected by grid.rt0Face == 1.  The
+// weights are set so the AVERAGE of the two face states is the c=1/6 face value
 //   u_f = (uL+uR)/2 + (dx/6)(gL - gR),
 // whose flux difference is the 4th-order-accurate divergence operator.  Each
-// state reduces exactly to the linear RT0 modal value for smooth data (qL==qR:
-// no jump -> low-Mach preserving); across a discontinuity they differ, and the
-// HLLC upwinding on that jump both captures shocks and relaxes the slope DOF
-// toward the physical derivative (measured: 3rd-order acoustics with unlimited
-// rho/p faces, and sharper shocks than the linear modal states with TVD).
+// state reduces exactly to the linear RT0 modal value uSelf+sSelf for smooth
+// data (qL==qR: no jump -> low-Mach preserving); across a discontinuity they
+// differ, and HLLC upwinds the jump (shock capture + slope relaxation).  `sSelf`
+// is the signed half-cell RT0 increment toward the face (+mxs/rho on a right
+// face, -mxs/rho on a left face) -- the same term the linear modal state uses.
 __device__ inline real parabolicFace(real uSelf, real uNbr, real sSelf) {
   return (5.0/6.0)*uSelf + (1.0/6.0)*uNbr + (2.0/3.0)*sSelf;
 }
@@ -611,17 +603,26 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     qB[4] = grid.tvdRec(P[b2Idx], P[b1Idx], P[cIdx]);
     qF[4] = grid.tvdRec(P[f1Idx], P[cIdx],  P[b1Idx]);
 
-    // RT0/P0 DG: replace the limited face-normal velocity by the biased-parabola
-    // RT0 states (unlimited; see parabolicFace).  ρ, pressure and the tangential
-    // velocities keep the TVD reconstruction above.  Slope s = (dx/2)·G/ρ is the
-    // half-cell RT0 velocity increment toward the face.
+    // RT0/P0 DG: replace the limited face-normal velocity by the RT0 face state.
+    // ρ, pressure and the tangential velocities keep the reconstruction above.
+    // Modal slope mxs = (dx/2)·Gx, so a cell's right-face value is u + mxs/ρ and
+    // its left-face value is u − mxs/ρ.  rt0Face selects how the two sides meet:
+    //   0 = linear RT0 modal (each cell extrapolates its own slope), or
+    //   1 = c=1/6 biased parabola (both states average to the 4th-order c=1/6
+    //       face value; see parabolicFace).  Both are unlimited; HLLC upwinds.
     if (grid.scheme == 1) {
       real sxL = 0.5*dx*Gx[l1Idx]/Rho[l1Idx], sxR = 0.5*dx*Gx[cIdx]/Rho[cIdx];
       real syL = 0.5*dy*Gy[d1Idx]/Rho[d1Idx], syR = 0.5*dy*Gy[cIdx]/Rho[cIdx];
       real szL = 0.5*dz*Gz[b1Idx]/Rho[b1Idx], szR = 0.5*dz*Gz[cIdx]/Rho[cIdx];
-      qL[1] = parabolicFace(U[l1Idx], U[cIdx],  sxL);   qR[1] = parabolicFace(U[cIdx], U[l1Idx], -sxR);
-      qD[2] = parabolicFace(V[d1Idx], V[cIdx],  syL);   qU[2] = parabolicFace(V[cIdx], V[d1Idx], -syR);
-      qB[3] = parabolicFace(W[b1Idx], W[cIdx],  szL);   qF[3] = parabolicFace(W[cIdx], W[b1Idx], -szR);
+      if (grid.rt0Face == 1) {
+        qL[1] = parabolicFace(U[l1Idx], U[cIdx],  sxL);  qR[1] = parabolicFace(U[cIdx], U[l1Idx], -sxR);
+        qD[2] = parabolicFace(V[d1Idx], V[cIdx],  syL);  qU[2] = parabolicFace(V[cIdx], V[d1Idx], -syR);
+        qB[3] = parabolicFace(W[b1Idx], W[cIdx],  szL);  qF[3] = parabolicFace(W[cIdx], W[b1Idx], -szR);
+      } else {
+        qL[1] = U[l1Idx] + sxL;   qR[1] = U[cIdx] - sxR;   // x-face normal (u)
+        qD[2] = V[d1Idx] + syL;   qU[2] = V[cIdx] - syR;   // y-face normal (v)
+        qB[3] = W[b1Idx] + szL;   qF[3] = W[cIdx] - szR;   // z-face normal (w)
+      }
     }
 
     Vec5 fluxL = grid.hllcFlux(grid.prim2cons(qL), grid.prim2cons(qR), Vec3(1,0,0));
@@ -711,10 +712,15 @@ __global__ void computeFluxDimKernel(CompressibleSolver &grid, i32 dim) {
       qL[m] = grid.tvdRec(prim[m][lm2], prim[m][lm1], prim[m][cIdx]);
       qR[m] = grid.tvdRec(prim[m][lp1], prim[m][cIdx], prim[m][lm1]);
     }
-    if (grid.scheme == 1) {   // biased-parabola RT0 normal states; HLLC upwinds
+    if (grid.scheme == 1) {   // RT0 normal states: linear modal (0) or c=1/6 (1)
       real sL = 0.5*h*G[lm1]/prim[0][lm1], sR = 0.5*h*G[cIdx]/prim[0][cIdx];
-      qL[nv] = parabolicFace(prim[nv][lm1], prim[nv][cIdx],  sL);
-      qR[nv] = parabolicFace(prim[nv][cIdx], prim[nv][lm1], -sR);
+      if (grid.rt0Face == 1) {
+        qL[nv] = parabolicFace(prim[nv][lm1], prim[nv][cIdx],  sL);
+        qR[nv] = parabolicFace(prim[nv][cIdx], prim[nv][lm1], -sR);
+      } else {
+        qL[nv] = prim[nv][lm1]  + sL;
+        qR[nv] = prim[nv][cIdx] - sR;
+      }
     }
     Vec5 flux = grid.hllcFlux(grid.prim2cons(qL), grid.prim2cons(qR), Vec3(di, dj, dk));
     for (i32 n = 0; n < 5; n++) Fx[n][cIdx] = flux[n];
@@ -1117,11 +1123,20 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
       }
       else
       for (i32 f = 0; f < NEVOLVE; f++) {
+        // Refine only on the PRIMARY conserved fields (rho, momentum, rhoE).
+        //  - The RT0 slope DOFs (Gx,Gy,Gz) are auxiliary sub-cell moments, not
+        //    primary fields: refining on them adds spurious grid (their detail
+        //    is noisy where G/rho is large, i.e. low-density regions) and is the
+        //    main source of the RT0-mode over-refinement.
+        //  - z-momentum is identically 0 in pseudo-2D, so it never fires anyway;
+        //    skip it explicitly so a stray roundoff detail can never trigger.
+        if (f >= F_GX) continue;                               // skip Gx,Gy,Gz
+        if (grid.pseudo2D && f == F_RHOW) continue;            // z-mom is 0 in 2D
         real *Q = grid.getField(f);
         // normalize the detail by the domain max of this field's scale
-        // (computed pre-transform, device-side)
-        i32 k = (f == F_RHO) ? 0 : (f <= F_RHOW ? 1 : (f == F_RHOE ? 2 : 3));
-        real mag = fmax(grid.globalScale[k], (real)1e-32);
+        // (computed pre-transform, device-side): rho / |momentum| / rhoE
+        i32 sc = (f == F_RHO) ? 0 : (f <= F_RHOW ? 1 : 2);
+        real mag = fmax(grid.globalScale[sc], (real)1e-32);
 
         if (abs(Q[cIdx]/mag) > grid.waveletThresh || abs(ls) < dx) {
           if (lvl < grid.nLvls-1 && (abs(Q[cIdx]/mag) > grid.waveletThresh*2 || abs(ls) < dx)) {

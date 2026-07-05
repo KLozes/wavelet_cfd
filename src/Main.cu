@@ -6,7 +6,7 @@
 #include "CompressibleSolver.cuh"
 
 //
-// Usage:  ./wave3d [testCase] [nLvls] [nBlocksX] [wThresh] [scheme]
+// Usage:  ./wave3d --case N [--flag value ...]        (all flags optional)
 //
 //   testCase 0 : pseudo-2D / quasi-1D Sod shock tube (validated vs exact)
 //   testCase 1 : 2D circular Sod explosion with adaptive mesh refinement
@@ -18,27 +18,60 @@
 //   testCase 6 : circular Sod explosion on a static radial AMR grid — measures
 //                coarse/fine conservation error (mass/energy drift) vs refluxing
 //
-//   scheme (arg 5) : 0 = finite volume (HLLC+TVD), 1 = RT0/P0 DG
-//                    (defaults to 1 for testCase >= 2, else 0)
-//   Ma     (arg 6) : Gresho Mach number (testCase 4 only; default 0.1)
+//   --case N     test case (default 0); also accepted as the first bare arg
+//   --nlvls N    number of refinement levels           (per-case default)
+//   --nblocks N  base blocks in x                       (per-case default)
+//   --wthresh X  wavelet detail threshold               (per-case default)
+//   --scheme N   0 = finite volume (HLLC+TVD), 1 = RT0/P0 DG  (>=2 -> 1)
+//   --ma X       Gresho Mach / acConv amplitude / testCase-1 inner pressure
+//   --bc N       BC: 0 slip wall, 1 no-slip, 2 periodic, 3 transmissive
+//   --reflux N   0/1 conservative coarse/fine flux correction   (default 0)
+//   --recon N    0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola
+//   --tend X     end time override                      (per-case default)
+//   --rt0face N  RT0 normal face (scheme 1): 0 = linear modal (default),
+//                1 = c=1/6 biased parabola (4th-order face average)
 //
+// Back-compat: `./wave3d N` (bare first arg) still selects the test case.
 // testCases 0-2,4 run pseudo-2D (single z block); testCase 3 is fully 3D.
 //
 int main(int argc, char* argv[]) {
 
-  i32 testCase = (argc > 1) ? atoi(argv[1]) : 0;
+  // --flag value parser: findArg returns the token after --flag, or nullptr.
+  auto findArg = [&](const char* key) -> const char* {
+    for (int a = 1; a < argc - 1; a++)
+      if (strcmp(argv[a], key) == 0) return argv[a+1];
+    return nullptr;
+  };
+  auto hasArg = [&](const char* key) { return findArg(key) != nullptr; };
+  auto argI   = [&](const char* key, i32 def)    { const char* v = findArg(key); return v ? atoi(v) : def; };
+  auto argF   = [&](const char* key, real def)   { const char* v = findArg(key); return v ? (real)atof(v) : def; };
+
+  // guard against the old positional style (silently ignored now): warn if more
+  // than one bare arg is passed and no --flag is present.
+  bool anyNamed = false;
+  for (int a = 1; a < argc; a++) if (strncmp(argv[a], "--", 2) == 0) anyNamed = true;
+  if (!anyNamed && argc > 2)
+    printf("[warn] positional args are deprecated and ignored; use named flags, "
+           "e.g. --case %s --nlvls %s ...  (run with --case only, or -h, for the list)\n",
+           argv[1], argv[2]);
+
+  // testCase: --case N, or the first bare (non---) argument for back-compat
+  i32 testCase = argI("--case", (argc > 1 && argv[1][0] != '-') ? atoi(argv[1]) : 0);
   bool gresho  = (testCase == 4 || testCase == 5);         // Gresho vortex (uniform / static-AMR)
   bool sodAmr  = (testCase == 6);                          // Sod shock on a static planar AMR grid
   bool acoustic= (testCase == 7);                          // acoustic pulse crossing a static coarse/fine interface
   bool acConv  = (testCase == 8);                          // periodic sine acoustic wave, order-of-accuracy study
-  i32 nLvls    = (argc > 2) ? atoi(argv[2]) : (testCase == 1 ? 4 : (testCase == 5 ? 3 : (sodAmr ? 3 : (acoustic ? 3 : 1))));
-  i32 nBlocksX = (argc > 3) ? atoi(argv[3]) : (testCase == 1 ? 16 : (testCase == 2 ? 40 : (testCase == 3 ? 8 : (testCase == 4 ? 40 : (testCase == 5 ? 10 : (sodAmr ? 16 : (acoustic ? 64 : (acConv ? 8 : 100))))))));
-  real wThresh = (argc > 4) ? atof(argv[4]) : (testCase == 1 ? 0.004 : 0.01);
-  i32 scheme   = (argc > 5) ? atoi(argv[5]) : (sodAmr ? 0 : (testCase >= 2 ? 1 : 0));
-  real Ma      = (argc > 6) ? atof(argv[6]) : 0.1;   // Gresho Mach number
-  i32 bcArg    = (argc > 7) ? atoi(argv[7]) : -1;    // bcType override (-1 = per-testCase default)
-  i32 refluxA  = (argc > 8) ? atoi(argv[8]) : 0;     // 1 = conservative coarse/fine refluxing
-  i32 reconA   = (argc > 9) ? atoi(argv[9]) : 1;     // 0 = TVD limiter, 1 = ROUND (default), 2 = LD-ROUND
+  i32 nLvls    = argI("--nlvls", (testCase == 1 ? 4 : (testCase == 5 ? 3 : (sodAmr ? 3 : (acoustic ? 3 : 1)))));
+  i32 nBlocksX = argI("--nblocks", (testCase == 1 ? 16 : (testCase == 2 ? 40 : (testCase == 3 ? 8 : (testCase == 4 ? 40 : (testCase == 5 ? 10 : (sodAmr ? 16 : (acoustic ? 64 : (acConv ? 8 : 100)))))))));
+  real wThresh = argF("--wthresh", (testCase == 1 ? 0.004 : 0.01));
+  i32 scheme   = argI("--scheme", (sodAmr ? 0 : (testCase >= 2 ? 1 : 0)));
+  bool haveMa  = hasArg("--ma");
+  real Ma      = haveMa ? argF("--ma", 0.1) : 0.1;   // Gresho Mach number / acConv amplitude
+  i32 bcArg    = argI("--bc", -1);                   // bcType override (-1 = per-testCase default)
+  i32 refluxA  = argI("--reflux", 0);                // 1 = conservative coarse/fine refluxing
+  i32 reconA   = argI("--recon", 1);                 // 0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola (smooth only)
+  real tEndArg = argF("--tend", -1.0);               // tEnd override (-1 = per-testCase default)
+  i32 rt0FaceA = argI("--rt0face", 0);               // RT0 normal face (scheme==1): 0=linear modal (default), 1=c=1/6 parabola
 
   bool cube   = (testCase == 3);
   bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv);
@@ -54,9 +87,14 @@ int main(int argc, char* argv[]) {
   // acConv: RK3's O(dt^3) global error would cap an order study at 3; scaling
   // cfl ~ dx^(1/3) keeps dt^3 ~ dx^4, below 4th-order spatial error.
   real cfl  = acConv ? 0.40*cbrt(4.0/nBlocksX) : 0.40;
+  // testCase 1: --ma sets the circular-Sod inner pressure (1.0 = classic 10:1
+  // ratio; 10 = strong 100:1 blast).  The strong blast's faster shock needs a
+  // shorter tEnd to stay inside the domain.
+  real sodPin = (testCase == 1) ? (haveMa ? argF("--ma", 1.0) : 1.0) : 0.0;
   real acPeriod = domainLenX / sqrt(gam);   // sound-crossing time (c0=sqrt(gam), p0=rho0=1)
-  real tEnd  = (testCase == 2) ? 1.0 : (testCase == 3 ? 0.15 : (gresho ? 1.0 : (sodAmr ? 0.15 : (acoustic ? 0.35 : (acConv ? 2.0*acPeriod : 0.20)))));
-  real tStep = (testCase == 1) ? 0.008 : (testCase == 2 ? 0.1 : (testCase == 3 ? 0.03 : (gresho ? 0.1 : (sodAmr ? 0.02 : (acoustic ? 0.02 : (acConv ? tEnd : 0.01))))));
+  real tEnd  = (testCase == 1 && sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin) : ((testCase == 2) ? 1.0 : (testCase == 3 ? 0.15 : (gresho ? 1.0 : (sodAmr ? 0.15 : (acoustic ? 0.35 : (acConv ? 2.0*acPeriod : 0.20))))));
+  if (tEndArg > 0) tEnd = tEndArg;                   // CLI override (arg 10)
+  real tStep = (testCase == 1) ? ((tEndArg > 0) ? tEnd/50.0 : ((sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin)/10.0 : 0.008)) : (testCase == 2 ? 0.1 : (testCase == 3 ? 0.03 : (gresho ? 0.1 : (sodAmr ? 0.02 : (acoustic ? 0.02 : (acConv ? tEnd : 0.01))))));
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls);
   solver->pseudo2D        = (baseGridSize[2] == blockSize) ? 1 : 0;  // collapse z (pseudo-2D)
@@ -65,12 +103,13 @@ int main(int argc, char* argv[]) {
   solver->scheme          = scheme;
   solver->icType          = (testCase == 1 || sodAmr) ? 1 : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : 0)))));
   solver->bcType          = (bcArg >= 0) ? bcArg : (acConv ? 2 : 3);   // periodic for the acoustic wave; else transmissive
-  solver->vortexAdvect    = acConv ? Ma : 0.0;          // acConv: reuse Ma as the wave amplitude A
+  solver->vortexAdvect    = acConv ? Ma : sodPin;       // acConv: wave amplitude A; testCase 1: Sod inner pressure
   solver->greshoP0        = 1.0/(gam*Ma*Ma);            // Gresho background pressure -> Mach = Ma
   solver->staticGrid      = acoustic ? 3 : ((testCase == 5 || sodAmr) ? 1 : 0);   // 1=radial shells, 2=planar band, 3=centre step
   solver->refineRadius    = 0.4;                        // fine-region half-extent (unused for the step)
   solver->reflux          = refluxA;                    // conservative coarse/fine flux correction
   solver->recon           = reconA;                     // face reconstruction (TVD / ROUND / LD-ROUND)
+  solver->rt0Face         = rt0FaceA;                    // RT0 normal face: 0=linear modal, 1=c=1/6 parabola
   solver->immerserdBcType = 0;
   solver->initialize();
 

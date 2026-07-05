@@ -19,11 +19,14 @@ STD       = c++17
 NVCCFLAGS = -O2 -std=$(STD) -arch=$(ARCH)
 LDFLAGS   = -lpng -lz
 
-# per-executable cell cap (blocks = NCELLS_MAX/blockSizeTot).  wave3d keeps the
-# default (8M cells).  wavesdf runs the grid in lean mode (skips the flow solver's
+# per-executable cell cap (blocks = NCELLS_MAX/blockSizeTot).  wave3d gets 64M
+# cells (30 fields x 4B -> ~7.7 GB, fits the 16 GB card) for high-resolution
+# adaptive runs (e.g. 8192^2 circular Sod).  wave3d_dp keeps the 8M default
+# (doubles: 64M would need ~15.4 GB).  wavesdf runs the grid in lean mode (skips the flow solver's
 # cFlagsList/nbrIdxList/prntIdxList/imageDataX); with the fp32 Sdf that is ~310
 # B/block, so 384M cells (6M blocks, ~2.2 GB) fit on a 3 GB card -- enough for a
 # clean res 2048 (~1.9M blocks).
+WAVE3D_DEFS  = -DNCELLS_MAX=64000000
 WAVESDF_DEFS = -DNCELLS_MAX=384000000
 # wavewsdf (the wavelet / BVH-oracle SDF) stores the 1-jet per cell (value +
 # gradient = 16 B/cell).  Its surface-fit octree is ~1000x sparser than a
@@ -65,7 +68,7 @@ wave3d_dp: $(WAVE3D_DP_OBJS)
 
 # ---- build rules (one per executable, so each gets its own NCELLS_MAX) ------
 $(OBJ_DIR)/wave3d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d
-	$(NVCC) $(NVCCFLAGS) -I./$(SRC_DIR) -dc $< -o $@
+	$(NVCC) $(NVCCFLAGS) $(WAVE3D_DEFS) -I./$(SRC_DIR) -dc $< -o $@
 
 $(OBJ_DIR)/wavesdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavesdf
 	$(NVCC) $(NVCCFLAGS) $(WAVESDF_DEFS) -I./$(SRC_DIR) -dc $< -o $@

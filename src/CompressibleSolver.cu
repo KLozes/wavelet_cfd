@@ -414,22 +414,25 @@ void CompressibleSolver::printDiagnostics(void) {
       maxW = fmax(maxW, fabs(w));
       minP = fmin(minP, p);
       maxP = fmax(maxP, p);
-      if (p > 1.02 || p < 0.098) nSpike++;
+      // spike bounds = 2% above / below the IC pressure range [0.1, pHi]
+      real pHi = (vortexAdvect > 0.0) ? vortexAdvect : 1.0;
+      if (p > 1.02*pHi || p < 0.098) nSpike++;
       nActive++;
     }
   }
 
+  real pHi = (vortexAdvect > 0.0) ? vortexAdvect : 1.0;
   printf("---- diagnostics ----\n");
   printf("  active cells : %lld\n", (long long)nActive);
   printf("  max|u| = %.4e  max|v| = %.4e  max|w| = %.4e   (w should be ~0)\n", maxU, maxV, maxW);
-  printf("  pressure range: [%.4f, %.4f]   (init range [0.1, 1.0])\n", minP, maxP);
-  printf("  pressure-spike cells (p>1.02 or p<0.098): %lld  (%.3f%%)\n",
-         (long long)nSpike, 100.0*real(nSpike)/fmax(1.0,real(nActive)));
+  printf("  pressure range: [%.4f, %.4f]   (init range [0.1, %.1f])\n", minP, maxP, pHi);
+  printf("  pressure-spike cells (p>%.2f or p<0.098): %lld  (%.3f%%)\n",
+         1.02*pHi, (long long)nSpike, 100.0*real(nSpike)/fmax(1.0,real(nActive)));
 
   // per-level z-block extent: shows whether refinement also subdivides z
   printf("  per-level interior-block z-extent (nz blocks = max kb+1):\n");
   for (i32 L = 0; L < nLvls; L++) {
-    i32 nzMax = 0, nBlk = 0;
+    i32 nzMax = 0, nBlk = 0, nWall = 0;   // nWall: blocks touching the domain boundary
     i32 gx = baseGridSize[0]*powi(2,L)/blockSize;
     i32 gy = baseGridSize[1]*powi(2,L)/blockSize;
     i32 gz = baseGridSize[2]*powi(2,L)/blockSize;
@@ -444,9 +447,10 @@ void CompressibleSolver::printDiagnostics(void) {
       if (ib < 0 || jb < 0 || kb < 0 || ib >= gx || jb >= gy || kb >= gz) continue;
       nzMax = max(nzMax, kb+1);
       nBlk++;
+      if (ib == 0 || ib == gx-1 || jb == 0 || jb == gy-1) nWall++;   // wall-adjacent
     }
-    printf("    lvl %d: %d interior blocks, nz = %d block(s) thick (domain is %d block at base)\n",
-           L, nBlk, nzMax, baseGridSize[2]/blockSize);
+    printf("    lvl %d: %d interior blocks (%d wall-adjacent = %.1f%%), nz = %d block(s) thick\n",
+           L, nBlk, nWall, nBlk ? 100.0*nWall/nBlk : 0.0, nzMax);
   }
   printf("---------------------\n");
 }
@@ -686,8 +690,15 @@ __device__ real CompressibleSolver::tvdRec(real &ul, real &uc, real &ur) {
       psi = (real)0.5*phi + (real)0.5;
     }
   }
+  else if (recon == 3) {
+    // unlimited 3rd-order upwind parabola (kappa = 1/3 MUSCL): the psi-line the
+    // ROUND schemes blend toward, with no limiting at all.
+    //   face = -1/6 ul + 5/6 uc + 1/3 ur
+    // For SMOOTH tests only -- oscillates at shocks.
+    psi = (real)(1.0/3.0) + (real)(5.0/6.0)*phi;
+  }
   else {
-    // smooth TVD limiter (default)
+    // smooth TVD limiter
     psi = lim(phi);
   }
   return ul + psi * du;
