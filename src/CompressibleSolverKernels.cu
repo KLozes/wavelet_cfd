@@ -1462,8 +1462,26 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
         if (abs(Q[cIdx]/mag) > grid.waveletThresh || abs(ls) < dx) {
           if (lvl < grid.nLvls-1 && (abs(Q[cIdx]/mag) > grid.waveletThresh*2 || abs(ls) < dx)) {
             i32 bSize = blockSize/2;
-            i32 kc = grid.pseudo2D ? kb : (2*kb + k/bSize);
-            grid.activateBlock(lvl+1, 2*ib+i/bSize, 2*jb+j/bSize, kc);
+            i32 cx = 2*ib+i/bSize, cy = 2*jb+j/bSize;
+            i32 cz = grid.pseudo2D ? kb : (2*kb + k/bSize);
+            grid.activateBlock(lvl+1, cx, cy, cz);
+            if (grid.periodic) {
+              // refine the across-seam partner child in the SAME cycle: an edge
+              // child (leftmost/rightmost column at lvl+1) and its opposite-edge
+              // partner are periodic neighbors, so activate the partner too --
+              // else the opposite edge reaches the finest level a cycle late (a
+              // transient coarse/fine seam).  Identity for non-edge children.
+              i32 gcx = grid.baseGridSize[0]/blockSize*powi(2,lvl+1);
+              i32 gcy = grid.baseGridSize[1]/blockSize*powi(2,lvl+1);
+              i32 px = (cx==0) ? gcx-1 : (cx==gcx-1 ? 0 : cx);
+              i32 py = (cy==0) ? gcy-1 : (cy==gcy-1 ? 0 : cy);
+              i32 pz = cz;
+              if (!grid.pseudo2D) {
+                i32 gcz = grid.baseGridSize[2]/blockSize*powi(2,lvl+1);
+                pz = (cz==0) ? gcz-1 : (cz==gcz-1 ? 0 : cz);
+              }
+              if (px!=cx || py!=cy || pz!=cz) grid.activateBlock(lvl+1, px, py, pz);
+            }
           }
           grid.bFlagsList[bIdx] = KEEP;
         }
