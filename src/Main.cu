@@ -30,10 +30,10 @@
 //   --rt0face N  RT0 normal face (scheme 1): 0 = linear modal (default),
 //                1 = c=1/6 biased parabola (4th-order face average)
 //   --mdflux N   1 = genuinely multidimensional Osher-type corner flux
-//                (Gaburro-Ricchiuto-Dumbser, arXiv:2506.00207) with first-order
-//                corner states; 2 = same + CTU transverse half-step predictor
-//                on the midpoint states (raises the stable CFL); pseudo-2D
-//                only, recon/rt0face ignored
+//                (Gaburro-Ricchiuto-Dumbser, arXiv:2506.00207); 2 = CTU-Hancock:
+//                half-step predictor + single-Euler corrector, 2nd order in
+//                time, stable to CFL ~1.2 at 1/3 the RK3 cost (FV only).
+//                pseudo-2D only; states follow --recon/--rt0face
 //   --cfl X      CFL number (default 0.40; dt = cfl * min(dx/(|u|+c)))
 //
 // Back-compat: `./wave3d N` (bare first arg) still selects the test case.

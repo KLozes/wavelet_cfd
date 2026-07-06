@@ -159,7 +159,13 @@ void CompressibleSolver::computeDeltaT(void) {
 
 void CompressibleSolver::computeRightHandSide(void) {
   if (mdFlux) {
-    // genuinely multidimensional Osher-type corner fluxes (first-order states)
+    if (mdFlux == 2) {
+      // CTU-Hancock: half-step-predict all cells into the Old bank (free until
+      // updateFields), fill its halos, then assemble the multiD fluxes on the
+      // time-centred field
+      hancockPredictKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+      setBoundaryConditions(F_OLD);
+    }
     multiDRhsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     return;
   }

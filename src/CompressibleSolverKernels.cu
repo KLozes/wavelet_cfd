@@ -934,40 +934,67 @@ __device__ void mdCornerFlux(CompressibleSolver &grid,
     }
 }
 
-// CTU-style transverse predictor (mdFlux == 2): the donor cell's state for a
-// midpoint Riemann problem is advanced a half step by the TRANSVERSE flux
-// gradient (central cell-flux difference),
-//   Q* = Q - (dt/2) [ g(Q_+1) - g(Q_-1) ] / (2 dTrans),
-// making the face input dt-aware (Colella's corner-transport idea): the
-// numerical domain of dependence tracks the physical one as dt grows, which is
-// what raises the stable CFL of a genuinely multiD scheme.  Falls back to the
-// raw state if the predictor loses positivity.  Returns primitives (r,u,v,w,p).
-__device__ void ctuState(CompressibleSolver &grid,
-                         real *Rho, real *U, real *V, real *W, real *P,
-                         i32 bIdx, i32 ii, i32 jj, i32 k,
-                         i32 tx, i32 ty, real coeff, i32 transDir, real out[5]) {
-  i32 id0 = grid.getNbrIdx(bIdx, ii,      jj,      k);
-  i32 idm = grid.getNbrIdx(bIdx, ii - tx, jj - ty, k);
-  i32 idp = grid.getNbrIdx(bIdx, ii + tx, jj + ty, k);
+// CTU-Hancock half-step predictor (mdFlux == 2): every cell is advanced
+//   Q* = Q^n - (dt/2) [ (f(Q_r1)-f(Q_l1))/(2dx) + (g(Q_u1)-g(Q_d1))/(2dy) ]
+// (central cell-flux gradients in BOTH directions) and the predicted
+// PRIMITIVES are stored in the Old bank.  The whole multiD flux assembly
+// (corners, midpoints, reconstruction) then runs on the predicted field, so
+// every flux is time-centred at t + dt/2: Colella's corner-transport stability
+// (CFL ~ 1) plus Hancock's 2nd-order-in-time accuracy, in one Euler corrector.
+// Falls back to the raw state on positivity loss.  The Old bank is free during
+// the RHS (updateFieldsKernel rewrites it afterwards).
+__global__ void hancockPredictKernel(CompressibleSolver &grid) {
+  real *Rho = grid.getField(F_RHO);
+  real *U   = grid.getField(F_RHOU);
+  real *V   = grid.getField(F_RHOV);
+  real *P   = grid.getField(F_RHOE);
 
-  real r0 = Rho[id0], u0 = U[id0], v0 = V[id0], w0 = W[id0], p0 = P[id0];
-  out[0] = r0; out[1] = u0; out[2] = v0; out[3] = w0; out[4] = p0;
+  START_CELL_LOOP
+    GET_CELL_INDICES
 
-  real fm[5], fp[5];
-  mdPhysFlux(Rho[idm], U[idm], V[idm], W[idm], P[idm], transDir, fm);
-  mdPhysFlux(Rho[idp], U[idp], V[idp], W[idp], P[idp], transDir, fp);
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb, kb;
+    grid.decode(loc, lvl, ib, jb, kb);
+    real dx = grid.getDx(lvl), dy = grid.getDy(lvl);
+    real cfx = 0.25*grid.deltaT/dx;    // (dt/2) * central-diff/(2 dx)
+    real cfy = 0.25*grid.deltaT/dy;
 
-  real Q[5];
-  Q[0] = r0;  Q[1] = r0*u0;  Q[2] = r0*v0;  Q[3] = r0*w0;
-  Q[4] = p0/(gam - 1.0) + 0.5*r0*(u0*u0 + v0*v0 + w0*w0);
-  for (i32 n = 0; n < 5; n++) Q[n] -= coeff*(fp[n] - fm[n]);
+    i32 l1 = grid.getNbrIdx(bIdx, i-1, j, k);
+    i32 r1 = grid.getNbrIdx(bIdx, i+1, j, k);
+    i32 d1 = grid.getNbrIdx(bIdx, i, j-1, k);
+    i32 u1 = grid.getNbrIdx(bIdx, i, j+1, k);
 
-  real r = Q[0];
-  if (r < (real)1e-10) return;                       // positivity fallback
-  real u = Q[1]/r, v = Q[2]/r, w = Q[3]/r;
-  real p = (gam - 1.0)*(Q[4] - 0.5*r*(u*u + v*v + w*w));
-  if (p < (real)1e-10) return;
-  out[0] = r; out[1] = u; out[2] = v; out[3] = w; out[4] = p;
+    real r0 = Rho[cIdx], u0 = U[cIdx], v0 = V[cIdx], p0 = P[cIdx];
+    real ro = r0, uo = u0, vo = v0, po = p0;   // fallback
+
+    real fm[5], fp[5], gm[5], gp[5];
+    mdPhysFlux(Rho[l1], U[l1], V[l1], 0.0, P[l1], 0, fm);
+    mdPhysFlux(Rho[r1], U[r1], V[r1], 0.0, P[r1], 0, fp);
+    mdPhysFlux(Rho[d1], U[d1], V[d1], 0.0, P[d1], 1, gm);
+    mdPhysFlux(Rho[u1], U[u1], V[u1], 0.0, P[u1], 1, gp);
+
+    real Q[5];
+    Q[0] = r0;  Q[1] = r0*u0;  Q[2] = r0*v0;  Q[3] = 0.0;
+    Q[4] = p0/(gam - 1.0) + 0.5*r0*(u0*u0 + v0*v0);
+    for (i32 n = 0; n < 5; n++) Q[n] -= cfx*(fp[n] - fm[n]) + cfy*(gp[n] - gm[n]);
+
+    real r = Q[0];
+    if (r > (real)1e-10) {
+      real u = Q[1]/r, v = Q[2]/r;
+      real p = (gam - 1.0)*(Q[4] - 0.5*r*(u*u + v*v));
+      if (p > (real)1e-10) { ro = r; uo = u; vo = v; po = p; }
+    }
+
+    grid.getField(F_OLD + F_RHO )[cIdx] = ro;
+    grid.getField(F_OLD + F_RHOU)[cIdx] = uo;
+    grid.getField(F_OLD + F_RHOV)[cIdx] = vo;
+    grid.getField(F_OLD + F_RHOW)[cIdx] = 0.0;
+    grid.getField(F_OLD + F_RHOE)[cIdx] = po;
+    grid.getField(F_OLD + F_GX)[cIdx] = grid.getField(F_GX)[cIdx];
+    grid.getField(F_OLD + F_GY)[cIdx] = grid.getField(F_GY)[cIdx];
+    grid.getField(F_OLD + F_GZ)[cIdx] = 0.0;
+
+  END_CELL_LOOP
 }
 
 // MultiD corner-flux RHS: computes the cell's 4 vertex flux tensors on the fly,
@@ -976,13 +1003,18 @@ __device__ void ctuState(CompressibleSolver &grid,
 // updateFieldsKernel.  RT0 slope DOFs use the same Simpson face momentum
 // fluxes in the standard DG weak-form update.
 __global__ void multiDRhsKernel(CompressibleSolver &grid) {
-  real *Rho = grid.getField(F_RHO);
-  real *U   = grid.getField(F_RHOU);
-  real *V   = grid.getField(F_RHOV);
-  real *W   = grid.getField(F_RHOW);
-  real *P   = grid.getField(F_RHOE);
-  real *Gx  = grid.getField(F_GX);
-  real *Gy  = grid.getField(F_GY);
+  // mdFlux==2 (CTU-Hancock): every state -- corners, midpoints, reconstruction
+  // stencils -- comes from the HALF-STEP-PREDICTED primitives in the Old bank,
+  // so all fluxes are time-centred at t + dt/2 (2nd-order time with the single
+  // Euler corrector).  Otherwise the live primitive fields.
+  i32 fb = (grid.mdFlux == 2) ? F_OLD : 0;
+  real *Rho = grid.getField(fb + F_RHO);
+  real *U   = grid.getField(fb + F_RHOU);
+  real *V   = grid.getField(fb + F_RHOV);
+  real *W   = grid.getField(fb + F_RHOW);
+  real *P   = grid.getField(fb + F_RHOE);
+  real *Gx  = grid.getField(fb + F_GX);
+  real *Gy  = grid.getField(fb + F_GY);
 
   START_CELL_LOOP
     GET_CELL_INDICES
@@ -1006,35 +1038,11 @@ __global__ void multiDRhsKernel(CompressibleSolver &grid) {
     real rc = Rho[cIdx], pc = P[cIdx];
 
     // Face-midpoint donor states via mdFaceState (raw P0, or recon==3
-    // unlimited parabolic; RT0 modal normal velocity in scheme 1).  mdFlux==2
-    // additionally applies the CTU transverse half-step correction on top of
-    // the RAW states (CTU is a first-order-state construction; recon==3 and
-    // CTU are not combined).
+    // unlimited parabolic; RT0 modal normal velocity in scheme 1), evaluated
+    // on the fb bank (predicted field under CTU-Hancock).
     real qA[5], qB[5];
     real FxLm[5], FxRm[5], FyBm[5], FyTm[5];
-    if (grid.mdFlux == 2) {
-      real cfy = 0.25*grid.deltaT/dy;   // (dt/2) * central-diff/(2 dy)
-      real cfx = 0.25*grid.deltaT/dx;
-      i32 l1 = grid.getNbrIdx(bIdx, i-1, j, k);
-      i32 r1 = grid.getNbrIdx(bIdx, i+1, j, k);
-      i32 d1 = grid.getNbrIdx(bIdx, i, j-1, k);
-      i32 u1 = grid.getNbrIdx(bIdx, i, j+1, k);
-      real sl1[5], scx[5], sr1[5], sd1[5], scy[5], su1[5];
-      ctuState(grid, Rho, U, V, W, P, bIdx, i-1, j, k, 0, 1, cfy, 1, sl1);
-      ctuState(grid, Rho, U, V, W, P, bIdx, i,   j, k, 0, 1, cfy, 1, scx);
-      ctuState(grid, Rho, U, V, W, P, bIdx, i+1, j, k, 0, 1, cfy, 1, sr1);
-      ctuState(grid, Rho, U, V, W, P, bIdx, i, j-1, k, 1, 0, cfx, 0, sd1);
-      ctuState(grid, Rho, U, V, W, P, bIdx, i, j,   k, 1, 0, cfx, 0, scy);
-      ctuState(grid, Rho, U, V, W, P, bIdx, i, j+1, k, 1, 0, cfx, 0, su1);
-      osher1dFlux(sl1[0], sl1[1] + 0.5*dx*Gx[l1]/sl1[0], sl1[2], 0.0, sl1[4],
-                  scx[0], scx[1] - 0.5*dx*Gx[cIdx]/scx[0], scx[2], 0.0, scx[4], 0, FxLm);
-      osher1dFlux(scx[0], scx[1] + 0.5*dx*Gx[cIdx]/scx[0], scx[2], 0.0, scx[4],
-                  sr1[0], sr1[1] - 0.5*dx*Gx[r1]/sr1[0], sr1[2], 0.0, sr1[4], 0, FxRm);
-      osher1dFlux(sd1[0], sd1[1], sd1[2] + 0.5*dy*Gy[d1]/sd1[0], 0.0, sd1[4],
-                  scy[0], scy[1], scy[2] - 0.5*dy*Gy[cIdx]/scy[0], 0.0, scy[4], 1, FyBm);
-      osher1dFlux(scy[0], scy[1], scy[2] + 0.5*dy*Gy[cIdx]/scy[0], 0.0, scy[4],
-                  su1[0], su1[1], su1[2] - 0.5*dy*Gy[u1]/su1[0], 0.0, su1[4], 1, FyTm);
-    } else {
+    {
       mdFaceState(grid, Rho, U, V, P, Gx, Gy, bIdx, i-1, j, k, 0,  1.0, 0.0, dx, qA);
       mdFaceState(grid, Rho, U, V, P, Gx, Gy, bIdx, i,   j, k, 0, -1.0, 0.0, dx, qB);
       osher1dFlux(qA[0],qA[1],qA[2],qA[3],qA[4], qB[0],qB[1],qB[2],qB[3],qB[4], 0, FxLm);

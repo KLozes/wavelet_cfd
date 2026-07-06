@@ -25,6 +25,8 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid);
 // multiD Osher-type RHS: on-the-fly corner flux tensors + 1D Osher midpoints,
 // Simpson face assembly, RT0 slope updates
 __global__ void multiDRhsKernel(CompressibleSolver &grid);
+// CTU-Hancock half-step predictor (mdFlux==2): predicted primitives -> Old bank
+__global__ void hancockPredictKernel(CompressibleSolver &grid);
 
 __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage);
 
