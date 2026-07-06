@@ -67,6 +67,12 @@ public:
                         // (ROUND/LD-ROUND: Huang, Deng, Matar & Ying, JCP 555 (2026), Eqs. 4.1/4.2)
                         // ROUND: 6-7x lower smooth-wave error than TVD, cleaner low-Mach,
                         // shocks stay spike-free (soft ~1% non-TVD overshoots by design)
+  real slopeRelax;      // RT0 slope-RHS scaling sigma in (0,1] ("mass lumping"):
+                        // shrinks the slope subsystem's spectral radius (the DG
+                        // M=h/3 stiffness that halves the RT0 CFL vs FV) at the
+                        // cost of slower slope transients.  The low-Mach property
+                        // (face/volume cancellation, RhsG = 0 at equilibrium)
+                        // is scaling-invariant.  1 = standard DG dynamics.
   i32 rt0Face;          // RT0 normal-velocity face state (scheme==1 only):
                         // 0 = linear modal (default), 1 = c=1/6 biased parabola
                         // (4th-order face average; see parabolicFace)
@@ -103,6 +109,7 @@ public:
       icType = 0;
       scheme = 0;
       recon = 1;
+      slopeRelax = 1.0;
       rt0Face = 0;
       mdFlux = 0;
       vortexAdvect = 0.0;

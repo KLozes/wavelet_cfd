@@ -79,7 +79,8 @@ int main(int argc, char* argv[]) {
   real tEndArg = argF("--tend", -1.0);               // tEnd override (-1 = per-testCase default)
   i32 rt0FaceA = argI("--rt0face", 0);               // RT0 normal face (scheme==1): 0=linear modal (default), 1=c=1/6 parabola
   i32 mdFluxA  = argI("--mdflux", 0);                // 1 = multidimensional Osher-type corner flux (first-order states)
-  real cflArg  = argF("--cfl", -1.0);                // CFL override (-1 = default 0.40; dt = cfl*min(dx/(|u|+c)))
+  real cflArg  = argF("--cfl", -1.0);
+  real gsigma  = argF("--gsigma", 1.0);              // RT0 slope-RHS scaling (mass lumping; <1 raises the stable CFL)                // CFL override (-1 = default 0.40; dt = cfl*min(dx/(|u|+c)))
 
   bool cube   = (testCase == 3);
   bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv);
@@ -118,7 +119,8 @@ int main(int argc, char* argv[]) {
   solver->refineRadius    = 0.4;                        // fine-region half-extent (unused for the step)
   solver->recon           = reconA;                     // face reconstruction (TVD / ROUND / LD-ROUND)
   solver->rt0Face         = rt0FaceA;                    // RT0 normal face: 0=linear modal, 1=c=1/6 parabola
-  solver->mdFlux          = mdFluxA;                     // multidimensional Osher-type corner flux
+  solver->mdFlux          = mdFluxA;
+  solver->slopeRelax      = gsigma;                     // multidimensional Osher-type corner flux
   solver->immerserdBcType = 0;
   solver->initialize();
 
