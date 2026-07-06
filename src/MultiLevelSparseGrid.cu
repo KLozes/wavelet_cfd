@@ -195,6 +195,19 @@ __host__ __device__ real* MultiLevelSparseGrid::getField(i32 f) {
   return &fieldData[(u64)f*(u64)nBlocksMax*(u64)blockSizeTot];
 }
 
+// wrap a block index into the interior range at level lvl (periodic torus).
+// pseudo2D keeps the single z-block; identity for already-interior indices.
+__device__ void MultiLevelSparseGrid::wrapBlockPeriodic(i32 lvl, i32 &i, i32 &j, i32 &k) {
+  i32 gx = baseGridSize[0]/blockSize*powi(2,lvl);
+  i32 gy = baseGridSize[1]/blockSize*powi(2,lvl);
+  i = ((i % gx) + gx) % gx;
+  j = ((j % gy) + gy) % gy;
+  if (!pseudo2D) {
+    i32 gz = baseGridSize[2]/blockSize*powi(2,lvl);
+    k = ((k % gz) + gz) % gz;
+  }
+}
+
 __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j, i32 k) {
   u64 loc = encode(lvl, i, j, k);
   i32 idx = hashTable.insert(loc);

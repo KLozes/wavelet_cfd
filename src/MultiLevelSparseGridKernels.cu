@@ -202,12 +202,17 @@ __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid) {
     grid.decode(loc, lvl, ib, jb, kb);
 
     if (grid.isInteriorBlock(lvl, ib, jb, kb) && grid.bFlagsList[bIdx] == KEEP) {
-      // add neighboring blocks (x-y only in pseudo2D)
+      // add neighboring blocks (x-y only in pseudo2D).  Periodic: wrap the target
+      // into the interior so an edge block grades its opposite-edge image (a real
+      // interior block) rather than a lone exterior ghost -- keeping the two seam
+      // edges refined to matching levels.  Wrap is identity for interior targets.
       i32 dkLim = grid.pseudo2D ? 0 : 1;
       for (i32 dk=-dkLim; dk<=dkLim; dk++) {
         for (i32 dj=-1; dj<=1; dj++) {
           for (i32 di=-1; di<=1; di++) {
-            grid.activateBlock(lvl, ib+di, jb+dj, kb+dk);
+            i32 ni=ib+di, nj=jb+dj, nk=kb+dk;
+            if (grid.periodic) grid.wrapBlockPeriodic(lvl, ni, nj, nk);
+            grid.activateBlock(lvl, ni, nj, nk);
           }
         }
       }
@@ -226,11 +231,16 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
     grid.decode(loc, lvl, ib, jb, kb);
 
     if (grid.isInteriorBlock(lvl, ib, jb, kb) && lvl > 2 && grid.bFlagsList[bIdx] == KEEP) {
+      // periodic: wrap the parent target so a near-seam block's coarse
+      // reconstruction support is built on the opposite edge too (identity for
+      // interior targets), keeping the image's parent chain present.
       i32 dkLim = grid.pseudo2D ? 0 : 1;
       for (i32 dk=-dkLim; dk<=dkLim; dk++) {
         for (i32 dj=-1; dj<=1; dj++) {
           for (i32 di=-1; di<=1; di++) {
-            grid.activateBlock(lvl-1, ib/2+di, jb/2+dj, kb/2+dk);
+            i32 pi=ib/2+di, pj=jb/2+dj, pk=kb/2+dk;
+            if (grid.periodic) grid.wrapBlockPeriodic(lvl-1, pi, pj, pk);
+            grid.activateBlock(lvl-1, pi, pj, pk);
           }
         }
       }
@@ -279,7 +289,15 @@ __global__ void addBoundaryBlocksKernel(MultiLevelSparseGrid &grid) {
         for (i32 dj=-1; dj<=1; dj++) {
           for (i32 di=-1; di<=1; di++) {
             if (grid.isExteriorBlock(lvl, ib+di, jb+dj, kb+dk)) {
-              grid.activateBlock(lvl, ib+di, jb+dj, kb+dk);
+              grid.activateBlock(lvl, ib+di, jb+dj, kb+dk);   // exterior ghost halo
+              if (grid.periodic) {
+                // the ghost's periodic image (opposite interior edge) must exist
+                // at the same level so setBoundaryConditions can fill the ghost
+                // from a real block (else the same-level lookup misses -> vacuum)
+                i32 ii=ib+di, ij=jb+dj, ik=kb+dk;
+                grid.wrapBlockPeriodic(lvl, ii, ij, ik);
+                grid.activateBlock(lvl, ii, ij, ik);
+              }
             }
           }
         }

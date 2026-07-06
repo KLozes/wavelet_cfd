@@ -80,6 +80,7 @@ int main(int argc, char* argv[]) {
   i32 rt0FaceA = argI("--rt0face", 0);               // RT0 normal face (scheme==1): 0=linear modal (default), 1=c=1/6 parabola
   i32 mdFluxA  = argI("--mdflux", 0);                // 1 = multidimensional Osher-type corner flux (first-order states)
   real cflArg  = argF("--cfl", -1.0);                // CFL override (-1 = default 0.40; dt = cfl*min(dx/(|u|+c)))
+  real advectA = argF("--advect", 0.0);              // isentropic-vortex (case 2) advection velocity u0=v0 (periodic seam-crossing test)
 
   bool cube   = (testCase == 3);
   bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv);
@@ -112,7 +113,7 @@ int main(int argc, char* argv[]) {
   solver->scheme          = scheme;
   solver->icType          = (testCase == 1 || sodAmr) ? 1 : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : 0)))));
   solver->bcType          = (bcArg >= 0) ? bcArg : (acConv ? 2 : 3);   // periodic for the acoustic wave; else transmissive
-  solver->vortexAdvect    = acConv ? Ma : sodPin;       // acConv: wave amplitude A; testCase 1: Sod inner pressure
+  solver->vortexAdvect    = acConv ? Ma : (testCase == 2 ? advectA : sodPin);  // acConv: wave amplitude A; case 2: vortex advection; testCase 1: Sod inner pressure
   solver->greshoP0        = 1.0/(gam*Ma*Ma);            // Gresho background pressure -> Mach = Ma
   solver->staticGrid      = acoustic ? 3 : ((testCase == 5 || sodAmr) ? 1 : 0);   // 1=radial shells, 2=planar band, 3=centre step
   solver->refineRadius    = 0.4;                        // fine-region half-extent (unused for the step)

@@ -38,6 +38,11 @@ public:
   // z-direction carries blockSize uniform cells that never refine, the
   // z-momentum is never updated, and no z fluxes/boundary blocks are created.
   i32 pseudo2D = 0;
+  // periodic: treat the domain as a torus during refinement -- grading,
+  // reconstruction and boundary-ghost activation wrap across the seam so the two
+  // opposite edges stay refined to matching, graded levels, and every periodic
+  // ghost block has a same-level interior image to be filled from.
+  i32 periodic = 0;
   i32 imageSizeX[2] = {1,1};
   i32 imageSizeY[2] = {1,1};
   i32 imageSizeZ[2] = {1,1};
@@ -84,6 +89,7 @@ public:
   __host__ __device__ real *getField(i32 f);
 
   __device__ void activateBlock(i32 lvl, i32 i, i32 j, i32 k);
+  __device__ void wrapBlockPeriodic(i32 lvl, i32 &i, i32 &j, i32 &k); // wrap block index into the interior range (torus)
   
   __host__ __device__ u64 encode(i32 lvl, i32 i, i32 j, i32 k);
   __host__ __device__ void decode(u64 loc, i32 &lvl, i32 &i, i32 &j, i32 &k);

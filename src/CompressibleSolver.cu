@@ -10,6 +10,7 @@
 #include "MultiLevelSparseGridKernels.cuh"
 
 void CompressibleSolver::initialize(void) {
+  periodic = (bcType == 2);   // torus refinement: keep seam edges matched (see MultiLevelSparseGrid)
   if (mdFlux && !pseudo2D) {
     printf("[warn] multiD corner flux is implemented for pseudo-2D only; disabling\n");
     mdFlux = 0;
