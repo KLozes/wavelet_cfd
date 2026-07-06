@@ -990,8 +990,26 @@ __global__ void hancockPredictKernel(CompressibleSolver &grid) {
     grid.getField(F_OLD + F_RHOV)[cIdx] = vo;
     grid.getField(F_OLD + F_RHOW)[cIdx] = 0.0;
     grid.getField(F_OLD + F_RHOE)[cIdx] = po;
-    grid.getField(F_OLD + F_GX)[cIdx] = grid.getField(F_GX)[cIdx];
-    grid.getField(F_OLD + F_GY)[cIdx] = grid.getField(F_GY)[cIdx];
+
+    // RT0 slope DOFs: half-step via their own DG update with central face
+    // momentum fluxes (a stale-g predictor leaves the dispersive g<->p coupling
+    // a full dt behind and blows up by CFL ~0.4)
+    real gx = grid.getField(F_GX)[cIdx], gy = grid.getField(F_GY)[cIdx];
+    if (grid.scheme == 1) {
+      real fc[5], gc[5];
+      mdPhysFlux(r0, u0, v0, 0.0, p0, 0, fc);
+      mdPhysFlux(r0, u0, v0, 0.0, p0, 1, gc);
+      real mxs = 0.5*dx*gx, mys = 0.5*dy*gy;
+      real Fbx = (r0*u0*r0*u0 + mxs*mxs/3.0)/r0 + p0;
+      real Fby = (r0*v0*r0*v0 + mys*mys/3.0)/r0 + p0;
+      // central face fluxes: FxL ~ (f(l1)+f(c))/2, FxR ~ (f(c)+f(r1))/2
+      real fxs = fc[1] + 0.5*(fm[1] + fp[1]);   // FxL[1] + FxR[1]
+      real fys = gc[2] + 0.5*(gm[2] + gp[2]);   // FyB[2] + FyT[2]
+      gx += 0.5*grid.deltaT*(6.0/(dx*dx))*(2.0*Fbx - fxs);
+      gy += 0.5*grid.deltaT*(6.0/(dy*dy))*(2.0*Fby - fys);
+    }
+    grid.getField(F_OLD + F_GX)[cIdx] = gx;
+    grid.getField(F_OLD + F_GY)[cIdx] = gy;
     grid.getField(F_OLD + F_GZ)[cIdx] = 0.0;
 
   END_CELL_LOOP

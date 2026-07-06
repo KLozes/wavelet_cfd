@@ -32,7 +32,9 @@
 //   --mdflux N   1 = genuinely multidimensional Osher-type corner flux
 //                (Gaburro-Ricchiuto-Dumbser, arXiv:2506.00207); 2 = CTU-Hancock:
 //                half-step predictor + single-Euler corrector, 2nd order in
-//                time, stable to CFL ~1.2 at 1/3 the RK3 cost (FV only).
+//                time, single flux sweep per step.  Stable CFL: FV ~1.2,
+//                RT0 ~0.35 (the slope DOFs are near-imaginary modes and the
+//                midpoint-class corrector leaks above that; RK3 for margin).
 //                pseudo-2D only; states follow --recon/--rt0face
 //   --cfl X      CFL number (default 0.40; dt = cfl * min(dx/(|u|+c)))
 //

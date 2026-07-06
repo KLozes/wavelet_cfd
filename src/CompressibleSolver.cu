@@ -15,14 +15,11 @@ void CompressibleSolver::initialize(void) {
     printf("[warn] multiD corner flux is implemented for pseudo-2D only; disabling\n");
     mdFlux = 0;
   }
-  if (mdFlux == 2 && scheme == 1) {
-    // the CTU corrector is a single forward-Euler stage: FE has no
-    // imaginary-axis stability, and the RT0 slope DOFs are dispersive modes
-    // (they need RK3).  An ADER-DG local predictor would be the RT0-compatible
-    // fully-discrete route.
-    printf("[warn] CTU (mdflux 2) is FV-only; falling back to mdflux 1 for RT0\n");
-    mdFlux = 1;
-  }
+  // (mdFlux == 2 with scheme 1: the Hancock predictor time-centres the slope
+  // DOFs' feed -- face momentum fluxes and volume term -- making the g<->p
+  // coupling a partitioned midpoint-like integration, unlike the old
+  // transverse-only CTU whose pure-FE corrector was unconditionally unstable
+  // for the dispersive slope modes.)
   // wavelet-normalization scales (device-side global maxima)
   cudaMallocManaged(&globalScale, 4*sizeof(real));
   cudaMemset(globalScale, 0, 4*sizeof(real));
