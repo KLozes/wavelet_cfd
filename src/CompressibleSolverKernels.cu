@@ -1082,13 +1082,14 @@ __global__ void multiDRhsKernel(CompressibleSolver &grid) {
     // blind to, and it makes the same face flux a stable feed for the RT0
     // slope DOFs.  1D limit stays exactly the Roe/Osher-scaled flux.
     real FxL1 = 0, FxR1 = 0, FyB2 = 0, FyT2 = 0;   // momentum components for the slopes
+    real L[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (i32 n = 0; n < 5; n++) {
       const real w6 = 1.0/6.0, w23 = 2.0/3.0;
       real FxL = w6*(xLL[n] + xUL[n]) + w23*FxLm[n];   // left  face (i-1/2, j)
       real FxR = w6*(xLR[n] + xUR[n]) + w23*FxRm[n];   // right face (i+1/2, j)
       real FyB = w6*(yLL[n] + yLR[n]) + w23*FyBm[n];   // bottom face (i, j-1/2)
       real FyT = w6*(yUL[n] + yUR[n]) + w23*FyTm[n];   // top    face (i, j+1/2)
-      grid.getField(F_RHS + n)[cIdx] = (FxL - FxR)/dx + (FyB - FyT)/dy;
+      L[n] = (FxL - FxR)/dx + (FyB - FyT)/dy;
       if (n == 1) { FxL1 = FxL; FxR1 = FxR; }
       if (n == 2) { FyB2 = FyB; FyT2 = FyT; }
     }
@@ -1101,10 +1102,32 @@ __global__ void multiDRhsKernel(CompressibleSolver &grid) {
       // stored as the physical gradient: dG/dt = (2/dx) d(mxs)/dt.
       real mxa = rc*U[cIdx], mxs = 0.5*dx*Gx[cIdx];
       real mya = rc*V[cIdx], mys = 0.5*dy*Gy[cIdx];
-      grid.getField(F_RHS + F_GX)[cIdx] =
-        (6.0/(dx*dx))*(2.0*((mxa*mxa + mxs*mxs/3.0)/rc + pc) - (FxR1 + FxL1));
-      grid.getField(F_RHS + F_GY)[cIdx] =
-        (6.0/(dy*dy))*(2.0*((mya*mya + mys*mys/3.0)/rc + pc) - (FyT2 + FyB2));
+      L[5] = (6.0/(dx*dx))*(2.0*((mxa*mxa + mxs*mxs/3.0)/rc + pc) - (FxR1 + FxL1));
+      L[6] = (6.0/(dy*dy))*(2.0*((mya*mya + mys*mys/3.0)/rc + pc) - (FyT2 + FyB2));
+    }
+
+    if (grid.mdFlux == 2) {
+      // CTU-Hancock fused single-stage corrector: all neighbour data came from
+      // the PREDICTED bank (fb = F_OLD), so the live fields can be updated in
+      // place -- convert this cell's live primitives to conservative, apply
+      // q^{n+1} = q^n + dt L, and store CONSERVATIVE (step() skips the usual
+      // primitiveToConservative/updateFields for mdFlux==2).  The accumulator
+      // bank is never touched: it holds the predicted states.
+      real dt = grid.deltaT;
+      real rl = grid.getField(F_RHO)[cIdx],  ul = grid.getField(F_RHOU)[cIdx];
+      real vl = grid.getField(F_RHOV)[cIdx], pl = grid.getField(F_RHOE)[cIdx];
+      grid.getField(F_RHO )[cIdx] = rl + dt*L[0];
+      grid.getField(F_RHOU)[cIdx] = rl*ul + dt*L[1];
+      grid.getField(F_RHOV)[cIdx] = rl*vl + dt*L[2];
+      grid.getField(F_RHOW)[cIdx] = 0.0;
+      grid.getField(F_RHOE)[cIdx] = pl/(gam - 1.0) + 0.5*rl*(ul*ul + vl*vl) + dt*L[4];
+      grid.getField(F_GX)[cIdx] += dt*L[5];
+      grid.getField(F_GY)[cIdx] += dt*L[6];
+      grid.getField(F_GZ)[cIdx]  = 0.0;
+    } else {
+      // LSRK: accumulate L onto the pre-scaled accumulator bank
+      for (i32 n = 0; n < NEVOLVE; n++)
+        grid.getField(F_RHS + n)[cIdx] += L[n];
     }
 
   END_CELL_LOOP
@@ -1112,9 +1135,17 @@ __global__ void multiDRhsKernel(CompressibleSolver &grid) {
 
 __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
   //
-  // TVD Runge-Kutta 3 update of the NEVOLVE evolved DOFs
-  //   (P0 ρ,E + momentum cell-averages + RT0 slope DOFs Gx,Gy,Gz).
+  // Low-storage (Williamson 2N) RK3 update of the NEVOLVE evolved DOFs.
+  // The RHS kernels ACCUMULATE L onto the pre-scaled bank, so on entry the
+  // accumulator holds  S_i = A_i S_{i-1} + L(q_{i-1});  here
+  //   q += B_i dt S_i,   then   S *= A_{i+1}
+  // (A_1 = 0 is realized by zeroing S after the last stage).  Any 3-stage
+  // 3rd-order explicit RK shares the linear stability polynomial of the
+  // previous Shu-Osher SSP-RK3, so all measured CFL limits are unchanged;
+  // only the formal SSP property is given up.
   //
+  const real Bw[3]    = {1.0/3.0, 15.0/16.0, 8.0/15.0};
+  const real Anext[3] = {-5.0/9.0, -153.0/128.0, 0.0};
   real dt = grid.deltaT;
 
   START_CELL_LOOP
@@ -1126,34 +1157,23 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
     if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
 
       for (i32 f = 0; f < NEVOLVE; f++) {
-        real *Q   = grid.getField(f);
-        real *Old = grid.getField(F_OLD + f);
-        real *Rhs = grid.getField(F_RHS + f);
-
-        if (stage == 0) {
-          Old[cIdx] = Q[cIdx];
-          Q[cIdx]   = Q[cIdx] + dt * Rhs[cIdx];
-        }
-        else if (stage == 1) {
-          Q[cIdx]   = 3.0/4.0*Old[cIdx] + 1.0/4.0*Q[cIdx] + 1.0/4.0 * dt * Rhs[cIdx];
-        }
-        else {
-          Q[cIdx]   = 1.0/3.0*Old[cIdx] + 2.0/3.0*Q[cIdx] + 2.0/3.0 * dt * Rhs[cIdx];
-        }
+        real *Q = grid.getField(f);
+        real *S = grid.getField(F_RHS + f);
+        Q[cIdx] += Bw[stage] * dt * S[cIdx];
       }
 
       // pseudo2D: z-momentum and its RT0 slope are never evolved
       if (grid.pseudo2D) {
-        grid.getField(F_RHOW)[cIdx]        = 0;
-        grid.getField(F_OLD + F_RHOW)[cIdx] = 0;
-        grid.getField(F_GZ)[cIdx]          = 0;
-        grid.getField(F_OLD + F_GZ)[cIdx]   = 0;
+        grid.getField(F_RHOW)[cIdx] = 0;
+        grid.getField(F_GZ)[cIdx]   = 0;
       }
     }
 
-    // reset the rhs accumulators for the next substep
+    // pre-scale the accumulator for the next stage (0 after the last stage:
+    // that is the next step's A_1 = 0, and it leaves the bank clean for its
+    // between-step roles -- wavelet snapshot / sort buffer / Hancock predictor)
     for (i32 f = 0; f < NEVOLVE; f++)
-      grid.getField(F_RHS + f)[cIdx] = 0;
+      grid.getField(F_RHS + f)[cIdx] *= Anext[stage];
 
   END_CELL_LOOP
 }

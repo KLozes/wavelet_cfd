@@ -18,7 +18,7 @@ static constexpr real gam = 1.4;
 // so that, being level-independent smooth fields, they ride the existing
 // interpolating-wavelet AMR machinery unchanged.  The FV scheme leaves them 0.
 //
-// field layout (nFields = 25).  fields 0-4 alternate between conservative and
+// field layout (nFields = 17).  fields 0-4 alternate between conservative and
 // primitive storage in place (see conservative/primitive conversion kernels):
 //
 //   0 : Rho  | Rho
@@ -29,23 +29,36 @@ static constexpr real gam = 1.4;
 //   5 : Gx               RT0 x-momentum slope  (∂(ρu)/∂x)
 //   6 : Gy               RT0 y-momentum slope  (∂(ρv)/∂y)
 //   7 : Gz               RT0 z-momentum slope  (∂(ρw)/∂z)
-//   8..15  : Old{0..7}                        (RK3 substep storage)
-//   16..23 : Rhs{0..7}                        (right hand side accumulator)
-//   24     : DeltaT / MagRhoU / pressure       (scratch, reused)
+//   8..15  : shared scratch bank (see below)
+//   16     : DeltaT / MagRhoU / pressure       (scratch, reused)
+//
+// Time stepping is low-storage (Williamson 2N) RK3, which needs only q plus
+// ONE accumulator bank, so the former separate Old/Rhs banks are a single
+// aliased bank (F_OLD == F_RHS == 8) whose uses are temporally disjoint:
+//   - during the RK stages: the LSRK accumulator S (the RHS kernels
+//     ACCUMULATE L into it; updateFields does q += B dt S, then S *= A_next)
+//   - between steps (adaptation): the wavelet-transform reference snapshot
+//     and the block-sort double-buffer
+//   - during a CTU-Hancock step (mdFlux==2): the half-step predicted
+//     primitives (the fused single-stage corrector updates q in place and
+//     never touches the bank)
+// Any 3-stage 3rd-order explicit RK shares the linear stability polynomial,
+// so all measured CFL limits are unchanged vs the previous Shu-Osher SSP-RK3;
+// only the formal SSP property is given up.
 //
 // Only fields 0..7 (NEVOLVE) are sorted, restricted, interpolated and wavelet-
-// transformed; 8..24 are transient within a timestep.  The multiD corner-flux
-// path computes its corner tensors on the fly (no flux storage fields).
+// transformed; 8..16 are transient.  The multiD corner-flux path computes its
+// corner tensors on the fly (no flux storage fields).
 //
 enum CompressibleField {
   F_RHO = 0, F_RHOU = 1, F_RHOV = 2, F_RHOW = 3, F_RHOE = 4,
   F_GX  = 5, F_GY  = 6, F_GZ  = 7,
-  F_OLD = 8,       // Old{0..7} occupy  8..15
-  F_RHS = 16,      // Rhs{0..7} occupy 16..23
-  F_SCRATCH = 24
+  F_OLD = 8,       // shared bank 8..15 (snapshot / sort buffer / Hancock)
+  F_RHS = 8,       // alias: the LSRK accumulator during the RK stages
+  F_SCRATCH = 16
 };
 static constexpr i32 NEVOLVE = 8;                 // evolved DOFs (fields 0..7)
-static constexpr i32 nCompressibleFields = 25;
+static constexpr i32 nCompressibleFields = 17;
 
 class CompressibleSolver : public MultiLevelSparseGrid {
 public:
@@ -131,6 +144,7 @@ public:
   void computeDeltaT(void);
   void computeRightHandSide(void);
   void updateFields(i32 stage);
+  void zeroAccumulator(void);   // zero the shared bank before LSRK stage 1
 
   void restrictFields();
   void interpolateFields();

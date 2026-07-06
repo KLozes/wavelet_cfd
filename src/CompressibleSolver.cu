@@ -44,6 +44,14 @@ void CompressibleSolver::initialize(void) {
     printf("nblocks %d\n", hashTable.nKeys);
     paint();
   }
+  zeroAccumulator();   // the cascade dirtied the shared bank (LSRK needs 0)
+}
+
+// zero the shared bank so the LSRK accumulation (A_1 = 0) starts clean; the
+// NEVOLVE fields are contiguous slabs of fieldData
+void CompressibleSolver::zeroAccumulator(void) {
+  cudaMemset(getField(F_RHS), 0,
+             (size_t)NEVOLVE*(size_t)blockSizeTot*(size_t)nBlocksMax*sizeof(real));
 }
 
 real CompressibleSolver::step(real tStep) {
@@ -68,6 +76,9 @@ real CompressibleSolver::step(real tStep) {
       sortBlocks();
       cudaDeviceSynchronize(); sub.tock(); tSortUs += sub.duration().count();
       setBoundaryConditions();
+      // the wavelet snapshot / sort buffer dirtied the shared bank; the LSRK
+      // accumulator must be zero when stage 1 begins (A_1 = 0)
+      zeroAccumulator();
     }
     cudaDeviceSynchronize();
     clock.tock();
@@ -79,12 +90,23 @@ real CompressibleSolver::step(real tStep) {
       deltaT = tStep - t;
     }
 
-    // mdFlux==2 (CTU): fully-discrete predictor-corrector -- the transverse
-    // half-step predictor time-centres the face states, and the corrector is a
-    // SINGLE forward-Euler stage (composing the dt-dependent operator inside
-    // SSP-RK3's fractional stages over-corrects and destabilizes).
-    i32 nStage = (mdFlux == 2) ? 1 : 3;
-    for (i32 stage = 0; stage < nStage; stage++) {
+    if (mdFlux == 2) {
+      // CTU-Hancock: fully-discrete predictor-corrector.  The corrector is
+      // FUSED into multiDRhsKernel (it updates q in place, conservative), so
+      // there is no primitiveToConservative/updateFields here; the shared
+      // bank holds the half-step predicted primitives during the RHS.
+      conservativeToPrimitive();
+      setBoundaryConditions();
+      computeRightHandSide();
+      setBoundaryConditions();
+      if (nLvls > 1) {
+        restrictFields();
+        interpolateFields();
+        setBoundaryConditions();
+      }
+    }
+    else
+    for (i32 stage = 0; stage < 3; stage++) {
       conservativeToPrimitive();
       setBoundaryConditions();
       computeRightHandSide();
@@ -138,6 +160,14 @@ void CompressibleSolver::forwardWaveletTransform(void) {
   computeGlobalScalesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
 
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(i32));
+  // The face-flux scatter atomicAdds missing-neighbor contributions into the
+  // bEmpty trash block's slice of the ACCUMULATOR bank -- which is aliased
+  // with this snapshot bank.  bEmpty sits outside the cell loop, so neither
+  // the S-roll in updateFields nor copyToOld ever cleans it (and NaN*0 = NaN
+  // defeats the *=0 roll anyway).  waveletPredict reads the snapshot through
+  // the same missing-neighbor path, so clear the trash before it is read.
+  for (i32 f = 0; f < NEVOLVE; f++)
+    cudaMemset(getField(F_OLD + f) + (u64)bEmpty*blockSizeTot, 0, blockSizeTot*sizeof(real));
   copyToOldFieldsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   forwardWaveletTransformKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   waveletThresholdingKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
