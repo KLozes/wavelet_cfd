@@ -38,9 +38,6 @@ public:
   // z-direction carries blockSize uniform cells that never refine, the
   // z-momentum is never updated, and no z fluxes/boundary blocks are created.
   i32 pseudo2D = 0;
-  // periodic: wrap exterior ghost blocks to the opposite interior edge (the
-  // self/center neighbor slot is remapped in sortBlocks so it survives re-sorts).
-  i32 periodic = 0;
   i32 imageSizeX[2] = {1,1};
   i32 imageSizeY[2] = {1,1};
   i32 imageSizeZ[2] = {1,1};

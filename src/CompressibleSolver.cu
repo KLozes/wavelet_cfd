@@ -10,7 +10,6 @@
 #include "MultiLevelSparseGridKernels.cuh"
 
 void CompressibleSolver::initialize(void) {
-  periodic = (bcType == 2);   // enable ghost-block wrap in sortBlocks (survives re-sorts)
   if (mdFlux && !pseudo2D) {
     printf("[warn] multiD corner flux is implemented for pseudo-2D only; disabling\n");
     mdFlux = 0;

@@ -134,11 +134,8 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   if (!lean) {   // parent/neighbor indices + cell flags are flow-solver-only
     updatePrntIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     updateNbrIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-    // periodic wrap of the ghost-block center slot must be re-applied after every
-    // re-sort, since updateNbrIndicesKernel above rebuilds it from scratch.
-    if (periodic) {
-      updateNbrIndicesPeriodicKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-    }
+    // periodicity is applied in setBoundaryConditions (the exterior ghost blocks
+    // are filled from their wrap-around image), not by remapping neighbor slots.
     flagActiveCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     flagParentCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   }
@@ -158,10 +155,8 @@ __device__ i32 MultiLevelSparseGrid::getNbrIdx(i32 bIdx, i32 i, i32 j, i32 k) {
   i32 ib = i / blockSize;
   i32 jb = j / blockSize;
   i32 kb = k / blockSize;
-  // A within-block offset (ib=jb=kb=1) is always this block itself; use bIdx
-  // directly rather than the center neighbor slot 13, which the periodic BC
-  // remaps to the opposite-edge image block for ghost blocks (that remap must
-  // not corrupt a ghost block's own internal cell lookups).
+  // A within-block offset (ib=jb=kb=1) is always this block itself; return bIdx
+  // directly to skip the neighbor-list read on the common in-block cell lookup.
   i32 nbrIdx = (ib == 1 && jb == 1 && kb == 1)
              ? bIdx
              : nbrIdxList[27*bIdx + ib + 3*jb + 9*kb];

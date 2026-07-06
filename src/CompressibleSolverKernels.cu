@@ -291,9 +291,20 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff) 
                          grid.baseGridSize[2]*powi(2, lvl)/blockSize};
 
       if (grid.bcType == 2) {
-        // periodic: the ghost block's center slot 13 holds the opposite-edge image
-        // block (set by updateNbrIndicesPeriodicKernel); copy its matching cell.
-        i32 imgBlock = grid.nbrIdxList[27*bIdx + 13];
+        // periodic: this exterior ghost block is the wrap-around image of an
+        // interior block one step past the opposite edge.  Locate that image
+        // block directly -- wrap (ib,jb,kb) into range, one hash lookup -- and
+        // copy its matching cell into the ghost cell.  The ghost block then holds
+        // a genuine periodic copy that the flux stencils read like any interior
+        // neighbor (no neighbor-index remap; slot 13 stays the block itself).
+        i32 ibw = ib, jbw = jb, kbw = kb;
+        if (ib < 0)             ibw = gridSize[0] - 1;
+        if (ib >= gridSize[0])  ibw = 0;
+        if (jb < 0)             jbw = gridSize[1] - 1;
+        if (jb >= gridSize[1])  jbw = 0;
+        if (kb < 0)             kbw = gridSize[2] - 1;
+        if (kb >= gridSize[2])  kbw = 0;
+        i32 imgBlock = grid.hashTable.getValue(grid.encode(lvl, ibw, jbw, kbw));
         i32 bcIdx = imgBlock*blockSizeTot + i + j*blockSize + k*blockSize*blockSize;
         Rho[cIdx]  = Rho[bcIdx];
         RhoU[cIdx] = RhoU[bcIdx];
