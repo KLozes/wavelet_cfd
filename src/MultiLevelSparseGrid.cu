@@ -66,8 +66,8 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   // request zero base fields, in which case fieldData is not allocated.
   fieldData = nullptr;
   if (nFields > 0) {
-    cudaMallocManaged(&fieldData, nFields*blockSizeTot*nBlocksMax*sizeof(real));
-    cudaMemset(fieldData, 0, nFields*blockSizeTot*nBlocksMax*sizeof(real));
+    cudaMallocManaged(&fieldData, (size_t)nFields*(size_t)blockSizeTot*(size_t)nBlocksMax*sizeof(real));
+    cudaMemset(fieldData, 0, (size_t)nFields*(size_t)blockSizeTot*(size_t)nBlocksMax*sizeof(real));
   }
 
   cudaDeviceSynchronize();
@@ -195,7 +195,9 @@ __device__ bool MultiLevelSparseGrid::isExteriorBlock(i32 lvl, i32 i, i32 j, i32
 }
 
 __host__ __device__ real* MultiLevelSparseGrid::getField(i32 f) {
-  return &fieldData[f*nBlocksMax*blockSizeTot];
+  // 64-bit offset: f*nBlocksMax*blockSizeTot overflows i32 for
+  // nFields*nCellsMax > 2^31 (e.g. 35 fields at the 64M-cell cap)
+  return &fieldData[(u64)f*(u64)nBlocksMax*(u64)blockSizeTot];
 }
 
 __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j, i32 k) {

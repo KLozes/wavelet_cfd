@@ -16,7 +16,7 @@
 //   testCase 5 : Gresho vortex on a STATIC radial AMR grid (fine at centre,
 //                coarse outward) — tests flow crossing fixed coarse/fine faces
 //   testCase 6 : circular Sod explosion on a static radial AMR grid — measures
-//                coarse/fine conservation error (mass/energy drift) vs refluxing
+//                coarse/fine conservation error (mass/energy drift)
 //
 //   --case N     test case (default 0); also accepted as the first bare arg
 //   --nlvls N    number of refinement levels           (per-case default)
@@ -25,11 +25,16 @@
 //   --scheme N   0 = finite volume (HLLC+TVD), 1 = RT0/P0 DG  (>=2 -> 1)
 //   --ma X       Gresho Mach / acConv amplitude / testCase-1 inner pressure
 //   --bc N       BC: 0 slip wall, 1 no-slip, 2 periodic, 3 transmissive
-//   --reflux N   0/1 conservative coarse/fine flux correction   (default 0)
 //   --recon N    0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola
 //   --tend X     end time override                      (per-case default)
 //   --rt0face N  RT0 normal face (scheme 1): 0 = linear modal (default),
 //                1 = c=1/6 biased parabola (4th-order face average)
+//   --mdflux N   1 = genuinely multidimensional Osher-type corner flux
+//                (Gaburro-Ricchiuto-Dumbser, arXiv:2506.00207) with first-order
+//                corner states; 2 = same + CTU transverse half-step predictor
+//                on the midpoint states (raises the stable CFL); pseudo-2D
+//                only, recon/rt0face ignored
+//   --cfl X      CFL number (default 0.40; dt = cfl * min(dx/(|u|+c)))
 //
 // Back-compat: `./wave3d N` (bare first arg) still selects the test case.
 // testCases 0-2,4 run pseudo-2D (single z block); testCase 3 is fully 3D.
@@ -68,10 +73,11 @@ int main(int argc, char* argv[]) {
   bool haveMa  = hasArg("--ma");
   real Ma      = haveMa ? argF("--ma", 0.1) : 0.1;   // Gresho Mach number / acConv amplitude
   i32 bcArg    = argI("--bc", -1);                   // bcType override (-1 = per-testCase default)
-  i32 refluxA  = argI("--reflux", 0);                // 1 = conservative coarse/fine refluxing
   i32 reconA   = argI("--recon", 1);                 // 0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola (smooth only)
   real tEndArg = argF("--tend", -1.0);               // tEnd override (-1 = per-testCase default)
   i32 rt0FaceA = argI("--rt0face", 0);               // RT0 normal face (scheme==1): 0=linear modal (default), 1=c=1/6 parabola
+  i32 mdFluxA  = argI("--mdflux", 0);                // 1 = multidimensional Osher-type corner flux (first-order states)
+  real cflArg  = argF("--cfl", -1.0);                // CFL override (-1 = default 0.40; dt = cfl*min(dx/(|u|+c)))
 
   bool cube   = (testCase == 3);
   bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv);
@@ -87,6 +93,7 @@ int main(int argc, char* argv[]) {
   // acConv: RK3's O(dt^3) global error would cap an order study at 3; scaling
   // cfl ~ dx^(1/3) keeps dt^3 ~ dx^4, below 4th-order spatial error.
   real cfl  = acConv ? 0.40*cbrt(4.0/nBlocksX) : 0.40;
+  if (cflArg > 0) cfl = cflArg;                      // CLI override
   // testCase 1: --ma sets the circular-Sod inner pressure (1.0 = classic 10:1
   // ratio; 10 = strong 100:1 blast).  The strong blast's faster shock needs a
   // shorter tEnd to stay inside the domain.
@@ -107,21 +114,20 @@ int main(int argc, char* argv[]) {
   solver->greshoP0        = 1.0/(gam*Ma*Ma);            // Gresho background pressure -> Mach = Ma
   solver->staticGrid      = acoustic ? 3 : ((testCase == 5 || sodAmr) ? 1 : 0);   // 1=radial shells, 2=planar band, 3=centre step
   solver->refineRadius    = 0.4;                        // fine-region half-extent (unused for the step)
-  solver->reflux          = refluxA;                    // conservative coarse/fine flux correction
   solver->recon           = reconA;                     // face reconstruction (TVD / ROUND / LD-ROUND)
   solver->rt0Face         = rt0FaceA;                    // RT0 normal face: 0=linear modal, 1=c=1/6 parabola
+  solver->mdFlux          = mdFluxA;                     // multidimensional Osher-type corner flux
   solver->immerserdBcType = 0;
   solver->initialize();
 
   // Circular-Sod-on-static-radial-AMR conservation test: the cylindrical shock
   // expands from the centre through the radial coarse/fine interface.  Mass and
   // energy are exactly conserved until the shock reaches the (still) boundaries, so
-  // their drift is purely the coarse/fine interface flux mismatch — the quantity
-  // refluxing exists to remove.
+  // their drift is purely the coarse/fine interface flux mismatch.
   double m0 = 0, px0 = 0, e0 = 0;
   if (sodAmr) {
     solver->totalConserved(m0, px0, e0);
-    printf("[cons] reflux=%d  initial mass=%.12e  energy=%.12e\n", refluxA, m0, e0);
+    printf("[cons] initial mass=%.12e  energy=%.12e\n", m0, e0);
   }
 
   real t = 0;

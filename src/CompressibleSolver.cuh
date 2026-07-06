@@ -33,19 +33,19 @@ static constexpr real gam = 1.4;
 //   16..23 : Rhs{0..7}                        (right hand side accumulator)
 //   24     : DeltaT / MagRhoU / pressure       (scratch, reused)
 //
+// Only fields 0..7 (NEVOLVE) are sorted, restricted, interpolated and wavelet-
+// transformed; 8..24 are transient within a timestep.  The multiD corner-flux
+// path computes its corner tensors on the fly (no flux storage fields).
+//
 enum CompressibleField {
   F_RHO = 0, F_RHOU = 1, F_RHOV = 2, F_RHOW = 3, F_RHOE = 4,
   F_GX  = 5, F_GY  = 6, F_GZ  = 7,
   F_OLD = 8,       // Old{0..7} occupy  8..15
   F_RHS = 16,      // Rhs{0..7} occupy 16..23
-  F_SCRATCH = 24,
-  F_FLUX = 25      // Flux{rho,rhou,rhov,rhow,rhoE} at 25..29 — one lower-face
-                   // conserved-flux vector per cell, reused for each dimension
-                   // sweep (used only on the refluxing RHS path)
+  F_SCRATCH = 24
 };
 static constexpr i32 NEVOLVE = 8;                 // evolved DOFs (fields 0..7)
-static constexpr i32 NCONS   = 5;                 // conserved vars carried by the flux array
-static constexpr i32 nCompressibleFields = 30;
+static constexpr i32 nCompressibleFields = 25;
 
 class CompressibleSolver : public MultiLevelSparseGrid {
 public:
@@ -70,11 +70,15 @@ public:
   i32 rt0Face;          // RT0 normal-velocity face state (scheme==1 only):
                         // 0 = linear modal (default), 1 = c=1/6 biased parabola
                         // (4th-order face average; see parabolicFace)
+  i32 mdFlux;           // 1 = genuinely multidimensional Osher-type corner flux
+                        // (Gaburro, Ricchiuto & Dumbser, arXiv:2506.00207, Eq. 23)
+                        // with FIRST-ORDER corner states: FV = P0 cell averages,
+                        // RT0 = P0 rho,E + RT0 modal momentum at the corner.
+                        // pseudo-2D only; recon/rt0Face/reflux do not apply.
   real vortexAdvect;    // isentropic-vortex IC advection velocity (u0=v0)
   real greshoP0;        // Gresho-vortex background pressure = 1/(gam*Ma^2) (sets Mach)
   i32 staticGrid;       // 1 = fixed refinement (no dynamic wavelet adaptation)
   real refineRadius;    // static-grid: outer radius of the level-1 refinement shell (about the domain centre)
-  i32 reflux;           // 1 = conservative flux correction at coarse/fine interfaces (per-dim flux-array RHS)
 
   i32 tGrid;
   i32 tSolver;
@@ -100,11 +104,11 @@ public:
       scheme = 0;
       recon = 1;
       rt0Face = 0;
+      mdFlux = 0;
       vortexAdvect = 0.0;
       greshoP0 = 0.0;
       staticGrid = 0;
       refineRadius = 0.4;
-      reflux = 0;
 
       tGrid = 0.0;
       tSolver = 0.0;
@@ -118,7 +122,7 @@ public:
   real step(real dt);
   void sortFieldData(void);
   void setInitialConditions(void);
-  void setBoundaryConditions(void);
+  void setBoundaryConditions(i32 fOff = 0);   // fOff selects the state bank (0 = live fields)
   void conservativeToPrimitive(void);
   void primitiveToConservative(void);
   void forwardWaveletTransform(void);

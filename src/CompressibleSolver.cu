@@ -11,6 +11,18 @@
 
 void CompressibleSolver::initialize(void) {
   periodic = (bcType == 2);   // enable ghost-block wrap in sortBlocks (survives re-sorts)
+  if (mdFlux && !pseudo2D) {
+    printf("[warn] multiD corner flux is implemented for pseudo-2D only; disabling\n");
+    mdFlux = 0;
+  }
+  if (mdFlux == 2 && scheme == 1) {
+    // the CTU corrector is a single forward-Euler stage: FE has no
+    // imaginary-axis stability, and the RT0 slope DOFs are dispersive modes
+    // (they need RK3).  An ADER-DG local predictor would be the RT0-compatible
+    // fully-discrete route.
+    printf("[warn] CTU (mdflux 2) is FV-only; falling back to mdflux 1 for RT0\n");
+    mdFlux = 1;
+  }
   // wavelet-normalization scales (device-side global maxima)
   cudaMallocManaged(&globalScale, 4*sizeof(real));
   cudaMemset(globalScale, 0, 4*sizeof(real));
@@ -69,7 +81,13 @@ real CompressibleSolver::step(real tStep) {
     if (t + deltaT > tStep) {
       deltaT = tStep - t;
     }
-    for (i32 stage = 0; stage < 3; stage++) {
+
+    // mdFlux==2 (CTU): fully-discrete predictor-corrector -- the transverse
+    // half-step predictor time-centres the face states, and the corrector is a
+    // SINGLE forward-Euler stage (composing the dt-dependent operator inside
+    // SSP-RK3's fractional stages over-corrects and destabilizes).
+    i32 nStage = (mdFlux == 2) ? 1 : 3;
+    for (i32 stage = 0; stage < nStage; stage++) {
       conservativeToPrimitive();
       setBoundaryConditions();
       computeRightHandSide();
@@ -104,8 +122,8 @@ void CompressibleSolver::setInitialConditions(void) {
   cudaDeviceSynchronize();
 }
 
-void CompressibleSolver::setBoundaryConditions(void) {
-  setBoundaryConditionsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+void CompressibleSolver::setBoundaryConditions(i32 fOff) {
+  setBoundaryConditionsKernel<<<cudaGridSize, cudaBlockSize>>>(*this, fOff);
 }
 
 void CompressibleSolver::conservativeToPrimitive(void) {
@@ -140,21 +158,12 @@ void CompressibleSolver::computeDeltaT(void) {
 }
 
 void CompressibleSolver::computeRightHandSide(void) {
-  if (!reflux) {
-    computeRightHandSideKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  if (mdFlux) {
+    // genuinely multidimensional Osher-type corner fluxes (first-order states)
+    multiDRhsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     return;
   }
-  // per-dimension flux-array RHS with conservative coarse/fine refluxing: one
-  // reused lower-face flux array swept over x, y (and z in true 3D).
-  i32 ndim = pseudo2D ? 2 : 3;
-  for (i32 dim = 0; dim < ndim; dim++) {
-    computeFluxDimKernel<<<cudaGridSize, cudaBlockSize>>>(*this, dim);
-    if (nLvls > 1) {  // conservative coarse/fine flux correction
-      refluxDimKernel<<<cudaGridSize, cudaBlockSize>>>(*this, dim);        // zero coarse interface flux
-      refluxAccumDimKernel<<<cudaGridSize, cudaBlockSize>>>(*this, dim);   // += fine-face average
-    }
-    applyFluxDimKernel<<<cudaGridSize, cudaBlockSize>>>(*this, dim);
-  }
+  computeRightHandSideKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
 }
 
 void CompressibleSolver::updateFields(i32 stage) {
