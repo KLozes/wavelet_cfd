@@ -645,19 +645,18 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     //   face  : d(mxs)/dt −= 3·F_xmom/dx   →   RhsGx −= 6·fluxL[1]/dx²
     //   volume: d(mxs)/dt += (6/dx)·[(mxa²+mxs²/3)/ρ + p] → RhsGx += 12/dx²·[…]
     if (grid.scheme == 1) {
-      real sg = grid.slopeRelax;
       real rc = Rho[cIdx], pc = P[cIdx];
-      real gxF = -sg*6.0*fluxL[1]/(dx*dx);
+      real gxF = -6.0*fluxL[1]/(dx*dx);
       atomicAdd(&RhsGx[cIdx],  gxF);
       atomicAdd(&RhsGx[l1Idx], gxF);
       real mxa = rc*U[cIdx], mxs = 0.5*dx*Gx[cIdx];
-      atomicAdd(&RhsGx[cIdx], sg*12.0/(dx*dx)*((mxa*mxa + mxs*mxs/3.0)/rc + pc));
+      atomicAdd(&RhsGx[cIdx], 12.0/(dx*dx)*((mxa*mxa + mxs*mxs/3.0)/rc + pc));
 
-      real gyF = -sg*6.0*fluxD[2]/(dy*dy);
+      real gyF = -6.0*fluxD[2]/(dy*dy);
       atomicAdd(&RhsGy[cIdx],  gyF);
       atomicAdd(&RhsGy[d1Idx], gyF);
       real mya = rc*V[cIdx], mys = 0.5*dy*Gy[cIdx];
-      atomicAdd(&RhsGy[cIdx], sg*12.0/(dy*dy)*((mya*mya + mys*mys/3.0)/rc + pc));
+      atomicAdd(&RhsGy[cIdx], 12.0/(dy*dy)*((mya*mya + mys*mys/3.0)/rc + pc));
     }
 
     // z-flux only in true 3D; pseudo2D never updates z-momentum (W stays 0)
@@ -820,15 +819,12 @@ __device__ void mdFaceState1D(CompressibleSolver &grid,
     real s;
     if (d == 0) s = side*0.5*h*Gx[id]/Rho[id];
     else        s = side*0.5*h*Gy[id]/Rho[id];
-    if (grid.rt0Face >= 1) {
-      // rt0Face 1: alpha = 1/3 (c=1/6, matched to the full sigma=1 slope
-      // dynamics); rt0Face 2: alpha = 2/3 (matched to sigma = 1/3)
-      real al = (grid.rt0Face == 2) ? (2.0/3.0) : (1.0/3.0);
+    if (grid.rt0Face == 1) {
       i32 di = (d == 0), dj = (d == 1);
       i32 sgn = (side > 0) ? 1 : -1;
       i32 idf = grid.getNbrIdx(bIdx, ii + sgn*di, jj + sgn*dj, kk);
-      if (d == 0) u = (0.5+al)*U[id] + (0.5-al)*U[idf] + 2.0*al*s;
-      else        v = (0.5+al)*V[id] + (0.5-al)*V[idf] + 2.0*al*s;
+      if (d == 0) u = (5.0/6.0)*U[id] + (1.0/6.0)*U[idf] + (2.0/3.0)*s;
+      else        v = (5.0/6.0)*V[id] + (1.0/6.0)*V[idf] + (2.0/3.0)*s;
     } else {
       if (d == 0) u = U[id] + s;
       else        v = V[id] + s;
@@ -1009,8 +1005,8 @@ __global__ void hancockPredictKernel(CompressibleSolver &grid) {
       // central face fluxes: FxL ~ (f(l1)+f(c))/2, FxR ~ (f(c)+f(r1))/2
       real fxs = fc[1] + 0.5*(fm[1] + fp[1]);   // FxL[1] + FxR[1]
       real fys = gc[2] + 0.5*(gm[2] + gp[2]);   // FyB[2] + FyT[2]
-      gx += grid.slopeRelax*0.5*grid.deltaT*(6.0/(dx*dx))*(2.0*Fbx - fxs);
-      gy += grid.slopeRelax*0.5*grid.deltaT*(6.0/(dy*dy))*(2.0*Fby - fys);
+      gx += 0.5*grid.deltaT*(6.0/(dx*dx))*(2.0*Fbx - fxs);
+      gy += 0.5*grid.deltaT*(6.0/(dy*dy))*(2.0*Fby - fys);
     }
     grid.getField(F_OLD + F_GX)[cIdx] = gx;
     grid.getField(F_OLD + F_GY)[cIdx] = gy;
@@ -1106,9 +1102,9 @@ __global__ void multiDRhsKernel(CompressibleSolver &grid) {
       real mxa = rc*U[cIdx], mxs = 0.5*dx*Gx[cIdx];
       real mya = rc*V[cIdx], mys = 0.5*dy*Gy[cIdx];
       grid.getField(F_RHS + F_GX)[cIdx] =
-        grid.slopeRelax*(6.0/(dx*dx))*(2.0*((mxa*mxa + mxs*mxs/3.0)/rc + pc) - (FxR1 + FxL1));
+        (6.0/(dx*dx))*(2.0*((mxa*mxa + mxs*mxs/3.0)/rc + pc) - (FxR1 + FxL1));
       grid.getField(F_RHS + F_GY)[cIdx] =
-        grid.slopeRelax*(6.0/(dy*dy))*(2.0*((mya*mya + mys*mys/3.0)/rc + pc) - (FyT2 + FyB2));
+        (6.0/(dy*dy))*(2.0*((mya*mya + mys*mys/3.0)/rc + pc) - (FyT2 + FyB2));
     }
 
   END_CELL_LOOP
