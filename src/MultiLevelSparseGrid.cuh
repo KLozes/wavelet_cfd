@@ -54,7 +54,7 @@ public:
   // 3D coarse-grid domain decomposition: the base (level-0) grid is split into a
   // p[0]*p[1]*p[2] box layout; a block is owned by the PE that owns its level-0
   // ancestor.  A partition boundary is filled like a periodic/wall ghost, but
-  // from a neighbor PE via NVSHMEM instead of a local copy.
+  // from a neighbor PE via a comm::neighborExchange message instead of a local copy.
   struct Partition {
     i32 p[3];          // process-grid dims (px,py,pz)
     i32 c[3];          // this PE's coords within the process grid

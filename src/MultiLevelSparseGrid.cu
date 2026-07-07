@@ -83,14 +83,10 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   // request zero base fields, in which case fieldData is not allocated.
   fieldData = nullptr;
   if (nFields > 0) {
+    // per-PE local storage (each PE holds only its subdomain + halo); the halo
+    // moves via comm::neighborExchange, so no symmetric heap is needed.
     size_t bytes = (size_t)nFields*(size_t)blockSizeTot*(size_t)nBlocksMax*sizeof(real);
-#ifdef USE_MGPU
-    // fieldData lives on the symmetric heap so neighbor PEs can fetch halo
-    // blocks by one-sided get (loopback backend: plain managed memory).
-    fieldData = (real*)comm::mallocSym(bytes);
-#else
     cudaMallocManaged(&fieldData, bytes);
-#endif
     cudaMemset(fieldData, 0, bytes);
   }
 
@@ -104,11 +100,9 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
   cudaFree(prntIdxList);
   cudaFree(nbrIdxList);
   cudaFree(cFlagsList);
-#ifdef USE_MGPU
-  comm::freeSym(fieldData);
-  cudaFree(ownerBase);
-#else
   cudaFree(fieldData);
+#ifdef USE_MGPU
+  cudaFree(ownerBase);
 #endif
   cudaFree(imageDataX);
 }
@@ -374,7 +368,7 @@ void MultiLevelSparseGrid::paint(void) {
 #ifdef USE_MGPU
   // each PE renders its own subdomain tile to a rank-prefixed file so ranks do
   // not collide (single-rank output keeps the original names for A/B diffing).
-  // NOTE: computeImageData reads fieldData on the host; under the real NVSHMEM
+  // NOTE: computeImageData reads fieldData on the host; under the real MPI
   // backend that must first be staged to host memory (loopback is managed, ok).
   char pre[16] = "";
   if (comm::size() > 1) sprintf(pre, "r%d_", comm::rank());

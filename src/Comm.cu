@@ -1,77 +1,60 @@
 #include "Comm.cuh"
 #include <cuda_runtime.h>
+#include <vector>
 
-#ifdef USE_NVSHMEM
+#ifdef USE_MPI
 // ---------------------------------------------------------------------------
-// Real NVSHMEM backend (compiled only where the toolkit is available).
+// CUDA-aware MPI backend (compiled only where an MPI is available).
 // ---------------------------------------------------------------------------
 #include <mpi.h>
-#include <nvshmem.h>
-#include <nvshmemx.h>
 
 namespace comm {
 
   static int g_rank = 0, g_size = 1;
 
   void init(int *argc, char ***argv) {
-    MPI_Init(argc, argv);
-    MPI_Comm mpi = MPI_COMM_WORLD;
-    MPI_Comm_rank(mpi, &g_rank);
-    MPI_Comm_size(mpi, &g_size);
-    // one GPU per PE within the node (rank % gpus-per-node)
-    int nGpu = 1; cudaGetDeviceCount(&nGpu);
+    int provided;
+    MPI_Init_thread(argc, argv, MPI_THREAD_SINGLE, &provided);
+    MPI_Comm_rank(MPI_COMM_WORLD, &g_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &g_size);
+    int nGpu = 1; cudaGetDeviceCount(&nGpu);   // one GPU per rank within the node
     cudaSetDevice(g_rank % nGpu);
-    nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
-    attr.mpi_comm = &mpi;
-    nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
-    g_rank = nvshmem_my_pe();
-    g_size = nvshmem_n_pes();
   }
-  void finalize() { nvshmem_finalize(); MPI_Finalize(); }
+  void finalize() { MPI_Finalize(); }
   int  rank() { return g_rank; }
   int  size() { return g_size; }
-  void barrier() { nvshmem_barrier_all(); }
+  void barrier() { MPI_Barrier(MPI_COMM_WORLD); }
   void run(int argc, char **argv, void (*fn)(int, char **)) { fn(argc, argv); }
 
-  void *mallocSym(size_t bytes) { return nvshmem_malloc(bytes); }
-  void  freeSym(void *ptr) { nvshmem_free(ptr); }
-
-  // Reductions go through a small symmetric scratch + team reduce, then are
-  // copied back to the caller's (host-accessible) buffer.
-  static void reduce(real *v, int n, bool isMax) {
-    real *src = (real*)nvshmem_malloc(n*sizeof(real));
-    real *dst = (real*)nvshmem_malloc(n*sizeof(real));
-    cudaMemcpy(src, v, n*sizeof(real), cudaMemcpyDefault);
 #ifdef USE_DOUBLE
-    if (isMax) nvshmem_double_max_reduce(NVSHMEM_TEAM_WORLD, dst, src, n);
-    else       nvshmem_double_min_reduce(NVSHMEM_TEAM_WORLD, dst, src, n);
+  static const MPI_Datatype MPI_REAL_T = MPI_DOUBLE;
 #else
-    if (isMax) nvshmem_float_max_reduce(NVSHMEM_TEAM_WORLD, dst, src, n);
-    else       nvshmem_float_min_reduce(NVSHMEM_TEAM_WORLD, dst, src, n);
+  static const MPI_Datatype MPI_REAL_T = MPI_FLOAT;
 #endif
-    cudaMemcpy(v, dst, n*sizeof(real), cudaMemcpyDefault);
-    nvshmem_free(src); nvshmem_free(dst);
-  }
-  void allreduceMin(real *v, int n) { reduce(v, n, false); }
-  void allreduceMax(real *v, int n) { reduce(v, n, true); }
+  void allreduceMin(real *v, int n) { MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_REAL_T, MPI_MIN, MPI_COMM_WORLD); }
+  void allreduceMax(real *v, int n) { MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_REAL_T, MPI_MAX, MPI_COMM_WORLD); }
 
-  // NVSHMEM halo uses nvshmem_getmem on the symmetric heap, not a peer table.
-  void registerPeer(void *) {}
-  void **peers() { return nullptr; }
-  void neighborExchange(int, const int *, void **, const size_t *, void **, const size_t *) {}
+  void neighborExchange(int nNbr, const int *nbr, void **sbuf, const size_t *sbytes,
+                        void **rbuf, const size_t *rbytes) {
+    std::vector<MPI_Request> req; req.reserve(2*nNbr);
+    for (int n = 0; n < nNbr; n++) {
+      MPI_Request r; MPI_Irecv(rbuf[n], (int)rbytes[n], MPI_BYTE, nbr[n], 0, MPI_COMM_WORLD, &r); req.push_back(r);
+    }
+    for (int n = 0; n < nNbr; n++) {
+      MPI_Request r; MPI_Isend(sbuf[n], (int)sbytes[n], MPI_BYTE, nbr[n], 0, MPI_COMM_WORLD, &r); req.push_back(r);
+    }
+    if (!req.empty()) MPI_Waitall((int)req.size(), req.data(), MPI_STATUSES_IGNORE);
+  }
 
 }
 
 #else
 // ---------------------------------------------------------------------------
-// Loopback backend: single process emulating P PEs as P host threads on one
-// GPU.  Builds with plain nvcc (no NVSHMEM/MPI).  Collectives are thread
-// barriers + a shared reduction buffer; symmetric alloc is managed memory (all
-// PEs share one address space, so a remote PE's buffer is a plain pointer).
-// This lets the domain-decomposition logic be validated at P>1 on a dev box.
+// Loopback backend: single process emulating P PEs as P host threads on one GPU
+// (no MPI).  Runs the identical message-passing code path used with MPI, so it
+// validates the decomposition + halo at P>1 on a single-GPU box.
 // ---------------------------------------------------------------------------
 #include <thread>
-#include <vector>
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
@@ -82,7 +65,6 @@ namespace comm {
   static thread_local int tl_rank = 0;
   static pthread_barrier_t g_barrier;
   static std::vector<real> g_red;     // [P * MAXN] reduction scratch
-  static void **g_peers = nullptr;    // managed [P] handle table (peer solver ptrs)
 
   static const int MAXN = 8;
 
@@ -97,7 +79,6 @@ namespace comm {
     if (g_P < 1) g_P = 1;
     pthread_barrier_init(&g_barrier, nullptr, g_P);
     g_red.assign((size_t)g_P * MAXN, 0);
-    cudaMallocManaged(&g_peers, (size_t)g_P * sizeof(void*));
     g_mail = new MailSlot[(size_t)g_P * g_P];
   }
   void finalize() { pthread_barrier_destroy(&g_barrier); }
@@ -112,13 +93,6 @@ namespace comm {
       th.emplace_back([=]() { tl_rank = r; fn(argc, argv); });
     for (auto &t : th) t.join();
   }
-
-  void *mallocSym(size_t bytes) {
-    void *p = nullptr;
-    cudaMallocManaged(&p, bytes);
-    return p;
-  }
-  void freeSym(void *ptr) { cudaFree(ptr); }
 
   // in-place all-reduce of n reals: publish, barrier, everyone reduces the P
   // published rows, barrier.  (n <= MAXN.)
@@ -138,12 +112,6 @@ namespace comm {
   }
   void allreduceMin(real *v, int n) { reduce(v, n, false); }
   void allreduceMax(real *v, int n) { reduce(v, n, true); }
-
-  void registerPeer(void *self) {
-    g_peers[tl_rank] = self;
-    pthread_barrier_wait(&g_barrier);
-  }
-  void **peers() { return g_peers; }
 
   // shared-memory rendezvous: publish my sends into the mailbox, barrier, then
   // copy the messages addressed to me out of it (device-to-device).

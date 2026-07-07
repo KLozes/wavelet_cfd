@@ -5,21 +5,18 @@
 #include "Settings.cuh"
 
 //
-// SPMD communication layer for the multi-GPU (domain-decomposed) build.
-// Only compiled/linked into the wave3d_mgpu target.  Two backends, chosen at
-// compile time:
+// SPMD communication layer for the multi-GPU (domain-decomposed) build.  The
+// solver talks only to this interface; two backends selected at compile time:
 //
-//   default (loopback):   single process, single PE.  Collectives are the
-//     identity, symmetric allocation falls back to cudaMallocManaged.  This is
-//     the path that builds and runs on a machine with no NVSHMEM/MPI (e.g. the
-//     GTX 1650 dev box) and is used to validate the decomposition logic at P=1
-//     bit-for-bit against the single-GPU wave3d binary.
+//   default (loopback):  single process, P PEs emulated as P host threads on one
+//     GPU.  neighborExchange is a shared mailbox + barriers, collectives are
+//     barrier reductions.  Builds with plain nvcc (no MPI), so it runs and is
+//     validated on a machine with no cluster -- and, because it runs the SAME
+//     message-passing code path, it validates the actual MPI structure.
 //
-//   -DUSE_NVSHMEM:  real GPU-initiated communication over the NVSHMEM symmetric
-//     heap.  Compiled only where the NVSHMEM toolkit is present; bootstrapped
-//     via MPI (nvshmemx_init_attr).  This is the actual multi-GPU target.
-//
-// The rest of the solver is backend-agnostic: it calls only this interface.
+//   -DUSE_MPI:  real multi-GPU/multi-node over CUDA-aware MPI.  neighborExchange
+//     is MPI_Irecv/MPI_Isend/MPI_Waitall on the (device) buffers, collectives are
+//     MPI_Allreduce.  Compiled only where an MPI is available.
 //
 namespace comm {
 
@@ -29,17 +26,10 @@ namespace comm {
   int  size();                          // number of PEs
   void barrier();                       // all-PE synchronization
 
-  // Run the per-rank body once per PE.  NVSHMEM: each process is one PE, so this
-  // just calls fn.  Loopback: spawns `size()` host threads (one per logical PE,
-  // each with its own thread-local rank) so P subdomains can be exercised in a
-  // single process on a single GPU for correctness validation.
+  // Run the per-rank body once per PE.  MPI: each process is one PE, so this just
+  // calls fn.  Loopback: spawns `size()` host threads (one per logical PE, each
+  // with its own thread-local rank).
   void run(int argc, char **argv, void (*fn)(int, char **));
-
-  // Symmetric-heap allocation: the SAME number of bytes on every PE, at a
-  // symmetric address, so a remote PE's buffer is addressable for one-sided
-  // get/put.  (loopback: plain cudaMallocManaged.)
-  void *mallocSym(size_t bytes);
-  void  freeSym(void *ptr);
 
   // In-place all-PE reductions of a host-accessible vector of n reals.
   void allreduceMin(real *v, int n);
@@ -48,20 +38,12 @@ namespace comm {
   // Point-to-point neighbor exchange: this PE sends sbuf[n] (sbytes[n] bytes) to
   // nbrRank[n] and receives from nbrRank[n] into rbuf[n] (rbytes[n] bytes), for
   // all nNbr neighbors, completing together.  Buffers are device memory.
-  //   MPI backend:   MPI_Irecv/MPI_Isend/MPI_Waitall (CUDA-aware).
-  //   loopback:      a shared (src,dst) mailbox + barriers, cudaMemcpy per pair.
-  // This is the single transport the halo + topology exchanges are built on.
+  //   MPI:       MPI_Irecv/MPI_Isend/MPI_Waitall (CUDA-aware).
+  //   loopback:  a shared (src,dst) mailbox + barriers, cudaMemcpy per pair.
+  // The halo + topology directory exchanges are built on this one primitive.
   void neighborExchange(int nNbr, const int *nbrRank,
                         void **sbuf, const size_t *sbytes,
                         void **rbuf, const size_t *rbytes);
-
-  // Loopback halo support: each PE publishes an opaque handle (its solver/grid
-  // pointer) into a device-readable table so a peer's kernel can copy ghost
-  // blocks directly (all PEs share one GPU/address space).  Under NVSHMEM the
-  // halo goes through nvshmem_getmem on the symmetric heap instead, so these are
-  // no-ops there.  peers() returns the [size()] handle table (managed).
-  void   registerPeer(void *self);
-  void **peers();
 
 }
 

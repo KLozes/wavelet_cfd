@@ -33,8 +33,7 @@ void CompressibleSolver::initialize(void) {
   sortBlocks();
   setBoundaryConditions();
 #ifdef USE_MGPU
-  comm::registerPeer(this);   // publish this PE's grid early so rebuildGhosts can query peers
-  rebuildGhosts();            // base-level partition ghost ring
+  rebuildGhosts();            // base-level partition ghost ring (directory exchange)
   setInitialConditions();     // fill the ghost cells (analytic IC, global position)
   primitiveToConservative();
   setBoundaryConditions();

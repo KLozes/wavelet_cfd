@@ -1,7 +1,3 @@
-[submodule "extern/nvshmem"]
-	path = extern/nvshmem
-	url = https://github.com/NVIDIA/nvshmem.git
-	shallow = true
 [submodule "extern/openmpi"]
 	path = extern/openmpi
 	url = https://github.com/open-mpi/ompi.git
