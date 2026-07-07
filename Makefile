@@ -58,7 +58,10 @@ WAVE3D_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_dp/%.cu.o,$(WAVE3D_SRCS))
 # a box without NVSHMEM/MPI and can be A/B'd against wave3d at P=1.  For a real
 # multi-GPU target, add:  -DUSE_NVSHMEM -I$(NVSHMEM_HOME)/include, and to the link
 # line:  -rdc=true -L$(NVSHMEM_HOME)/lib -lnvshmem_host -lnvshmem_device -lmpi
-WAVE3D_MGPU_DEFS = -DNCELLS_MAX=64000000 -DUSE_MGPU
+# modest cap: the loopback backend allocates a full fieldData per PE-thread in
+# one process, so keep P*fieldData within the dev GPU (8M cells -> ~0.5 GB/PE).
+# Physics is cap-independent, so this still A/B's against the 64M wave3d build.
+WAVE3D_MGPU_DEFS = -DNCELLS_MAX=8000000 -DUSE_MGPU
 WAVE3D_MGPU_SRCS = HashTable MultiLevelSparseGrid MultiLevelSparseGridKernels \
                    CompressibleSolver CompressibleSolverKernels Comm MainMgpu
 WAVE3D_MGPU_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_mgpu/%.cu.o,$(WAVE3D_MGPU_SRCS))

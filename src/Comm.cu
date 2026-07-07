@@ -55,6 +55,10 @@ namespace comm {
   void allreduceMin(real *v, int n) { reduce(v, n, false); }
   void allreduceMax(real *v, int n) { reduce(v, n, true); }
 
+  // NVSHMEM halo uses nvshmem_getmem on the symmetric heap, not a peer table.
+  void registerPeer(void *) {}
+  void **peers() { return nullptr; }
+
 }
 
 #else
@@ -77,6 +81,7 @@ namespace comm {
   static thread_local int tl_rank = 0;
   static pthread_barrier_t g_barrier;
   static std::vector<real> g_red;     // [P * MAXN] reduction scratch
+  static void **g_peers = nullptr;    // managed [P] handle table (peer solver ptrs)
 
   static const int MAXN = 8;
 
@@ -87,6 +92,7 @@ namespace comm {
     if (g_P < 1) g_P = 1;
     pthread_barrier_init(&g_barrier, nullptr, g_P);
     g_red.assign((size_t)g_P * MAXN, 0);
+    cudaMallocManaged(&g_peers, (size_t)g_P * sizeof(void*));
   }
   void finalize() { pthread_barrier_destroy(&g_barrier); }
   int  rank() { return tl_rank; }
@@ -126,6 +132,12 @@ namespace comm {
   }
   void allreduceMin(real *v, int n) { reduce(v, n, false); }
   void allreduceMax(real *v, int n) { reduce(v, n, true); }
+
+  void registerPeer(void *self) {
+    g_peers[tl_rank] = self;
+    pthread_barrier_wait(&g_barrier);
+  }
+  void **peers() { return g_peers; }
 
 }
 

@@ -1189,6 +1189,35 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
   END_CELL_LOOP
 }
 
+#ifdef USE_MGPU
+// Partition-boundary halo exchange (loopback): fill each ghost block (an interior
+// block this PE does not own) by copying fOff..fOff+nf-1 from the owning PE's
+// matching block.  peers[] is the comm handle table (peer CompressibleSolver*);
+// all PEs share the GPU/address space, so the owner's fields are directly
+// addressable.  Runs between lock-step barriers so the owner's data is current.
+__global__ void haloExchangeKernel(CompressibleSolver &grid, void **peers, i32 fOff, i32 nf) {
+
+  START_CELL_LOOP
+
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb, kb;
+    grid.decode(loc, lvl, ib, jb, kb);
+
+    if (grid.isInteriorBlock(lvl, ib, jb, kb) && !grid.isOwnedBlock(lvl, ib, jb, kb)) {
+      CompressibleSolver *pg = (CompressibleSolver*)peers[grid.ownerPE(lvl, ib, jb, kb)];
+      i32 srcBlk = pg->hashTable.getValue(loc);
+      if (srcBlk != bEmpty) {
+        i32 lc = cIdx - bIdx*blockSizeTot;               // cell offset within block
+        i32 src = srcBlk*blockSizeTot + lc;
+        for (i32 f = fOff; f < fOff + nf; f++)
+          grid.getField(f)[cIdx] = pg->getField(f)[src];
+      }
+    }
+
+  END_CELL_LOOP
+}
+#endif
+
 __global__ void copyToOldFieldsKernel(CompressibleSolver &grid) {
 
   START_CELL_LOOP

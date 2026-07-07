@@ -45,6 +45,14 @@ namespace comm {
   void allreduceMin(real *v, int n);
   void allreduceMax(real *v, int n);
 
+  // Loopback halo support: each PE publishes an opaque handle (its solver/grid
+  // pointer) into a device-readable table so a peer's kernel can copy ghost
+  // blocks directly (all PEs share one GPU/address space).  Under NVSHMEM the
+  // halo goes through nvshmem_getmem on the symmetric heap instead, so these are
+  // no-ops there.  peers() returns the [size()] handle table (managed).
+  void   registerPeer(void *self);
+  void **peers();
+
 }
 
 #endif

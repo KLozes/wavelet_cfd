@@ -51,6 +51,10 @@ void CompressibleSolver::initialize(void) {
     paint();
   }
   zeroAccumulator();   // the cascade dirtied the shared bank (LSRK needs 0)
+#ifdef USE_MGPU
+  comm::registerPeer(this);   // publish this PE's grid so peers can fetch halos
+  haloExchange(0, NEVOLVE);   // seed the ghost blocks from their owners
+#endif
 }
 
 // zero the shared bank so the LSRK accumulation (A_1 = 0) starts clean; the
@@ -115,6 +119,9 @@ real CompressibleSolver::step(real tStep) {
     for (i32 stage = 0; stage < 3; stage++) {
       conservativeToPrimitive();
       setBoundaryConditions();
+#ifdef USE_MGPU
+      haloExchange(0, NEVOLVE);   // ghosts get owners' primitives (+G) before the RHS reads them
+#endif
       computeRightHandSide();
       primitiveToConservative();
       updateFields(stage);
@@ -223,6 +230,20 @@ void CompressibleSolver::computeRightHandSide(void) {
 void CompressibleSolver::updateFields(i32 stage) {
   updateFieldsKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage);
 }
+
+#ifdef USE_MGPU
+// Refresh partition-boundary ghost blocks from their owning PEs.  Bracketed by
+// barriers so every PE has finished writing its owned data before anyone reads
+// it, and no PE overwrites before all reads complete.
+void CompressibleSolver::haloExchange(i32 fOff, i32 nf) {
+  if (comm::size() == 1) return;
+  cudaDeviceSynchronize();
+  comm::barrier();
+  haloExchangeKernel<<<cudaGridSize, cudaBlockSize>>>(*this, comm::peers(), fOff, nf);
+  cudaDeviceSynchronize();
+  comm::barrier();
+}
+#endif
 
 void CompressibleSolver::restrictFields(void) {
   restrictFieldsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
@@ -551,6 +572,9 @@ void CompressibleSolver::computeVortexError(void) {
     i32 gy = baseGridSize[1]/blockSize*powi(2,lvl);
     i32 gz = pseudo2D ? baseGridSize[2]/blockSize : baseGridSize[2]/blockSize*powi(2,lvl);
     if (ib < 0 || jb < 0 || kb < 0 || ib >= gx || jb >= gy || kb >= gz) continue;
+#ifdef USE_MGPU
+    if (!isOwnedBlock(lvl, ib, jb, kb)) continue;   // skip ghost (halo) blocks in the error norm
+#endif
 
     for (i32 c = 0; c < blockSizeTot; c++) {
       i32 cIdx = bIdx*blockSizeTot + c;
@@ -617,6 +641,9 @@ void CompressibleSolver::computeGreshoError(void) {
     i32 gy = baseGridSize[1]/blockSize*powi(2,lvl);
     i32 gz = pseudo2D ? baseGridSize[2]/blockSize : baseGridSize[2]/blockSize*powi(2,lvl);
     if (ib < 0 || jb < 0 || kb < 0 || ib >= gx || jb >= gy || kb >= gz) continue;
+#ifdef USE_MGPU
+    if (!isOwnedBlock(lvl, ib, jb, kb)) continue;   // skip ghost (halo) blocks in the error norm
+#endif
 
     for (i32 c = 0; c < blockSizeTot; c++) {
       i32 cIdx = bIdx*blockSizeTot + c;

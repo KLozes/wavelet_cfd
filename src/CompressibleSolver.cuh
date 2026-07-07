@@ -145,6 +145,9 @@ public:
   void computeRightHandSide(void);
   void updateFields(i32 stage);
   void zeroAccumulator(void);   // zero the shared bank before LSRK stage 1
+#ifdef USE_MGPU
+  void haloExchange(i32 fOff, i32 nf);   // fill partition-boundary ghost blocks from owners
+#endif
 
   void restrictFields();
   void interpolateFields();
