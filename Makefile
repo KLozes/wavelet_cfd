@@ -93,8 +93,10 @@ $(OBJ_DIR)/wavewsdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavewsdf
 $(OBJ_DIR)/wave3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d_dp
 	$(NVCC) $(NVCCFLAGS) $(WAVE3D_DP_DEFS) -I./$(SRC_DIR) -dc $< -o $@
 
+# --default-stream per-thread: the loopback backend runs one host thread per
+# logical PE, so give each thread its own default stream (independent syncs).
 $(OBJ_DIR)/wave3d_mgpu/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d_mgpu
-	$(NVCC) $(NVCCFLAGS) $(WAVE3D_MGPU_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+	$(NVCC) $(NVCCFLAGS) --default-stream per-thread $(WAVE3D_MGPU_DEFS) -I./$(SRC_DIR) -dc $< -o $@
 
 $(OBJ_DIR)/wave3d $(OBJ_DIR)/wavesdf $(OBJ_DIR)/wavewsdf $(OBJ_DIR)/wave3d_dp $(OBJ_DIR)/wave3d_mgpu:
 	mkdir -p $@

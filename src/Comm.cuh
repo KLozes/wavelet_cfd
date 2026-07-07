@@ -29,6 +29,12 @@ namespace comm {
   int  size();                          // number of PEs
   void barrier();                       // all-PE synchronization
 
+  // Run the per-rank body once per PE.  NVSHMEM: each process is one PE, so this
+  // just calls fn.  Loopback: spawns `size()` host threads (one per logical PE,
+  // each with its own thread-local rank) so P subdomains can be exercised in a
+  // single process on a single GPU for correctness validation.
+  void run(int argc, char **argv, void (*fn)(int, char **));
+
   // Symmetric-heap allocation: the SAME number of bytes on every PE, at a
   // symmetric address, so a remote PE's buffer is addressable for one-sided
   // get/put.  (loopback: plain cudaMallocManaged.)

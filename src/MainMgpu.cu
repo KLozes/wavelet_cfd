@@ -42,9 +42,8 @@
 // Back-compat: `./wave3d N` (bare first arg) still selects the test case.
 // testCases 0-2,4 run pseudo-2D (single z block); testCase 3 is fully 3D.
 //
-int main(int argc, char* argv[]) {
-
-  comm::init(&argc, &argv);   // SPMD bring-up: this PE's rank/size and GPU
+// per-rank body (run once per PE; loopback runs it on one thread per logical PE)
+static void runRank(int argc, char* argv[]) {
 
   // --flag value parser: findArg returns the token after --flag, or nullptr.
   auto findArg = [&](const char* key) -> const char* {
@@ -182,6 +181,11 @@ int main(int argc, char* argv[]) {
 
   cudaDeviceSynchronize();
   delete solver;
+}
+
+int main(int argc, char* argv[]) {
+  comm::init(&argc, &argv);        // SPMD bring-up: parse --np, set rank/size, pick GPU
+  comm::run(argc, argv, runRank);  // run the per-rank body (P threads under loopback)
   comm::finalize();
   cudaDeviceReset();
 }
