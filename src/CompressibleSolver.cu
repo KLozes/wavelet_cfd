@@ -257,83 +257,87 @@ void CompressibleSolver::updateFields(i32 stage) {
 // Refresh partition-boundary ghost blocks from their owning PEs.  Bracketed by
 // barriers so every PE has finished writing its owned data before anyone reads
 // it, and no PE overwrites before all reads complete.
-// Build the per-peer halo plan once per adaptation: count the ghosts received
-// from each peer, size the (globally uniform) per-peer slot, and fill the
-// (ghost block, owner source block) lists.  The exchanges then reuse this plan.
-void CompressibleSolver::buildHaloPlan(void) {
-  if (comm::size() == 1) return;
-  i32 nPE = comm::size();
-  if (!haloCnt) {
-    cudaMallocManaged(&haloCnt,  nPE*sizeof(i32));
-    cudaMallocManaged(&haloFill, nPE*sizeof(i32));
+// Build and exchange the per-neighbor boundary directories (once per adaptation).
+// Each PE lists the loc codes of its owned blocks whose 2-ring reaches into each
+// neighbor, sizes the globally-uniform per-neighbor slot, and exchanges the
+// counts then the loc payloads via comm::neighborExchange.
+void CompressibleSolver::buildDirectories(void) {
+  if (comm::size() == 1 || nNbr == 0) return;
+  if (!dirSendCnt) {
+    cudaMallocManaged(&dirSendCnt, nNbr*sizeof(i32));
+    cudaMallocManaged(&dirRecvCnt, nNbr*sizeof(i32));
+    cudaMallocManaged(&dirFill,    nNbr*sizeof(i32));
   }
-  cudaMemset(haloCnt, 0, nPE*sizeof(i32));
-  countGhostPeersKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  cudaMemset(dirSendCnt, 0, nNbr*sizeof(i32));
+  countDirKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
-  i32 maxc = 0; for (i32 p = 0; p < nPE; p++) if (haloCnt[p] > maxc) maxc = haloCnt[p];
-  real mc = (real)maxc; comm::allreduceMax(&mc, 1);          // slot must match on every PE
-  i32 needSlot = (i32)mc + 8;                                // small margin
-  if (needSlot > haloSlot) {                                 // (re)allocate, grow-only
-    cudaFree(haloGhost); cudaFree(haloSrc); comm::freeSym(haloSend); cudaFree(haloRecv);
-    haloSlot = needSlot;
+  i32 maxc = 0; for (i32 s = 0; s < nNbr; s++) if (dirSendCnt[s] > maxc) maxc = dirSendCnt[s];
+  real mc = (real)maxc; comm::allreduceMax(&mc, 1);            // slot uniform on every PE
+  i32 needSlot = (i32)mc + 8;
+  if (needSlot > dirSlot) {
+    cudaFree(dirSendLoc); cudaFree(dirRecvLoc); cudaFree(sendBuf); cudaFree(recvBuf);
+    dirSlot = needSlot;
     size_t fs = (size_t)NEVOLVE*blockSizeTot;
-    cudaMallocManaged(&haloGhost, (size_t)nPE*haloSlot*sizeof(i32));
-    cudaMallocManaged(&haloSrc,   (size_t)nPE*haloSlot*sizeof(i32));
-    haloSend = (real*)comm::mallocSym((size_t)nPE*haloSlot*fs*sizeof(real));
-    cudaMallocManaged(&haloRecv,  (size_t)haloSlot*fs*sizeof(real));
+    cudaMallocManaged(&dirSendLoc, (size_t)nNbr*dirSlot*sizeof(u64));
+    cudaMallocManaged(&dirRecvLoc, (size_t)nNbr*dirSlot*sizeof(u64));
+    cudaMallocManaged(&sendBuf,    (size_t)nNbr*dirSlot*fs*sizeof(real));
+    cudaMallocManaged(&recvBuf,    (size_t)nNbr*dirSlot*fs*sizeof(real));
   }
-  comm::barrier();                                           // all PEs share haloSlot before the fill (peers read it)
-  cudaMemset(haloFill, 0, nPE*sizeof(i32));
-  fillHaloPlanKernel<<<cudaGridSize, cudaBlockSize>>>(*this, comm::peers());
+  comm::barrier();
+  cudaMemset(dirFill, 0, nNbr*sizeof(i32));
+  fillDirKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
-  comm::barrier();                                           // lists ready before any peer packs against them
+  // exchange counts, then the loc payloads
+  std::vector<void*> ss(nNbr), rr(nNbr); std::vector<size_t> sb(nNbr), rb(nNbr);
+  for (i32 s = 0; s < nNbr; s++) { ss[s]=&dirSendCnt[s]; rr[s]=&dirRecvCnt[s]; sb[s]=sizeof(i32); rb[s]=sizeof(i32); }
+  comm::neighborExchange(nNbr, nbrRank, ss.data(), sb.data(), rr.data(), rb.data());
+  for (i32 s = 0; s < nNbr; s++) {
+    ss[s]=&dirSendLoc[(size_t)s*dirSlot]; rr[s]=&dirRecvLoc[(size_t)s*dirSlot];
+    sb[s]=(size_t)dirSendCnt[s]*sizeof(u64); rb[s]=(size_t)dirRecvCnt[s]*sizeof(u64);
+  }
+  comm::neighborExchange(nNbr, nbrRank, ss.data(), sb.data(), rr.data(), rb.data());
+  comm::barrier();
 }
 
-// Batched halo exchange: each PE packs the blocks its peers requested into one
-// dense region per receiver, then each PE pulls its region from every owner in a
-// single contiguous transfer and scatters it into its ghost blocks.  Reuses the
-// plan from buildHaloPlan (topology only changes at adaptation).
+// Halo exchange: pack this PE's directory blocks per neighbor, exchange the
+// packed buffers with comm::neighborExchange (one contiguous message per
+// neighbor), and unpack into the ghost blocks.  Reuses the directories from
+// buildDirectories; nothing reaches into a peer's memory.
 void CompressibleSolver::haloExchange(i32 fOff, i32 nf) {
-  if (comm::size() == 1) return;
-  i32 nPE = comm::size();
+  if (comm::size() == 1 || nNbr == 0) return;
   size_t fs = (size_t)nf*blockSizeTot;
   cudaDeviceSynchronize();
   comm::barrier();
-  packHaloKernel<<<cudaGridSize, cudaBlockSize>>>(*this, comm::peers(), nPE, fOff, nf);
+  packDirKernel<<<cudaGridSize, cudaBlockSize>>>(*this, fOff, nf);
   cudaDeviceSynchronize();
-  comm::barrier();                                           // every owner's send buffer is packed
-  for (i32 p = 0; p < nPE; p++) {
-    if (p == part.rank || haloCnt[p] == 0) continue;
-    CompressibleSolver *pp = (CompressibleSolver*)comm::peers()[p];
-    // ONE contiguous transfer: pull owner p's region packed for me (loopback:
-    // memcpy from the peer's send buffer; NVSHMEM: nvshmem_getmem on the
-    // symmetric heap at offset part.rank*haloSlot*fs from PE p).
-    cudaMemcpy(haloRecv, pp->haloSend + (size_t)(part.rank*haloSlot)*fs,
-               (size_t)haloCnt[p]*fs*sizeof(real), cudaMemcpyDefault);
-    unpackHaloKernel<<<cudaGridSize, cudaBlockSize>>>(*this, p, fOff, nf);
-    cudaDeviceSynchronize();
+  std::vector<void*> ss(nNbr), rr(nNbr); std::vector<size_t> sb(nNbr), rb(nNbr);
+  for (i32 s = 0; s < nNbr; s++) {
+    ss[s]=&sendBuf[(size_t)s*dirSlot*fs]; rr[s]=&recvBuf[(size_t)s*dirSlot*fs];
+    sb[s]=(size_t)dirSendCnt[s]*fs*sizeof(real); rb[s]=(size_t)dirRecvCnt[s]*fs*sizeof(real);
   }
+  comm::neighborExchange(nNbr, nbrRank, ss.data(), sb.data(), rr.data(), rb.data());
+  unpackDirKernel<<<cudaGridSize, cudaBlockSize>>>(*this, fOff, nf);
+  cudaDeviceSynchronize();
   comm::barrier();
 }
 
-// Prune the stale partition ghosts and recreate the exact 2-ring from the
-// neighbors' current blocks, then re-sort so everything gets valid indices.
-// Called after the post-adaptGrid sortBlocks (compact list, valid hashes): the
-// ghost layer thus tracks — and prunes with — the moving grid, so each PE holds
-// only its subdomain + a thin halo (a real decomposition, not the full grid).
+// Prune the stale partition ghosts and recreate the 2-ring from the neighbors'
+// directories, then re-sort.  Called after the post-adaptGrid sortBlocks: the
+// ghost layer tracks — and prunes with — the moving grid, so each PE holds only
+// its subdomain + a thin halo (a real decomposition, not the full grid).
 void CompressibleSolver::rebuildGhosts(void) {
   if (comm::size() == 1) return;
+  buildDirectories();                                           // exchange the boundary directories
   cudaDeviceSynchronize();
   markGhostsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);      // old ghosts -> DELETE; owned/exterior -> KEEP
-  comm::barrier();                                               // every PE's hash valid
-  rebuildGhostsKernel<<<cudaGridSize, cudaBlockSize>>>(*this, comm::peers());  // 2-ring: un-deletes / adds needed ghosts
+  cudaDeviceSynchronize();
+  consumeDirKernel<<<cudaGridSize, cudaBlockSize>>>(*this);      // create ghosts from directories (un-delete)
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
   deleteDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this);      // drop the ghosts no longer needed
   cudaDeviceSynchronize();
   sortBlocks();                                                  // compact + rebuild indices
   comm::barrier();
-  buildHaloPlan();                                              // refresh the per-peer exchange plan
 }
 #endif
 

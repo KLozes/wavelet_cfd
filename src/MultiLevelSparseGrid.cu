@@ -146,6 +146,22 @@ void MultiLevelSparseGrid::initPartition(void) {
     }
     ownerBase[i + part.nb[0]*(j + part.nb[1]*k)] = col[0] + part.p[0]*(col[1] + part.p[1]*col[2]);
   }
+
+  // neighbor PEs: the adjacent process-grid cells (3x3x3 around this PE, minus
+  // self, clipped to the grid).  Fixed for the run.
+  cudaMallocManaged(&nbrRank, 26*sizeof(i32));
+  cudaMallocManaged(&nbrOf,   (size_t)P*sizeof(i32));
+  for (i32 r = 0; r < P; r++) nbrOf[r] = -1;
+  nNbr = 0;
+  for (i32 dz = -1; dz <= 1; dz++)
+  for (i32 dy = -1; dy <= 1; dy++)
+  for (i32 dx = -1; dx <= 1; dx++) {
+    if (dx==0 && dy==0 && dz==0) continue;
+    i32 cx = part.c[0]+dx, cy = part.c[1]+dy, cz = part.c[2]+dz;
+    if (cx<0||cx>=part.p[0]||cy<0||cy>=part.p[1]||cz<0||cz>=part.p[2]) continue;
+    i32 r = cx + part.p[0]*(cy + part.p[1]*cz);
+    nbrRank[nNbr] = r; nbrOf[r] = nNbr; nNbr++;
+  }
   cudaDeviceSynchronize();
 }
 

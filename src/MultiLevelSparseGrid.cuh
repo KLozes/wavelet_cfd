@@ -69,6 +69,11 @@ public:
   // indexes it, so an arbitrary / load-balanced partition is just a rewrite of
   // this array (the box split is one particular fill).
   i32 *ownerBase;
+  // neighbor PEs (the <=26 adjacent process-grid cells) for the directory/halo
+  // exchanges -- a fixed set (no rebalancing), computed once in initPartition.
+  i32  nNbr;        // number of neighbor PEs
+  i32 *nbrRank;     // [nNbr]  neighbor PE ranks
+  i32 *nbrOf;       // [size]  rank -> neighbor slot (or -1)
   void initPartition(void);                                            // set `part` + fill ownerBase
   __host__ __device__ i32  ownerPE(i32 lvl, i32 ib, i32 jb, i32 kb);   // rank owning a block (ownerBase lookup)
   __host__ __device__ bool isOwnedBlock(i32 lvl, i32 ib, i32 jb, i32 kb);

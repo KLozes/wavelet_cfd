@@ -45,6 +45,16 @@ namespace comm {
   void allreduceMin(real *v, int n);
   void allreduceMax(real *v, int n);
 
+  // Point-to-point neighbor exchange: this PE sends sbuf[n] (sbytes[n] bytes) to
+  // nbrRank[n] and receives from nbrRank[n] into rbuf[n] (rbytes[n] bytes), for
+  // all nNbr neighbors, completing together.  Buffers are device memory.
+  //   MPI backend:   MPI_Irecv/MPI_Isend/MPI_Waitall (CUDA-aware).
+  //   loopback:      a shared (src,dst) mailbox + barriers, cudaMemcpy per pair.
+  // This is the single transport the halo + topology exchanges are built on.
+  void neighborExchange(int nNbr, const int *nbrRank,
+                        void **sbuf, const size_t *sbytes,
+                        void **rbuf, const size_t *rbytes);
+
   // Loopback halo support: each PE publishes an opaque handle (its solver/grid
   // pointer) into a device-readable table so a peer's kernel can copy ghost
   // blocks directly (all PEs share one GPU/address space).  Under NVSHMEM the

@@ -58,6 +58,7 @@ namespace comm {
   // NVSHMEM halo uses nvshmem_getmem on the symmetric heap, not a peer table.
   void registerPeer(void *) {}
   void **peers() { return nullptr; }
+  void neighborExchange(int, const int *, void **, const size_t *, void **, const size_t *) {}
 
 }
 
@@ -85,6 +86,10 @@ namespace comm {
 
   static const int MAXN = 8;
 
+  // shared (src,dst) mailbox for neighborExchange: g_mail[src*P + dst]
+  struct MailSlot { void *ptr; size_t bytes; };
+  static MailSlot *g_mail = nullptr;
+
   void init(int *argc, char ***argv) {
     g_P = 1;
     for (int a = 1; a + 1 < *argc; a++)
@@ -93,6 +98,7 @@ namespace comm {
     pthread_barrier_init(&g_barrier, nullptr, g_P);
     g_red.assign((size_t)g_P * MAXN, 0);
     cudaMallocManaged(&g_peers, (size_t)g_P * sizeof(void*));
+    g_mail = new MailSlot[(size_t)g_P * g_P];
   }
   void finalize() { pthread_barrier_destroy(&g_barrier); }
   int  rank() { return tl_rank; }
@@ -138,6 +144,22 @@ namespace comm {
     pthread_barrier_wait(&g_barrier);
   }
   void **peers() { return g_peers; }
+
+  // shared-memory rendezvous: publish my sends into the mailbox, barrier, then
+  // copy the messages addressed to me out of it (device-to-device).
+  void neighborExchange(int nNbr, const int *nbr, void **sbuf, const size_t *sbytes,
+                        void **rbuf, const size_t *rbytes) {
+    if (g_P == 1) return;
+    for (int n = 0; n < nNbr; n++)
+      g_mail[(size_t)tl_rank*g_P + nbr[n]] = { sbuf[n], sbytes[n] };
+    pthread_barrier_wait(&g_barrier);
+    for (int n = 0; n < nNbr; n++) {
+      MailSlot m = g_mail[(size_t)nbr[n]*g_P + tl_rank];
+      size_t nb = rbytes[n] < m.bytes ? rbytes[n] : m.bytes;
+      if (nb) cudaMemcpy(rbuf[n], m.ptr, nb, cudaMemcpyDefault);
+    }
+    pthread_barrier_wait(&g_barrier);
+  }
 
 }
 

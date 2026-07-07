@@ -130,9 +130,10 @@ public:
       tForwardUs = 0;
       tSortUs = 0;
 #ifdef USE_MGPU
-      haloSlot = 0;
-      haloCnt = haloGhost = haloSrc = haloFill = nullptr;
-      haloSend = haloRecv = nullptr;
+      dirSlot = 0;
+      dirSendCnt = dirRecvCnt = dirFill = nullptr;
+      dirSendLoc = dirRecvLoc = nullptr;
+      sendBuf = recvBuf = nullptr;
 #endif
   }
 
@@ -152,19 +153,23 @@ public:
   void zeroAccumulator(void);   // zero the shared bank before LSRK stage 1
 #ifdef USE_MGPU
   void haloExchange(i32 fOff, i32 nf);   // fill partition-boundary ghost blocks from owners
-  void rebuildGhosts(void);              // recreate the 2-ring ghost layer from neighbors' blocks
-  void buildHaloPlan(void);              // per-peer ghost block lists (once per adaptation)
-  // Batched halo plan (rebuilt each adaptation, reused every exchange).  Grouped
-  // by peer into fixed slots so the transfer is ONE contiguous copy per peer
-  // instead of thousands of per-block gets.  haloCnt/haloGhost/haloSrc/haloSend
-  // are read by peers (via the peer table), so they are plain managed members.
-  i32   haloSlot;      // blocks per peer region (identical on every PE)
-  i32  *haloCnt;       // [P]              # ghosts I receive from each peer
-  i32  *haloGhost;     // [P*haloSlot]     my local ghost block index (per peer)
-  i32  *haloSrc;       // [P*haloSlot]     owner's source block index (same order)
-  i32  *haloFill;      // [P]              scratch fill counter
-  real *haloSend;      // [P*haloSlot*NEVOLVE*blockSizeTot]  pack buffer (peers read their region)
-  real *haloRecv;      // [haloSlot*NEVOLVE*blockSizeTot]    unpack scratch (local)
+  void rebuildGhosts(void);              // recreate the 2-ring ghost layer from neighbors' directories
+  void buildDirectories(void);           // build + exchange the per-neighbor boundary directories
+  // Message-passing halo (no peer-memory access).  Per neighbor N, this PE sends
+  // a DIRECTORY of the location codes of its owned blocks whose 2-ring reaches
+  // into N (dirSend), and receives N's directory (dirRecv).  Ghosts are created
+  // from dirRecv; the field data is packed for each neighbor (all of dirSend, in
+  // order) and exchanged with comm::neighborExchange -- one contiguous message
+  // per neighbor.  Indices are resolved locally by hash lookup of the loc codes,
+  // so nothing reaches into a peer's memory.  Rebuilt each adaptation.
+  i32   dirSlot;       // per-neighbor directory capacity (blocks), identical on every PE
+  i32  *dirSendCnt;    // [nNbr]
+  i32  *dirRecvCnt;    // [nNbr]
+  u64  *dirSendLoc;    // [nNbr*dirSlot]  my boundary-block loc codes, per neighbor
+  u64  *dirRecvLoc;    // [nNbr*dirSlot]  neighbor's boundary-block loc codes
+  i32  *dirFill;       // [nNbr]          scratch fill counter
+  real *sendBuf;       // [nNbr*dirSlot*NEVOLVE*blockSizeTot]  packed field data out
+  real *recvBuf;       // [nNbr*dirSlot*NEVOLVE*blockSizeTot]  packed field data in
 #endif
 
   void restrictFields();

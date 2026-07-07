@@ -1211,97 +1211,107 @@ __global__ void markGhostsKernel(CompressibleSolver &grid) {
   END_BLOCK_LOOP
 }
 
-__global__ void rebuildGhostsKernel(CompressibleSolver &grid, void **peers) {
+// --- directory-based halo (message-passing; no peer-memory access) ---------
+// Distinct neighbor slots whose territory this owned block's 2-ring reaches.
+__device__ i32 blockNbrSlots(CompressibleSolver &grid, i32 lvl, i32 ib, i32 jb, i32 kb, i32 *slot) {
+  i32 n = 0, dkLim = grid.pseudo2D ? 0 : 2;
+  for (i32 dk=-dkLim; dk<=dkLim; dk++)
+  for (i32 dj=-2; dj<=2; dj++)
+  for (i32 di=-2; di<=2; di++) {
+    i32 ni=ib+di, nj=jb+dj, nk=kb+dk;
+    if (!grid.isInteriorBlock(lvl,ni,nj,nk)) continue;
+    i32 o = grid.ownerPE(lvl,ni,nj,nk);
+    if (o == grid.part.rank) continue;
+    i32 s = grid.nbrOf[o];
+    if (s < 0) continue;
+    bool seen = false;
+    for (i32 t=0; t<n; t++) if (slot[t]==s) { seen=true; break; }
+    if (!seen && n < 27) slot[n++] = s;
+  }
+  return n;
+}
 
+// Count / fill the per-neighbor directory of this PE's owned boundary blocks
+// (loc codes of owned blocks whose 2-ring reaches into a neighbor's territory).
+__global__ void countDirKernel(CompressibleSolver &grid) {
   START_BLOCK_LOOP
-
     u64 loc = grid.bLocList[bIdx];
-    i32 lvl, ib, jb, kb;
-    grid.decode(loc, lvl, ib, jb, kb);
-
-    if (loc != kEmpty && grid.isOwnedBlock(lvl, ib, jb, kb)) {
-      i32 dkLim = grid.pseudo2D ? 0 : 2;
-      for (i32 dk = -dkLim; dk <= dkLim; dk++)
-      for (i32 dj = -2; dj <= 2; dj++)
-      for (i32 di = -2; di <= 2; di++) {
-        i32 ni = ib+di, nj = jb+dj, nk = kb+dk;
-        if (!grid.isInteriorBlock(lvl, ni, nj, nk)) continue;    // domain-exterior: filled by BC
-        i32 owner = grid.ownerPE(lvl, ni, nj, nk);
-        if (owner == grid.part.rank) continue;                   // owned: already present
-        CompressibleSolver *pg = (CompressibleSolver*)peers[owner];
-        if (pg->hashTable.getValue(grid.encode(lvl, ni, nj, nk)) != bEmpty)
-          grid.activateBlock(lvl, ni, nj, nk);                   // neighbor has it -> create ghost
+    if (loc != kEmpty) {
+      i32 lvl,ib,jb,kb; grid.decode(loc,lvl,ib,jb,kb);
+      if (grid.isOwnedBlock(lvl,ib,jb,kb)) {
+        i32 slot[27]; i32 n = blockNbrSlots(grid,lvl,ib,jb,kb,slot);
+        for (i32 t=0; t<n; t++) atomicAdd(&grid.dirSendCnt[slot[t]], 1);
       }
     }
-
   END_BLOCK_LOOP
 }
 
-// ---- batched halo plan + pack/unpack ------------------------------------
-// Count how many ghost blocks this PE receives from each peer.
-__global__ void countGhostPeersKernel(CompressibleSolver &grid) {
+__global__ void fillDirKernel(CompressibleSolver &grid) {
   START_BLOCK_LOOP
     u64 loc = grid.bLocList[bIdx];
     if (loc != kEmpty) {
-      i32 lvl, ib, jb, kb; grid.decode(loc, lvl, ib, jb, kb);
-      if (grid.isInteriorBlock(lvl,ib,jb,kb) && !grid.isOwnedBlock(lvl,ib,jb,kb))
-        atomicAdd(&grid.haloCnt[grid.ownerPE(lvl,ib,jb,kb)], 1);
-    }
-  END_BLOCK_LOOP
-}
-
-// Fill the per-peer (ghost block, owner's source block) lists.  Order is this
-// PE's block order; the owner packs in the same order by reading these back.
-__global__ void fillHaloPlanKernel(CompressibleSolver &grid, void **peers) {
-  START_BLOCK_LOOP
-    u64 loc = grid.bLocList[bIdx];
-    if (loc != kEmpty) {
-      i32 lvl, ib, jb, kb; grid.decode(loc, lvl, ib, jb, kb);
-      if (grid.isInteriorBlock(lvl,ib,jb,kb) && !grid.isOwnedBlock(lvl,ib,jb,kb)) {
-        i32 owner = grid.ownerPE(lvl,ib,jb,kb);
-        CompressibleSolver *pg = (CompressibleSolver*)peers[owner];
-        i32 src = pg->hashTable.getValue(loc);
-        if (src != bEmpty) {
-          i32 i = atomicAdd(&grid.haloFill[owner], 1);
-          if (i < grid.haloSlot) {
-            grid.haloGhost[owner*grid.haloSlot + i] = bIdx;   // my ghost slot
-            grid.haloSrc  [owner*grid.haloSlot + i] = src;    // owner's source block
-          }
+      i32 lvl,ib,jb,kb; grid.decode(loc,lvl,ib,jb,kb);
+      if (grid.isOwnedBlock(lvl,ib,jb,kb)) {
+        i32 slot[27]; i32 n = blockNbrSlots(grid,lvl,ib,jb,kb,slot);
+        for (i32 t=0; t<n; t++) {
+          i32 s = slot[t], i = atomicAdd(&grid.dirFill[s], 1);
+          if (i < grid.dirSlot) grid.dirSendLoc[(size_t)s*grid.dirSlot + i] = loc;
         }
       }
     }
   END_BLOCK_LOOP
 }
 
-// Pack the blocks each peer requested FROM me into my send buffer, contiguous
-// per peer as [block][field][cell] -- one dense region per receiver.
-__global__ void packHaloKernel(CompressibleSolver &grid, void **peers, i32 nPE, i32 fOff, i32 nf) {
-  i32 slot = grid.haloSlot, bst = blockSizeTot, fs = nf*bst;
-  i32 me = grid.part.rank;
-  for (i64 tid = (i64)blockIdx.x*blockDim.x+threadIdx.x; tid < (i64)nPE*slot*bst; tid += (i64)gridDim.x*blockDim.x) {
-    i32 cell = tid % bst;
-    i32 i    = (tid / bst) % slot;
-    i32 r    = tid / bst / slot;
-    if (r == me) continue;
-    CompressibleSolver *pr = (CompressibleSolver*)peers[r];
-    if (i >= pr->haloCnt[me]) continue;                 // r wants haloCnt[me] blocks from me
-    i32 srcBlk = pr->haloSrc[me*slot + i];              // ...specifically these of MY blocks
-    real *dst = grid.haloSend + (size_t)(r*slot + i)*fs;
-    for (i32 f = 0; f < nf; f++)
-      dst[f*bst + cell] = grid.getField(fOff+f)[(size_t)srcBlk*bst + cell];
+// Create ghosts from received neighbor directories: for each received boundary
+// block, if this PE has an owned block within its 2-ring, activate it as a ghost.
+__global__ void consumeDirKernel(CompressibleSolver &grid) {
+  i32 slot = grid.dirSlot, nN = grid.nNbr, dkLim = grid.pseudo2D ? 0 : 2;
+  for (i64 tid = (i64)blockIdx.x*blockDim.x+threadIdx.x; tid < (i64)nN*slot; tid += (i64)gridDim.x*blockDim.x) {
+    i32 s = tid / slot, i = tid % slot;
+    if (i >= grid.dirRecvCnt[s]) continue;
+    u64 loc = grid.dirRecvLoc[(size_t)s*slot + i];
+    i32 lvl,ni,nj,nk; grid.decode(loc,lvl,ni,nj,nk);
+    bool want = false;
+    for (i32 dk=-dkLim; dk<=dkLim && !want; dk++)
+    for (i32 dj=-2; dj<=2 && !want; dj++)
+    for (i32 di=-2; di<=2 && !want; di++) {
+      i32 ai=ni+di, aj=nj+dj, ak=nk+dk;
+      if (grid.isInteriorBlock(lvl,ai,aj,ak) && grid.ownerPE(lvl,ai,aj,ak)==grid.part.rank
+          && grid.hashTable.getValue(grid.encode(lvl,ai,aj,ak)) != bEmpty)
+        want = true;
+    }
+    if (want) grid.activateBlock(lvl, ni, nj, nk);
   }
 }
 
-// Scatter one peer's received region into my ghost blocks for that peer.
-__global__ void unpackHaloKernel(CompressibleSolver &grid, i32 p, i32 fOff, i32 nf) {
-  i32 slot = grid.haloSlot, bst = blockSizeTot, fs = nf*bst;
-  i32 cnt = grid.haloCnt[p];
-  for (i64 tid = (i64)blockIdx.x*blockDim.x+threadIdx.x; tid < (i64)cnt*bst; tid += (i64)gridDim.x*blockDim.x) {
-    i32 cell = tid % bst, i = tid / bst;
-    i32 ghostBlk = grid.haloGhost[p*slot + i];
-    real *src = grid.haloRecv + (size_t)i*fs;
-    for (i32 f = 0; f < nf; f++)
-      grid.getField(fOff+f)[(size_t)ghostBlk*bst + cell] = src[f*bst + cell];
+// Pack this PE's directory blocks for each neighbor into the send buffer,
+// contiguous per neighbor as [block][field][cell]; index resolved by loc lookup.
+__global__ void packDirKernel(CompressibleSolver &grid, i32 fOff, i32 nf) {
+  i32 slot = grid.dirSlot, nN = grid.nNbr, bst = blockSizeTot, fs = nf*bst;
+  for (i64 tid = (i64)blockIdx.x*blockDim.x+threadIdx.x; tid < (i64)nN*slot*bst; tid += (i64)gridDim.x*blockDim.x) {
+    i32 cell = tid % bst, i = (tid / bst) % slot, s = tid / bst / slot;
+    if (i >= grid.dirSendCnt[s]) continue;
+    i32 blk = grid.hashTable.getValue(grid.dirSendLoc[(size_t)s*slot + i]);
+    if (blk == bEmpty) continue;
+    real *dst = grid.sendBuf + ((size_t)s*slot + i)*fs;
+    for (i32 f=0; f<nf; f++) dst[f*bst+cell] = grid.getField(fOff+f)[(size_t)blk*bst+cell];
+  }
+}
+
+// Unpack received neighbor data into this PE's ghost blocks: each received
+// directory entry this PE holds as a (non-owned) ghost gets copied from recvBuf.
+__global__ void unpackDirKernel(CompressibleSolver &grid, i32 fOff, i32 nf) {
+  i32 slot = grid.dirSlot, nN = grid.nNbr, bst = blockSizeTot, fs = nf*bst;
+  for (i64 tid = (i64)blockIdx.x*blockDim.x+threadIdx.x; tid < (i64)nN*slot*bst; tid += (i64)gridDim.x*blockDim.x) {
+    i32 cell = tid % bst, i = (tid / bst) % slot, s = tid / bst / slot;
+    if (i >= grid.dirRecvCnt[s]) continue;
+    u64 loc = grid.dirRecvLoc[(size_t)s*slot + i];
+    i32 ghost = grid.hashTable.getValue(loc);
+    if (ghost == bEmpty) continue;
+    i32 lvl,ib,jb,kb; grid.decode(loc,lvl,ib,jb,kb);
+    if (grid.isOwnedBlock(lvl,ib,jb,kb)) continue;   // only my ghosts
+    real *src = grid.recvBuf + ((size_t)s*slot + i)*fs;
+    for (i32 f=0; f<nf; f++) grid.getField(fOff+f)[(size_t)ghost*bst+cell] = src[f*bst+cell];
   }
 }
 #endif
