@@ -382,10 +382,19 @@ __global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f) {
 
     if (onMidPlane && grid.isInteriorBlock(lvl, ib, jb, kb) && loc != kEmpty && grid.cFlagsList[cIdx] == ACTIVE) {
       i32 nPixels = powi(2,(grid.nLvls - 1 - lvl));
+#ifdef USE_MGPU
+      // pixels are indexed into THIS PE's tile (owned extent), so offset by the
+      // tile origin; cells outside it (the ghost halo) fall out and are skipped.
+      i32 oxPxl = grid.part.b0[0]*blockSize*powi(2, grid.nLvls-1);
+      i32 oyPxl = grid.part.b0[1]*blockSize*powi(2, grid.nLvls-1);
+#else
+      i32 oxPxl = 0, oyPxl = 0;
+#endif
       for (uint jj=0; jj<nPixels; jj++) {
         for (uint ii=0; ii<nPixels; ii++) {
-          i32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
-          i32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
+          i32 iPxl = ib*blockSize*nPixels + i*nPixels + ii - oxPxl;
+          i32 jPxl = jb*blockSize*nPixels + j*nPixels + jj - oyPxl;
+          if (iPxl < 0 || iPxl >= grid.imageSizeX[0] || jPxl < 0 || jPxl >= grid.imageSizeX[1]) continue;
           if (f >= 0) {
             grid.imageDataX[jPxl*grid.imageSizeX[0] + iPxl] = U[cIdx];
           }

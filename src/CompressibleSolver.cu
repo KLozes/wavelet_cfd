@@ -13,9 +13,7 @@
 #endif
 
 void CompressibleSolver::initialize(void) {
-#ifdef USE_MGPU
-  initPartition();            // 3D coarse-grid domain decomposition across PEs
-#endif
+  // (initPartition() runs in the MultiLevelSparseGrid constructor for USE_MGPU)
   periodic = (bcType == 2);   // torus refinement: keep seam edges matched (see MultiLevelSparseGrid)
   if (mdFlux && !pseudo2D) {
     printf("[warn] multiD corner flux is implemented for pseudo-2D only; disabling\n");

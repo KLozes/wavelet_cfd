@@ -22,10 +22,24 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   nFields = nFields_;
   lean = lean_;
 
+#ifdef USE_MGPU
+  // partition is set up first (before any sizing) so per-PE storage can be sized
+  // to THIS PE's subdomain, never the full domain.
+  initPartition();
+#endif
+
   // imageDataX holds an x-y slice taken at the mid-z plane (the natural view
   // for the pseudo-2D / quasi-1D Sod problem).
+#ifdef USE_MGPU
+  // per-PE image TILE: only this PE's owned x-y extent at finest resolution, so
+  // no PE ever allocates the full-domain image (each writes its tile to a
+  // rank-prefixed png; stitch offline).
+  imageSizeX[0] = (part.b1[0]-part.b0[0])*blockSize*powi(2,nLvls-1);
+  imageSizeX[1] = (part.b1[1]-part.b0[1])*blockSize*powi(2,nLvls-1);
+#else
   imageSizeX[0] = (baseGridSize[0])*powi(2,nLvls-1);  // x (width)
   imageSizeX[1] = (baseGridSize[1])*powi(2,nLvls-1);  // y (height)
+#endif
 
   imageSizeY[0] = (baseGridSize[0])*powi(2,nLvls-1);  // image size is the max resolution not including boundary condition blocks
   imageSizeY[1] = (baseGridSize[2])*powi(2,nLvls-1);
@@ -92,6 +106,7 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
   cudaFree(cFlagsList);
 #ifdef USE_MGPU
   comm::freeSym(fieldData);
+  cudaFree(ownerBase);
 #else
   cudaFree(fieldData);
 #endif
@@ -108,31 +123,40 @@ void MultiLevelSparseGrid::initPartition(void) {
   part.c[0] =  part.rank %  part.p[0];
   part.c[1] = (part.rank /  part.p[0]) % part.p[1];
   part.c[2] =  part.rank / (part.p[0]  * part.p[1]);
-  i32 nb[3] = { baseGridSize[0]/blockSize, baseGridSize[1]/blockSize, baseGridSize[2]/blockSize };
+  for (i32 d = 0; d < 3; d++) part.nb[d] = baseGridSize[d]/blockSize;
   for (i32 d = 0; d < 3; d++) {
-    i32 q = nb[d]/part.p[d], rem = nb[d]%part.p[d];
+    i32 q = part.nb[d]/part.p[d], rem = part.nb[d]%part.p[d];
     part.b0[d] = part.c[d]*q + (part.c[d] < rem ? part.c[d] : rem);
     part.b1[d] = part.b0[d] + q + (part.c[d] < rem ? 1 : 0);
   }
+
+  // Fill the coarse ownership map: for every level-0 base block, which rank owns
+  // it.  This particular fill IS the regular box split (invert the b0/b1 even
+  // split per axis), so behaviour is identical to the previous formula -- but any
+  // partition (SFC cut, load balance) is now just a different fill of this array.
+  cudaMallocManaged(&ownerBase, (size_t)part.nb[0]*part.nb[1]*part.nb[2]*sizeof(i32));
+  for (i32 k = 0; k < part.nb[2]; k++)
+  for (i32 j = 0; j < part.nb[1]; j++)
+  for (i32 i = 0; i < part.nb[0]; i++) {
+    i32 idx3[3] = {i, j, k}, col[3];
+    for (i32 d = 0; d < 3; d++) {
+      i32 q = part.nb[d]/part.p[d], rem = part.nb[d]%part.p[d], lo = 0, c = 0;
+      for (c = 0; c < part.p[d]; c++) { i32 w = q + (c<rem?1:0); if (idx3[d] < lo+w) break; lo += w; }
+      col[d] = c;
+    }
+    ownerBase[i + part.nb[0]*(j + part.nb[1]*k)] = col[0] + part.p[0]*(col[1] + part.p[1]*col[2]);
+  }
+  cudaDeviceSynchronize();
 }
 
-// rank owning a block: map its level-0 ancestor base block to a process column.
+// rank owning a block: index the coarse ownership map by the block's level-0
+// ancestor (ib>>lvl, ...).  Exterior/ghost indices clamp to the edge base block.
 __host__ __device__ i32 MultiLevelSparseGrid::ownerPE(i32 lvl, i32 ib, i32 jb, i32 kb) {
-  i32 a[3]  = { ib >> lvl, jb >> lvl, kb >> lvl };
-  i32 nb[3] = { baseGridSize[0]/blockSize, baseGridSize[1]/blockSize, baseGridSize[2]/blockSize };
-  i32 col[3];
-  for (i32 d = 0; d < 3; d++) {
-    i32 x = a[d];
-    if (x < 0) x = 0;  if (x >= nb[d]) x = nb[d]-1;   // exterior ghost -> edge PE
-    i32 q = nb[d]/part.p[d], rem = nb[d]%part.p[d], lo = 0, c = 0;
-    for (c = 0; c < part.p[d]; c++) {
-      i32 w = q + (c < rem ? 1 : 0);
-      if (x < lo + w) break;
-      lo += w;
-    }
-    col[d] = c;
-  }
-  return col[0] + part.p[0]*(col[1] + part.p[1]*col[2]);
+  i32 i = ib >> lvl, j = jb >> lvl, k = kb >> lvl;
+  if (i < 0) i = 0;  if (i >= part.nb[0]) i = part.nb[0]-1;
+  if (j < 0) j = 0;  if (j >= part.nb[1]) j = part.nb[1]-1;
+  if (k < 0) k = 0;  if (k >= part.nb[2]) k = part.nb[2]-1;
+  return ownerBase[i + part.nb[0]*(j + part.nb[1]*k)];
 }
 
 __host__ __device__ bool MultiLevelSparseGrid::isOwnedBlock(i32 lvl, i32 ib, i32 jb, i32 kb) {
@@ -143,7 +167,15 @@ __host__ __device__ bool MultiLevelSparseGrid::isOwnedBlock(i32 lvl, i32 ib, i32
 void MultiLevelSparseGrid::initializeBaseGrid(void) {
   // the dense base grid must fit in the block pool (this path activates every
   // base block; sparse users that skip it are not subject to this bound)
+#ifdef USE_MGPU
+  // each PE materializes only its OWNED base box plus a 2-block ghost ring, so
+  // the bound is the per-PE share, not the full domain -- nBlocksMax can be sized
+  // per GPU and the global grid scales with the number of ranks.
+  assert(((size_t)(part.b1[0]-part.b0[0]+4)*(part.b1[1]-part.b0[1]+4)
+          *(pseudo2D ? 1 : (part.b1[2]-part.b0[2]+4))) < (size_t)nBlocksMax);
+#else
   assert(baseGridSize[0]*baseGridSize[1]*baseGridSize[2]/blockSizeTot < nBlocksMax);
+#endif
   // fill the bLocList with base grid blocks
   dim3 cudaBlockSize3(8,8,8);
   dim3 nCudaBlocks3(baseGridSize[0]/blockSize/8+1, 

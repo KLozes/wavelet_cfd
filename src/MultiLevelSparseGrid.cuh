@@ -60,9 +60,17 @@ public:
     i32 c[3];          // this PE's coords within the process grid
     i32 rank;          // this PE's id
     i32 b0[3], b1[3];  // owned base-block box [b0,b1) per axis (level-0 units)
+    i32 nb[3];         // coarse (level-0) grid dims: baseGridSize/blockSize per axis
   } part;
-  void initPartition(void);                                            // set `part` from comm rank/size
-  __host__ __device__ i32  ownerPE(i32 lvl, i32 ib, i32 jb, i32 kb);   // rank owning a block
+  // The ONLY full-(coarse-)domain array a PE keeps: one owning rank per level-0
+  // base block, replicated on every PE (tiny: nb0*nb1*nb2 int32s ~ a few KB).  It
+  // is a PE's whole map of "which rank holds any block / its halo source"; the
+  // per-block data itself is only this PE's subdomain + a ghost halo.  ownerPE
+  // indexes it, so an arbitrary / load-balanced partition is just a rewrite of
+  // this array (the box split is one particular fill).
+  i32 *ownerBase;
+  void initPartition(void);                                            // set `part` + fill ownerBase
+  __host__ __device__ i32  ownerPE(i32 lvl, i32 ib, i32 jb, i32 kb);   // rank owning a block (ownerBase lookup)
   __host__ __device__ bool isOwnedBlock(i32 lvl, i32 ib, i32 jb, i32 kb);
 #endif
 
