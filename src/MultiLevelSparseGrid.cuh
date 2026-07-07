@@ -50,6 +50,22 @@ public:
   i32 imageCounter;
   i32 nBlocks;
 
+#ifdef USE_MGPU
+  // 3D coarse-grid domain decomposition: the base (level-0) grid is split into a
+  // p[0]*p[1]*p[2] box layout; a block is owned by the PE that owns its level-0
+  // ancestor.  A partition boundary is filled like a periodic/wall ghost, but
+  // from a neighbor PE via NVSHMEM instead of a local copy.
+  struct Partition {
+    i32 p[3];          // process-grid dims (px,py,pz)
+    i32 c[3];          // this PE's coords within the process grid
+    i32 rank;          // this PE's id
+    i32 b0[3], b1[3];  // owned base-block box [b0,b1) per axis (level-0 units)
+  } part;
+  void initPartition(void);                                            // set `part` from comm rank/size
+  __host__ __device__ i32  ownerPE(i32 lvl, i32 ib, i32 jb, i32 kb);   // rank owning a block
+  __host__ __device__ bool isOwnedBlock(i32 lvl, i32 ib, i32 jb, i32 kb);
+#endif
+
   u64 *bLocList;        // block location codes
   i32 *bIdxList;        // block memory indices
 

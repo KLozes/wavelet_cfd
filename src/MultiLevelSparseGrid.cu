@@ -4,6 +4,9 @@
 #include <png++/png.hpp>
 #include "MultiLevelSparseGrid.cuh"
 #include "MultiLevelSparseGridKernels.cuh"
+#ifdef USE_MGPU
+#include "Comm.cuh"
+#endif
 
 MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_, i32 nLvls_, i32 nFields_, bool lean_) {
 
@@ -66,8 +69,15 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   // request zero base fields, in which case fieldData is not allocated.
   fieldData = nullptr;
   if (nFields > 0) {
-    cudaMallocManaged(&fieldData, (size_t)nFields*(size_t)blockSizeTot*(size_t)nBlocksMax*sizeof(real));
-    cudaMemset(fieldData, 0, (size_t)nFields*(size_t)blockSizeTot*(size_t)nBlocksMax*sizeof(real));
+    size_t bytes = (size_t)nFields*(size_t)blockSizeTot*(size_t)nBlocksMax*sizeof(real);
+#ifdef USE_MGPU
+    // fieldData lives on the symmetric heap so neighbor PEs can fetch halo
+    // blocks by one-sided get (loopback backend: plain managed memory).
+    fieldData = (real*)comm::mallocSym(bytes);
+#else
+    cudaMallocManaged(&fieldData, bytes);
+#endif
+    cudaMemset(fieldData, 0, bytes);
   }
 
   cudaDeviceSynchronize();
@@ -80,9 +90,55 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
   cudaFree(prntIdxList);
   cudaFree(nbrIdxList);
   cudaFree(cFlagsList);
+#ifdef USE_MGPU
+  comm::freeSym(fieldData);
+#else
   cudaFree(fieldData);
+#endif
   cudaFree(imageDataX);
 }
+
+#ifdef USE_MGPU
+// 3D coarse-grid partition of the base grid across comm::size() PEs.  Even split
+// per axis with the remainder handed to the low process-columns.
+void MultiLevelSparseGrid::initPartition(void) {
+  i32 P = comm::size();
+  part.p[0] = P; part.p[1] = 1; part.p[2] = 1;   // 1-D x-split by default (px=P)
+  part.rank = comm::rank();
+  part.c[0] =  part.rank %  part.p[0];
+  part.c[1] = (part.rank /  part.p[0]) % part.p[1];
+  part.c[2] =  part.rank / (part.p[0]  * part.p[1]);
+  i32 nb[3] = { baseGridSize[0]/blockSize, baseGridSize[1]/blockSize, baseGridSize[2]/blockSize };
+  for (i32 d = 0; d < 3; d++) {
+    i32 q = nb[d]/part.p[d], rem = nb[d]%part.p[d];
+    part.b0[d] = part.c[d]*q + (part.c[d] < rem ? part.c[d] : rem);
+    part.b1[d] = part.b0[d] + q + (part.c[d] < rem ? 1 : 0);
+  }
+}
+
+// rank owning a block: map its level-0 ancestor base block to a process column.
+__host__ __device__ i32 MultiLevelSparseGrid::ownerPE(i32 lvl, i32 ib, i32 jb, i32 kb) {
+  i32 a[3]  = { ib >> lvl, jb >> lvl, kb >> lvl };
+  i32 nb[3] = { baseGridSize[0]/blockSize, baseGridSize[1]/blockSize, baseGridSize[2]/blockSize };
+  i32 col[3];
+  for (i32 d = 0; d < 3; d++) {
+    i32 x = a[d];
+    if (x < 0) x = 0;  if (x >= nb[d]) x = nb[d]-1;   // exterior ghost -> edge PE
+    i32 q = nb[d]/part.p[d], rem = nb[d]%part.p[d], lo = 0, c = 0;
+    for (c = 0; c < part.p[d]; c++) {
+      i32 w = q + (c < rem ? 1 : 0);
+      if (x < lo + w) break;
+      lo += w;
+    }
+    col[d] = c;
+  }
+  return col[0] + part.p[0]*(col[1] + part.p[1]*col[2]);
+}
+
+__host__ __device__ bool MultiLevelSparseGrid::isOwnedBlock(i32 lvl, i32 ib, i32 jb, i32 kb) {
+  return isInteriorBlock(lvl, ib, jb, kb) && ownerPE(lvl, ib, jb, kb) == part.rank;
+}
+#endif
 
 void MultiLevelSparseGrid::initializeBaseGrid(void) {
   // the dense base grid must fit in the block pool (this path activates every
@@ -266,11 +322,21 @@ void MultiLevelSparseGrid::paintField(i32 f, const char *fileName) {
 
 void MultiLevelSparseGrid::paint(void) {
   cudaDeviceSynchronize();
-  char fileName[64];
+  char fileName[80];
+#ifdef USE_MGPU
+  // each PE renders its own subdomain tile to a rank-prefixed file so ranks do
+  // not collide (single-rank output keeps the original names for A/B diffing).
+  // NOTE: computeImageData reads fieldData on the host; under the real NVSHMEM
+  // backend that must first be staged to host memory (loopback is managed, ok).
+  char pre[16] = "";
+  if (comm::size() > 1) sprintf(pre, "r%d_", comm::rank());
+#else
+  const char *pre = "";
+#endif
   // f = -1 grid, 0 Rho, 1 RhoU, 2 RhoV, 3 RhoW, 4 RhoE (total energy)
   for (i32 f=-1; f<5; f++) {
-    if (f >= 0) sprintf(fileName, "output/image%02d_%05d.png", f, imageCounter);
-    else        sprintf(fileName, "output/grid_%05d.png", imageCounter);
+    if (f >= 0) sprintf(fileName, "output/%simage%02d_%05d.png", pre, f, imageCounter);
+    else        sprintf(fileName, "output/%sgrid_%05d.png", pre, imageCounter);
     paintField(f, fileName);
   }
   imageCounter++;

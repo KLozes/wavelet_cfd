@@ -52,6 +52,17 @@ WAVEWSDF_OBJS = $(patsubst %,$(OBJ_DIR)/wavewsdf/%.cu.o,$(WAVEWSDF_SRCS))
 WAVE3D_DP_DEFS = -DUSE_DOUBLE
 WAVE3D_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_dp/%.cu.o,$(WAVE3D_SRCS))
 
+# multi-GPU (domain-decomposed) Euler build.  Same solver + the Comm layer and a
+# comm-aware main; -DUSE_MGPU turns on the decomposition paths.  By default it
+# builds the LOOPBACK backend (single process/PE, no external deps) so it runs on
+# a box without NVSHMEM/MPI and can be A/B'd against wave3d at P=1.  For a real
+# multi-GPU target, add:  -DUSE_NVSHMEM -I$(NVSHMEM_HOME)/include, and to the link
+# line:  -rdc=true -L$(NVSHMEM_HOME)/lib -lnvshmem_host -lnvshmem_device -lmpi
+WAVE3D_MGPU_DEFS = -DNCELLS_MAX=64000000 -DUSE_MGPU
+WAVE3D_MGPU_SRCS = HashTable MultiLevelSparseGrid MultiLevelSparseGridKernels \
+                   CompressibleSolver CompressibleSolverKernels Comm MainMgpu
+WAVE3D_MGPU_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_mgpu/%.cu.o,$(WAVE3D_MGPU_SRCS))
+
 all: wave3d wavesdf wavewsdf
 
 wave3d: $(WAVE3D_OBJS)
@@ -64,6 +75,9 @@ wavewsdf: $(WAVEWSDF_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
 wave3d_dp: $(WAVE3D_DP_OBJS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
+
+wave3d_mgpu: $(WAVE3D_MGPU_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
 # ---- build rules (one per executable, so each gets its own NCELLS_MAX) ------
@@ -79,10 +93,13 @@ $(OBJ_DIR)/wavewsdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavewsdf
 $(OBJ_DIR)/wave3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d_dp
 	$(NVCC) $(NVCCFLAGS) $(WAVE3D_DP_DEFS) -I./$(SRC_DIR) -dc $< -o $@
 
-$(OBJ_DIR)/wave3d $(OBJ_DIR)/wavesdf $(OBJ_DIR)/wavewsdf $(OBJ_DIR)/wave3d_dp:
+$(OBJ_DIR)/wave3d_mgpu/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d_mgpu
+	$(NVCC) $(NVCCFLAGS) $(WAVE3D_MGPU_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+
+$(OBJ_DIR)/wave3d $(OBJ_DIR)/wavesdf $(OBJ_DIR)/wavewsdf $(OBJ_DIR)/wave3d_dp $(OBJ_DIR)/wave3d_mgpu:
 	mkdir -p $@
 
 clean:
-	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf
+	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf wave3d_dp wave3d_mgpu
 
 .PHONY: all clean
