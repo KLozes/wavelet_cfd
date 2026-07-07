@@ -754,6 +754,9 @@ void CompressibleSolver::totalConserved(double &mass, double &momx, double &ener
     i32 gy = baseGridSize[1]/blockSize*powi(2,lvl);
     i32 gz = pseudo2D ? baseGridSize[2]/blockSize : baseGridSize[2]/blockSize*powi(2,lvl);
     if (ib < 0 || jb < 0 || kb < 0 || ib >= gx || jb >= gy || kb >= gz) continue;
+#ifdef USE_MGPU
+    if (!isOwnedBlock(lvl, ib, jb, kb)) continue;   // owned-only: exclude ghost duplicates
+#endif
     double dV = (double)(domainSize[0]/double(baseGridSize[0]*powi(2,lvl)))
               * (double)(domainSize[1]/double(baseGridSize[1]*powi(2,lvl)))
               * (double)(pseudo2D ? domainSize[2]/double(baseGridSize[2])
