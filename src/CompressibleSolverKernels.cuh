@@ -31,9 +31,12 @@ __global__ void hancockPredictKernel(CompressibleSolver &grid);
 __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage);
 
 #ifdef USE_MGPU
-__global__ void haloExchangeKernel(CompressibleSolver &grid, void **peers, i32 fOff, i32 nf);
 __global__ void markGhostsKernel(CompressibleSolver &grid);
 __global__ void rebuildGhostsKernel(CompressibleSolver &grid, void **peers);
+__global__ void countGhostPeersKernel(CompressibleSolver &grid);
+__global__ void fillHaloPlanKernel(CompressibleSolver &grid, void **peers);
+__global__ void packHaloKernel(CompressibleSolver &grid, void **peers, i32 nPE, i32 fOff, i32 nf);
+__global__ void unpackHaloKernel(CompressibleSolver &grid, i32 p, i32 fOff, i32 nf);
 #endif
 
 __global__ void copyToOldFieldsKernel(CompressibleSolver &grid);

@@ -129,6 +129,11 @@ public:
       tTotal = 0.0;
       tForwardUs = 0;
       tSortUs = 0;
+#ifdef USE_MGPU
+      haloSlot = 0;
+      haloCnt = haloGhost = haloSrc = haloFill = nullptr;
+      haloSend = haloRecv = nullptr;
+#endif
   }
 
   void initialize(void);
@@ -148,6 +153,18 @@ public:
 #ifdef USE_MGPU
   void haloExchange(i32 fOff, i32 nf);   // fill partition-boundary ghost blocks from owners
   void rebuildGhosts(void);              // recreate the 2-ring ghost layer from neighbors' blocks
+  void buildHaloPlan(void);              // per-peer ghost block lists (once per adaptation)
+  // Batched halo plan (rebuilt each adaptation, reused every exchange).  Grouped
+  // by peer into fixed slots so the transfer is ONE contiguous copy per peer
+  // instead of thousands of per-block gets.  haloCnt/haloGhost/haloSrc/haloSend
+  // are read by peers (via the peer table), so they are plain managed members.
+  i32   haloSlot;      // blocks per peer region (identical on every PE)
+  i32  *haloCnt;       // [P]              # ghosts I receive from each peer
+  i32  *haloGhost;     // [P*haloSlot]     my local ghost block index (per peer)
+  i32  *haloSrc;       // [P*haloSlot]     owner's source block index (same order)
+  i32  *haloFill;      // [P]              scratch fill counter
+  real *haloSend;      // [P*haloSlot*NEVOLVE*blockSizeTot]  pack buffer (peers read their region)
+  real *haloRecv;      // [haloSlot*NEVOLVE*blockSizeTot]    unpack scratch (local)
 #endif
 
   void restrictFields();

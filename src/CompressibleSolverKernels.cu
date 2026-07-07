@@ -1190,33 +1190,6 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
 }
 
 #ifdef USE_MGPU
-// Partition-boundary halo exchange (loopback): fill each ghost block (an interior
-// block this PE does not own) by copying fOff..fOff+nf-1 from the owning PE's
-// matching block.  peers[] is the comm handle table (peer CompressibleSolver*);
-// all PEs share the GPU/address space, so the owner's fields are directly
-// addressable.  Runs between lock-step barriers so the owner's data is current.
-__global__ void haloExchangeKernel(CompressibleSolver &grid, void **peers, i32 fOff, i32 nf) {
-
-  START_CELL_LOOP
-
-    u64 loc = grid.bLocList[bIdx];
-    i32 lvl, ib, jb, kb;
-    grid.decode(loc, lvl, ib, jb, kb);
-
-    if (grid.isInteriorBlock(lvl, ib, jb, kb) && !grid.isOwnedBlock(lvl, ib, jb, kb)) {
-      CompressibleSolver *pg = (CompressibleSolver*)peers[grid.ownerPE(lvl, ib, jb, kb)];
-      i32 srcBlk = pg->hashTable.getValue(loc);
-      if (srcBlk != bEmpty) {
-        i32 lc = cIdx - bIdx*blockSizeTot;               // cell offset within block
-        i32 src = srcBlk*blockSizeTot + lc;
-        for (i32 f = fOff; f < fOff + nf; f++)
-          grid.getField(f)[cIdx] = pg->getField(f)[src];
-      }
-    }
-
-  END_CELL_LOOP
-}
-
 // Rebuild the partition ghost layer after an owned-only adaptGrid: for each owned
 // block, activate the 2-block ring of same-level neighbor-owned blocks that the
 // owning PE actually has (queried from its hash).  Iterating owned blocks at all
@@ -1262,6 +1235,74 @@ __global__ void rebuildGhostsKernel(CompressibleSolver &grid, void **peers) {
     }
 
   END_BLOCK_LOOP
+}
+
+// ---- batched halo plan + pack/unpack ------------------------------------
+// Count how many ghost blocks this PE receives from each peer.
+__global__ void countGhostPeersKernel(CompressibleSolver &grid) {
+  START_BLOCK_LOOP
+    u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      i32 lvl, ib, jb, kb; grid.decode(loc, lvl, ib, jb, kb);
+      if (grid.isInteriorBlock(lvl,ib,jb,kb) && !grid.isOwnedBlock(lvl,ib,jb,kb))
+        atomicAdd(&grid.haloCnt[grid.ownerPE(lvl,ib,jb,kb)], 1);
+    }
+  END_BLOCK_LOOP
+}
+
+// Fill the per-peer (ghost block, owner's source block) lists.  Order is this
+// PE's block order; the owner packs in the same order by reading these back.
+__global__ void fillHaloPlanKernel(CompressibleSolver &grid, void **peers) {
+  START_BLOCK_LOOP
+    u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      i32 lvl, ib, jb, kb; grid.decode(loc, lvl, ib, jb, kb);
+      if (grid.isInteriorBlock(lvl,ib,jb,kb) && !grid.isOwnedBlock(lvl,ib,jb,kb)) {
+        i32 owner = grid.ownerPE(lvl,ib,jb,kb);
+        CompressibleSolver *pg = (CompressibleSolver*)peers[owner];
+        i32 src = pg->hashTable.getValue(loc);
+        if (src != bEmpty) {
+          i32 i = atomicAdd(&grid.haloFill[owner], 1);
+          if (i < grid.haloSlot) {
+            grid.haloGhost[owner*grid.haloSlot + i] = bIdx;   // my ghost slot
+            grid.haloSrc  [owner*grid.haloSlot + i] = src;    // owner's source block
+          }
+        }
+      }
+    }
+  END_BLOCK_LOOP
+}
+
+// Pack the blocks each peer requested FROM me into my send buffer, contiguous
+// per peer as [block][field][cell] -- one dense region per receiver.
+__global__ void packHaloKernel(CompressibleSolver &grid, void **peers, i32 nPE, i32 fOff, i32 nf) {
+  i32 slot = grid.haloSlot, bst = blockSizeTot, fs = nf*bst;
+  i32 me = grid.part.rank;
+  for (i64 tid = (i64)blockIdx.x*blockDim.x+threadIdx.x; tid < (i64)nPE*slot*bst; tid += (i64)gridDim.x*blockDim.x) {
+    i32 cell = tid % bst;
+    i32 i    = (tid / bst) % slot;
+    i32 r    = tid / bst / slot;
+    if (r == me) continue;
+    CompressibleSolver *pr = (CompressibleSolver*)peers[r];
+    if (i >= pr->haloCnt[me]) continue;                 // r wants haloCnt[me] blocks from me
+    i32 srcBlk = pr->haloSrc[me*slot + i];              // ...specifically these of MY blocks
+    real *dst = grid.haloSend + (size_t)(r*slot + i)*fs;
+    for (i32 f = 0; f < nf; f++)
+      dst[f*bst + cell] = grid.getField(fOff+f)[(size_t)srcBlk*bst + cell];
+  }
+}
+
+// Scatter one peer's received region into my ghost blocks for that peer.
+__global__ void unpackHaloKernel(CompressibleSolver &grid, i32 p, i32 fOff, i32 nf) {
+  i32 slot = grid.haloSlot, bst = blockSizeTot, fs = nf*bst;
+  i32 cnt = grid.haloCnt[p];
+  for (i64 tid = (i64)blockIdx.x*blockDim.x+threadIdx.x; tid < (i64)cnt*bst; tid += (i64)gridDim.x*blockDim.x) {
+    i32 cell = tid % bst, i = tid / bst;
+    i32 ghostBlk = grid.haloGhost[p*slot + i];
+    real *src = grid.haloRecv + (size_t)i*fs;
+    for (i32 f = 0; f < nf; f++)
+      grid.getField(fOff+f)[(size_t)ghostBlk*bst + cell] = src[f*bst + cell];
+  }
 }
 #endif
 

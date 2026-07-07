@@ -257,12 +257,62 @@ void CompressibleSolver::updateFields(i32 stage) {
 // Refresh partition-boundary ghost blocks from their owning PEs.  Bracketed by
 // barriers so every PE has finished writing its owned data before anyone reads
 // it, and no PE overwrites before all reads complete.
+// Build the per-peer halo plan once per adaptation: count the ghosts received
+// from each peer, size the (globally uniform) per-peer slot, and fill the
+// (ghost block, owner source block) lists.  The exchanges then reuse this plan.
+void CompressibleSolver::buildHaloPlan(void) {
+  if (comm::size() == 1) return;
+  i32 nPE = comm::size();
+  if (!haloCnt) {
+    cudaMallocManaged(&haloCnt,  nPE*sizeof(i32));
+    cudaMallocManaged(&haloFill, nPE*sizeof(i32));
+  }
+  cudaMemset(haloCnt, 0, nPE*sizeof(i32));
+  countGhostPeersKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  i32 maxc = 0; for (i32 p = 0; p < nPE; p++) if (haloCnt[p] > maxc) maxc = haloCnt[p];
+  real mc = (real)maxc; comm::allreduceMax(&mc, 1);          // slot must match on every PE
+  i32 needSlot = (i32)mc + 8;                                // small margin
+  if (needSlot > haloSlot) {                                 // (re)allocate, grow-only
+    cudaFree(haloGhost); cudaFree(haloSrc); comm::freeSym(haloSend); cudaFree(haloRecv);
+    haloSlot = needSlot;
+    size_t fs = (size_t)NEVOLVE*blockSizeTot;
+    cudaMallocManaged(&haloGhost, (size_t)nPE*haloSlot*sizeof(i32));
+    cudaMallocManaged(&haloSrc,   (size_t)nPE*haloSlot*sizeof(i32));
+    haloSend = (real*)comm::mallocSym((size_t)nPE*haloSlot*fs*sizeof(real));
+    cudaMallocManaged(&haloRecv,  (size_t)haloSlot*fs*sizeof(real));
+  }
+  comm::barrier();                                           // all PEs share haloSlot before the fill (peers read it)
+  cudaMemset(haloFill, 0, nPE*sizeof(i32));
+  fillHaloPlanKernel<<<cudaGridSize, cudaBlockSize>>>(*this, comm::peers());
+  cudaDeviceSynchronize();
+  comm::barrier();                                           // lists ready before any peer packs against them
+}
+
+// Batched halo exchange: each PE packs the blocks its peers requested into one
+// dense region per receiver, then each PE pulls its region from every owner in a
+// single contiguous transfer and scatters it into its ghost blocks.  Reuses the
+// plan from buildHaloPlan (topology only changes at adaptation).
 void CompressibleSolver::haloExchange(i32 fOff, i32 nf) {
   if (comm::size() == 1) return;
+  i32 nPE = comm::size();
+  size_t fs = (size_t)nf*blockSizeTot;
   cudaDeviceSynchronize();
   comm::barrier();
-  haloExchangeKernel<<<cudaGridSize, cudaBlockSize>>>(*this, comm::peers(), fOff, nf);
+  packHaloKernel<<<cudaGridSize, cudaBlockSize>>>(*this, comm::peers(), nPE, fOff, nf);
   cudaDeviceSynchronize();
+  comm::barrier();                                           // every owner's send buffer is packed
+  for (i32 p = 0; p < nPE; p++) {
+    if (p == part.rank || haloCnt[p] == 0) continue;
+    CompressibleSolver *pp = (CompressibleSolver*)comm::peers()[p];
+    // ONE contiguous transfer: pull owner p's region packed for me (loopback:
+    // memcpy from the peer's send buffer; NVSHMEM: nvshmem_getmem on the
+    // symmetric heap at offset part.rank*haloSlot*fs from PE p).
+    cudaMemcpy(haloRecv, pp->haloSend + (size_t)(part.rank*haloSlot)*fs,
+               (size_t)haloCnt[p]*fs*sizeof(real), cudaMemcpyDefault);
+    unpackHaloKernel<<<cudaGridSize, cudaBlockSize>>>(*this, p, fOff, nf);
+    cudaDeviceSynchronize();
+  }
   comm::barrier();
 }
 
@@ -283,6 +333,7 @@ void CompressibleSolver::rebuildGhosts(void) {
   cudaDeviceSynchronize();
   sortBlocks();                                                  // compact + rebuild indices
   comm::barrier();
+  buildHaloPlan();                                              // refresh the per-peer exchange plan
 }
 #endif
 
