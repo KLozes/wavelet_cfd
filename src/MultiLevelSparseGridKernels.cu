@@ -169,7 +169,15 @@ __global__ void addFineBlocksKernel(MultiLevelSparseGrid &grid) {
     u64 loc = grid.bLocList[bIdx];
     grid.decode(loc, lvl, ib, jb, kb);
 
-    if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
+    bool refineBlk = grid.isInteriorBlock(lvl, ib, jb, kb);
+#ifdef USE_MGPU
+    // multi-GPU: a PE refines (and keeps dense level 1 on) only its OWNED blocks.
+    // adaptGrid thus produces owned blocks + the domain-exterior ring; the
+    // partition ghost layer is rebuilt separately (rebuildGhosts) from the
+    // neighbors' actual blocks, so it can be pruned as features move.
+    refineBlk = refineBlk && grid.isOwnedBlock(lvl, ib, jb, kb);
+#endif
+    if (refineBlk) {
       if (lvl == 0 || grid.bFlagsList[bIdx] == REFINE) {
         // add finer blocks if not already on finest level
         grid.bFlagsList[bIdx] = KEEP;
@@ -219,7 +227,11 @@ __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid) {
     u64 loc = grid.bLocList[bIdx];
     grid.decode(loc, lvl, ib, jb, kb);
 
-    if (grid.isInteriorBlock(lvl, ib, jb, kb) && grid.bFlagsList[bIdx] == KEEP) {
+    bool gradeBlk = grid.isInteriorBlock(lvl, ib, jb, kb) && grid.bFlagsList[bIdx] == KEEP;
+#ifdef USE_MGPU
+    gradeBlk = gradeBlk && grid.isOwnedBlock(lvl, ib, jb, kb);   // grade only owned; ghosts via rebuild
+#endif
+    if (gradeBlk) {
       // add neighboring blocks (x-y only in pseudo2D).  Periodic: wrap the target
       // into the interior so an edge block grades its opposite-edge image (a real
       // interior block) rather than a lone exterior ghost -- keeping the two seam
@@ -230,6 +242,11 @@ __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid) {
           for (i32 di=-1; di<=1; di++) {
             i32 ni=ib+di, nj=jb+dj, nk=kb+dk;
             if (grid.periodic) grid.wrapBlockPeriodic(lvl, ni, nj, nk);
+#ifdef USE_MGPU
+            // don't create partition ghosts here (rebuildGhosts does, mirroring
+            // the neighbor's real refinement); only conform the owned region.
+            if (grid.isInteriorBlock(lvl, ni, nj, nk) && !grid.isOwnedBlock(lvl, ni, nj, nk)) continue;
+#endif
             grid.activateBlock(lvl, ni, nj, nk);
           }
         }
@@ -248,7 +265,11 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
     u64 loc = grid.bLocList[bIdx];
     grid.decode(loc, lvl, ib, jb, kb);
 
-    if (grid.isInteriorBlock(lvl, ib, jb, kb) && lvl > 2 && grid.bFlagsList[bIdx] == KEEP) {
+    bool reconBlk = grid.isInteriorBlock(lvl, ib, jb, kb) && lvl > 2 && grid.bFlagsList[bIdx] == KEEP;
+#ifdef USE_MGPU
+    reconBlk = reconBlk && grid.isOwnedBlock(lvl, ib, jb, kb);
+#endif
+    if (reconBlk) {
       // periodic: wrap the parent target so a near-seam block's coarse
       // reconstruction support is built on the opposite edge too (identity for
       // interior targets), keeping the image's parent chain present.
@@ -258,6 +279,9 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
           for (i32 di=-1; di<=1; di++) {
             i32 pi=ib/2+di, pj=jb/2+dj, pk=kb/2+dk;
             if (grid.periodic) grid.wrapBlockPeriodic(lvl-1, pi, pj, pk);
+#ifdef USE_MGPU
+            if (grid.isInteriorBlock(lvl-1, pi, pj, pk) && !grid.isOwnedBlock(lvl-1, pi, pj, pk)) continue;
+#endif
             grid.activateBlock(lvl-1, pi, pj, pk);
           }
         }

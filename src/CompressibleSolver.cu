@@ -34,6 +34,13 @@ void CompressibleSolver::initialize(void) {
   primitiveToConservative();
   sortBlocks();
   setBoundaryConditions();
+#ifdef USE_MGPU
+  comm::registerPeer(this);   // publish this PE's grid early so rebuildGhosts can query peers
+  rebuildGhosts();            // base-level partition ghost ring
+  setInitialConditions();     // fill the ghost cells (analytic IC, global position)
+  primitiveToConservative();
+  setBoundaryConditions();
+#endif
   cudaDeviceSynchronize();
   printf("nblocks %d\n", hashTable.nKeys);
   paint();
@@ -41,20 +48,22 @@ void CompressibleSolver::initialize(void) {
   // build the adaptive grid by repeatedly transforming / refining
   for (i32 lvl=1; lvl<nLvls; lvl++) {
     forwardWaveletTransform();
-    adaptGrid();
+    adaptGrid();               // refines OWNED blocks (multi-GPU); domain-exterior ring
     setInitialConditions();
     primitiveToConservative();
     setBoundaryConditions();
     sortBlocks();
+#ifdef USE_MGPU
+    rebuildGhosts();           // (re)create the partition ghost blocks at this level
+    setInitialConditions();    // fill the new ghost cells from the analytic IC
+    primitiveToConservative();
+    setBoundaryConditions();
+#endif
     cudaDeviceSynchronize();
     printf("nblocks %d\n", hashTable.nKeys);
     paint();
   }
   zeroAccumulator();   // the cascade dirtied the shared bank (LSRK needs 0)
-#ifdef USE_MGPU
-  comm::registerPeer(this);   // publish this PE's grid so peers can fetch halos
-  haloExchange(0, NEVOLVE);   // seed the ghost blocks from their owners
-#endif
 }
 
 // zero the shared bank so the LSRK accumulation (A_1 = 0) starts clean; the
@@ -76,15 +85,27 @@ real CompressibleSolver::step(real tStep) {
     clock.tick();
     // dynamic wavelet adaptation; skipped for a static (fixed) refinement grid
     if (iter % 4 == 0 && nLvls > 1 && !staticGrid) {
+#ifdef USE_MGPU
+      haloExchange(0, NEVOLVE);   // fill last cycle's ghosts before the detail computation
+#endif
       restrictFields();
       cudaDeviceSynchronize(); sub.tick();
       forwardWaveletTransform();
       cudaDeviceSynchronize(); sub.tock(); tForwardUs += sub.duration().count();
       adaptGrid();
+      // The inverse fills new owned blocks from the F_OLD snapshot via the
+      // parents' (valid) neighbor indices.  The old ghost layer is kept through
+      // adaptGrid (flagged KEEP, not propagated since grading is owned-only) so
+      // those coarse-ghost parents are present and F_OLD-valid here.  sortBlocks
+      // clobbers F_OLD (permutation scratch), so it MUST come after the inverse.
       inverseWaveletTransform();
       cudaDeviceSynchronize(); sub.tick();
       sortBlocks();
       cudaDeviceSynchronize(); sub.tock(); tSortUs += sub.duration().count();
+#ifdef USE_MGPU
+      rebuildGhosts();            // prune the stale ghosts, recreate the 2-ring from neighbors
+      haloExchange(0, NEVOLVE);   // fill the fresh ghost blocks
+#endif
       setBoundaryConditions();
       // the wavelet snapshot / sort buffer dirtied the shared bank; the LSRK
       // accumulator must be zero when stage 1 begins (A_1 = 0)
@@ -131,6 +152,9 @@ real CompressibleSolver::step(real tStep) {
         restrictFields();
         interpolateFields();
         setBoundaryConditions();
+#ifdef USE_MGPU
+        haloExchange(0, NEVOLVE);   // refresh ghosts after the coarse/fine reconstruction
+#endif
       }
     }
     cudaDeviceSynchronize();
@@ -241,6 +265,25 @@ void CompressibleSolver::haloExchange(i32 fOff, i32 nf) {
   comm::barrier();
   haloExchangeKernel<<<cudaGridSize, cudaBlockSize>>>(*this, comm::peers(), fOff, nf);
   cudaDeviceSynchronize();
+  comm::barrier();
+}
+
+// Prune the stale partition ghosts and recreate the exact 2-ring from the
+// neighbors' current blocks, then re-sort so everything gets valid indices.
+// Called after the post-adaptGrid sortBlocks (compact list, valid hashes): the
+// ghost layer thus tracks — and prunes with — the moving grid, so each PE holds
+// only its subdomain + a thin halo (a real decomposition, not the full grid).
+void CompressibleSolver::rebuildGhosts(void) {
+  if (comm::size() == 1) return;
+  cudaDeviceSynchronize();
+  markGhostsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);      // old ghosts -> DELETE; owned/exterior -> KEEP
+  comm::barrier();                                               // every PE's hash valid
+  rebuildGhostsKernel<<<cudaGridSize, cudaBlockSize>>>(*this, comm::peers());  // 2-ring: un-deletes / adds needed ghosts
+  cudaDeviceSynchronize();
+  nBlocks = hashTable.nKeys;
+  deleteDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this);      // drop the ghosts no longer needed
+  cudaDeviceSynchronize();
+  sortBlocks();                                                  // compact + rebuild indices
   comm::barrier();
 }
 #endif

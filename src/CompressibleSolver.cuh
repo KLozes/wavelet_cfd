@@ -147,6 +147,7 @@ public:
   void zeroAccumulator(void);   // zero the shared bank before LSRK stage 1
 #ifdef USE_MGPU
   void haloExchange(i32 fOff, i32 nf);   // fill partition-boundary ghost blocks from owners
+  void rebuildGhosts(void);              // recreate the 2-ring ghost layer from neighbors' blocks
 #endif
 
   void restrictFields();

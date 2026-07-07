@@ -32,6 +32,8 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage);
 
 #ifdef USE_MGPU
 __global__ void haloExchangeKernel(CompressibleSolver &grid, void **peers, i32 fOff, i32 nf);
+__global__ void markGhostsKernel(CompressibleSolver &grid);
+__global__ void rebuildGhostsKernel(CompressibleSolver &grid, void **peers);
 #endif
 
 __global__ void copyToOldFieldsKernel(CompressibleSolver &grid);

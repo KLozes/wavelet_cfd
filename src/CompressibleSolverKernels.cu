@@ -1216,6 +1216,53 @@ __global__ void haloExchangeKernel(CompressibleSolver &grid, void **peers, i32 f
 
   END_CELL_LOOP
 }
+
+// Rebuild the partition ghost layer after an owned-only adaptGrid: for each owned
+// block, activate the 2-block ring of same-level neighbor-owned blocks that the
+// owning PE actually has (queried from its hash).  Iterating owned blocks at all
+// levels yields both the fine seam ghosts and, through each owned block's own
+// ring, the coarser parent-level ghosts the wavelet DD stencil needs.  Because it
+// mirrors the neighbors' CURRENT refinement and is rebuilt from scratch each
+// adaptation, the ghost layer prunes automatically as features move.
+// flag current ghosts (interior, not owned) for deletion; keep owned + exterior.
+// rebuildGhostsKernel then un-deletes (atomicMax NEW) the ones still needed.
+__global__ void markGhostsKernel(CompressibleSolver &grid) {
+  START_BLOCK_LOOP
+    u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      i32 lvl, ib, jb, kb;
+      grid.decode(loc, lvl, ib, jb, kb);
+      bool ghost = grid.isInteriorBlock(lvl, ib, jb, kb) && !grid.isOwnedBlock(lvl, ib, jb, kb);
+      grid.bFlagsList[bIdx] = ghost ? DELETE : KEEP;
+    }
+  END_BLOCK_LOOP
+}
+
+__global__ void rebuildGhostsKernel(CompressibleSolver &grid, void **peers) {
+
+  START_BLOCK_LOOP
+
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb, kb;
+    grid.decode(loc, lvl, ib, jb, kb);
+
+    if (loc != kEmpty && grid.isOwnedBlock(lvl, ib, jb, kb)) {
+      i32 dkLim = grid.pseudo2D ? 0 : 2;
+      for (i32 dk = -dkLim; dk <= dkLim; dk++)
+      for (i32 dj = -2; dj <= 2; dj++)
+      for (i32 di = -2; di <= 2; di++) {
+        i32 ni = ib+di, nj = jb+dj, nk = kb+dk;
+        if (!grid.isInteriorBlock(lvl, ni, nj, nk)) continue;    // domain-exterior: filled by BC
+        i32 owner = grid.ownerPE(lvl, ni, nj, nk);
+        if (owner == grid.part.rank) continue;                   // owned: already present
+        CompressibleSolver *pg = (CompressibleSolver*)peers[owner];
+        if (pg->hashTable.getValue(grid.encode(lvl, ni, nj, nk)) != bEmpty)
+          grid.activateBlock(lvl, ni, nj, nk);                   // neighbor has it -> create ghost
+      }
+    }
+
+  END_BLOCK_LOOP
+}
 #endif
 
 __global__ void copyToOldFieldsKernel(CompressibleSolver &grid) {
@@ -1426,7 +1473,16 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
 
-    if (lvl < 2) {
+    bool keepCoarse = (lvl < 2);
+#ifdef USE_MGPU
+    keepCoarse = keepCoarse && grid.isOwnedBlock(lvl, ib, jb, kb);   // owned coarse only; ghosts via rebuild
+    // keep the CURRENT ghost layer through adaptGrid (grading is owned-only, so
+    // it does not propagate) so the inverse DD stencil still has its coarse-ghost
+    // parents; the ghosts are then pruned + rebuilt to the exact 2-ring.
+    if (grid.isInteriorBlock(lvl, ib, jb, kb) && !grid.isOwnedBlock(lvl, ib, jb, kb))
+      grid.bFlagsList[bIdx] = KEEP;
+#endif
+    if (keepCoarse) {
       grid.bFlagsList[bIdx] = KEEP;
     }
 
@@ -1434,7 +1490,14 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
     real dx = min(grid.getDx(lvl), min(grid.getDy(lvl), grid.getDz(lvl)));
     real ls = grid.getBoundaryLevelSet(pos);
 
-    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb, kb)) {
+    bool refineHere = (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb, kb));
+#ifdef USE_MGPU
+    // only owned blocks drive detail-based refinement (and KEEP their parent).
+    // Ghosts get no flag -> adaptGrid deletes them; rebuildGhosts recreates the
+    // exact 2-ring from the neighbors' real blocks (so it prunes as features move).
+    refineHere = refineHere && grid.isOwnedBlock(lvl, ib, jb, kb);
+#endif
+    if (refineHere) {
       i32 prntIdx = grid.prntIdxList[bIdx];
       grid.bFlagsList[prntIdx] = KEEP;
 
