@@ -210,8 +210,13 @@ void CompressibleSolver::forwardWaveletTransform(void) {
   // the S-roll in updateFields nor copyToOld ever cleans it (and NaN*0 = NaN
   // defeats the *=0 roll anyway).  waveletPredict reads the snapshot through
   // the same missing-neighbor path, so clear the trash before it is read.
-  for (i32 f = 0; f < NEVOLVE; f++)
+  for (i32 f = 0; f < NEVOLVE; f++) {
     cudaMemset(getField(F_OLD + f) + (u64)bEmpty*blockSizeTot, 0, blockSizeTot*sizeof(real));
+    // live-field trash slice too: interpolate/restrict (and a missing-parent
+    // prediction via bEmpty's self-pointing neighbor row) read live fields
+    // through parent taps, and nothing else ever cleans this slice.
+    cudaMemset(getField(f) + (u64)bEmpty*blockSizeTot, 0, blockSizeTot*sizeof(real));
+  }
   copyToOldFieldsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   forwardWaveletTransformKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   waveletThresholdingKernel<<<cudaGridSize, cudaBlockSize>>>(*this);

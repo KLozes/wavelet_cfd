@@ -65,6 +65,15 @@ __global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid) {
 
 __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
 
+  // The trash block's neighbor row must point at the trash block itself: a
+  // block with a missing parent gets prntIdx == bEmpty, and the prediction
+  // stencil then walks bEmpty's neighbor list.  Self-pointing slots land those
+  // reads in the (zeroed) trash slice -- defined zeros, never stale indices
+  // into arbitrary memory.  (Single-GPU never has missing parents; the MGPU
+  // support closure can gap for one cycle at an advancing rank seam.)
+  if (blockIdx.x == 0 && threadIdx.x < 27)
+    grid.nbrIdxList[(size_t)bEmpty*27 + threadIdx.x] = bEmpty;
+
   START_BLOCK_LOOP
 
     i32 lvl, ib, jb, kb;
@@ -228,9 +237,8 @@ __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid) {
     grid.decode(loc, lvl, ib, jb, kb);
 
     bool gradeBlk = grid.isInteriorBlock(lvl, ib, jb, kb) && grid.bFlagsList[bIdx] == KEEP;
-#ifdef USE_MGPU
-    gradeBlk = gradeBlk && grid.isOwnedBlock(lvl, ib, jb, kb);   // grade only owned; ghosts via rebuild
-#endif
+    // (MGPU: grade from ALL kept interior blocks, owned AND partition ghosts --
+    // a ghost source conforms MY owned region to the neighbor's refinement.)
     if (gradeBlk) {
       // add neighboring blocks (x-y only in pseudo2D).  Periodic: wrap the target
       // into the interior so an edge block grades its opposite-edge image (a real
@@ -242,11 +250,11 @@ __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid) {
           for (i32 di=-1; di<=1; di++) {
             i32 ni=ib+di, nj=jb+dj, nk=kb+dk;
             if (grid.periodic) grid.wrapBlockPeriodic(lvl, ni, nj, nk);
-#ifdef USE_MGPU
-            // don't create partition ghosts here (rebuildGhosts does, mirroring
-            // the neighbor's real refinement); only conform the owned region.
-            if (grid.isInteriorBlock(lvl, ni, nj, nk) && !grid.isOwnedBlock(lvl, ni, nj, nk)) continue;
-#endif
+            // (MGPU: targets are created regardless of ownership -- every rank
+            // builds the full support closure over its owned + ghost region, so
+            // a manufactured block's own support chain is never cut.  Halo-
+            // mirrored real blocks replace manufactured data; rebuildGhosts
+            // prunes whatever the closure no longer needs.)
             grid.activateBlock(lvl, ni, nj, nk);
           }
         }
@@ -267,7 +275,14 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
 
     bool reconBlk = grid.isInteriorBlock(lvl, ib, jb, kb) && lvl > 2 && grid.bFlagsList[bIdx] == KEEP;
 #ifdef USE_MGPU
-    reconBlk = reconBlk && grid.isOwnedBlock(lvl, ib, jb, kb);
+    // Reconstruction support for ALL kept interior fine blocks, owned AND
+    // partition ghosts.  Restricting to owned sources + owned targets (the old
+    // behavior) deadlocks when a refinement front advances across a rank seam:
+    // the owner's seam blocks need parent support INSIDE the neighbor's
+    // still-coarse region -- a block that exists on no rank (the neighbor's
+    // pass skips ghost sources; the owner's pass skips non-owned targets), so
+    // the wavelet prediction taps read the zeroed trash slice and the
+    // reconstruction collapses (NaN at nLvls>=4, where this kernel activates).
 #endif
     if (reconBlk) {
       // periodic: wrap the parent target so a near-seam block's coarse
@@ -279,9 +294,8 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
           for (i32 di=-1; di<=1; di++) {
             i32 pi=ib/2+di, pj=jb/2+dj, pk=kb/2+dk;
             if (grid.periodic) grid.wrapBlockPeriodic(lvl-1, pi, pj, pk);
-#ifdef USE_MGPU
-            if (grid.isInteriorBlock(lvl-1, pi, pj, pk) && !grid.isOwnedBlock(lvl-1, pi, pj, pk)) continue;
-#endif
+            // (MGPU: created regardless of ownership -- full local support
+            // closure; see addAdjacentBlocksKernel.)
             grid.activateBlock(lvl-1, pi, pj, pk);
           }
         }
