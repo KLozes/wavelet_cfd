@@ -114,7 +114,7 @@ static void runRank(int argc, char* argv[]) {
   solver->waveletThresh   = wThresh;
   solver->scheme          = scheme;
   solver->icType          = (testCase == 1 || sodAmr) ? 1 : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : 0)))));
-  solver->bcType          = (bcArg >= 0) ? bcArg : (acConv ? 2 : 3);   // periodic for the acoustic wave; else transmissive
+  solver->bcType          = (bcArg >= 0) ? bcArg : ((acConv || testCase == 1) ? 2 : 3);   // periodic for the acoustic wave and circular Sod; else transmissive
   solver->vortexAdvect    = acConv ? Ma : (testCase == 2 ? advectA : sodPin);  // acConv: wave amplitude A; case 2: vortex advection; testCase 1: Sod inner pressure
   solver->greshoP0        = 1.0/(gam*Ma*Ma);            // Gresho background pressure -> Mach = Ma
   solver->staticGrid      = acoustic ? 3 : ((testCase == 5 || sodAmr) ? 1 : 0);   // 1=radial shells, 2=planar band, 3=centre step

@@ -95,6 +95,10 @@ real CompressibleSolver::step(real tStep) {
       // adaptGrid (flagged KEEP, not propagated since grading is owned-only) so
       // those coarse-ghost parents are present and F_OLD-valid here.  sortBlocks
       // clobbers F_OLD (permutation scratch), so it MUST come after the inverse.
+      // Domain-boundary ghost blocks CREATED by this adaptGrid have an all-zero
+      // F_OLD (never BC-filled), and a seam block's prediction taps read it ->
+      // refresh the snapshot bank's exterior ghosts before the inverse.
+      setBoundaryConditions(F_OLD);
       inverseWaveletTransform();
       cudaDeviceSynchronize(); sub.tick();
       sortBlocks();
@@ -834,6 +838,19 @@ void CompressibleSolver::paintPressure(const char *fileName) {
   computePressureKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   paintField(F_SCRATCH, fileName);   // scratch field now holds pressure
+}
+
+// Diagnostic: paint the per-cell normalized wavelet-detail indicator, exactly as
+// the thresholding kernel sees it (predicting from the live fields; mutates only
+// F_SCRATCH).  Pixel value saturates at the refine trigger (2*waveletThresh), so
+// white == would refine.  mode: 0 = max primary, 1 = rho, 2 = momentum, 3 = rhoE.
+void CompressibleSolver::paintDetail(const char *fileName, i32 mode) {
+  restrictFields();                            // parents = child averages (as at adapt time)
+  cudaMemset(globalScale, 0, 4*sizeof(real));
+  computeGlobalScalesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  detailToScratchKernel<<<cudaGridSize, cudaBlockSize>>>(*this, mode);
+  cudaDeviceSynchronize();
+  paintField(F_SCRATCH, fileName);
 }
 
 // ---------------------------------------------------------------------------

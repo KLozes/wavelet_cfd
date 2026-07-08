@@ -2,3 +2,4 @@
 	path = extern/openmpi
 	url = https://github.com/open-mpi/ompi.git
 	shallow = true
+	ignore = dirty

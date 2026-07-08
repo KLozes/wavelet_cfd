@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "CompressibleSolverKernels.cuh"
 
 //
@@ -140,8 +141,8 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
       // pIn = 1 is the classic 10:1 Sod ratio; pIn = 10 a strong 100:1 blast.
       //
       real pIn = (grid.vortexAdvect > 0.0) ? grid.vortexAdvect : 1.0;
-      real cx = grid.domainSize[0]/2;
-      real cy = grid.domainSize[1]/2;
+      real cx = grid.domainSize[0]/3;
+      real cy = grid.domainSize[1]/3;
       real radius = min(grid.domainSize[0], grid.domainSize[1])/5;
       real dist = sqrt((pos[0]-cx)*(pos[0]-cx) + (pos[1]-cy)*(pos[1]-cy));
       if (dist < radius) {
@@ -291,29 +292,82 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff) 
                          grid.baseGridSize[2]*powi(2, lvl)/blockSize};
 
       if (grid.bcType == 2) {
-        // periodic: this exterior ghost block is the wrap-around image of an
-        // interior block one step past the opposite edge.  Locate that image
-        // block directly -- wrap (ib,jb,kb) into range, one hash lookup -- and
-        // copy its matching cell into the ghost cell.  The ghost block then holds
-        // a genuine periodic copy that the flux stencils read like any interior
-        // neighbor (no neighbor-index remap; slot 13 stays the block itself).
-        i32 ibw = ib, jbw = jb, kbw = kb;
-        if (ib < 0)             ibw = gridSize[0] - 1;
-        if (ib >= gridSize[0])  ibw = 0;
-        if (jb < 0)             jbw = gridSize[1] - 1;
-        if (jb >= gridSize[1])  jbw = 0;
-        if (kb < 0)             kbw = gridSize[2] - 1;
-        if (kb >= gridSize[2])  kbw = 0;
-        i32 imgBlock = grid.hashTable.getValue(grid.encode(lvl, ibw, jbw, kbw));
-        i32 bcIdx = imgBlock*blockSizeTot + i + j*blockSize + k*blockSize*blockSize;
-        Rho[cIdx]  = Rho[bcIdx];
-        RhoU[cIdx] = RhoU[bcIdx];
-        RhoV[cIdx] = RhoV[bcIdx];
-        RhoW[cIdx] = RhoW[bcIdx];
-        RhoE[cIdx] = RhoE[bcIdx];
-        Gx[cIdx]   = Gx[bcIdx];   // RT0 slopes wrap unchanged under periodicity
-        Gy[cIdx]   = Gy[bcIdx];
-        Gz[cIdx]   = Gz[bcIdx];
+        // periodic: this exterior ghost block is the wrap-around image of the
+        // opposite-edge interior region.  Fill each ghost cell from the FINEST
+        // EXISTING block covering its wrapped position: same level if the image
+        // region is refined there (exact copy, as before), else walk up the
+        // ancestor chain and sample piecewise-constant -- an ordinary
+        // coarse/fine ghost.  The seam is then a regular coarse/fine interface
+        // and the two edges need NOT be refined to matching levels (the old
+        // same-level-image forcing mirrored any seam-touching refinement onto
+        // the opposite edge, refining it far from any physical feature).
+        i32 nx = gridSize[0]*blockSize, ny = gridSize[1]*blockSize;
+        i32 gcx = ((ib*blockSize + i) % nx + nx) % nx;   // wrapped global cell coords at lvl
+        i32 gcy = ((jb*blockSize + j) % ny + ny) % ny;
+        i32 gcz = kb*blockSize + k;
+        if (!grid.pseudo2D) {
+          i32 nz = gridSize[2]*blockSize;
+          gcz = ((gcz % nz) + nz) % nz;
+        }
+        i32 imgBlock = bEmpty, dGap = 0;
+        i32 cx = 0, cy = 0, cz = 0;
+        for (i32 L = lvl, d = 0; L >= 0; L--, d++) {
+          cx = gcx >> d;  cy = gcy >> d;
+          cz = grid.pseudo2D ? gcz : (gcz >> d);
+          imgBlock = grid.hashTable.getValue(grid.encode(L, cx/blockSize, cy/blockSize, cz/blockSize));
+          if (imgBlock != bEmpty) { dGap = d; break; }
+        }
+        if (imgBlock != bEmpty) {   // L=0 always exists (dense base grid)
+          real *F[8] = {Rho, RhoU, RhoV, RhoW, RhoE, Gx, Gy, Gz};
+          i32 ox = cx%blockSize, oy = cy%blockSize, oz = cz%blockSize;
+          if (dGap == 0) {          // same level: exact periodic copy (as before)
+            i32 bcIdx = imgBlock*blockSizeTot + ox + oy*blockSize + oz*blockSize*blockSize;
+            for (i32 f = 0; f < 8; f++) F[f][cIdx] = F[f][bcIdx];
+          }
+          else {
+            // coarser ancestor: monotone (tri)linear interpolation toward the
+            // ghost cell centre (positive convex weights -> no overshoot), the
+            // same quality as the interior coarse/fine ghost fill.  The fine
+            // centre sits at signed offset f. = ((sub+0.5)/2^d - 0.5) cells from
+            // the ancestor cell centre; each axis blends the ancestor cell with
+            // its neighbour on that side.  A missing neighbour (refinement
+            // boundary at the ancestor level) degrades that axis to PC.
+            i32 m = (1 << dGap) - 1;
+            real fx = ((real)(gcx & m) + 0.5) / (real)(1 << dGap) - 0.5;
+            real fy = ((real)(gcy & m) + 0.5) / (real)(1 << dGap) - 0.5;
+            real fz = grid.pseudo2D ? 0.0 : ((real)(gcz & m) + 0.5) / (real)(1 << dGap) - 0.5;
+            i32 sx = fx > 0 ? 1 : -1, sy = fy > 0 ? 1 : -1, sz = fz > 0 ? 1 : -1;
+            real ax = fabs(fx), ay = fabs(fy), az = fabs(fz);
+            i32 cEmpty = bEmpty * blockSizeTot;
+            i32 t000 = grid.getNbrIdx(imgBlock, ox,    oy,    oz);
+            i32 t100 = grid.getNbrIdx(imgBlock, ox+sx, oy,    oz);
+            i32 t010 = grid.getNbrIdx(imgBlock, ox,    oy+sy, oz);
+            i32 t110 = grid.getNbrIdx(imgBlock, ox+sx, oy+sy, oz);
+            i32 t001 = grid.pseudo2D ? t000 : grid.getNbrIdx(imgBlock, ox,    oy,    oz+sz);
+            i32 t101 = grid.pseudo2D ? t100 : grid.getNbrIdx(imgBlock, ox+sx, oy,    oz+sz);
+            i32 t011 = grid.pseudo2D ? t010 : grid.getNbrIdx(imgBlock, ox,    oy+sy, oz+sz);
+            i32 t111 = grid.pseudo2D ? t110 : grid.getNbrIdx(imgBlock, ox+sx, oy+sy, oz+sz);
+            // degrade an axis to PC if any tap on that side is missing, and
+            // redirect missing taps to the base cell (never read the trash block)
+            if (t100 >= cEmpty || t110 >= cEmpty || t101 >= cEmpty || t111 >= cEmpty) ax = 0.0;
+            if (t010 >= cEmpty || t110 >= cEmpty || t011 >= cEmpty || t111 >= cEmpty) ay = 0.0;
+            if (t001 >= cEmpty || t101 >= cEmpty || t011 >= cEmpty || t111 >= cEmpty) az = 0.0;
+            if (t100 >= cEmpty) t100 = t000;  if (t010 >= cEmpty) t010 = t000;
+            if (t110 >= cEmpty) t110 = t000;  if (t001 >= cEmpty) t001 = t000;
+            if (t101 >= cEmpty) t101 = t000;  if (t011 >= cEmpty) t011 = t000;
+            if (t111 >= cEmpty) t111 = t000;
+            real w000 = (1-ax)*(1-ay)*(1-az), w100 = ax*(1-ay)*(1-az);
+            real w010 = (1-ax)*ay*(1-az),     w110 = ax*ay*(1-az);
+            real w001 = (1-ax)*(1-ay)*az,     w101 = ax*(1-ay)*az;
+            real w011 = (1-ax)*ay*az,         w111 = ax*ay*az;
+            for (i32 f = 0; f < 8; f++) {
+              F[f][cIdx] = w000*F[f][t000] + w100*F[f][t100]
+                         + w010*F[f][t010] + w110*F[f][t110]
+                         + w001*F[f][t001] + w101*F[f][t101]
+                         + w011*F[f][t011] + w111*F[f][t111];
+            }
+          }
+        }
       }
       else {
         // find the nearest interior cell (zero-gradient reconstruction)
@@ -1518,6 +1572,55 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid) {
         real *Q = grid.getField(f);
         Q[cIdx] = 0.0;
       }
+    }
+
+  END_CELL_LOOP
+}
+
+//
+// Diagnostic: per-cell normalized wavelet-detail indicator into F_SCRATCH,
+// exactly as waveletThresholdingKernel would see it (max over the primary
+// fields of |Q - predict| / globalScale), but predicting from the LIVE fields
+// (baseOff 0) so nothing is mutated.  Saturated at the refine threshold
+// (2*waveletThresh): a white pixel in the painted image = would refine.
+// mode: 0 = max over primary fields, 1 = rho only, 2 = momentum, 3 = rhoE.
+//
+__global__ void detailToScratchKernel(CompressibleSolver &grid, i32 mode) {
+  real *S = grid.getField(F_SCRATCH);
+
+  START_CELL_LOOP
+    GET_CELL_INDICES
+
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb, kb;
+    grid.decode(loc, lvl, ib, jb, kb);
+
+    S[cIdx] = 0.0;
+    i32 cFlag = grid.cFlagsList[cIdx];
+    if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb, kb) && cFlag != GHOST) {
+      i32 prntIdx = grid.prntIdxList[bIdx];
+      i32 ip = i/2 + ib%2 * blockSize / 2;
+      i32 jp = j/2 + jb%2 * blockSize / 2;
+      i32 kp = grid.pseudo2D ? k : (k/2 + kb%2 * blockSize / 2);
+      real xs = 2*(i % 2) - 1;
+      real ys = 2*(j % 2) - 1;
+      real zs = grid.pseudo2D ? 0.0 : (2*(k % 2) - 1);
+
+      real ind = 0.0;
+      for (i32 f = 0; f < NEVOLVE; f++) {
+        if (f >= F_GX) continue;                       // match thresholding: primary fields only
+        if (grid.pseudo2D && f == F_RHOW) continue;
+        if (mode == 1 && f != F_RHO)  continue;
+        if (mode == 2 && !(f >= F_RHOU && f <= F_RHOW)) continue;
+        if (mode == 3 && f != F_RHOE) continue;
+        real *Q = grid.getField(f);
+        real pred = predictEvolvedField(grid, 0, f, prntIdx, ip, jp, kp, xs, ys, zs, lvl);
+        i32 sc = (f == F_RHO) ? 0 : (f <= F_RHOW ? 1 : 2);
+        real mag = fmax(grid.globalScale[sc], (real)1e-32);
+        ind = fmax(ind, fabs((Q[cIdx] - pred)/mag));
+      }
+      real trig = (real)2.0 * grid.waveletThresh;
+      S[cIdx] = fmin(ind / trig, (real)1.0);   // 1.0 == refine trigger
     }
 
   END_CELL_LOOP

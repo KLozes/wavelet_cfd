@@ -324,7 +324,14 @@ __global__ void addBoundaryBlocksKernel(MultiLevelSparseGrid &grid) {
     if (!grid.pseudo2D) {
       onBnd = onBnd || (kb == 0 || kb == grid.baseGridSize[2]/blockSize*powi(2,lvl)-1);
     }
-    if (grid.isInteriorBlock(lvl, ib, jb, kb) && onBnd) {
+    // Only blocks that SURVIVE this cascade (flagged by thresholding/refine/
+    // grading) get a ghost halo -- and, under periodic BCs, force their
+    // same-level seam image.  Without the flag check a to-be-deleted edge block
+    // still forces its image (which is created NEW -> KEEP and survives), and
+    // the image forces it back next cycle: seam pairs become immortal and their
+    // 3x3 halos spread the band tangentially ~1 block/cycle -- unbounded seam
+    // refinement long after the wave has passed.
+    if (grid.isInteriorBlock(lvl, ib, jb, kb) && onBnd && grid.bFlagsList[bIdx] != DELETE) {
       // add neighboring exterior blocks (x-y only in pseudo2D)
       i32 dkLim = grid.pseudo2D ? 0 : 1;
       for (i32 dk=-dkLim; dk<=dkLim; dk++) {
@@ -333,9 +340,13 @@ __global__ void addBoundaryBlocksKernel(MultiLevelSparseGrid &grid) {
             if (grid.isExteriorBlock(lvl, ib+di, jb+dj, kb+dk)) {
               grid.activateBlock(lvl, ib+di, jb+dj, kb+dk);   // exterior ghost halo
               if (grid.periodic) {
-                // the ghost's periodic image (opposite interior edge) must exist
-                // at the same level so setBoundaryConditions can fill the ghost
-                // from a real block (else the same-level lookup misses -> vacuum)
+                // the ghost's periodic image (opposite interior edge) is forced
+                // at the same level so the ghost fill is an exact same-level
+                // copy.  This mirrors seam-touching refinement onto the opposite
+                // edge (a 1-block-deep band); removing it (and filling ghosts
+                // from a coarser ancestor instead) was tried and is unstable
+                // when a shock crosses the seam -- the transient level-
+                // mismatched seam NaNs even with monotone-linear ghost fills.
                 i32 ii=ib+di, ij=jb+dj, ik=kb+dk;
                 grid.wrapBlockPeriodic(lvl, ii, ij, ik);
                 grid.activateBlock(lvl, ii, ij, ik);

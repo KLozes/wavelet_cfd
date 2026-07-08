@@ -183,6 +183,7 @@ public:
   void computeGreshoError(void);                // L2 velocity error + KE retention vs the exact Gresho vortex
   void totalConserved(double &mass, double &momx, double &energy); // domain totals of the conserved variables
   void paintPressure(const char *fileName);     // render the pressure field to a png
+  void paintDetail(const char *fileName, i32 mode = 0);  // render the wavelet-detail indicator (white = refine trigger)
 
   __device__ Vec5 prim2cons(Vec5 prim);
   __device__ Vec5 cons2prim(Vec5 cons);

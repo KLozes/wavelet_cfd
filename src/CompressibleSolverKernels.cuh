@@ -43,6 +43,9 @@ __global__ void copyToOldFieldsKernel(CompressibleSolver &grid);
 
 __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid);
 
+// diagnostic: normalized wavelet-detail indicator -> F_SCRATCH (see kernel)
+__global__ void detailToScratchKernel(CompressibleSolver &grid, i32 mode);
+
 __global__ void inverseWaveletTransformKernel(CompressibleSolver &grid);
 
 __global__ void waveletThresholdingKernel(CompressibleSolver &grid);

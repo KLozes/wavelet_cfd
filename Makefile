@@ -71,7 +71,9 @@ MPI_HOME ?= $(CURDIR)/extern/openmpi/install
 WAVE3D_MGPU_LDFLAGS =
 ifeq ($(USE_MPI),1)
   WAVE3D_MGPU_DEFS   += -DUSE_MPI -I$(MPI_HOME)/include
-  WAVE3D_MGPU_LDFLAGS = -L$(MPI_HOME)/lib -lmpi
+  # -rpath embeds the vendored lib dir so the binary finds libmpi.so at load
+  # without needing LD_LIBRARY_PATH set.
+  WAVE3D_MGPU_LDFLAGS = -L$(MPI_HOME)/lib -lmpi -Xlinker -rpath -Xlinker $(MPI_HOME)/lib
 endif
 
 all: wave3d wavesdf wavewsdf
