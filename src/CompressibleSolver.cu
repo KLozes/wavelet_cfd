@@ -136,10 +136,10 @@ real CompressibleSolver::step(real tStep) {
     else
     for (i32 stage = 0; stage < 3; stage++) {
       conservativeToPrimitive();
-      setBoundaryConditions();
 #ifdef USE_MGPU
       haloExchange(0, NEVOLVE);   // ghosts get owners' primitives (+G) before the RHS reads them
 #endif
+      setBoundaryConditions();    // AFTER halo: periodic exterior ghosts copy the freshly-haloed wrap image
       computeRightHandSide();
       primitiveToConservative();
       updateFields(stage);
@@ -534,6 +534,9 @@ void CompressibleSolver::computeAcousticL2Error(void) {
     i32 gx = baseGridSize[0]*powi(2,lvl)/blockSize;
     i32 gy = baseGridSize[1]*powi(2,lvl)/blockSize;
     if (ib < 0 || jb < 0 || ib >= gx || jb >= gy) continue;
+#ifdef USE_MGPU
+    if (!isOwnedBlock(lvl, ib, jb, kb)) continue;   // owned-only: exclude ghost duplicates
+#endif
     real dxl = domainSize[0]/real(baseGridSize[0]*powi(2,lvl));
     for (i32 c = 0; c < blockSizeTot; c++) {
       i32 cIdx = bIdx*blockSizeTot + c;
@@ -546,6 +549,10 @@ void CompressibleSolver::computeAcousticL2Error(void) {
       n++;
     }
   }
+#ifdef USE_MGPU
+  double red[2] = {err2, (double)n}; comm::allreduceSum(red, 2);   // global norm over all PEs
+  err2 = red[0]; n = (long)red[1];
+#endif
   double l2 = sqrt(err2/double(n));
   printf("[acoustic-conv] N=%d  L2(u) = %.6e   L2(u)/A = %.6e\n",
          baseGridSize[0], l2, l2/A);

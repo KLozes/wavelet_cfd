@@ -450,6 +450,15 @@ __global__ void computeGlobalScalesKernel(CompressibleSolver &grid) {
     real e = fabs(RhoE[cIdx]);
     real g = fmax(fabs(Gx[cIdx]), fmax(fabs(Gy[cIdx]), fabs(Gz[cIdx])));
 
+#ifdef USE_MGPU
+    // owned-only so the threshold normalization is rank-count-invariant: a
+    // ghost is a stale copy of another PE's cell, and the allreduce-max already
+    // folds in every PE's owned max.  Zero (the fmax identity for these
+    // magnitudes) drops non-owned lanes without breaking the warp shuffle.
+    { i32 lvl,ib,jb,kb; grid.decode(grid.bLocList[bIdx], lvl,ib,jb,kb);
+      if (!grid.isOwnedBlock(lvl,ib,jb,kb)) { r = 0; m = 0; e = 0; g = 0; } }
+#endif
+
     // warp shuffle reduction (grid-stride loop keeps whole warps in-range)
     for (int off = 16; off > 0; off >>= 1) {
       r = fmax(r, __shfl_down_sync(0xffffffff, r, off));
@@ -504,7 +513,16 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
 
+    // Owned-only under decomposition: a ghost's wavespeed is a one-substage-stale
+    // copy of another PE's cell, so including it would make each PE's local min
+    // (hence the allreduced dt, the step count, and the whole trajectory) depend
+    // on the rank count.  Restrict to owned cells so the local min reduces to the
+    // true global min -- identical for any number of ranks.
+#ifdef USE_MGPU
+    if (grid.isOwnedBlock(lvl, ib, jb, kb)) {
+#else
     if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
+#endif
       Vec5 q = grid.cons2prim(Vec5(Rho[cIdx], RhoU[cIdx], RhoV[cIdx], RhoW[cIdx], RhoE[cIdx]));
       real a   = sqrt(abs(gam*q[4]/(q[0]+1e-32)));
       real vel = sqrt(q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
@@ -1219,7 +1237,15 @@ __device__ i32 blockNbrSlots(CompressibleSolver &grid, i32 lvl, i32 ib, i32 jb, 
   for (i32 dj=-2; dj<=2; dj++)
   for (i32 di=-2; di<=2; di++) {
     i32 ni=ib+di, nj=jb+dj, nk=kb+dk;
-    if (!grid.isInteriorBlock(lvl,ni,nj,nk)) continue;
+    // A 2-ring position past the domain edge is, under periodic BCs, the
+    // wrap-around image on the far side -- which may be owned by another PE.
+    // Wrapping it here makes an edge block's directory reach that PE, so the
+    // periodic image blocks the far side's setBoundaryConditions needs become
+    // ghosts on it (else the wrap-image hash lookup misses -> NaN across ranks).
+    if (!grid.isInteriorBlock(lvl,ni,nj,nk)) {
+      if (!grid.periodic) continue;
+      grid.wrapBlockPeriodic(lvl, ni, nj, nk);
+    }
     i32 o = grid.ownerPE(lvl,ni,nj,nk);
     if (o == grid.part.rank) continue;
     i32 s = grid.nbrOf[o];
@@ -1276,10 +1302,19 @@ __global__ void consumeDirKernel(CompressibleSolver &grid) {
     for (i32 dj=-2; dj<=2 && !want; dj++)
     for (i32 di=-2; di<=2 && !want; di++) {
       i32 ai=ni+di, aj=nj+dj, ak=nk+dk;
-      if (grid.isInteriorBlock(lvl,ai,aj,ak) && grid.ownerPE(lvl,ai,aj,ak)==grid.part.rank
+      // periodic: a 2-ring position past the edge wraps to the far side (see
+      // blockNbrSlots) -- so this received block is my periodic image if an
+      // owned block sits within its wrapped 2-ring.
+      if (!grid.isInteriorBlock(lvl,ai,aj,ak)) {
+        if (!grid.periodic) continue;
+        grid.wrapBlockPeriodic(lvl, ai, aj, ak);
+      }
+      if (grid.ownerPE(lvl,ai,aj,ak)==grid.part.rank
           && grid.hashTable.getValue(grid.encode(lvl,ai,aj,ak)) != bEmpty)
         want = true;
     }
+    // store the ghost under the sender's TRUE interior code so the far side's
+    // periodic wrap-image lookup (setBoundaryConditions) resolves to it locally.
     if (want) grid.activateBlock(lvl, ni, nj, nk);
   }
 }

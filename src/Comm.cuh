@@ -34,6 +34,9 @@ namespace comm {
   // In-place all-PE reductions of a host-accessible vector of n reals.
   void allreduceMin(real *v, int n);
   void allreduceMax(real *v, int n);
+  // In-place all-PE sum of n doubles (double so error-norm accumulators combine
+  // without precision loss).
+  void allreduceSum(double *v, int n);
 
   // Point-to-point neighbor exchange: this PE sends sbuf[n] (sbytes[n] bytes) to
   // nbrRank[n] and receives from nbrRank[n] into rbuf[n] (rbytes[n] bytes), for

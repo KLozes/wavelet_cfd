@@ -33,6 +33,7 @@ namespace comm {
 #endif
   void allreduceMin(real *v, int n) { MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_REAL_T, MPI_MIN, MPI_COMM_WORLD); }
   void allreduceMax(real *v, int n) { MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_REAL_T, MPI_MAX, MPI_COMM_WORLD); }
+  void allreduceSum(double *v, int n) { MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD); }
 
   void neighborExchange(int nNbr, const int *nbr, void **sbuf, const size_t *sbytes,
                         void **rbuf, const size_t *rbytes) {
@@ -64,7 +65,8 @@ namespace comm {
   static int g_P = 1;
   static thread_local int tl_rank = 0;
   static pthread_barrier_t g_barrier;
-  static std::vector<real> g_red;     // [P * MAXN] reduction scratch
+  static std::vector<real>   g_red;    // [P * MAXN] min/max reduction scratch
+  static std::vector<double> g_redD;   // [P * MAXN] double-sum reduction scratch
 
   static const int MAXN = 8;
 
@@ -79,6 +81,7 @@ namespace comm {
     if (g_P < 1) g_P = 1;
     pthread_barrier_init(&g_barrier, nullptr, g_P);
     g_red.assign((size_t)g_P * MAXN, 0);
+    g_redD.assign((size_t)g_P * MAXN, 0);
     g_mail = new MailSlot[(size_t)g_P * g_P];
   }
   void finalize() { pthread_barrier_destroy(&g_barrier); }
@@ -112,6 +115,18 @@ namespace comm {
   }
   void allreduceMin(real *v, int n) { reduce(v, n, false); }
   void allreduceMax(real *v, int n) { reduce(v, n, true); }
+
+  void allreduceSum(double *v, int n) {
+    if (g_P == 1) return;
+    for (int j = 0; j < n; j++) g_redD[(size_t)tl_rank*MAXN + j] = v[j];
+    pthread_barrier_wait(&g_barrier);
+    for (int j = 0; j < n; j++) {
+      double acc = 0;
+      for (int r = 0; r < g_P; r++) acc += g_redD[(size_t)r*MAXN + j];
+      v[j] = acc;
+    }
+    pthread_barrier_wait(&g_barrier);
+  }
 
   // shared-memory rendezvous: publish my sends into the mailbox, barrier, then
   // copy the messages addressed to me out of it (device-to-device).
