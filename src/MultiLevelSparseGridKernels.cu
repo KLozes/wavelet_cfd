@@ -12,17 +12,18 @@ __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
                    j < grid.baseGridSize[1]/blockSize + 1 &&
                    k < grid.baseGridSize[2]/blockSize + 1);
 #ifdef USE_MGPU
-  // this PE creates its owned base blocks plus a ghost ring: any candidate
-  // (interior, or the -1/nb domain-exterior ring) within Chebyshev distance 2
-  // of an owned base block is activated -- 2 blocks toward a partition
-  // neighbor (the scatter-form flux needs a full +-2-cell stencil) and the
-  // 1-deep domain-exterior ring fall out of the same rule.  Purely ownership-
-  // map-driven, so it works for the box split and the Z-curve cut alike.
+  // this PE creates its owned base blocks plus a 1-block ghost ring (Chebyshev-1,
+  // corners included): any candidate (interior, or the -1/nb domain-exterior
+  // ring) within Chebyshev distance 1 of an owned base block is activated.  One
+  // block suffices because blockSize>=4 keeps the +-2-cell flux stencil inside
+  // the +-1 block and the wavelet's parent taps hit the (owned) parent's 1-ring.
+  // Purely ownership-map-driven, so it works for the box split and the Z-curve
+  // cut alike.
   bool near = false;
-  i32 dkLim = grid.pseudo2D ? 0 : 2;
+  i32 dkLim = grid.pseudo2D ? 0 : 1;   // 1-block ghost ring (Chebyshev-1); see blockNbrSlots
   for (i32 dk=-dkLim; dk<=dkLim && !near; dk++)
-  for (i32 dj=-2; dj<=2 && !near; dj++)
-  for (i32 di=-2; di<=2 && !near; di++) {
+  for (i32 dj=-1; dj<=1 && !near; dj++)
+  for (i32 di=-1; di<=1 && !near; di++) {
     i32 ni=i+di, nj=j+dj, nk=k+dk;
     if (ni < 0 || nj < 0 || nk < 0 ||
         ni >= grid.baseGridSize[0]/blockSize || nj >= grid.baseGridSize[1]/blockSize ||
@@ -610,19 +611,65 @@ __global__ void paintRankGridKernel(MultiLevelSparseGrid &grid, i32 level) {
     if (loc != kEmpty && lvl == level && onMidPlane
         && grid.isInteriorBlock(lvl, ib, jb, kb)) {
       bool ghost = !grid.isOwnedBlock(lvl, ib, jb, kb);
-      real val = ghost ? (real)(grid.nLvls + 2 + lvl) : (real)(lvl + 1);
+      // Intensity in [0,1] (host maxVal = 1): absent = black (0), ghost halo a
+      // flat dark gray, owned a bright ramp by level (coarse -> fine = 0.5 ->
+      // 1.0).  Cells are SOLID-filled so the category survives downscaling (a
+      // mesh-only render averages to grey by cell size, not by owned/ghost);
+      // only the top/left edge is darkened for a faint gridline.
+      real base = ghost ? (real)0.28
+                        : (real)0.5 + (real)0.5 * (real)lvl / (real)(grid.nLvls > 1 ? grid.nLvls - 1 : 1);
       i32 nPixels = powi(2,(grid.nLvls - 1 - lvl));
       for (i32 jj=0; jj<nPixels; jj++) {
         for (i32 ii=0; ii<nPixels; ii++) {
           i32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
           i32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
           if (iPxl < 0 || iPxl >= grid.imageSizeX[0] || jPxl < 0 || jPxl >= grid.imageSizeX[1]) continue;
-          grid.imageDataX[jPxl*grid.imageSizeX[0] + iPxl] =
-            (ii > 0 && jj > 0) ? (real)0 : val;   // gridlines like the grid render
+          bool edge = (i == 0 && ii == 0) || (j == 0 && jj == 0);   // block-boundary gridline only
+          grid.imageDataX[jPxl*grid.imageSizeX[0] + iPxl] = edge ? base*(real)0.45 : base;
         }
       }
     }
 
   END_CELL_LOOP
+}
+#endif
+
+#ifdef USE_MGPU
+// Debug: per-rank ghost-layer census.  For each interior block, classify owned
+// vs ghost by level, and flag "far" ghosts -- non-owned blocks with NO owned
+// block within Chebyshev-2 at the SAME level (the flux/prediction stencil reach).
+// A correct halo has zero far ghosts; a nonzero count is real over-inclusion.
+// Counters packed as dbgCnt[3*lvl + {0:owned,1:ghost,2:farGhost}].
+__global__ void ghostCensusKernel(MultiLevelSparseGrid &grid) {
+  START_BLOCK_LOOP
+    u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      i32 lvl, ib, jb, kb;
+      grid.decode(loc, lvl, ib, jb, kb);
+      if (grid.isInteriorBlock(lvl, ib, jb, kb) && lvl < grid.nLvls) {
+        if (grid.isOwnedBlock(lvl, ib, jb, kb)) {
+          atomicAdd(&grid.dbgCnt[3*lvl + 0], 1);
+        } else {
+          atomicAdd(&grid.dbgCnt[3*lvl + 1], 1);
+          bool nearOwned = false;
+          i32 dkL = grid.pseudo2D ? 0 : 2;
+          for (i32 dk=-dkL; dk<=dkL && !nearOwned; dk++)
+          for (i32 dj=-2; dj<=2 && !nearOwned; dj++)
+          for (i32 di=-2; di<=2 && !nearOwned; di++) {
+            i32 ni=ib+di, nj=jb+dj, nk=kb+dk;
+            if (grid.isInteriorBlock(lvl,ni,nj,nk)
+                && grid.getBlockIdx(grid.encode(lvl,ni,nj,nk)) != bEmpty
+                && grid.isOwnedBlock(lvl,ni,nj,nk)) nearOwned = true;
+          }
+          if (!nearOwned) {
+            atomicAdd(&grid.dbgCnt[3*lvl + 2], 1);
+            i32 n = atomicAdd(&grid.dbgCnt[3*grid.nLvls], 1);   // print budget in the tail slot
+            if (n < 12) printf("[farghost] r%d lvl%d (%d,%d,%d) owner=r%d\n",
+                               grid.part.rank, lvl, ib, jb, kb, grid.ownerPE(lvl,ib,jb,kb));
+          }
+        }
+      }
+    }
+  END_BLOCK_LOOP
 }
 #endif

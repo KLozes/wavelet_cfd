@@ -41,6 +41,7 @@ __global__ void checkFillSupportKernel(MultiLevelSparseGrid &grid, i32 level);
 
 #ifdef USE_MGPU
 __global__ void paintRankGridKernel(MultiLevelSparseGrid &grid, i32 level);
+__global__ void ghostCensusKernel(MultiLevelSparseGrid &grid);
 #endif
 
 #endif

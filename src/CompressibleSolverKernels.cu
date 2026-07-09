@@ -1321,10 +1321,13 @@ __global__ void markGhostsKernel(CompressibleSolver &grid) {
 // --- directory-based halo (message-passing; no peer-memory access) ---------
 // Distinct neighbor slots whose territory this owned block's 2-ring reaches.
 __device__ i32 blockNbrSlots(CompressibleSolver &grid, i32 lvl, i32 ib, i32 jb, i32 kb, i32 *slot) {
-  i32 n = 0, dkLim = grid.pseudo2D ? 0 : 2;
+  // 1-block ring, corners included (Chebyshev-1).  Sufficient for blockSize>=4:
+  // the widest read is +-2 CELLS (flux) / the parent 27-tap (parent is same base
+  // column -> owned, only its 1-ring is a ghost) -- both stay within +-1 block.
+  i32 n = 0, dkLim = grid.pseudo2D ? 0 : 1;
   for (i32 dk=-dkLim; dk<=dkLim; dk++)
-  for (i32 dj=-2; dj<=2; dj++)
-  for (i32 di=-2; di<=2; di++) {
+  for (i32 dj=-1; dj<=1; dj++)
+  for (i32 di=-1; di<=1; di++) {
     i32 ni=ib+di, nj=jb+dj, nk=kb+dk;
     // A 2-ring position past the domain edge is, under periodic BCs, the
     // wrap-around image on the far side -- which may be owned by another PE.
@@ -1406,7 +1409,7 @@ __global__ void consumeNeedKernel(CompressibleSolver &grid) {
 }
 
 __global__ void consumeDirKernel(CompressibleSolver &grid) {
-  i32 slot = grid.dirSlot, nN = grid.nNbr, dkLim = grid.pseudo2D ? 0 : 2;
+  i32 slot = grid.dirSlot, nN = grid.nNbr, dkLim = grid.pseudo2D ? 0 : 1;
   for (i64 tid = (i64)blockIdx.x*blockDim.x+threadIdx.x; tid < (i64)nN*slot; tid += (i64)gridDim.x*blockDim.x) {
     i32 s = tid / slot, i = tid % slot;
     if (i >= grid.dirRecvCnt[s]) continue;
@@ -1414,8 +1417,8 @@ __global__ void consumeDirKernel(CompressibleSolver &grid) {
     i32 lvl,ni,nj,nk; grid.decode(loc,lvl,ni,nj,nk);
     bool want = false;
     for (i32 dk=-dkLim; dk<=dkLim && !want; dk++)
-    for (i32 dj=-2; dj<=2 && !want; dj++)
-    for (i32 di=-2; di<=2 && !want; di++) {
+    for (i32 dj=-1; dj<=1 && !want; dj++)
+    for (i32 di=-1; di<=1 && !want; di++) {
       i32 ai=ni+di, aj=nj+dj, ak=nk+dk;
       // periodic: a 2-ring position past the edge wraps to the far side (see
       // blockNbrSlots) -- so this received block is my periodic image if an

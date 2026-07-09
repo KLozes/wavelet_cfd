@@ -59,7 +59,7 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(i32));
   cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(i32));
   cudaMallocManaged(&snapValidList, nBlocksMax*sizeof(i32));
-  cudaMallocManaged(&dbgCnt, sizeof(i32));
+  cudaMallocManaged(&dbgCnt, 64*sizeof(i32));   // [1] topo violations, or [3*lvl+{0,1,2}] ghost census
   cudaMallocManaged(&createdCnt, sizeof(i32));
   cudaMemset(bLocList, 0, nBlocksMax*sizeof(u64));
   cudaMemset(bIdxList, 0, nBlocksMax*sizeof(i32));
@@ -595,13 +595,27 @@ void MultiLevelSparseGrid::paintRankGrid(void) {
     cudaDeviceSynchronize();
   }
   png::image<png::gray_pixel_16> image(imageSizeX[0], imageSizeX[1]);
-  real maxVal = (real)(2*nLvls + 1);  // fixed scale: 0 absent, 1..nLvls owned, nLvls+2.. ghosts
+  real maxVal = (real)1;   // paintRankGridKernel writes intensity directly in [0,1]
   for (i32 j = 0; j < imageSizeX[1]; j++)
     for (i32 i = 0; i < imageSizeX[0]; i++)
       image[j][i] = (png::gray_pixel_16)(fmin(fmax(imageDataX[j*imageSizeX[0]+i], (real)0), maxVal) / maxVal * 65535);
   char fileName[80];
   sprintf(fileName, "output/rankgrid_r%d_%05d.png", part.rank, imageCounter);
   image.write(fileName);
+
+  // ghost-layer census: owned/ghost/far-ghost per level
+  cudaMemset(dbgCnt, 0, 64*sizeof(i32));
+  ghostCensusKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  for (i32 r = 0; r < comm::size(); r++) {
+    if (r == part.rank) {
+      printf("[ghostcensus] r%d frame %d:", part.rank, imageCounter);
+      for (i32 L = 0; L < nLvls; L++)
+        printf("  L%d owned=%d ghost=%d far=%d", L, dbgCnt[3*L+0], dbgCnt[3*L+1], dbgCnt[3*L+2]);
+      printf("\n");
+    }
+    comm::barrier();
+  }
 }
 #endif
 
