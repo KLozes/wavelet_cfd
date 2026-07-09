@@ -1271,6 +1271,41 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
 // adaptation, the ghost layer prunes automatically as features move.
 // flag current ghosts (interior, not owned) for deletion; keep owned + exterior.
 // rebuildGhostsKernel then un-deletes (atomicMax NEW) the ones still needed.
+// Un-delete (never create) the non-owned interior blocks that OWNED blocks'
+// stencils still need: the same-level 1-ring (flux + grading closure) and the
+// parent-level 3x3 (wavelet prediction / interpolation / restriction support).
+// Locally-manufactured support that exists on no other rank (a refinement
+// front advancing into a neighbor's still-coarse region) would otherwise be
+// pruned each rebuild; its absence leaves trash-zero stencil taps whose vacuum
+// states NaN the HLLC flux and poison the LSRK accumulator of every bordering
+// cell -- the virgin-seam NaN at nLvls>=4.
+__global__ void keepLocalSupportKernel(CompressibleSolver &grid) {
+  START_BLOCK_LOOP
+    u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      i32 lvl, ib, jb, kb;
+      grid.decode(loc, lvl, ib, jb, kb);
+      if (grid.isInteriorBlock(lvl, ib, jb, kb) && grid.isOwnedBlock(lvl, ib, jb, kb)) {
+        i32 dkLim = grid.pseudo2D ? 0 : 1;
+        for (i32 dk=-dkLim; dk<=dkLim; dk++)
+        for (i32 dj=-1; dj<=1; dj++)
+        for (i32 di=-1; di<=1; di++) {
+          i32 ni=ib+di, nj=jb+dj, nk=kb+dk;
+          if (grid.periodic) grid.wrapBlockPeriodic(lvl, ni, nj, nk);
+          i32 n = grid.hashTable.getValue(grid.encode(lvl, ni, nj, nk));
+          if (n != bEmpty) atomicMax(&grid.bFlagsList[n], NEW);
+          if (lvl > 0) {
+            i32 pi=ib/2+di, pj=jb/2+dj, pk=kb/2+dk;
+            if (grid.periodic) grid.wrapBlockPeriodic(lvl-1, pi, pj, pk);
+            i32 p = grid.hashTable.getValue(grid.encode(lvl-1, pi, pj, pk));
+            if (p != bEmpty) atomicMax(&grid.bFlagsList[p], NEW);
+          }
+        }
+      }
+    }
+  END_BLOCK_LOOP
+}
+
 __global__ void markGhostsKernel(CompressibleSolver &grid) {
   START_BLOCK_LOOP
     u64 loc = grid.bLocList[bIdx];
@@ -1877,3 +1912,6 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
 
   END_CELL_LOOP
 }
+
+
+

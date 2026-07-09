@@ -35,6 +35,7 @@ __global__ void markGhostsKernel(CompressibleSolver &grid);
 __global__ void countDirKernel(CompressibleSolver &grid);
 __global__ void fillDirKernel(CompressibleSolver &grid);
 __global__ void consumeDirKernel(CompressibleSolver &grid);
+__global__ void keepLocalSupportKernel(CompressibleSolver &grid);
 __global__ void packDirKernel(CompressibleSolver &grid, i32 fOff, i32 nf);
 __global__ void unpackDirKernel(CompressibleSolver &grid, i32 fOff, i32 nf);
 #endif

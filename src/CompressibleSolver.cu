@@ -341,6 +341,11 @@ void CompressibleSolver::rebuildGhosts(void) {
   cudaDeviceSynchronize();
   consumeDirKernel<<<cudaGridSize, cudaBlockSize>>>(*this);      // create ghosts from directories (un-delete)
   cudaDeviceSynchronize();
+  // keep (un-delete only) the existing non-owned blocks that owned stencils
+  // need -- locally-manufactured support at an advancing rank seam survives
+  // even when no other rank has it (see keepLocalSupportKernel)
+  keepLocalSupportKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
   deleteDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this);      // drop the ghosts no longer needed
   cudaDeviceSynchronize();
