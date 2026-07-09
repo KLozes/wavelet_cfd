@@ -624,7 +624,7 @@ __global__ void paintRankGridKernel(MultiLevelSparseGrid &grid, i32 level) {
           i32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
           i32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
           if (iPxl < 0 || iPxl >= grid.imageSizeX[0] || jPxl < 0 || jPxl >= grid.imageSizeX[1]) continue;
-          bool edge = (i == 0 && ii == 0) || (j == 0 && jj == 0);   // block-boundary gridline only
+          bool edge = (ii == 0 || jj == 0);   // per-CELL gridline (like the normal grid render)
           grid.imageDataX[jPxl*grid.imageSizeX[0] + iPxl] = edge ? base*(real)0.45 : base;
         }
       }
