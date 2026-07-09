@@ -35,4 +35,8 @@ __global__ void addBoundaryBlocksKernel(MultiLevelSparseGrid &grid);
 
 __global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f);
 
+__global__ void checkTopologyKernel(MultiLevelSparseGrid &grid, i32 phaseTag);
+
+__global__ void checkFillSupportKernel(MultiLevelSparseGrid &grid, i32 level);
+
 #endif

@@ -314,7 +314,9 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff) 
         for (i32 L = lvl, d = 0; L >= 0; L--, d++) {
           cx = gcx >> d;  cy = gcy >> d;
           cz = grid.pseudo2D ? gcz : (gcz >> d);
-          imgBlock = grid.hashTable.getValue(grid.encode(L, cx/blockSize, cy/blockSize, cz/blockSize));
+          // validated lookup: a deleted image block's corpse key must not stop
+          // the ancestor walk at a zeroed slot (see getBlockIdx)
+          imgBlock = grid.getBlockIdx(grid.encode(L, cx/blockSize, cy/blockSize, cz/blockSize));
           if (imgBlock != bEmpty) { dGap = d; break; }
         }
         if (imgBlock != bEmpty) {   // L=0 always exists (dense base grid)
@@ -486,6 +488,34 @@ __device__ inline double atomicMaxFloat(double *addr, double val) {
 // {|rho|, |momentum|, |rhoE|, max|grad|} into globalScale[0..3], pre-zeroed by
 // the host.  Warp-level shuffle reduction first, then one atomicMax per warp --
 // all device-side, no host round-trip.
+// DIAG: count near-vacuum cells (rho < 0.05; physical min is the 0.125 ambient),
+// split by owned block vs ghost block, to locate an unphysical density overshoot.
+__device__ unsigned long long g_vacOwned;
+__device__ unsigned long long g_vacGhost;
+__global__ void dbgVacKernel(CompressibleSolver &grid) {
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    i32 lvl, ib, jb, kb;
+    u64 loc = grid.bLocList[bIdx];
+    grid.decode(loc, lvl, ib, jb, kb);
+    if (loc != kEmpty && grid.isInteriorBlock(lvl,ib,jb,kb)) {
+      real r = grid.getField(F_RHO)[cIdx];
+      if (r < 0.05) {
+#ifdef USE_MGPU
+        bool own = grid.isOwnedBlock(lvl,ib,jb,kb);
+        unsigned long long n = own ? atomicAdd(&g_vacOwned, 1ULL) : atomicAdd(&g_vacGhost, 1ULL);
+        if (n < 4)   // print the first few offenders: where exactly is the bad data?
+          printf("[vac] %s rank=%d lvl=%d blk=(%d,%d) cell=(%d,%d) rho=%.3e flag=%d snap=%d\n",
+                 own?"OWNED":"ghost", grid.part.rank, lvl, ib, jb, i, j, r,
+                 grid.bFlagsList[bIdx], grid.snapValidList[bIdx]);
+#else
+        atomicAdd(&g_vacOwned, 1ULL);
+#endif
+      }
+    }
+  END_CELL_LOOP
+}
+
 __global__ void computeGlobalScalesKernel(CompressibleSolver &grid) {
   real *Rho  = grid.getField(F_RHO);
   real *RhoU = grid.getField(F_RHOU);
@@ -1271,40 +1301,10 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
 // adaptation, the ghost layer prunes automatically as features move.
 // flag current ghosts (interior, not owned) for deletion; keep owned + exterior.
 // rebuildGhostsKernel then un-deletes (atomicMax NEW) the ones still needed.
-// Un-delete (never create) the non-owned interior blocks that OWNED blocks'
-// stencils still need: the same-level 1-ring (flux + grading closure) and the
-// parent-level 3x3 (wavelet prediction / interpolation / restriction support).
-// Locally-manufactured support that exists on no other rank (a refinement
-// front advancing into a neighbor's still-coarse region) would otherwise be
-// pruned each rebuild; its absence leaves trash-zero stencil taps whose vacuum
-// states NaN the HLLC flux and poison the LSRK accumulator of every bordering
-// cell -- the virgin-seam NaN at nLvls>=4.
-__global__ void keepLocalSupportKernel(CompressibleSolver &grid) {
-  START_BLOCK_LOOP
-    u64 loc = grid.bLocList[bIdx];
-    if (loc != kEmpty) {
-      i32 lvl, ib, jb, kb;
-      grid.decode(loc, lvl, ib, jb, kb);
-      if (grid.isInteriorBlock(lvl, ib, jb, kb) && grid.isOwnedBlock(lvl, ib, jb, kb)) {
-        i32 dkLim = grid.pseudo2D ? 0 : 1;
-        for (i32 dk=-dkLim; dk<=dkLim; dk++)
-        for (i32 dj=-1; dj<=1; dj++)
-        for (i32 di=-1; di<=1; di++) {
-          i32 ni=ib+di, nj=jb+dj, nk=kb+dk;
-          if (grid.periodic) grid.wrapBlockPeriodic(lvl, ni, nj, nk);
-          i32 n = grid.hashTable.getValue(grid.encode(lvl, ni, nj, nk));
-          if (n != bEmpty) atomicMax(&grid.bFlagsList[n], NEW);
-          if (lvl > 0) {
-            i32 pi=ib/2+di, pj=jb/2+dj, pk=kb/2+dk;
-            if (grid.periodic) grid.wrapBlockPeriodic(lvl-1, pi, pj, pk);
-            i32 p = grid.hashTable.getValue(grid.encode(lvl-1, pi, pj, pk));
-            if (p != bEmpty) atomicMax(&grid.bFlagsList[p], NEW);
-          }
-        }
-      }
-    }
-  END_BLOCK_LOOP
-}
+// (keepLocalSupportKernel was removed: under the owned-target + NEED/adopt
+// protocol every needed non-owned block is directory-backed by its owner --
+// locally-manufactured orphans no longer exist, and un-deleting a ghost no
+// directory names would keep a permanently-unfillable zero block alive.)
 
 __global__ void markGhostsKernel(CompressibleSolver &grid) {
   START_BLOCK_LOOP
@@ -1353,7 +1353,14 @@ __global__ void countDirKernel(CompressibleSolver &grid) {
     u64 loc = grid.bLocList[bIdx];
     if (loc != kEmpty) {
       i32 lvl,ib,jb,kb; grid.decode(loc,lvl,ib,jb,kb);
-      if (grid.isOwnedBlock(lvl,ib,jb,kb)) {
+      // Publish owned SURVIVING blocks to every neighbour whose 2-ring reaches
+      // them (they become ghosts there).  The flag filter is essential: a block
+      // thresholding marked DELETE (to be coarsened) must NOT be exported -- the
+      // neighbour would import it as a KEEP ghost, grade from it, and NEED its
+      // ring back to us, resurrecting the region every cycle (a one-way ratchet
+      // to a uniformly-dense grid).  Legitimate cross-seam support is instead
+      // revived explicitly: a NEED/adopt touch raises the flag above DELETE.
+      if (grid.isOwnedBlock(lvl,ib,jb,kb) && grid.bFlagsList[bIdx] != DELETE) {
         i32 slot[27]; i32 n = blockNbrSlots(grid,lvl,ib,jb,kb,slot);
         for (i32 t=0; t<n; t++) atomicAdd(&grid.dirSendCnt[slot[t]], 1);
       }
@@ -1366,7 +1373,7 @@ __global__ void fillDirKernel(CompressibleSolver &grid) {
     u64 loc = grid.bLocList[bIdx];
     if (loc != kEmpty) {
       i32 lvl,ib,jb,kb; grid.decode(loc,lvl,ib,jb,kb);
-      if (grid.isOwnedBlock(lvl,ib,jb,kb)) {
+      if (grid.isOwnedBlock(lvl,ib,jb,kb) && grid.bFlagsList[bIdx] != DELETE) {   // survivors only (see countDirKernel)
         i32 slot[27]; i32 n = blockNbrSlots(grid,lvl,ib,jb,kb,slot);
         for (i32 t=0; t<n; t++) {
           i32 s = slot[t], i = atomicAdd(&grid.dirFill[s], 1);
@@ -1379,6 +1386,25 @@ __global__ void fillDirKernel(CompressibleSolver &grid) {
 
 // Create ghosts from received neighbor directories: for each received boundary
 // block, if this PE has an owned block within its 2-ring, activate it as a ghost.
+// Adopt the neighbours' NEED lists: each received loc is a support block the
+// sender's closure required in OUR territory (owned-target rule forbade the
+// sender creating it).  We create it as an owned block; the same exchange's
+// directory pass then exports it back to the sender as a ghost, and its data is
+// prolonged from our (valid) parent level by reconstituteOldSnapshot.
+__global__ void consumeNeedKernel(CompressibleSolver &grid) {
+#ifdef USE_MGPU
+  i32 slot = grid.needSlot, nN = grid.nNbr;
+  for (i64 tid = (i64)blockIdx.x*blockDim.x+threadIdx.x; tid < (i64)nN*slot; tid += (i64)gridDim.x*blockDim.x) {
+    i32 s = tid / slot, i = tid % slot;
+    if (i >= min(grid.needRecvCnt[s], slot)) continue;
+    u64 loc = grid.needRecvLoc[(size_t)s*slot + i];
+    i32 lvl,ni,nj,nk; grid.decode(loc,lvl,ni,nj,nk);
+    if (grid.isInteriorBlock(lvl,ni,nj,nk) && grid.isOwnedBlock(lvl,ni,nj,nk))
+      grid.activateBlock(lvl, ni, nj, nk);
+  }
+#endif
+}
+
 __global__ void consumeDirKernel(CompressibleSolver &grid) {
   i32 slot = grid.dirSlot, nN = grid.nNbr, dkLim = grid.pseudo2D ? 0 : 2;
   for (i64 tid = (i64)blockIdx.x*blockDim.x+threadIdx.x; tid < (i64)nN*slot; tid += (i64)gridDim.x*blockDim.x) {
@@ -1399,7 +1425,7 @@ __global__ void consumeDirKernel(CompressibleSolver &grid) {
         grid.wrapBlockPeriodic(lvl, ai, aj, ak);
       }
       if (grid.ownerPE(lvl,ai,aj,ak)==grid.part.rank
-          && grid.hashTable.getValue(grid.encode(lvl,ai,aj,ak)) != bEmpty)
+          && grid.getBlockIdx(grid.encode(lvl,ai,aj,ak)) != bEmpty)   // validated: corpses don't count
         want = true;
     }
     // store the ghost under the sender's TRUE interior code so the far side's
@@ -1415,9 +1441,11 @@ __global__ void packDirKernel(CompressibleSolver &grid, i32 fOff, i32 nf) {
   for (i64 tid = (i64)blockIdx.x*blockDim.x+threadIdx.x; tid < (i64)nN*slot*bst; tid += (i64)gridDim.x*blockDim.x) {
     i32 cell = tid % bst, i = (tid / bst) % slot, s = tid / bst / slot;
     if (i >= grid.dirSendCnt[s]) continue;
-    i32 blk = grid.hashTable.getValue(grid.dirSendLoc[(size_t)s*slot + i]);
-    if (blk == bEmpty) continue;
+    // validated lookup: after the D5 tail reorder the directories are always
+    // fresh, so a corpse here is a protocol bug -- ship zeros, never stale memory
+    i32 blk = grid.getBlockIdx(grid.dirSendLoc[(size_t)s*slot + i]);
     real *dst = grid.sendBuf + ((size_t)s*slot + i)*fs;
+    if (blk == bEmpty) { for (i32 f=0; f<nf; f++) dst[f*bst+cell] = 0.0; continue; }
     for (i32 f=0; f<nf; f++) dst[f*bst+cell] = grid.getField(fOff+f)[(size_t)blk*bst+cell];
   }
 }
@@ -1430,7 +1458,7 @@ __global__ void unpackDirKernel(CompressibleSolver &grid, i32 fOff, i32 nf) {
     i32 cell = tid % bst, i = (tid / bst) % slot, s = tid / bst / slot;
     if (i >= grid.dirRecvCnt[s]) continue;
     u64 loc = grid.dirRecvLoc[(size_t)s*slot + i];
-    i32 ghost = grid.hashTable.getValue(loc);
+    i32 ghost = grid.getBlockIdx(loc);   // validated: never unpack into a corpse slot
     if (ghost == bEmpty) continue;
     i32 lvl,ib,jb,kb; grid.decode(loc,lvl,ib,jb,kb);
     if (grid.isOwnedBlock(lvl,ib,jb,kb)) continue;   // only my ghosts
@@ -1446,6 +1474,10 @@ __global__ void copyToOldFieldsKernel(CompressibleSolver &grid) {
 
     for (i32 f = 0; f < NEVOLVE; f++)
       grid.getField(F_OLD + f)[cIdx] = grid.getField(f)[cIdx];
+    // this block now carries a valid F_OLD snapshot; blocks created afterwards
+    // (refinement/support/imported ghosts) are marked 0 by activateBlock and get
+    // their F_OLD reconstituted (halo + hierarchical interpolation) before the inverse
+    if (cIdx % blockSizeTot == 0) grid.snapValidList[bIdx] = 1;
 
   END_CELL_LOOP
 }
@@ -1661,6 +1693,53 @@ __global__ void detailToScratchKernel(CompressibleSolver &grid, i32 mode) {
   END_CELL_LOOP
 }
 
+// Reconstitute the F_OLD wavelet snapshot for blocks created this cycle (new
+// refinement / support / imported ghosts) that never went through copyToOld.
+// Run per level, coarse->fine: a new block's snapshot is the smooth wavelet
+// prediction from its parent (one level coarser, already valid), and it carries
+// no detail (Q=0).  Only OWNED new blocks are filled here; ghosts get the
+// owner's reconstituted snapshot from the F_OLD halo between levels.  Without
+// this a new block's slot holds stale garbage that the inverse would read
+// through the reconstruction stencil (single-GPU is safe because a MISSING block
+// resolves to the zeroed trash slice; an imported ghost is a live slot).
+__global__ void fillOldSnapshotKernel(CompressibleSolver &grid, i32 level) {
+
+  START_CELL_LOOP
+    GET_CELL_INDICES
+
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb, kb;
+    grid.decode(loc, lvl, ib, jb, kb);
+
+    if (lvl == level && lvl > 0 && grid.snapValidList[bIdx] == 0
+        && grid.isInteriorBlock(lvl, ib, jb, kb) && grid.bFlagsList[bIdx] != DELETE
+#ifdef USE_MGPU
+        && grid.isOwnedBlock(lvl, ib, jb, kb)
+#endif
+       ) {
+      i32 prntIdx = grid.prntIdxList[bIdx];
+      if (prntIdx == bEmpty) continue;   // no parent -> stay zero (single-GPU zero-block behaviour)
+      i32 ip = i/2 + ib%2 * blockSize / 2;
+      i32 jp = j/2 + jb%2 * blockSize / 2;
+      i32 kp = grid.pseudo2D ? k : (k/2 + kb%2 * blockSize / 2);
+      real xs = 2*(i % 2) - 1;
+      real ys = 2*(j % 2) - 1;
+      real zs = grid.pseudo2D ? 0.0 : (2*(k % 2) - 1);
+      for (i32 f = 0; f < NEVOLVE; f++) {
+        // wavelet prolongation from the parent (whose F_OLD -- and neighbour
+        // taps, via the freshly-rebuilt index lists -- is up to date).  The live
+        // field stays 0 (a new block carries no detail); the inverse then adds
+        // this same prediction, so Q lands on the prolonged value exactly as it
+        // would on a single GPU.
+        grid.getField(F_OLD + f)[cIdx] = predictEvolvedField(grid, F_OLD, f, prntIdx, ip, jp, kp, xs, ys, zs, lvl);
+        grid.getField(f)[cIdx] = 0.0;
+      }
+      if (cIdx % blockSizeTot == 0) grid.snapValidList[bIdx] = 1;   // valid parent for the next level
+    }
+
+  END_CELL_LOOP
+}
+
 __global__ void inverseWaveletTransformKernel(CompressibleSolver &grid) {
 
   START_CELL_LOOP
@@ -1699,12 +1778,10 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
 
     bool keepCoarse = (lvl < 2);
 #ifdef USE_MGPU
-    keepCoarse = keepCoarse && grid.isOwnedBlock(lvl, ib, jb, kb);   // owned coarse only; ghosts via rebuild
-    // keep the CURRENT ghost layer through adaptGrid (grading is owned-only, so
-    // it does not propagate) so the inverse DD stencil still has its coarse-ghost
-    // parents; the ghosts are then pruned + rebuilt to the exact 2-ring.
-    if (grid.isInteriorBlock(lvl, ib, jb, kb) && !grid.isOwnedBlock(lvl, ib, jb, kb))
-      grid.bFlagsList[bIdx] = KEEP;
+    keepCoarse = keepCoarse && grid.isOwnedBlock(lvl, ib, jb, kb);   // owned coarse only
+    // no blanket ghost-KEEP: the ghost layer is rebuilt each cycle by the seam
+    // sync (create+delete propagation, both directions), and the F_OLD the
+    // inverse reads is rebuilt by reconstituteOldSnapshot
 #endif
     if (keepCoarse) {
       grid.bFlagsList[bIdx] = KEEP;

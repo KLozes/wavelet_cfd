@@ -40,7 +40,7 @@ void CompressibleSolver::initialize(void) {
     double wOwn = 0;
     for (i32 t = 0; t < part.nb[0]*part.nb[1]*part.nb[2]; t++)
       if (ownerBase[t] == part.rank) wOwn += wBase[t];
-    printf("[zcurve] rank %d owns %.0f blocks after balanced re-cut\n", part.rank, wOwn);
+    printf("[sfc] rank %d owns %.0f blocks after balanced re-cut\n", part.rank, wOwn);
   }
 #endif
   zeroAccumulator();   // the cascade dirtied the shared bank (LSRK needs 0)
@@ -67,7 +67,7 @@ void CompressibleSolver::buildInitialGrid(bool doPaint) {
   // build the adaptive grid by repeatedly transforming / refining
   for (i32 lvl=1; lvl<nLvls; lvl++) {
     forwardWaveletTransform();
-    adaptGrid();               // refines OWNED blocks (multi-GPU); domain-exterior ring
+    adaptGridConsistent();     // MGPU: cascade with per-kernel seam sync (== adaptGrid on 1 GPU)
     setInitialConditions();
     primitiveToConservative();
     setBoundaryConditions();
@@ -198,7 +198,7 @@ void CompressibleSolver::migrateBlocks(const i32 *newOwner) {
           memcpy(getField(f) + (size_t)sIdx*blockSizeTot, fd + (size_t)f*blockSizeTot,
                  blockSizeTot*sizeof(real));
       }
-    if (dropped) printf("[zcurve] rank %d: %d migrated blocks DROPPED (pool full)\n", part.rank, dropped);
+    if (dropped) printf("[sfc] rank %d: %d migrated blocks DROPPED (pool full)\n", part.rank, dropped);
     cudaFree(locs); cudaFree(slots);
   }
   for (i32 t = 0; t < nm; t++) { if (sBuf[t]) cudaFree(sBuf[t]); if (rBuf[t]) cudaFree(rBuf[t]); }
@@ -228,41 +228,24 @@ void CompressibleSolver::rebalancePartition(void) {
   bool changed = false;
   for (i32 c = 0; c < nCol && !changed; c++) changed = (ownerScratch[c] != ownerBase[c]);
   if (!changed) return;
-  printf("[zcurve] rank %d rebalancing at iter %d (max/avg = %.2f)\n", part.rank, iter, mx * P / total);
-  // TEMP DIAG: owned blocks before migration
-  cudaDeviceSynchronize();
-  i32 ownedBefore = 0;
-  for (i32 b = 0; b < hashTable.nKeys; b++) {
-    u64 loc = bLocList[b]; if (loc == kEmpty) continue;
-    i32 lvl=(i32)(loc>>60), kb=(i32)((loc>>40)&0xFFFFF)-1, jb=(i32)((loc>>20)&0xFFFFF)-1, ib=(i32)(loc&0xFFFFF)-1;
-    if (ib>=0 && jb>=0 && kb>=0 && isOwnedBlock(lvl,ib,jb,kb)) ownedBefore++;
-  }
+  printf("[sfc] rank %d rebalancing at iter %d (max/avg = %.2f)\n", part.rank, iter, mx * P / total);
   migrateBlocks(ownerScratch);
   memcpy(ownerBase, ownerScratch, (size_t)nCol*sizeof(i32));
   derivePartition();
   invalidateCommBuffers();      // neighbor set may have changed with the map
-  sortBlocks();                 // indices/flags for the new block set
-  rebuildGhosts();              // prune + mirror under the new map
+  sortBlocks();                 // index/flag the migrated owned set
+  rebuildGhosts();              // 2-ring halo under the new map
   haloExchange(0, NEVOLVE);
   setBoundaryConditions();
   zeroAccumulator();            // the shared bank must be clean for LSRK stage 1
-  // TEMP DIAG: owned blocks + NaN scan after the commit
-  cudaDeviceSynchronize();
-  i32 ownedAfter = 0, nanCells = 0;
-  real *Rho = getField(F_RHO);
-  for (i32 b = 0; b < hashTable.nKeys; b++) {
-    u64 loc = bLocList[b]; if (loc == kEmpty) continue;
-    i32 lvl=(i32)(loc>>60), kb=(i32)((loc>>40)&0xFFFFF)-1, jb=(i32)((loc>>20)&0xFFFFF)-1, ib=(i32)(loc&0xFFFFF)-1;
-    if (!(ib>=0 && jb>=0 && kb>=0 && isOwnedBlock(lvl,ib,jb,kb))) continue;
-    ownedAfter++;
-    for (i32 c = 0; c < blockSizeTot; c++) {
-      real r = Rho[(size_t)b*blockSizeTot + c];
-      if (!(r == r) || r <= 0) nanCells++;
-    }
-  }
-  printf("[zcurve-DIAG] rank %d ownedBefore=%d ownedAfter=%d badRho=%d\n",
-         part.rank, ownedBefore, ownedAfter, nanCells);
   comm::barrier();
+  // NOTE: dynamic rebalance is EXPERIMENTAL and off by default (--rebalance 0).
+  // The migrated grid is not yet re-settled to full cross-rank 2:1/support
+  // consistency, so the solution can diffuse over the following cycles.  The
+  // correct fix is to make the refinement cascade itself consistent across rank
+  // seams (iterate adaptGrid + a structure exchange to a global fixed point);
+  // migration then needs no special re-settle.  Static partitioning (Phases
+  // A/B: Hilbert cut + load-balanced init) is correct and is the default.
 }
 #endif
 
@@ -290,6 +273,7 @@ void CompressibleSolver::zeroAccumulator(void) {
              (size_t)NEVOLVE*(size_t)blockSizeTot*(size_t)nBlocksMax*sizeof(real));
 }
 
+
 real CompressibleSolver::step(real tStep) {
 
   real t = 0;
@@ -303,13 +287,9 @@ real CompressibleSolver::step(real tStep) {
     // dynamic wavelet adaptation; skipped for a static (fixed) refinement grid
     if (iter % 4 == 0 && nLvls > 1 && !staticGrid) {
 #ifdef USE_MGPU
-      // dynamic Z-curve rebalance BEFORE the adaptation: the cascade that
-      // follows (grading/reconstruction closure + rebuildGhosts) then builds
-      // the support structure for the migrated cut line -- running it after
-      // the adaptation would leave the new seam without manufactured support
-      // for 4 RK iterations (the virgin-seam failure mode).  The decision is
-      // replicated, so every rank takes this branch on the same iterations
-      // (the loopback comm backend barriers globally).
+      // dynamic load rebalance (experimental; off unless --rebalance > 0).  The
+      // replicated decision means every rank takes this branch on the same
+      // iterations, so the collective comm inside stays in lockstep.
       if (rebalanceEvery > 0 && iter > 0 && iter % (4*rebalanceEvery) == 0)
         rebalancePartition();
       haloExchange(0, NEVOLVE);   // fill last cycle's ghosts before the detail computation
@@ -318,27 +298,15 @@ real CompressibleSolver::step(real tStep) {
       cudaDeviceSynchronize(); sub.tick();
       forwardWaveletTransform();
       cudaDeviceSynchronize(); sub.tock(); tForwardUs += sub.duration().count();
+      // refinement cascade; under MGPU this exchanges block activity across rank
+      // seams after every create kernel so grading/support close consistently
+      adaptGridConsistent();
 #ifdef USE_MGPU
-      { // TEMP DIAG: post-threshold KEEP counts per level (owned only)
-        cudaDeviceSynchronize();
-        i32 kl[4] = {0,0,0,0};
-        for (i32 b = 0; b < hashTable.nKeys; b++) {
-          u64 loc = bLocList[b]; if (loc == kEmpty) continue;
-          i32 lvl=(i32)(loc>>60), kb=(i32)((loc>>40)&0xFFFFF)-1, jb=(i32)((loc>>20)&0xFFFFF)-1, ib=(i32)(loc&0xFFFFF)-1;
-          if (ib>=0 && jb>=0 && kb>=0 && lvl<4 && isOwnedBlock(lvl,ib,jb,kb) && bFlagsList[b] != DELETE) kl[lvl]++;
-        }
-        printf("THRESH iter=%d rank=%d keep=%d/%d/%d/%d\n", iter, part.rank, kl[0], kl[1], kl[2], kl[3]);
-      }
+      // the inverse reconstructs each new fine block from its (coarse) parent's
+      // F_OLD; rebuild that snapshot for every block created this cycle (owned
+      // fills + halo to ghosts, coarse->fine) before the inverse reads it
+      reconstituteOldSnapshot();
 #endif
-      adaptGrid();
-      // The inverse fills new owned blocks from the F_OLD snapshot via the
-      // parents' (valid) neighbor indices.  The old ghost layer is kept through
-      // adaptGrid (flagged KEEP, not propagated since grading is owned-only) so
-      // those coarse-ghost parents are present and F_OLD-valid here.  sortBlocks
-      // clobbers F_OLD (permutation scratch), so it MUST come after the inverse.
-      // Domain-boundary ghost blocks CREATED by this adaptGrid have an all-zero
-      // F_OLD (never BC-filled), and a seam block's prediction taps read it ->
-      // refresh the snapshot bank's exterior ghosts before the inverse.
       setBoundaryConditions(F_OLD);
       inverseWaveletTransform();
       cudaDeviceSynchronize(); sub.tick();
@@ -346,35 +314,32 @@ real CompressibleSolver::step(real tStep) {
       cudaDeviceSynchronize(); sub.tock(); tSortUs += sub.duration().count();
 #ifdef USE_MGPU
       rebuildGhosts();            // prune the stale ghosts, recreate the 2-ring from neighbors
+      topoCheck(2);               // debug: post-rebuild bindings
       haloExchange(0, NEVOLVE);   // fill the fresh ghost blocks
 #endif
       setBoundaryConditions();
       // the wavelet snapshot / sort buffer dirtied the shared bank; the LSRK
       // accumulator must be zero when stage 1 begins (A_1 = 0)
       zeroAccumulator();
-#ifdef USE_MGPU
-      if (true) {   // TEMP DIAG: owned count per adaptation
+      if (dbgChecks) {   // debug census: owned-interior block count must track the 1-GPU count
         cudaDeviceSynchronize();
-        i32 ol[8] = {0,0,0,0,0,0,0,0};
+        double nOwn = 0;
         for (i32 b = 0; b < hashTable.nKeys; b++) {
-          u64 loc = bLocList[b]; if (loc == kEmpty) continue;
-          i32 lvl=(i32)(loc>>60), kb=(i32)((loc>>40)&0xFFFFF)-1, jb=(i32)((loc>>20)&0xFFFFF)-1, ib=(i32)(loc&0xFFFFF)-1;
-          if (ib>=0 && jb>=0 && kb>=0 && isOwnedBlock(lvl,ib,jb,kb) && lvl < 8) ol[lvl]++;
-        }
-        i32 g3 = 0, a3 = 0;   // rank-owned lvl-3 cells: GHOST vs total
-        for (i32 b = 0; b < hashTable.nKeys; b++) {
-          u64 loc = bLocList[b]; if (loc == kEmpty) continue;
-          i32 lvl=(i32)(loc>>60), kb=(i32)((loc>>40)&0xFFFFF)-1, jb=(i32)((loc>>20)&0xFFFFF)-1, ib=(i32)(loc&0xFFFFF)-1;
-          if (!(ib>=0 && jb>=0 && kb>=0 && lvl==3 && isOwnedBlock(lvl,ib,jb,kb))) continue;
-          for (i32 c = 0; c < blockSizeTot; c++) {
-            a3++;
-            if (cFlagsList[(size_t)b*blockSizeTot + c] == GHOST) g3++;
-          }
-        }
-        printf("ADAPT iter=%d rank=%d owned=%d/%d/%d/%d gs=%.3g ghostFrac3=%.3f\n", iter, part.rank,
-               ol[0], ol[1], ol[2], ol[3], (double)globalScale[0], a3 ? (double)g3/a3 : 0.0);
-      }
+          u64 loc = bLocList[b];
+          if (loc == kEmpty) continue;
+          i32 lvl, ib, jb, kb; decode(loc, lvl, ib, jb, kb);
+          if (!isInteriorBlock(lvl, ib, jb, kb)) continue;
+#ifdef USE_MGPU
+          if (!isOwnedBlock(lvl, ib, jb, kb)) continue;
 #endif
+          nOwn += 1;
+        }
+#ifdef USE_MGPU
+        comm::allreduceSum(&nOwn, 1);
+        if (part.rank == 0)
+#endif
+        printf("[census] iter %d ownedInteriorBlocks=%.0f\n", iter, nOwn);
+      }
     }
     cudaDeviceSynchronize();
     clock.tock();
@@ -408,6 +373,16 @@ real CompressibleSolver::step(real tStep) {
       haloExchange(0, NEVOLVE);   // ghosts get owners' primitives (+G) before the RHS reads them
 #endif
       setBoundaryConditions();    // AFTER halo: periodic exterior ghosts copy the freshly-haloed wrap image
+#ifdef USE_MGPU
+      if (dbgChecks && stage == 0) {   // debug: near-vacuum states entering the flux = data-protocol bug
+        unsigned long long z=0; cudaMemcpyToSymbol(g_vacOwned,&z,sizeof(z)); cudaMemcpyToSymbol(g_vacGhost,&z,sizeof(z));
+        dbgVacKernel<<<cudaGridSize,cudaBlockSize>>>(*this); cudaDeviceSynchronize();
+        unsigned long long vo=0,vg=0; cudaMemcpyFromSymbol(&vo,g_vacOwned,sizeof(vo)); cudaMemcpyFromSymbol(&vg,g_vacGhost,sizeof(vg));
+        double vod=(double)vo, vgd=(double)vg; comm::allreduceSum(&vod,1); comm::allreduceSum(&vgd,1);
+        if ((vod > 0 || vgd > 0) && part.rank==0)
+          printf("[vac] iter %d pre-rhs vacuum-owned=%.0f vacuum-ghost=%.0f\n", iter, vod, vgd);
+      }
+#endif
       computeRightHandSide();
       primitiveToConservative();
       updateFields(stage);
@@ -415,11 +390,11 @@ real CompressibleSolver::step(real tStep) {
 
       if (nLvls > 1) {
         restrictFields();
-        interpolateFields();
-        setBoundaryConditions();
 #ifdef USE_MGPU
         haloExchange(0, NEVOLVE);   // refresh ghosts after the coarse/fine reconstruction
 #endif
+        interpolateFields();
+        setBoundaryConditions();
       }
     }
     cudaDeviceSynchronize();
@@ -490,6 +465,32 @@ void CompressibleSolver::inverseWaveletTransform(void) {
   inverseWaveletTransformKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
 }
 
+#ifdef USE_MGPU
+// Reconstitute the F_OLD snapshot for every block created this cycle, before the
+// inverse reads it.  Dense levels 0-1 already carry a valid snapshot (copyToOld);
+// process finer levels coarse->fine so each new block's parent is already valid:
+// fill OWNED new blocks by wavelet-predicting from the parent (fillOldSnapshot),
+// then halo so the neighbours' ghosts pick up the owners' freshly-filled snapshot
+// before that level becomes a parent.  This replaces the persistent (blanket-kept)
+// ghost layer as the source of the inverse's coarse-parent data.
+void CompressibleSolver::reconstituteOldSnapshot(void) {
+  haloExchange(F_OLD, NEVOLVE);                 // ghosts of the dense levels get owners' snapshot
+  setBoundaryConditions(F_OLD);                 // exterior taps must be BC-filled BEFORE prolongation reads them
+  for (i32 L = 2; L < nLvls; L++) {
+    if (dbgChecks) {                            // debug: every fill target must have valid parent support
+      cudaDeviceSynchronize(); cudaMemset(dbgCnt, 0, sizeof(i32));
+      checkFillSupportKernel<<<cudaGridSize, cudaBlockSize>>>(*this, L);
+      cudaDeviceSynchronize();
+      double v = (double)dbgCnt[0]; comm::allreduceSum(&v, 1);
+      if (v > 0 && part.rank == 0) printf("[fillchk] level %d: %.0f SUPPORT VIOLATIONS\n", L, v);
+    }
+    fillOldSnapshotKernel<<<cudaGridSize, cudaBlockSize>>>(*this, L);
+    haloExchange(F_OLD, NEVOLVE);               // owners' level-L fill -> neighbours' level-L ghosts
+    setBoundaryConditions(F_OLD);               // refresh exterior images of the freshly-filled level
+  }
+}
+#endif
+
 void CompressibleSolver::computeDeltaT(void) {
   computeDeltaTKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
@@ -554,6 +555,15 @@ void CompressibleSolver::buildDirectories(void) {
     cudaMallocManaged(&dirRecvLoc, (size_t)nNbr*dirSlot*sizeof(u64));
     cudaMallocManaged(&sendBuf,    (size_t)nNbr*dirSlot*fs*sizeof(real));
     cudaMallocManaged(&recvBuf,    (size_t)nNbr*dirSlot*fs*sizeof(real));
+    // NEED lists (adopt mechanism): every near-seam KEEP block can request up to
+    // its full 27-target ring in the neighbour's territory, so size by 27x the
+    // directory scale (loc codes only -- cheap)
+    cudaFree(this->needLoc); cudaFree(needRecvLoc);
+    this->needSlot = 27*dirSlot;
+    cudaMallocManaged(&this->needLoc, (size_t)nNbr*this->needSlot*sizeof(u64));
+    cudaMallocManaged(&needRecvLoc,   (size_t)nNbr*this->needSlot*sizeof(u64));
+    if (!this->needCnt) { cudaMallocManaged(&this->needCnt, nNbr*sizeof(i32)); cudaMemset(this->needCnt, 0, nNbr*sizeof(i32)); }
+    if (!needRecvCnt)   { cudaMallocManaged(&needRecvCnt, nNbr*sizeof(i32)); }
   }
   comm::barrier();
   cudaMemset(dirFill, 0, nNbr*sizeof(i32));
@@ -605,11 +615,11 @@ void CompressibleSolver::rebuildGhosts(void) {
   cudaDeviceSynchronize();
   consumeDirKernel<<<cudaGridSize, cudaBlockSize>>>(*this);      // create ghosts from directories (un-delete)
   cudaDeviceSynchronize();
-  // keep (un-delete only) the existing non-owned blocks that owned stencils
-  // need -- locally-manufactured support at an advancing rank seam survives
-  // even when no other rank has it (see keepLocalSupportKernel)
-  keepLocalSupportKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-  cudaDeviceSynchronize();
+  // NB: no keepLocalSupport pass.  Under the owned-target + NEED/adopt protocol
+  // every non-owned interior block has an owner and is directory-backed; a ghost
+  // no directory names is a genuine zombie (its owner coarsened it) and MUST be
+  // pruned -- keeping it alive leaves a permanently-unfillable zero block whose
+  // presence flips owned boundary cells from GHOST to ACTIVE (vacuum feeder).
   nBlocks = hashTable.nKeys;
   deleteDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this);      // drop the ghosts no longer needed
   cudaDeviceSynchronize();
@@ -617,6 +627,193 @@ void CompressibleSolver::rebuildGhosts(void) {
   comm::barrier();
 }
 #endif
+
+// Debug census: owned interior block count (allreduced), printed with a stage tag.
+void CompressibleSolver::censusPrint(const char *tag) {
+  if (!dbgChecks) return;
+  cudaDeviceSynchronize();
+  double nOwn = 0;
+  for (i32 b = 0; b < hashTable.nKeys; b++) {
+    u64 loc = bLocList[b];
+    if (loc == kEmpty) continue;
+    i32 lvl, ib, jb, kb; decode(loc, lvl, ib, jb, kb);
+    if (!isInteriorBlock(lvl, ib, jb, kb)) continue;
+    if (bFlagsList[b] == DELETE) continue;
+#ifdef USE_MGPU
+    if (!isOwnedBlock(lvl, ib, jb, kb)) continue;
+#endif
+    nOwn += 1;
+  }
+#ifdef USE_MGPU
+  comm::allreduceSum(&nOwn, 1);
+  if (part.rank == 0)
+    printf("[stage] %-14s ownedInteriorSum=%.0f\n", tag, nOwn);
+#else
+  printf("[stage] %-14s ownedInteriorSum=%.0f\n", tag, nOwn);
+#endif
+}
+
+// Debug-mode integrity check: run the topology assert kernel, allreduce the
+// violation counter, and report.  Gated by --debug (dbgChecks); zero cost when off.
+void CompressibleSolver::topoCheck(i32 phaseTag) {
+  if (!dbgChecks) return;
+  cudaDeviceSynchronize();
+  cudaMemset(dbgCnt, 0, sizeof(i32));
+  checkTopologyKernel<<<cudaGridSize, cudaBlockSize>>>(*this, phaseTag);
+  cudaDeviceSynchronize();
+  double v = (double)dbgCnt[0];
+#ifdef USE_MGPU
+  comm::allreduceSum(&v, 1);
+#endif
+  if (v > 0
+#ifdef USE_MGPU
+      && part.rank == 0
+#endif
+     ) printf("[topo] phase %d: %.0f TOPOLOGY VIOLATIONS (see [topo] lines)\n", phaseTag, v);
+}
+
+#ifdef USE_MGPU
+// Block-activity exchange: publish this rank's owned blocks to its neighbors and
+// import (create as ghosts) the neighbors' blocks that fall within our 2-ring.
+// STRUCTURE ONLY -- no field data moves, so the F_OLD wavelet snapshot survives
+// (unlike rebuildGhosts, which sorts and clobbers the shared bank).  Run after
+// every kernel that creates blocks so a neighbor's fresh refinement is visible
+// before our next grading / reconstruction pass -- the cross-seam analogue of
+// the single-GPU cascade closing in one sweep.
+void CompressibleSolver::exchangeStructure(void) {
+  if (comm::size() == 1 || nNbr == 0) return;
+  // Full seam SYNC, both directions (the periodic-boundary analogue):
+  //  - NEED lists first: support targets our closure required in a neighbour's
+  //    territory are sent to their owner, who creates them as owned ("adopt");
+  //  - directories: every owned block near the seam -> a GHOST on the neighbour
+  //    (this same pass exports the just-adopted blocks back to the requester);
+  //  - stale ghosts (no longer in any neighbour's directory and not local
+  //    support) are DELETED so the layer never accumulates.
+  // No sortBlocks -- that clobbers the F_OLD snapshot bank mid-cascade.
+  if (needCnt && needSlot > 0) {
+    cudaDeviceSynchronize();
+    // overflowed counts mean silently-dropped support blocks (missing-block
+    // vacuum) -- report loudly, then clamp; the buffers grow with dirSlot
+    for (i32 s = 0; s < nNbr; s++) {
+      if (needCnt[s] > needSlot) {
+        printf("[need] rank %d: %d NEEDs for nbr %d OVERFLOW slot %d -- support dropped%s\n",
+               part.rank, needCnt[s], s, needSlot, dbgChecks ? " (FATAL under --debug)" : "");
+        if (dbgChecks) { fflush(stdout); abort(); }
+        needCnt[s] = needSlot;
+      }
+    }
+    std::vector<void*> ss(nNbr), rr(nNbr); std::vector<size_t> sb(nNbr), rb(nNbr);
+    for (i32 s = 0; s < nNbr; s++) { ss[s]=&needCnt[s]; rr[s]=&needRecvCnt[s]; sb[s]=sizeof(i32); rb[s]=sizeof(i32); }
+    comm::neighborExchange(nNbr, nbrRank, ss.data(), sb.data(), rr.data(), rb.data());
+    for (i32 s = 0; s < nNbr; s++) {
+      ss[s]=&needLoc[(size_t)s*needSlot]; rr[s]=&needRecvLoc[(size_t)s*needSlot];
+      sb[s]=(size_t)needCnt[s]*sizeof(u64); rb[s]=(size_t)needRecvCnt[s]*sizeof(u64);
+    }
+    comm::neighborExchange(nNbr, nbrRank, ss.data(), sb.data(), rr.data(), rb.data());
+    consumeNeedKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // adopt: create them as owned
+    cudaDeviceSynchronize();
+    cudaMemset(needCnt, 0, nNbr*sizeof(i32));                    // reset for the next create kernel
+  }
+  buildDirectories();
+  consumeDirKernel<<<cudaGridSize, cudaBlockSize>>>(*this);      // create/touch ghosts of the peers' SURVIVING blocks
+  cudaDeviceSynchronize();
+  nBlocks = hashTable.nKeys;
+  // NB: no markGhosts / deleteData here.  markGhosts raises EVERY owned block to
+  // KEEP -- mid-cascade that overwrites thresholding's DELETE decisions on every
+  // exchange, so no block can ever coarsen (a one-way ratchet to a dense grid;
+  // the seam band was this ratchet's local form).  Ghost lifecycle without it:
+  // all flags start the cycle DELETE (memset in the forward transform);
+  // consumeDir touches ghosts named in the survivor directories (NEW -> KEEP);
+  // ghosts of coarsened peer blocks stay DELETE, are never grading sources, and
+  // are pruned once by the tail deleteData.  A mid-cascade deleteData would also
+  // ZERO the data of blocks a later exchange legitimately re-imports.
+}
+#endif
+
+// The refinement cascade.  On a single GPU this is exactly adaptGrid().
+//
+// Under MGPU the cascade maintains the invariant that each rank's local grid is
+// a WINDOW of the single-GPU union grid: owned blocks + the union-grid blocks in
+// the Chebyshev-2 same-level ring of the owned set (which covers every stencil:
+// the +-2-cell flux ring, the 27-tap wavelet prediction on the parent level, and
+// the one-sided interpolation parents).  Mechanics per create kernel:
+//   - OWNED targets only; a target in a neighbour's territory is sent as a NEED
+//     and the owner creates it (adopt) -- no rank manufactures blocks it cannot
+//     fill, and the refined set stays partition-independent;
+//   - exchangeStructure after each kernel: NEED adopt + directory publication of
+//     owned SURVIVING (flag != DELETE) blocks + consumeDir ghost import, so the
+//     next collective kernel grades against the neighbours' fresh refinement.
+//     Publishing only survivors is what lets blocks coarsen: ghosts of deleted
+//     peer blocks stay DELETE and are pruned at the tail;
+//   - recon/boundary stages iterate to a GLOBAL fixed point (createdCnt
+//     allreduce) to close multi-hop adoption chains;
+//   - tail: prune, rebuild fresh (corpse-free) directories for the F_OLD halo,
+//     refresh prnt/nbr index lists that the prolongation/BC/inverse traverse.
+void CompressibleSolver::adaptGridConsistent(void) {
+  if (nLvls <= 1) return;
+#ifndef USE_MGPU
+  adaptGrid();
+#else
+  // single pass each: children of owned are owned (no NEEDs possible), and the
+  // grading ring of the union KEEP set is exactly what one pass + adopt builds
+  // (repeating addAdjacent would grade rings-of-rings -- over-refinement vs 1 GPU)
+  censusPrint("pre-cascade");
+  addFineBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  exchangeStructure();
+  setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // imported ghosts -> KEEP (grading sources)
+  censusPrint("post-fine");
+  addAdjacentBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  exchangeStructure();
+  setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  censusPrint("post-adjacent");
+  // reconstruction + boundary: settle each stage to a GLOBAL fixed point.  The
+  // recon kernel has no level filter, so on one rank the fixed point equals the
+  // old per-level loop; across ranks it also closes multi-hop chains where an
+  // adopted support block needs support of its own on yet another rank.  The
+  // quiescence test is "did ANY rank CREATE a block this pass" (createdCnt is
+  // bumped only by activateBlock's create branch, incl. adoptions).
+  const i32 passCap = nLvls + comm::size() + 4;
+  for (i32 stage = 0; stage < 2; stage++) {
+    i32 pass = 0;
+    while (true) {
+      cudaDeviceSynchronize();
+      cudaMemset(createdCnt, 0, sizeof(i32));
+      if (stage == 0) addReconstructionBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+      else            addBoundaryBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+      setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+      exchangeStructure();
+      setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+      cudaDeviceSynchronize();
+      real created = (real)createdCnt[0];
+      comm::allreduceMax(&created, 1);
+      if (created == 0.0) break;
+      if (++pass >= passCap) {
+        printf("[adapt] rank %d: stage %d settlement exceeded %d passes (still creating)\n",
+               part.rank, stage, passCap);
+        break;
+      }
+    }
+  }
+  // tail: final prune, then FRESH directories (corpse-free: the pre-prune lists
+  // may name just-deleted blocks, and packing those ships zeros over the peers'
+  // valid ghost F_OLD), then the index refresh the prolongation/BC/inverse
+  // traverse.  Single-GPU tolerates stale indices only because its support is
+  // built a cycle ahead of use; the seam layer is not.
+  censusPrint("post-settle");
+  cudaDeviceSynchronize();
+  nBlocks = hashTable.nKeys;
+  deleteDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  buildDirectories();
+  updatePrntIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  updateNbrIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  censusPrint("post-prune");
+  topoCheck(1);   // debug: cascade tail -- bindings must be loc-consistent before prolongation
+#endif
+}
 
 void CompressibleSolver::restrictFields(void) {
   restrictFieldsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);

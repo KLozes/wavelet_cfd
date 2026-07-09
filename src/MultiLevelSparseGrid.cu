@@ -1,5 +1,6 @@
 #include <thrust/sort.h>
 #include <algorithm>
+#include <vector>
 
 #include <png++/png.hpp>
 #include "MultiLevelSparseGrid.cuh"
@@ -30,16 +31,13 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
 
   // imageDataX holds an x-y slice taken at the mid-z plane (the natural view
   // for the pseudo-2D / quasi-1D Sod problem).
-#ifdef USE_MGPU
-  // per-PE image TILE: only this PE's owned x-y extent at finest resolution, so
-  // no PE ever allocates the full-domain image (each writes its tile to a
-  // rank-prefixed png; stitch offline).
-  imageSizeX[0] = (part.b1[0]-part.b0[0])*blockSize*powi(2,nLvls-1);
-  imageSizeX[1] = (part.b1[1]-part.b0[1])*blockSize*powi(2,nLvls-1);
-#else
+  // Full-domain on every PE: each PE paints only its OWNED leaf cells (the AMR
+  // leaves partition the domain, so every finest-pixel is written by exactly
+  // one rank), then paintField sum-reduces into one full-domain figure that
+  // rank 0 writes.  A Z-curve owned region is not a clean box, so per-PE bbox
+  // tiles would overlap and never stitch -- the reduce sidesteps that.
   imageSizeX[0] = (baseGridSize[0])*powi(2,nLvls-1);  // x (width)
   imageSizeX[1] = (baseGridSize[1])*powi(2,nLvls-1);  // y (height)
-#endif
 
   imageSizeY[0] = (baseGridSize[0])*powi(2,nLvls-1);  // image size is the max resolution not including boundary condition blocks
   imageSizeY[1] = (baseGridSize[2])*powi(2,nLvls-1);
@@ -60,9 +58,15 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   cudaMallocManaged(&bLocList, nBlocksMax*sizeof(u64));
   cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(i32));
   cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(i32));
+  cudaMallocManaged(&snapValidList, nBlocksMax*sizeof(i32));
+  cudaMallocManaged(&dbgCnt, sizeof(i32));
+  cudaMallocManaged(&createdCnt, sizeof(i32));
   cudaMemset(bLocList, 0, nBlocksMax*sizeof(u64));
   cudaMemset(bIdxList, 0, nBlocksMax*sizeof(i32));
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(i32));
+  cudaMemset(snapValidList, 0, nBlocksMax*sizeof(i32));
+  cudaMemset(dbgCnt, 0, sizeof(i32));
+  cudaMemset(createdCnt, 0, sizeof(i32));
 
   // flow-solver-only per-block arrays + the slice buffer: skipped in lean mode
   // (the narrowband SDF needs none of them -- see the `lean` note in the header).
@@ -97,6 +101,7 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
   cudaDeviceSynchronize();
   cudaFree(bLocList);
   cudaFree(bIdxList);
+  cudaFree(snapValidList);
   cudaFree(prntIdxList);
   cudaFree(nbrIdxList);
   cudaFree(cFlagsList);
@@ -117,18 +122,33 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
 //     neighbors r-1 / r+1 (the basis for dynamic rebalancing).
 i32 g_partMode = 1;
 
-// Morton code of a base block (2D interleave in pseudo-2D, 3D otherwise).
-static u64 mortonCode(i32 x, i32 y, i32 z, bool twoD) {
-  u64 m = 0;
-  for (i32 b = 0; b < 21; b++) {
-    if (twoD) {
-      m |= ((u64)((x >> b) & 1)) << (2*b) | ((u64)((y >> b) & 1)) << (2*b+1);
-    } else {
-      m |= ((u64)((x >> b) & 1)) << (3*b)   | ((u64)((y >> b) & 1)) << (3*b+1)
-         | ((u64)((z >> b) & 1)) << (3*b+2);
+// Space-filling-curve index of a base block.  Pseudo-2D uses a HILBERT curve
+// (better locality than Morton -- consecutive indices are always face-adjacent,
+// no diagonal jumps -- so a contiguous interval is a compact region with little
+// seam area).  True-3D falls back to a 3D Morton (Z) code.
+//
+// 2D Hilbert distance on an n x n grid (n a power of two), Wikipedia xy2d.
+static u64 hilbert2D(i32 n, i32 x, i32 y) {
+  u64 d = 0;
+  for (i32 s = n/2; s > 0; s /= 2) {
+    i32 rx = (x & s) > 0 ? 1 : 0;
+    i32 ry = (y & s) > 0 ? 1 : 0;
+    d += (u64)s * (u64)s * (u64)((3*rx) ^ ry);
+    if (ry == 0) {                         // rotate/flip the quadrant
+      if (rx == 1) { x = n-1 - x; y = n-1 - y; }
+      i32 t = x; x = y; y = t;
     }
   }
+  return d;
+}
+static u64 morton3D(i32 x, i32 y, i32 z) {
+  u64 m = 0;
+  for (i32 b = 0; b < 21; b++)
+    m |= ((u64)((x>>b)&1))<<(3*b) | ((u64)((y>>b)&1))<<(3*b+1) | ((u64)((z>>b)&1))<<(3*b+2);
   return m;
+}
+static u64 curveIndex(i32 x, i32 y, i32 z, i32 hn, bool twoD) {
+  return twoD ? hilbert2D(hn, x, y) : morton3D(x, y, z);
 }
 
 // Fill ownerBase by cutting the Morton-ordered base blocks into P contiguous
@@ -140,12 +160,13 @@ void MultiLevelSparseGrid::partitionByWeight(const double *w, i32 *dst) {
   i32 P = comm::size();
   i32 n = part.nb[0]*part.nb[1]*part.nb[2];
   bool twoD = (part.nb[2] == 1);
+  i32 hn = 1; while (hn < part.nb[0] || hn < part.nb[1]) hn <<= 1;   // Hilbert grid side (pow2)
   std::vector<std::pair<u64,i32>> order(n);
   for (i32 k = 0; k < part.nb[2]; k++)
   for (i32 j = 0; j < part.nb[1]; j++)
   for (i32 i = 0; i < part.nb[0]; i++) {
     i32 idx = i + part.nb[0]*(j + part.nb[1]*k);
-    order[idx] = {mortonCode(i, j, k, twoD), idx};
+    order[idx] = {curveIndex(i, j, k, hn, twoD), idx};
   }
   std::sort(order.begin(), order.end());
   double total = 0;
@@ -300,22 +321,43 @@ void MultiLevelSparseGrid::resetGrid(void) {
   cudaDeviceSynchronize();
 }
 
+// debug: single-GPU stage census matching CompressibleSolver::censusPrint (no comm)
+static void censusPrint1(MultiLevelSparseGrid &g, const char *tag) {
+  if (!g.dbgChecks) return;
+  cudaDeviceSynchronize();
+  i32 nOwn = 0;
+  for (i32 b = 0; b < g.hashTable.nKeys; b++) {
+    u64 loc = g.bLocList[b];
+    if (loc == kEmpty) continue;
+    i32 lvl, ib, jb, kb; g.decode(loc, lvl, ib, jb, kb);
+    if (!g.isInteriorBlock(lvl, ib, jb, kb)) continue;
+    if (g.bFlagsList[b] == DELETE) continue;
+    nOwn++;
+  }
+  printf("[stage] %-14s ownedInterior(nonDelete)=%d\n", tag, nOwn);
+}
+
 void MultiLevelSparseGrid::adaptGrid(void) {
 
   if (nLvls > 1) {
+    censusPrint1(*this, "pre-cascade");
     addFineBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    censusPrint1(*this, "post-fine");
     addAdjacentBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    censusPrint1(*this, "post-adjacent");
     for(i32 lvl=nLvls-1; lvl>2; lvl--) {
       setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
       addReconstructionBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     }
     addBoundaryBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    censusPrint1(*this, "post-settle");
     cudaDeviceSynchronize();
     nBlocks = hashTable.nKeys;
     deleteDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     updatePrntIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    censusPrint1(*this, "post-prune");
   }
 }
 
@@ -331,8 +373,6 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   if (!lean) {   // parent/neighbor indices + cell flags are flow-solver-only
     updatePrntIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     updateNbrIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-    // periodicity is applied in setBoundaryConditions (the exterior ghost blocks
-    // are filled from their wrap-around image), not by remapping neighbor slots.
     flagActiveCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     flagParentCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   }
@@ -405,13 +445,37 @@ __device__ void MultiLevelSparseGrid::wrapBlockPeriodic(i32 lvl, i32 &i, i32 &j,
   }
 }
 
+// Validated loc->slot lookup: the hash table never removes keys, so getValue can
+// resolve a DELETED block's corpse slot (bLoc = kEmpty, fields zeroed).  Callers
+// that would read or bind through the returned index must treat a corpse as
+// missing (bEmpty) -- otherwise stencil taps silently read wrong/zeroed memory.
+__device__ i32 MultiLevelSparseGrid::getBlockIdx(u64 loc) {
+  i32 v = hashTable.getValue(loc);
+  return (v != bEmpty && bLocList[v] == loc) ? v : bEmpty;
+}
+
 __device__ void MultiLevelSparseGrid::activateBlock(i32 lvl, i32 i, i32 j, i32 k) {
   u64 loc = encode(lvl, i, j, k);
   i32 idx = hashTable.insert(loc);
-  if (idx != bEmpty) { 
-    // new key was inserted if not bEmpty
+  if (idx == bEmpty) return;
+  if (bLocList[idx] != loc || bIdxList[idx] != idx) {
+    // CREATE: fresh slot (never used, zeroed fields) or corpse revival (deleted,
+    // fields zeroed by deleteData).  All writes are idempotent, so concurrent
+    // activators of the same loc are safe.  snapValid=0 marks "no F_OLD snapshot
+    // yet" -- reconstituted by prolongation before the inverse reads it.  (The
+    // bIdx test also catches the virgin-slot corner case loc==0: the exterior
+    // block (-1,-1,-1) at lvl 0 encodes to 0, matching memset-zero slots.)
     bLocList[idx] = loc;
     bIdxList[idx] = idx;
+    atomicMax(&bFlagsList[idx], NEW);
+    snapValidList[idx] = 0;
+    atomicAdd(createdCnt, 1);   // settlement loops: "did any rank CREATE a block this pass?"
+  } else {
+    // TOUCH: the block is already live -- only raise its flag.  It must keep its
+    // snapshot validity and its live data: cascade kernels re-activate existing
+    // blocks constantly (a KEEP block's own 1-ring includes itself), and zeroing
+    // snapValid here would make the fill overwrite valid F_OLD with a smooth
+    // prediction and wipe the block's detail every adaptation cycle.
     atomicMax(&bFlagsList[idx], NEW);
   }
 }
@@ -436,9 +500,24 @@ __device__ void MultiLevelSparseGrid::decode(u64 loc, i32 &lvl, i32 &i, i32 &j, 
 
 // render a single field f (>=0) or the refinement-level map (f=-1) to a png
 void MultiLevelSparseGrid::paintField(i32 f, const char *fileName) {
-  png::image<png::gray_pixel_16> image(imageSizeX[0], imageSizeX[1]);
+  i32 nPix = imageSizeX[0]*imageSizeX[1];
+  // clear first: each PE paints only its owned cells, so unpainted pixels must
+  // read 0 for the cross-PE sum (and a shrunk single-PE frame leaves no stale).
+  cudaMemset(imageDataX, 0, (size_t)nPix*sizeof(real));
   computeImageDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this, f);
   cudaDeviceSynchronize();
+#ifdef USE_MGPU
+  // combine the per-PE owned paints into one full-domain image (exactly one
+  // rank wrote each pixel; the rest are 0), then only rank 0 writes the file.
+  if (comm::size() > 1) {
+    std::vector<double> buf(nPix);
+    for (i32 t = 0; t < nPix; t++) buf[t] = (double)imageDataX[t];
+    comm::allreduceSum(buf.data(), nPix);
+    if (comm::rank() != 0) return;
+    for (i32 t = 0; t < nPix; t++) imageDataX[t] = (real)buf[t];
+  }
+#endif
+  png::image<png::gray_pixel_16> image(imageSizeX[0], imageSizeX[1]);
 
   // normalize image data and fill png image
   real maxVal = -1e32;
@@ -461,23 +540,39 @@ void MultiLevelSparseGrid::paintField(i32 f, const char *fileName) {
   image.write(fileName);
 }
 
+#ifdef USE_MGPU
+// Render the (replicated) domain partition: every pixel coloured by the rank
+// owning its base column.  Independent of the distributed grid data -- rank 0
+// draws it straight from ownerBase -- so it is cheap and always consistent.
+// Called at every point the ownership map changes (Phase B re-cut, Phase C
+// migration) to visualise the load partition and its evolution.
+void MultiLevelSparseGrid::paintPartition(void) {
+  if (comm::rank() != 0) { partImgCounter++; return; }
+  i32 P = comm::size();
+  i32 sub = blockSize*powi(2, nLvls-1);              // pixels per base column
+  png::image<png::gray_pixel_16> image(imageSizeX[0], imageSizeX[1]);
+  for (i32 py = 0; py < imageSizeX[1]; py++)
+    for (i32 px = 0; px < imageSizeX[0]; px++) {
+      i32 ci = px / sub, cj = py / sub;             // pseudo2D: k=0 plane
+      i32 owner = ownerBase[ci + part.nb[0]*(cj + part.nb[1]*0)];
+      image[py][px] = (png::gray_pixel_16)(((double)owner + 0.5)/(double)P * 65535.0);
+    }
+  char fn[80];
+  sprintf(fn, "output/partition_%05d.png", partImgCounter++);
+  image.write(fn);
+}
+#endif
+
+
 void MultiLevelSparseGrid::paint(void) {
   cudaDeviceSynchronize();
   char fileName[80];
-#ifdef USE_MGPU
-  // each PE renders its own subdomain tile to a rank-prefixed file so ranks do
-  // not collide (single-rank output keeps the original names for A/B diffing).
-  // NOTE: computeImageData reads fieldData on the host; under the real MPI
-  // backend that must first be staged to host memory (loopback is managed, ok).
-  char pre[16] = "";
-  if (comm::size() > 1) sprintf(pre, "r%d_", comm::rank());
-#else
-  const char *pre = "";
-#endif
+  // One full-domain figure per field: paintField sum-reduces the per-PE owned
+  // paints and rank 0 writes it (single-rank keeps the identical filenames).
   // f = -1 grid, 0 Rho, 1 RhoU, 2 RhoV, 3 RhoW, 4 RhoE (total energy)
   for (i32 f=-1; f<5; f++) {
-    if (f >= 0) sprintf(fileName, "output/%simage%02d_%05d.png", pre, f, imageCounter);
-    else        sprintf(fileName, "output/%sgrid_%05d.png", pre, imageCounter);
+    if (f >= 0) sprintf(fileName, "output/image%02d_%05d.png", f, imageCounter);
+    else        sprintf(fileName, "output/grid_%05d.png", imageCounter);
     paintField(f, fileName);
   }
   imageCounter++;

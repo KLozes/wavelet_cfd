@@ -83,8 +83,9 @@ static void runRank(int argc, char* argv[]) {
   i32 mdFluxA  = argI("--mdflux", 0);                // 1 = multidimensional Osher-type corner flux (first-order states)
   real cflArg  = argF("--cfl", -1.0);                // CFL override (-1 = default 0.40; dt = cfl*min(dx/(|u|+c)))
   real advectA = argF("--advect", 0.0);              // isentropic-vortex (case 2) advection velocity u0=v0 (periodic seam-crossing test)
-  i32 zcurveA  = argI("--zcurve", 1);                // partition: 1 = Z-curve weight-balanced cut (default), 0 = box strips
-  i32 rebalA   = argI("--rebalance", 8);             // dynamic rebalance period (adaptation cycles; 0 = off)
+  i32 zcurveA  = argI("--zcurve", 1);                // partition: 1 = space-filling-curve (Hilbert) weight-balanced cut (default), 0 = box strips
+  i32 rebalA   = argI("--rebalance", 0);             // dynamic rebalance period, adaptation cycles (0 = off; EXPERIMENTAL)
+  i32 debugA   = argI("--debug", 0);                 // 1 = run topology/data integrity assert kernels each cycle
 
   bool cube   = (testCase == 3);
   bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv);
@@ -126,6 +127,7 @@ static void runRank(int argc, char* argv[]) {
   solver->rt0Face         = rt0FaceA;                    // RT0 normal face: 0=linear modal, 1=c=1/6 parabola
   solver->mdFlux          = mdFluxA;                     // multidimensional Osher-type corner flux
   solver->rebalanceEvery  = rebalA;                     // dynamic Z-curve rebalance period
+  solver->dbgChecks       = debugA;                     // integrity assert kernels (--debug 1)
   solver->immerserdBcType = 0;
   solver->initialize();
 

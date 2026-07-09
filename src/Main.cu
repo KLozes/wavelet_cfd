@@ -75,7 +75,8 @@ int main(int argc, char* argv[]) {
   bool haveMa  = hasArg("--ma");
   real Ma      = haveMa ? argF("--ma", 0.1) : 0.1;   // Gresho Mach number / acConv amplitude
   i32 bcArg    = argI("--bc", -1);                   // bcType override (-1 = per-testCase default)
-  i32 reconA   = argI("--recon", 1);                 // 0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola (smooth only)
+  i32 reconA   = argI("--recon", 1);
+  i32 debugA   = argI("--debug", 0);                 // 1 = per-cycle integrity/census diagnostics                 // 0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola (smooth only)
   real tEndArg = argF("--tend", -1.0);               // tEnd override (-1 = per-testCase default)
   i32 rt0FaceA = argI("--rt0face", 0);               // RT0 normal face (scheme==1): 0=linear modal (default), 1=c=1/6 parabola
   i32 mdFluxA  = argI("--mdflux", 0);                // 1 = multidimensional Osher-type corner flux (first-order states)
@@ -118,7 +119,8 @@ int main(int argc, char* argv[]) {
   solver->greshoP0        = 1.0/(gam*Ma*Ma);            // Gresho background pressure -> Mach = Ma
   solver->staticGrid      = acoustic ? 3 : ((testCase == 5 || sodAmr) ? 1 : 0);   // 1=radial shells, 2=planar band, 3=centre step
   solver->refineRadius    = 0.4;                        // fine-region half-extent (unused for the step)
-  solver->recon           = reconA;                     // face reconstruction (TVD / ROUND / LD-ROUND)
+  solver->recon           = reconA;
+  solver->dbgChecks       = debugA;                     // face reconstruction (TVD / ROUND / LD-ROUND)
   solver->rt0Face         = rt0FaceA;                    // RT0 normal face: 0=linear modal, 1=c=1/6 parabola
   solver->mdFlux          = mdFluxA;                     // multidimensional Osher-type corner flux
   solver->immerserdBcType = 0;

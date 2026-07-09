@@ -122,7 +122,9 @@ public:
       greshoP0 = 0.0;
       staticGrid = 0;
       refineRadius = 0.4;
-      rebalanceEvery = 8;
+#ifdef USE_MGPU
+      rebalanceEvery = 0;   // dynamic rebalance off by default (experimental)
+#endif
 
       tGrid = 0.0;
       tSolver = 0.0;
@@ -148,13 +150,18 @@ public:
   void primitiveToConservative(void);
   void forwardWaveletTransform(void);
   void inverseWaveletTransform(void);
+  void adaptGridConsistent(void);   // refinement cascade w/ cross-rank structure exchange (== adaptGrid on 1 GPU)
 
   void computeDeltaT(void);
   void computeRightHandSide(void);
   void updateFields(i32 stage);
   void zeroAccumulator(void);   // zero the shared bank before LSRK stage 1
+  void topoCheck(i32 phaseTag);          // debug: assert prnt/nbr/hash bindings are loc-consistent (--debug)
+  void censusPrint(const char *tag);     // debug: allreduced owned-interior block count with a stage tag
 #ifdef USE_MGPU
   void haloExchange(i32 fOff, i32 nf);   // fill partition-boundary ghost blocks from owners
+  void exchangeStructure(void);          // publish owned blocks + import neighbors' (structure only, no data)
+  void reconstituteOldSnapshot(void);    // rebuild F_OLD for blocks created this cycle (halo + coarse->fine interp)
   void rebuildGhosts(void);              // recreate the 2-ring ghost layer from neighbors' directories
   void rebalanceWeights(void);           // count owned blocks/base column, allreduce, re-cut the Morton curve
   void rebalancePartition(void);         // dynamic: recount, re-cut, migrate (every rebalanceEvery adaptations)
@@ -177,6 +184,8 @@ public:
   u64  *dirSendLoc;    // [nNbr*dirSlot]  my boundary-block loc codes, per neighbor
   u64  *dirRecvLoc;    // [nNbr*dirSlot]  neighbor's boundary-block loc codes
   i32  *dirFill;       // [nNbr]          scratch fill counter
+  i32  *needRecvCnt = nullptr;  // [nNbr]           needs received from each neighbor
+  u64  *needRecvLoc = nullptr;  // [nNbr*needSlot]  loc codes to adopt (in OUR territory)
   real *sendBuf;       // [nNbr*dirSlot*NEVOLVE*blockSizeTot]  packed field data out
   real *recvBuf;       // [nNbr*dirSlot*NEVOLVE*blockSizeTot]  packed field data in
 #endif

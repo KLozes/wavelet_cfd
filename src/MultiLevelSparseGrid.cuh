@@ -54,6 +54,9 @@ public:
   i32 imageSizeZ[2] = {1,1};
 
   i32 imageCounter;
+#ifdef USE_MGPU
+  i32 partImgCounter = 0;   // partition-plot frame counter
+#endif
   i32 nBlocks;
 
 #ifdef USE_MGPU
@@ -80,6 +83,13 @@ public:
   i32  nNbr;        // number of neighbor PEs
   i32 *nbrRank;     // [nNbr]  neighbor PE ranks
   i32 *nbrOf;       // [size]  rank -> neighbor slot (or -1)
+  // NEED lists: support targets the grading/reconstruction closure required but
+  // could not create locally (owned-target rule).  Recorded at the skip point,
+  // sent to the owning rank each exchangeStructure; the owner creates them as
+  // owned blocks ("adopt") and they return as our ghosts in the same exchange.
+  i32  needSlot = 0;         // per-neighbor capacity (sized with dirSlot)
+  i32 *needCnt  = nullptr;   // [nNbr]  needs recorded for each neighbor
+  u64 *needLoc  = nullptr;   // [nNbr*needSlot]
   void initPartition(void);                                            // set `part` + fill ownerBase
   void partitionByWeight(const double *w, i32 *dst = nullptr);   // Morton-cut owner fill (w nullptr = uniform; dst nullptr = ownerBase)
   void derivePartition(void);                // bbox + neighbor set + capacity check from ownerBase
@@ -95,6 +105,10 @@ public:
   i32 *chldIdxList;     // block child indices
   i32 *bFlagsList;      // block Flags
   i32 *cFlagsList;      // cell Flags
+  i32 *snapValidList;   // 1 if this block held a valid F_OLD snapshot at copyToOld, else 0 (new/imported)
+  i32  dbgChecks = 0;   // runtime debug: topology/data-integrity assert kernels (--debug)
+  i32 *dbgCnt = nullptr;      // [1] managed violation counter for the check kernels
+  i32 *createdCnt = nullptr;  // [1] managed count of blocks CREATED (not touched) since last reset
 
   real *fieldData;      // flow field data
   real *imageDataX;     // output image data
@@ -127,6 +141,7 @@ public:
   __host__ __device__ real *getField(i32 f);
 
   __device__ void activateBlock(i32 lvl, i32 i, i32 j, i32 k);
+  __device__ i32  getBlockIdx(u64 loc);   // validated loc->slot (corpse-safe getValue; bEmpty if stale)
   __device__ void wrapBlockPeriodic(i32 lvl, i32 &i, i32 &j, i32 &k); // wrap block index into the interior range (torus)
   
   __host__ __device__ u64 encode(i32 lvl, i32 i, i32 j, i32 k);
@@ -134,6 +149,9 @@ public:
 
   void paint(void);
   void paintField(i32 f, const char *fileName);  // render one field (or grid, f=-1) to a png
+#ifdef USE_MGPU
+  void paintPartition(void);   // render the rank-ownership map (rank 0 writes output/partition_*.png)
+#endif
   virtual void computeImageData(i32 f);
 
 };

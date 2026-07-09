@@ -92,7 +92,11 @@ __device__ i32 HashTable::insertValue(u64 key, i32 value) {
     }
 
     if (prev == key) {
-      valueList[slot] = value;;
+      valueList[slot] = value;
+      break;   // key already present: update in place.  Without this break the
+               // loop probes on and CASes a DUPLICATE key into the next empty
+               // slot -- getValue then resolves whichever copy probes first,
+               // silently binding stencil taps to a stale block index.
     }
     slot = (slot + 1) % hashTableSize;
   }

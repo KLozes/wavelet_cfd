@@ -35,7 +35,6 @@ __global__ void markGhostsKernel(CompressibleSolver &grid);
 __global__ void countDirKernel(CompressibleSolver &grid);
 __global__ void fillDirKernel(CompressibleSolver &grid);
 __global__ void consumeDirKernel(CompressibleSolver &grid);
-__global__ void keepLocalSupportKernel(CompressibleSolver &grid);
 __global__ void packDirKernel(CompressibleSolver &grid, i32 fOff, i32 nf);
 __global__ void unpackDirKernel(CompressibleSolver &grid, i32 fOff, i32 nf);
 __global__ void countBaseWeightsKernel(CompressibleSolver &grid);
@@ -49,6 +48,11 @@ __global__ void forwardWaveletTransformKernel(CompressibleSolver &grid);
 // diagnostic: normalized wavelet-detail indicator -> F_SCRATCH (see kernel)
 __global__ void detailToScratchKernel(CompressibleSolver &grid, i32 mode);
 
+__global__ void fillOldSnapshotKernel(CompressibleSolver &grid, i32 level);
+__global__ void consumeNeedKernel(CompressibleSolver &grid);
+__global__ void dbgVacKernel(CompressibleSolver &grid);
+extern __device__ unsigned long long g_vacOwned;
+extern __device__ unsigned long long g_vacGhost;
 __global__ void inverseWaveletTransformKernel(CompressibleSolver &grid);
 
 __global__ void waveletThresholdingKernel(CompressibleSolver &grid);

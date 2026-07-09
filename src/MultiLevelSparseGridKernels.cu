@@ -42,6 +42,11 @@ __global__ void updateIndicesKernel(MultiLevelSparseGrid &grid) {
     if (grid.bLocList[bIdx] != kEmpty) {
       grid.bIdxList[bIdx] = bIdx;
       grid.hashTable.insertValue(grid.bLocList[bIdx], bIdx);
+      // normalize the flag: the sort permuted blocks but not flags, so post-sort
+      // flags are stale garbage.  Every surviving block is KEEP by definition;
+      // consumers between sorts (directory publication's flag!=DELETE filter,
+      // the inverse's DELETE guard) rely on this.
+      grid.bFlagsList[bIdx] = KEEP;
     }
 
   END_BLOCK_LOOP
@@ -57,8 +62,9 @@ __global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid) {
 
     if (lvl > 0) {
       u64 pLoc = grid.encode(lvl-1, ib/2, jb/2, kb/2);
-      i32 prntIdx = grid.hashTable.getValue(pLoc);  
-      grid.prntIdxList[bIdx] = prntIdx;
+      // validated lookup: a deleted parent's corpse key must bind bEmpty (the
+      // zeroed trash slice), not the corpse slot -- see getBlockIdx
+      grid.prntIdxList[bIdx] = grid.getBlockIdx(pLoc);
     }
 
   END_BLOCK_LOOP
@@ -87,7 +93,8 @@ __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
       for(int dj=-1; dj<2; dj++) {
         for(int di=-1; di<2; di++) {
           u64 nbrLoc = grid.encode(lvl, ib+di, jb+dj, kb+dk);
-          grid.nbrIdxList[bIdx*27+idx] = grid.hashTable.getValue(nbrLoc);
+          // validated lookup (corpse keys -> bEmpty), see getBlockIdx
+          grid.nbrIdxList[bIdx*27+idx] = grid.getBlockIdx(nbrLoc);
           idx++;
         }
       }
@@ -182,10 +189,6 @@ __global__ void addFineBlocksKernel(MultiLevelSparseGrid &grid) {
 
     bool refineBlk = grid.isInteriorBlock(lvl, ib, jb, kb);
 #ifdef USE_MGPU
-    // multi-GPU: a PE refines (and keeps dense level 1 on) only its OWNED blocks.
-    // adaptGrid thus produces owned blocks + the domain-exterior ring; the
-    // partition ghost layer is rebuilt separately (rebuildGhosts) from the
-    // neighbors' actual blocks, so it can be pruned as features move.
     refineBlk = refineBlk && grid.isOwnedBlock(lvl, ib, jb, kb);
 #endif
     if (refineBlk) {
@@ -239,8 +242,6 @@ __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid) {
     grid.decode(loc, lvl, ib, jb, kb);
 
     bool gradeBlk = grid.isInteriorBlock(lvl, ib, jb, kb) && grid.bFlagsList[bIdx] == KEEP;
-    // (MGPU: grade from ALL kept interior blocks, owned AND partition ghosts --
-    // a ghost source conforms MY owned region to the neighbor's refinement.)
     if (gradeBlk) {
       // add neighboring blocks (x-y only in pseudo2D).  Periodic: wrap the target
       // into the interior so an edge block grades its opposite-edge image (a real
@@ -252,11 +253,22 @@ __global__ void addAdjacentBlocksKernel(MultiLevelSparseGrid &grid) {
           for (i32 di=-1; di<=1; di++) {
             i32 ni=ib+di, nj=jb+dj, nk=kb+dk;
             if (grid.periodic) grid.wrapBlockPeriodic(lvl, ni, nj, nk);
-            // (MGPU: targets are created regardless of ownership -- every rank
-            // builds the full support closure over its owned + ghost region, so
-            // a manufactured block's own support chain is never cut.  Halo-
-            // mirrored real blocks replace manufactured data; rebuildGhosts
-            // prunes whatever the closure no longer needs.)
+#ifdef USE_MGPU
+            // owned targets only; a target in a neighbour's territory is recorded
+            // as a NEED and sent to its owner (exchangeStructure), who creates it
+            // and exports it back to us as a ghost in the same exchange
+            if (!grid.isOwnedBlock(lvl, ni, nj, nk)) {
+              if (grid.isInteriorBlock(lvl, ni, nj, nk) && grid.needCnt) {
+                i32 o = grid.ownerPE(lvl, ni, nj, nk);
+                i32 s = (o >= 0) ? grid.nbrOf[o] : -1;
+                if (s >= 0) {
+                  i32 q = atomicAdd(&grid.needCnt[s], 1);
+                  if (q < grid.needSlot) grid.needLoc[(size_t)s*grid.needSlot + q] = grid.encode(lvl, ni, nj, nk);
+                }
+              }
+              continue;
+            }
+#endif
             grid.activateBlock(lvl, ni, nj, nk);
           }
         }
@@ -276,16 +288,6 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
     grid.decode(loc, lvl, ib, jb, kb);
 
     bool reconBlk = grid.isInteriorBlock(lvl, ib, jb, kb) && lvl > 2 && grid.bFlagsList[bIdx] == KEEP;
-#ifdef USE_MGPU
-    // Reconstruction support for ALL kept interior fine blocks, owned AND
-    // partition ghosts.  Restricting to owned sources + owned targets (the old
-    // behavior) deadlocks when a refinement front advances across a rank seam:
-    // the owner's seam blocks need parent support INSIDE the neighbor's
-    // still-coarse region -- a block that exists on no rank (the neighbor's
-    // pass skips ghost sources; the owner's pass skips non-owned targets), so
-    // the wavelet prediction taps read the zeroed trash slice and the
-    // reconstruction collapses (NaN at nLvls>=4, where this kernel activates).
-#endif
     if (reconBlk) {
       // periodic: wrap the parent target so a near-seam block's coarse
       // reconstruction support is built on the opposite edge too (identity for
@@ -296,8 +298,20 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
           for (i32 di=-1; di<=1; di++) {
             i32 pi=ib/2+di, pj=jb/2+dj, pk=kb/2+dk;
             if (grid.periodic) grid.wrapBlockPeriodic(lvl-1, pi, pj, pk);
-            // (MGPU: created regardless of ownership -- full local support
-            // closure; see addAdjacentBlocksKernel.)
+#ifdef USE_MGPU
+            // owned targets only + NEED record (see addAdjacentBlocksKernel)
+            if (!grid.isOwnedBlock(lvl-1, pi, pj, pk)) {
+              if (grid.isInteriorBlock(lvl-1, pi, pj, pk) && grid.needCnt) {
+                i32 o = grid.ownerPE(lvl-1, pi, pj, pk);
+                i32 s = (o >= 0) ? grid.nbrOf[o] : -1;
+                if (s >= 0) {
+                  i32 q = atomicAdd(&grid.needCnt[s], 1);
+                  if (q < grid.needSlot) grid.needLoc[(size_t)s*grid.needSlot + q] = grid.encode(lvl-1, pi, pj, pk);
+                }
+              }
+              continue;
+            }
+#endif
             grid.activateBlock(lvl-1, pi, pj, pk);
           }
         }
@@ -365,6 +379,20 @@ __global__ void addBoundaryBlocksKernel(MultiLevelSparseGrid &grid) {
                 // mismatched seam NaNs even with monotone-linear ghost fills.
                 i32 ii=ib+di, ij=jb+dj, ik=kb+dk;
                 grid.wrapBlockPeriodic(lvl, ii, ij, ik);
+#ifdef USE_MGPU
+                // owned-target rule: the wrapped image is an INTERIOR block that
+                // may belong to another rank -- record a NEED for its owner
+                // instead of manufacturing an unfillable orphan locally
+                if (!grid.isOwnedBlock(lvl, ii, ij, ik)) {
+                  i32 o = grid.ownerPE(lvl, ii, ij, ik);
+                  i32 s = (o >= 0 && grid.nbrOf) ? grid.nbrOf[o] : -1;
+                  if (s >= 0 && grid.needCnt) {
+                    i32 q = atomicAdd(&grid.needCnt[s], 1);
+                    if (q < grid.needSlot) grid.needLoc[(size_t)s*grid.needSlot + q] = grid.encode(lvl, ii, ij, ik);
+                  }
+                  continue;
+                }
+#endif
                 grid.activateBlock(lvl, ii, ij, ik);
               }
             }
@@ -407,16 +435,17 @@ __global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f) {
       onMidPlane = (zMid >= kLo && zMid < kLo + nPixelsZ);
     }
 
-    if (onMidPlane && grid.isInteriorBlock(lvl, ib, jb, kb) && loc != kEmpty && grid.cFlagsList[cIdx] == ACTIVE) {
-      i32 nPixels = powi(2,(grid.nLvls - 1 - lvl));
+    // paint each ACTIVE leaf cell into its full-domain pixel footprint.  Under
+    // MGPU restrict to OWNED cells so exactly one rank writes each pixel (ghost
+    // halo cells are skipped) -- paintField then sum-reduces across ranks.
+    bool paintCell = onMidPlane && grid.isInteriorBlock(lvl, ib, jb, kb)
+                     && loc != kEmpty && grid.cFlagsList[cIdx] == ACTIVE;
 #ifdef USE_MGPU
-      // pixels are indexed into THIS PE's tile (owned extent), so offset by the
-      // tile origin; cells outside it (the ghost halo) fall out and are skipped.
-      i32 oxPxl = grid.part.b0[0]*blockSize*powi(2, grid.nLvls-1);
-      i32 oyPxl = grid.part.b0[1]*blockSize*powi(2, grid.nLvls-1);
-#else
-      i32 oxPxl = 0, oyPxl = 0;
+    paintCell = paintCell && grid.isOwnedBlock(lvl, ib, jb, kb);
 #endif
+    if (paintCell) {
+      i32 nPixels = powi(2,(grid.nLvls - 1 - lvl));
+      i32 oxPxl = 0, oyPxl = 0;   // full-domain pixel indexing on every PE
       for (uint jj=0; jj<nPixels; jj++) {
         for (uint ii=0; ii<nPixels; ii++) {
           i32 iPxl = ib*blockSize*nPixels + i*nPixels + ii - oxPxl;
@@ -436,4 +465,121 @@ __global__ void computeImageDataKernel(MultiLevelSparseGrid &grid, i32 f) {
     }
 
   END_CELL_LOOP
+}
+//
+// D0 integrity checks (runtime-gated by grid.dbgChecks; see the MGPU seam plan).
+// Print at most a few violations per launch (dbgCnt-limited) and REPAIR bad
+// bindings to bEmpty so a debug run continues past the first hit.
+//
+
+// Topology integrity: for every live block verify (1) the hash maps its loc back
+// to this slot (catches duplicate keys / split-brain), (2) the parent binding
+// points at a block whose loc IS the parent loc, (3) each of the 27 neighbor
+// bindings points at a block whose loc IS that neighbor loc.  Stale bindings --
+// e.g. a corpse slot of a deleted block, or an index list that predates a
+// mid-cycle create/delete -- silently redirect stencil taps to wrong memory.
+__global__ void checkTopologyKernel(MultiLevelSparseGrid &grid, i32 phaseTag) {
+#ifdef USE_MGPU
+  const i32 rk = grid.part.rank;
+#else
+  const i32 rk = 0;
+#endif
+  START_BLOCK_LOOP
+    u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      i32 lvl, ib, jb, kb;
+      grid.decode(loc, lvl, ib, jb, kb);
+      // (1) hash self-consistency
+      i32 self = grid.hashTable.getValue(loc);
+      if (self != bIdx) {
+        i32 n = atomicAdd(grid.dbgCnt, 1);
+        if (n < 8) printf("[topo] r%d ph%d SELF lvl%d (%d,%d,%d) slot=%d getValue=%d\n",
+                          rk, phaseTag, lvl, ib, jb, kb, bIdx, self);
+      }
+      // (2) parent binding
+      if (lvl > 0 && grid.prntIdxList) {
+        i32 p = grid.prntIdxList[bIdx];
+        u64 pLoc = grid.encode(lvl-1, ib/2, jb/2, kb/2);
+        if (p != bEmpty && grid.bLocList[p] != pLoc) {
+          i32 n = atomicAdd(grid.dbgCnt, 1);
+          if (n < 8) printf("[topo] r%d ph%d PRNT lvl%d (%d,%d,%d) slot=%d prnt=%d prntLoc=%llx want=%llx\n",
+                            rk, phaseTag, lvl, ib, jb, kb, bIdx, p,
+                            (unsigned long long)grid.bLocList[p], (unsigned long long)pLoc);
+          grid.prntIdxList[bIdx] = bEmpty;   // repair: read the trash slice, not wrong memory
+        }
+      }
+      // (3) neighbor bindings
+      if (grid.nbrIdxList) {
+        i32 t = 0;
+        for (i32 dk=-1; dk<2; dk++)
+        for (i32 dj=-1; dj<2; dj++)
+        for (i32 di=-1; di<2; di++) {
+          i32 nb = grid.nbrIdxList[(size_t)bIdx*27 + t];
+          u64 nLoc = grid.encode(lvl, ib+di, jb+dj, kb+dk);
+          if (nb != bEmpty && grid.bLocList[nb] != nLoc) {
+            i32 n = atomicAdd(grid.dbgCnt, 1);
+            if (n < 8) printf("[topo] r%d ph%d NBR lvl%d (%d,%d,%d)+(%d,%d,%d) slot=%d nbr=%d nbrLoc=%llx want=%llx\n",
+                              rk, phaseTag, lvl, ib, jb, kb, di, dj, dk, bIdx, nb,
+                              (unsigned long long)grid.bLocList[nb], (unsigned long long)nLoc);
+            grid.nbrIdxList[(size_t)bIdx*27 + t] = bEmpty;
+          }
+          t++;
+        }
+      }
+    }
+  END_BLOCK_LOOP
+}
+
+// Fill-support check: before prolonging F_OLD into new owned blocks at `level`,
+// verify each such block has (a) a valid parent binding, (b) a parent with a
+// valid snapshot, and (c) no missing parent-ring tap (the 27-tap wavelet stencil
+// touches all 26 parent neighbors; on the union grid the reconstruction closure
+// guarantees they exist, so a bEmpty interior tap means the seam protocol failed
+// to import or adopt that block).  Prints the missing tap loc and its owner rank.
+__global__ void checkFillSupportKernel(MultiLevelSparseGrid &grid, i32 level) {
+#ifdef USE_MGPU
+  START_BLOCK_LOOP
+    u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      i32 lvl, ib, jb, kb;
+      grid.decode(loc, lvl, ib, jb, kb);
+      if (lvl == level && grid.isInteriorBlock(lvl, ib, jb, kb)
+          && grid.isOwnedBlock(lvl, ib, jb, kb)
+          && grid.snapValidList[bIdx] == 0 && grid.bFlagsList[bIdx] != DELETE) {
+        i32 p = grid.prntIdxList[bIdx];
+        u64 pLoc = grid.encode(lvl-1, ib/2, jb/2, kb/2);
+        if (p == bEmpty || grid.bLocList[p] != pLoc) {
+          i32 n = atomicAdd(grid.dbgCnt, 1);
+          if (n < 8) printf("[fillchk] r%d lvl%d (%d,%d,%d): parent binding invalid (p=%d)\n",
+                            grid.part.rank, lvl, ib, jb, kb, p);
+        }
+        else if (grid.snapValidList[p] != 1) {
+          i32 n = atomicAdd(grid.dbgCnt, 1);
+          if (n < 8) printf("[fillchk] r%d lvl%d (%d,%d,%d): parent (%d,%d,%d) snapValid=%d\n",
+                            grid.part.rank, lvl, ib, jb, kb, ib/2, jb/2, kb/2, grid.snapValidList[p]);
+        }
+        else {
+          i32 t = 0, dkL = grid.pseudo2D ? 0 : 1;
+          for (i32 dk=-1; dk<2; dk++)
+          for (i32 dj=-1; dj<2; dj++)
+          for (i32 di=-1; di<2; di++) {
+            bool inPlane = grid.pseudo2D ? (dk == 0) : true;
+            if (inPlane && !(di==0 && dj==0 && dk==0)) {
+              i32 pi = ib/2+di, pj = jb/2+dj, pk = kb/2+dk;
+              if (grid.isInteriorBlock(lvl-1, pi, pj, pk)
+                  && grid.nbrIdxList[(size_t)p*27 + t] == bEmpty) {
+                i32 n = atomicAdd(grid.dbgCnt, 1);
+                if (n < 8) printf("[fillchk] r%d lvl%d (%d,%d,%d): parent-ring tap lvl%d (%d,%d,%d) MISSING (owner=r%d)\n",
+                                  grid.part.rank, lvl, ib, jb, kb, lvl-1, pi, pj, pk,
+                                  grid.ownerPE(lvl-1, pi, pj, pk));
+              }
+            }
+            t++;
+          }
+          (void)dkL;
+        }
+      }
+    }
+  END_BLOCK_LOOP
+#endif
 }
