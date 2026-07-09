@@ -94,6 +94,13 @@ void CompressibleSolver::invalidateCommBuffers(void) {
   if (dirSendLoc) { cudaFree(dirSendLoc); cudaFree(dirRecvLoc); cudaFree(sendBuf); cudaFree(recvBuf); }
   dirSendLoc = dirRecvLoc = nullptr; sendBuf = recvBuf = nullptr;
   dirSlot = 0;
+  // the NEED/adopt buffers are per-neighbour too; a re-cut can change nNbr, so
+  // free them here as well (buildDirectories reallocates all of them on demand)
+  if (needCnt) { cudaFree(needCnt); cudaFree(needRecvCnt); }
+  needCnt = needRecvCnt = nullptr;
+  if (needLoc) { cudaFree(needLoc); cudaFree(needRecvLoc); }
+  needLoc = needRecvLoc = nullptr;
+  needSlot = 0;
 }
 #endif
 
@@ -229,23 +236,23 @@ void CompressibleSolver::rebalancePartition(void) {
   for (i32 c = 0; c < nCol && !changed; c++) changed = (ownerScratch[c] != ownerBase[c]);
   if (!changed) return;
   printf("[sfc] rank %d rebalancing at iter %d (max/avg = %.2f)\n", part.rank, iter, mx * P / total);
-  migrateBlocks(ownerScratch);
+  migrateBlocks(ownerScratch);   // uses the OLD ownerBase to find departures
   memcpy(ownerBase, ownerScratch, (size_t)nCol*sizeof(i32));
   derivePartition();
   invalidateCommBuffers();      // neighbor set may have changed with the map
   sortBlocks();                 // index/flag the migrated owned set
-  rebuildGhosts();              // 2-ring halo under the new map
-  haloExchange(0, NEVOLVE);
-  setBoundaryConditions();
+  rebuildGhosts();              // ghost halo + fresh directories under the new map
+  haloExchange(0, NEVOLVE);     // fill ghost live data so the pre-cascade restrict/
+  setBoundaryConditions();      // forward transform see valid seam neighbours
   zeroAccumulator();            // the shared bank must be clean for LSRK stage 1
   comm::barrier();
-  // NOTE: dynamic rebalance is EXPERIMENTAL and off by default (--rebalance 0).
-  // The migrated grid is not yet re-settled to full cross-rank 2:1/support
-  // consistency, so the solution can diffuse over the following cycles.  The
-  // correct fix is to make the refinement cascade itself consistent across rank
-  // seams (iterate adaptGrid + a structure exchange to a global fixed point);
-  // migration then needs no special re-settle.  Static partitioning (Phases
-  // A/B: Hilbert cut + load-balanced init) is correct and is the default.
+  // Migration ships only the LIVE fields (0..7) of the departing owned blocks;
+  // the very next adaptation cascade (which runs immediately after this in step)
+  // re-settles everything else exactly as a normal cycle: copyToOld regenerates
+  // F_OLD from the migrated live data, adaptGridConsistent rebuilds the cross-
+  // rank 2:1/support closure (owned-target + NEED/adopt), and reconstituteOld-
+  // Snapshot fills any new blocks.  No special re-settle is needed -- that was
+  // the missing piece the seam protocol now provides.
 }
 #endif
 
