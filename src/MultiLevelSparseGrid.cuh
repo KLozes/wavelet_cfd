@@ -21,6 +21,12 @@ enum CELL_FLAGS {
   ACTIVE = 2,
 };
 
+#ifdef USE_MGPU
+// partition mode: 0 = regular box split (1-D x-strips), 1 = Z-curve (Morton)
+// weight-balanced cut (default).  Set from the CLI before solver construction.
+extern i32 g_partMode;
+#endif
+
 class MultiLevelSparseGrid : public Managed {
 public:
 
@@ -75,6 +81,8 @@ public:
   i32 *nbrRank;     // [nNbr]  neighbor PE ranks
   i32 *nbrOf;       // [size]  rank -> neighbor slot (or -1)
   void initPartition(void);                                            // set `part` + fill ownerBase
+  void partitionByWeight(const double *w, i32 *dst = nullptr);   // Morton-cut owner fill (w nullptr = uniform; dst nullptr = ownerBase)
+  void derivePartition(void);                // bbox + neighbor set + capacity check from ownerBase
   __host__ __device__ i32  ownerPE(i32 lvl, i32 ib, i32 jb, i32 kb);   // rank owning a block (ownerBase lookup)
   __host__ __device__ bool isOwnedBlock(i32 lvl, i32 ib, i32 jb, i32 kb);
 #endif
@@ -103,6 +111,7 @@ public:
   void initializeBaseGrid(void);
   
   void adaptGrid(void);
+  void resetGrid(void);   // wipe blocks + fields for a from-scratch rebuild
   void sortBlocks(void);
   virtual void sortFieldData(void) = 0;
 

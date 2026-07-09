@@ -108,61 +108,136 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
 }
 
 #ifdef USE_MGPU
-// 3D coarse-grid partition of the base grid across comm::size() PEs.  Even split
-// per axis with the remainder handed to the low process-columns.
+// Coarse-grid partition of the base grid across comm::size() PEs.
+//   g_partMode 0: regular box split (1-D x-strips), the legacy default.
+//   g_partMode 1: Z-curve (Morton) split -- base blocks are ordered along the
+//     Morton curve and cut into P contiguous, weight-balanced intervals.
+//     Curve intervals are spatially compact (less seam area than strips) and
+//     contiguous, so a later re-cut only exchanges blocks with the curve
+//     neighbors r-1 / r+1 (the basis for dynamic rebalancing).
+i32 g_partMode = 1;
+
+// Morton code of a base block (2D interleave in pseudo-2D, 3D otherwise).
+static u64 mortonCode(i32 x, i32 y, i32 z, bool twoD) {
+  u64 m = 0;
+  for (i32 b = 0; b < 21; b++) {
+    if (twoD) {
+      m |= ((u64)((x >> b) & 1)) << (2*b) | ((u64)((y >> b) & 1)) << (2*b+1);
+    } else {
+      m |= ((u64)((x >> b) & 1)) << (3*b)   | ((u64)((y >> b) & 1)) << (3*b+1)
+         | ((u64)((z >> b) & 1)) << (3*b+2);
+    }
+  }
+  return m;
+}
+
+// Fill ownerBase by cutting the Morton-ordered base blocks into P contiguous
+// intervals of (approximately) equal total weight.  w = one weight per base
+// block (ownerBase indexing); pass nullptr for uniform weights.  Every rank
+// computes the same cuts from the same weights, so the map stays replicated.
+void MultiLevelSparseGrid::partitionByWeight(const double *w, i32 *dst) {
+  if (!dst) dst = ownerBase;
+  i32 P = comm::size();
+  i32 n = part.nb[0]*part.nb[1]*part.nb[2];
+  bool twoD = (part.nb[2] == 1);
+  std::vector<std::pair<u64,i32>> order(n);
+  for (i32 k = 0; k < part.nb[2]; k++)
+  for (i32 j = 0; j < part.nb[1]; j++)
+  for (i32 i = 0; i < part.nb[0]; i++) {
+    i32 idx = i + part.nb[0]*(j + part.nb[1]*k);
+    order[idx] = {mortonCode(i, j, k, twoD), idx};
+  }
+  std::sort(order.begin(), order.end());
+  double total = 0;
+  for (i32 t = 0; t < n; t++) total += w ? w[order[t].second] : 1.0;
+  // walk the curve, advancing the rank when its weight share is filled
+  double acc = 0, target = total / P;
+  i32 r = 0;
+  for (i32 t = 0; t < n; t++) {
+    // never leave a rank empty: force advance if the remaining blocks are
+    // exactly enough for the remaining ranks
+    if ((acc >= (r+1)*target && r < P-1) || (n - t) == (P - 1 - r)) r++;
+    dst[order[t].second] = r;
+    acc += w ? w[order[t].second] : 1.0;
+  }
+}
+
+// Derive everything the machinery needs from the (replicated) ownership map:
+// the owned bounding box (image tiles), the neighbor-PE set (any rank owning a
+// base block within the 2-ring of one of ours, with periodic wrap partners
+// always included -- they carry zero-count exchanges in non-periodic runs),
+// and a base-grid capacity check.  Called after every ownerBase (re)fill.
+void MultiLevelSparseGrid::derivePartition(void) {
+  i32 P = comm::size();
+  // owned bounding box
+  for (i32 d = 0; d < 3; d++) { part.b0[d] = part.nb[d]; part.b1[d] = 0; }
+  i32 nOwned = 0;
+  for (i32 k = 0; k < part.nb[2]; k++)
+  for (i32 j = 0; j < part.nb[1]; j++)
+  for (i32 i = 0; i < part.nb[0]; i++) {
+    if (ownerBase[i + part.nb[0]*(j + part.nb[1]*k)] != part.rank) continue;
+    nOwned++;
+    i32 v[3] = {i, j, k};
+    for (i32 d = 0; d < 3; d++) {
+      if (v[d]   < part.b0[d]) part.b0[d] = v[d];
+      if (v[d]+1 > part.b1[d]) part.b1[d] = v[d]+1;
+    }
+  }
+  // neighbor set: foreign owners within the 2-ring (wrapped) of owned blocks
+  for (i32 r = 0; r < P; r++) nbrOf[r] = -1;
+  nNbr = 0;
+  i32 dkLim = (part.nb[2] == 1) ? 0 : 2;
+  for (i32 k = 0; k < part.nb[2]; k++)
+  for (i32 j = 0; j < part.nb[1]; j++)
+  for (i32 i = 0; i < part.nb[0]; i++) {
+    if (ownerBase[i + part.nb[0]*(j + part.nb[1]*k)] != part.rank) continue;
+    for (i32 dk=-dkLim; dk<=dkLim; dk++)
+    for (i32 dj=-2; dj<=2; dj++)
+    for (i32 di=-2; di<=2; di++) {
+      i32 ni = ((i+di) % part.nb[0] + part.nb[0]) % part.nb[0];
+      i32 nj = ((j+dj) % part.nb[1] + part.nb[1]) % part.nb[1];
+      i32 nk = ((k+dk) % part.nb[2] + part.nb[2]) % part.nb[2];
+      i32 o = ownerBase[ni + part.nb[0]*(nj + part.nb[1]*nk)];
+      if (o == part.rank || nbrOf[o] >= 0) continue;
+      nbrRank[nNbr] = o; nbrOf[o] = nNbr; nNbr++;
+    }
+  }
+  // base grid + ring must fit the block pool (dense-base capacity check)
+  assert((size_t)nOwned * (part.nb[2] == 1 ? 25 : 125) < (size_t)nBlocksMax);
+}
+
 void MultiLevelSparseGrid::initPartition(void) {
   i32 P = comm::size();
-  part.p[0] = P; part.p[1] = 1; part.p[2] = 1;   // 1-D x-split by default (px=P)
+  part.p[0] = P; part.p[1] = 1; part.p[2] = 1;   // process-grid kept for the box mode
   part.rank = comm::rank();
   part.c[0] =  part.rank %  part.p[0];
   part.c[1] = (part.rank /  part.p[0]) % part.p[1];
   part.c[2] =  part.rank / (part.p[0]  * part.p[1]);
   for (i32 d = 0; d < 3; d++) part.nb[d] = baseGridSize[d]/blockSize;
-  for (i32 d = 0; d < 3; d++) {
-    i32 q = part.nb[d]/part.p[d], rem = part.nb[d]%part.p[d];
-    part.b0[d] = part.c[d]*q + (part.c[d] < rem ? part.c[d] : rem);
-    part.b1[d] = part.b0[d] + q + (part.c[d] < rem ? 1 : 0);
-  }
 
-  // Fill the coarse ownership map: for every level-0 base block, which rank owns
-  // it.  This particular fill IS the regular box split (invert the b0/b1 even
-  // split per axis), so behaviour is identical to the previous formula -- but any
-  // partition (SFC cut, load balance) is now just a different fill of this array.
   cudaMallocManaged(&ownerBase, (size_t)part.nb[0]*part.nb[1]*part.nb[2]*sizeof(i32));
-  for (i32 k = 0; k < part.nb[2]; k++)
-  for (i32 j = 0; j < part.nb[1]; j++)
-  for (i32 i = 0; i < part.nb[0]; i++) {
-    i32 idx3[3] = {i, j, k}, col[3];
-    for (i32 d = 0; d < 3; d++) {
-      i32 q = part.nb[d]/part.p[d], rem = part.nb[d]%part.p[d], lo = 0, c = 0;
-      for (c = 0; c < part.p[d]; c++) { i32 w = q + (c<rem?1:0); if (idx3[d] < lo+w) break; lo += w; }
-      col[d] = c;
-    }
-    ownerBase[i + part.nb[0]*(j + part.nb[1]*k)] = col[0] + part.p[0]*(col[1] + part.p[1]*col[2]);
-  }
-
-  // neighbor PEs: the adjacent process-grid cells (3x3x3 around this PE, minus
-  // self).  Process columns wrap periodically so the wrap-around partners are
-  // present when the DOMAIN is periodic (bcType==2, set post-construction); the
-  // directory kernels only route blocks to a wrap partner when grid.periodic, so
-  // in a non-periodic run those slots simply carry zero-count exchanges.  Dedup
-  // by rank: a PE that is a neighbor across more than one seam (e.g. px=2
-  // periodic, adjacent AND wrap-adjacent to the same partner) gets ONE slot.
-  cudaMallocManaged(&nbrRank, 26*sizeof(i32));
+  cudaMallocManaged(&nbrRank, (size_t)P*sizeof(i32));      // any rank can be a curve neighbor
   cudaMallocManaged(&nbrOf,   (size_t)P*sizeof(i32));
-  for (i32 r = 0; r < P; r++) nbrOf[r] = -1;
-  nNbr = 0;
-  for (i32 dz = -1; dz <= 1; dz++)
-  for (i32 dy = -1; dy <= 1; dy++)
-  for (i32 dx = -1; dx <= 1; dx++) {
-    if (dx==0 && dy==0 && dz==0) continue;
-    i32 cx = ((part.c[0]+dx) % part.p[0] + part.p[0]) % part.p[0];
-    i32 cy = ((part.c[1]+dy) % part.p[1] + part.p[1]) % part.p[1];
-    i32 cz = ((part.c[2]+dz) % part.p[2] + part.p[2]) % part.p[2];
-    i32 r = cx + part.p[0]*(cy + part.p[1]*cz);
-    if (r == part.rank || nbrOf[r] >= 0) continue;   // self (tiny p wraps onto self) / already added
-    nbrRank[nNbr] = r; nbrOf[r] = nNbr; nNbr++;
+
+  if (g_partMode == 1) {
+    partitionByWeight(nullptr);            // uniform weights; rebalanced later
   }
+  else {
+    // legacy regular box split (1-D x-strips): even split per axis with the
+    // remainder handed to the low process-columns.
+    for (i32 k = 0; k < part.nb[2]; k++)
+    for (i32 j = 0; j < part.nb[1]; j++)
+    for (i32 i = 0; i < part.nb[0]; i++) {
+      i32 idx3[3] = {i, j, k}, col[3];
+      for (i32 d = 0; d < 3; d++) {
+        i32 q = part.nb[d]/part.p[d], rem = part.nb[d]%part.p[d], lo = 0, c = 0;
+        for (c = 0; c < part.p[d]; c++) { i32 w = q + (c<rem?1:0); if (idx3[d] < lo+w) break; lo += w; }
+        col[d] = c;
+      }
+      ownerBase[i + part.nb[0]*(j + part.nb[1]*k)] = col[0] + part.p[0]*(col[1] + part.p[1]*col[2]);
+    }
+  }
+  derivePartition();
   cudaDeviceSynchronize();
 }
 
@@ -205,6 +280,23 @@ void MultiLevelSparseGrid::initializeBaseGrid(void) {
 
   // sort the data by location code
   sortBlocks();
+  cudaDeviceSynchronize();
+}
+
+// wipe the entire block structure and field data so the grid can be rebuilt
+// from scratch (used by the Z-curve weighted re-cut at initialization).
+void MultiLevelSparseGrid::resetGrid(void) {
+  cudaDeviceSynchronize();
+  hashTable.reset();
+  thrust::fill(thrust::device, bLocList, bLocList + nBlocksMax, kEmpty);
+  thrust::fill(thrust::device, bIdxList, bIdxList + nBlocksMax, bEmpty);
+  cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(i32));
+  if (!lean) {
+    cudaMemset(cFlagsList, 0, (size_t)nBlocksMax*blockSizeTot*sizeof(i32));
+    thrust::fill(thrust::device, prntIdxList, prntIdxList + nBlocksMax, bEmpty);
+  }
+  cudaMemset(fieldData, 0, (size_t)nFields*(size_t)nBlocksMax*(size_t)blockSizeTot*sizeof(real));
+  nBlocks = 0;
   cudaDeviceSynchronize();
 }
 

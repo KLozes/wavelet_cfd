@@ -12,22 +12,24 @@ __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
                    j < grid.baseGridSize[1]/blockSize + 1 &&
                    k < grid.baseGridSize[2]/blockSize + 1);
 #ifdef USE_MGPU
-  // this PE creates its owned base box plus a ghost ring: 2 blocks thick toward a
-  // partition-neighbor PE (the scatter-form flux computes the seam-face flux and
-  // needs a full +-2-cell stencil, reaching the 2nd neighbor block), and 1 block
-  // (the domain-exterior ring, index -1 / nb) toward a true domain boundary.
-  i32 nbx = grid.baseGridSize[0]/blockSize;
-  i32 nby = grid.baseGridSize[1]/blockSize;
-  i32 nbz = grid.baseGridSize[2]/blockSize;
-  i32 lo0 = (grid.part.b0[0] > 0)   ? grid.part.b0[0]-2 : -1;
-  i32 hi0 = (grid.part.b1[0] < nbx) ? grid.part.b1[0]+1 : nbx;
-  i32 lo1 = (grid.part.b0[1] > 0)   ? grid.part.b0[1]-2 : -1;
-  i32 hi1 = (grid.part.b1[1] < nby) ? grid.part.b1[1]+1 : nby;
-  i32 lo2 = (grid.part.b0[2] > 0)   ? grid.part.b0[2]-2 : -1;
-  i32 hi2 = (grid.part.b1[2] < nbz) ? grid.part.b1[2]+1 : nbz;
-  bool inRing = (i >= lo0 && i <= hi0 && j >= lo1 && j <= hi1 &&
-                 (grid.pseudo2D || (k >= lo2 && k <= hi2)));
-  if (inDomain && inRing) grid.activateBlock(0, i, j, k);
+  // this PE creates its owned base blocks plus a ghost ring: any candidate
+  // (interior, or the -1/nb domain-exterior ring) within Chebyshev distance 2
+  // of an owned base block is activated -- 2 blocks toward a partition
+  // neighbor (the scatter-form flux needs a full +-2-cell stencil) and the
+  // 1-deep domain-exterior ring fall out of the same rule.  Purely ownership-
+  // map-driven, so it works for the box split and the Z-curve cut alike.
+  bool near = false;
+  i32 dkLim = grid.pseudo2D ? 0 : 2;
+  for (i32 dk=-dkLim; dk<=dkLim && !near; dk++)
+  for (i32 dj=-2; dj<=2 && !near; dj++)
+  for (i32 di=-2; di<=2 && !near; di++) {
+    i32 ni=i+di, nj=j+dj, nk=k+dk;
+    if (ni < 0 || nj < 0 || nk < 0 ||
+        ni >= grid.baseGridSize[0]/blockSize || nj >= grid.baseGridSize[1]/blockSize ||
+        nk >= grid.baseGridSize[2]/blockSize) continue;
+    if (grid.ownerPE(0, ni, nj, nk) == grid.part.rank) near = true;
+  }
+  if (inDomain && near) grid.activateBlock(0, i, j, k);
 #else
   if (inDomain) grid.activateBlock(0, i, j, k);
 #endif

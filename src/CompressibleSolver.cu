@@ -27,6 +27,28 @@ void CompressibleSolver::initialize(void) {
   // wavelet-normalization scales (device-side global maxima)
   cudaMallocManaged(&globalScale, 4*sizeof(real));
   cudaMemset(globalScale, 0, 4*sizeof(real));
+  buildInitialGrid(true);
+#ifdef USE_MGPU
+  // Z-curve mode: the uniform-weight cut over-loads the ranks whose curve
+  // interval covers the refined region.  Recount the real per-base-column
+  // block weights, re-cut the curve, and rebuild from scratch on the balanced
+  // map (the IC is analytic, so a rebuild IS the migration).
+  if (g_partMode == 1 && comm::size() > 1) {
+    rebalanceWeights();          // count + allreduce + re-cut + re-derive
+    resetGrid();
+    buildInitialGrid(false);
+    double wOwn = 0;
+    for (i32 t = 0; t < part.nb[0]*part.nb[1]*part.nb[2]; t++)
+      if (ownerBase[t] == part.rank) wOwn += wBase[t];
+    printf("[zcurve] rank %d owns %.0f blocks after balanced re-cut\n", part.rank, wOwn);
+  }
+#endif
+  zeroAccumulator();   // the cascade dirtied the shared bank (LSRK needs 0)
+}
+
+// base grid + IC + the refine/re-IC cascade (the body of initialize(); run a
+// second time in Z-curve mode after the weighted re-cut)
+void CompressibleSolver::buildInitialGrid(bool doPaint) {
   initializeBaseGrid();
   setInitialConditions();
   primitiveToConservative();
@@ -40,7 +62,7 @@ void CompressibleSolver::initialize(void) {
 #endif
   cudaDeviceSynchronize();
   printf("nblocks %d\n", hashTable.nKeys);
-  paint();
+  if (doPaint) paint();
 
   // build the adaptive grid by repeatedly transforming / refining
   for (i32 lvl=1; lvl<nLvls; lvl++) {
@@ -58,10 +80,208 @@ void CompressibleSolver::initialize(void) {
 #endif
     cudaDeviceSynchronize();
     printf("nblocks %d\n", hashTable.nKeys);
-    paint();
+    if (doPaint) paint();
   }
-  zeroAccumulator();   // the cascade dirtied the shared bank (LSRK needs 0)
 }
+
+#ifdef USE_MGPU
+// the per-neighbor directory/halo buffers are sized for the CURRENT neighbor
+// set; any ownerBase change can change nNbr, so they must be rebuilt from
+// scratch after a re-cut (buildDirectories re-allocates on null/dirSlot=0)
+void CompressibleSolver::invalidateCommBuffers(void) {
+  if (dirSendCnt) { cudaFree(dirSendCnt); cudaFree(dirRecvCnt); cudaFree(dirFill); }
+  dirSendCnt = dirRecvCnt = dirFill = nullptr;
+  if (dirSendLoc) { cudaFree(dirSendLoc); cudaFree(dirRecvLoc); cudaFree(sendBuf); cudaFree(recvBuf); }
+  dirSendLoc = dirRecvLoc = nullptr; sendBuf = recvBuf = nullptr;
+  dirSlot = 0;
+}
+#endif
+
+#ifdef USE_MGPU
+// ---------------------------------------------------------------------------
+// Dynamic Z-curve rebalancing.  Every rebalanceEvery adaptations: recount the
+// per-base-column weights, and if the load imbalance exceeds ~15%, re-cut the
+// Morton curve and MIGRATE whole base columns to their new owners.  The old
+// and new maps are replicated on every rank, so both sides of every transfer
+// are known locally; blocks travel as (loc, NEVOLVE field slabs).  The
+// loopback comm backend barriers globally in neighborExchange, so ALL ranks
+// call this together -- the decision is deterministic from replicated data.
+// ---------------------------------------------------------------------------
+void CompressibleSolver::migrateBlocks(const i32 *newOwner) {
+  i32 P = comm::size();
+  i32 nCol = part.nb[0]*part.nb[1]*part.nb[2];
+
+  // partner set = ranks I lose columns to, plus ranks I gain columns from
+  std::vector<i32> partnerOf(P, -1);
+  std::vector<i32> mig;
+  for (i32 c = 0; c < nCol; c++) {
+    i32 o = ownerBase[c], w = newOwner[c];
+    if (o == w) continue;
+    if (o == part.rank && partnerOf[w] < 0) { partnerOf[w] = (i32)mig.size(); mig.push_back(w); }
+    if (w == part.rank && partnerOf[o] < 0) { partnerOf[o] = (i32)mig.size(); mig.push_back(o); }
+  }
+  i32 nm = (i32)mig.size();
+
+  // my departing blocks, grouped by destination (host scan; managed memory)
+  cudaDeviceSynchronize();
+  std::vector<std::vector<i32>> outIdx(nm);
+  for (i32 b = 0; b < hashTable.nKeys; b++) {
+    u64 loc = bLocList[b];
+    if (loc == kEmpty) continue;
+    i32 lvl = (i32)(loc >> 60);
+    i32 kb  = (i32)((loc >> 40) & ((1<<20)-1)) - 1;
+    i32 jb  = (i32)((loc >> 20) & ((1<<20)-1)) - 1;
+    i32 ib  = (i32)( loc        & ((1<<20)-1)) - 1;
+    // exterior-ring blocks clamp to their edge column (ownerPE semantics) so a
+    // departing boundary column ships its domain-exterior ghosts along with it
+    // -- the new owner needs them immediately (level-0 boundary cells have no
+    // parent to interpolate from; the ring is otherwise only rebuilt at the
+    // next adaptGrid).
+    i32 ci = ib >> lvl, cj = jb >> lvl, ck = kb >> lvl;
+    if (ci < 0) ci = 0;  if (ci >= part.nb[0]) ci = part.nb[0]-1;
+    if (cj < 0) cj = 0;  if (cj >= part.nb[1]) cj = part.nb[1]-1;
+    if (ck < 0) ck = 0;  if (ck >= part.nb[2]) ck = part.nb[2]-1;
+    i32 c = ci + part.nb[0]*(cj + part.nb[1]*ck);
+    if (ownerBase[c] == part.rank && newOwner[c] != part.rank)
+      outIdx[partnerOf[newOwner[c]]].push_back(b);
+  }
+
+  // counts, then payloads
+  std::vector<i32> sc(nm), rc(nm);
+  for (i32 t = 0; t < nm; t++) sc[t] = (i32)outIdx[t].size();
+  std::vector<void*> sp(nm), rp(nm); std::vector<size_t> sb(nm), rb(nm);
+  for (i32 t = 0; t < nm; t++) { sp[t]=&sc[t]; rp[t]=&rc[t]; sb[t]=sizeof(i32); rb[t]=sizeof(i32); }
+  comm::neighborExchange(nm, mig.data(), sp.data(), sb.data(), rp.data(), rb.data());
+
+  size_t slab = (size_t)NEVOLVE*blockSizeTot;                  // reals per block
+  size_t blkB = sizeof(u64) + slab*sizeof(real);               // shipped bytes per block
+  std::vector<char*> sBuf(nm, nullptr), rBuf(nm, nullptr);
+  for (i32 t = 0; t < nm; t++) {
+    if (sc[t]) cudaMallocManaged(&sBuf[t], (size_t)sc[t]*blkB);
+    if (rc[t]) cudaMallocManaged(&rBuf[t], (size_t)rc[t]*blkB);
+  }
+  for (i32 t = 0; t < nm; t++)
+    for (i32 x = 0; x < sc[t]; x++) {
+      i32 b = outIdx[t][x];
+      char *dst = sBuf[t] + (size_t)x*blkB;
+      *(u64*)dst = bLocList[b];
+      real *fd = (real*)(dst + sizeof(u64));
+      for (i32 f = 0; f < NEVOLVE; f++)
+        memcpy(fd + (size_t)f*blockSizeTot, getField(f) + (size_t)b*blockSizeTot,
+               blockSizeTot*sizeof(real));
+    }
+  for (i32 t = 0; t < nm; t++) {
+    sp[t]=sBuf[t]; rp[t]=rBuf[t];
+    sb[t]=(size_t)sc[t]*blkB; rb[t]=(size_t)rc[t]*blkB;
+  }
+  comm::neighborExchange(nm, mig.data(), sp.data(), sb.data(), rp.data(), rb.data());
+
+  // insert the received blocks (device hash), then land their field data
+  i32 R = 0; for (i32 t = 0; t < nm; t++) R += rc[t];
+  if (R) {
+    u64 *locs; i32 *slots;
+    cudaMallocManaged(&locs,  (size_t)R*sizeof(u64));
+    cudaMallocManaged(&slots, (size_t)R*sizeof(i32));
+    i32 x = 0;
+    for (i32 t = 0; t < nm; t++)
+      for (i32 y = 0; y < rc[t]; y++) locs[x++] = *(u64*)(rBuf[t] + (size_t)y*blkB);
+    migrateInsertKernel<<<(R+255)/256, 256>>>(*this, locs, R, slots);
+    cudaDeviceSynchronize();
+    x = 0;
+    i32 dropped = 0;
+    for (i32 t = 0; t < nm; t++)
+      for (i32 y = 0; y < rc[t]; y++, x++) {
+        i32 sIdx = slots[x];
+        if (sIdx == bEmpty) { dropped++; continue; }
+        real *fd = (real*)(rBuf[t] + (size_t)y*blkB + sizeof(u64));
+        for (i32 f = 0; f < NEVOLVE; f++)
+          memcpy(getField(f) + (size_t)sIdx*blockSizeTot, fd + (size_t)f*blockSizeTot,
+                 blockSizeTot*sizeof(real));
+      }
+    if (dropped) printf("[zcurve] rank %d: %d migrated blocks DROPPED (pool full)\n", part.rank, dropped);
+    cudaFree(locs); cudaFree(slots);
+  }
+  for (i32 t = 0; t < nm; t++) { if (sBuf[t]) cudaFree(sBuf[t]); if (rBuf[t]) cudaFree(rBuf[t]); }
+  nBlocks = hashTable.nKeys;   // inserts bumped the key count
+}
+
+// periodic rebalance driver (call with the grid consistent, between steps)
+void CompressibleSolver::rebalancePartition(void) {
+  if (comm::size() == 1 || g_partMode != 1) return;
+  i32 P = comm::size();
+  i32 nCol = part.nb[0]*part.nb[1]*part.nb[2];
+  // fresh replicated weights
+  if (!wBase) cudaMallocManaged(&wBase, (size_t)nCol*sizeof(double));
+  cudaMemset(wBase, 0, (size_t)nCol*sizeof(double));
+  countBaseWeightsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  comm::allreduceSum(wBase, nCol);
+  // imbalance test (identical on every rank: replicated inputs)
+  std::vector<double> wr(P, 0.0);
+  double total = 0;
+  for (i32 c = 0; c < nCol; c++) { wr[ownerBase[c]] += wBase[c]; total += wBase[c]; }
+  double mx = 0; for (i32 r = 0; r < P; r++) if (wr[r] > mx) mx = wr[r];
+  if (mx * P < 1.15 * total || total == 0) return;   // balanced enough
+  // new cut; skip if the map did not change
+  if (!ownerScratch) cudaMallocManaged(&ownerScratch, (size_t)nCol*sizeof(i32));
+  partitionByWeight(wBase, ownerScratch);
+  bool changed = false;
+  for (i32 c = 0; c < nCol && !changed; c++) changed = (ownerScratch[c] != ownerBase[c]);
+  if (!changed) return;
+  printf("[zcurve] rank %d rebalancing at iter %d (max/avg = %.2f)\n", part.rank, iter, mx * P / total);
+  // TEMP DIAG: owned blocks before migration
+  cudaDeviceSynchronize();
+  i32 ownedBefore = 0;
+  for (i32 b = 0; b < hashTable.nKeys; b++) {
+    u64 loc = bLocList[b]; if (loc == kEmpty) continue;
+    i32 lvl=(i32)(loc>>60), kb=(i32)((loc>>40)&0xFFFFF)-1, jb=(i32)((loc>>20)&0xFFFFF)-1, ib=(i32)(loc&0xFFFFF)-1;
+    if (ib>=0 && jb>=0 && kb>=0 && isOwnedBlock(lvl,ib,jb,kb)) ownedBefore++;
+  }
+  migrateBlocks(ownerScratch);
+  memcpy(ownerBase, ownerScratch, (size_t)nCol*sizeof(i32));
+  derivePartition();
+  invalidateCommBuffers();      // neighbor set may have changed with the map
+  sortBlocks();                 // indices/flags for the new block set
+  rebuildGhosts();              // prune + mirror under the new map
+  haloExchange(0, NEVOLVE);
+  setBoundaryConditions();
+  zeroAccumulator();            // the shared bank must be clean for LSRK stage 1
+  // TEMP DIAG: owned blocks + NaN scan after the commit
+  cudaDeviceSynchronize();
+  i32 ownedAfter = 0, nanCells = 0;
+  real *Rho = getField(F_RHO);
+  for (i32 b = 0; b < hashTable.nKeys; b++) {
+    u64 loc = bLocList[b]; if (loc == kEmpty) continue;
+    i32 lvl=(i32)(loc>>60), kb=(i32)((loc>>40)&0xFFFFF)-1, jb=(i32)((loc>>20)&0xFFFFF)-1, ib=(i32)(loc&0xFFFFF)-1;
+    if (!(ib>=0 && jb>=0 && kb>=0 && isOwnedBlock(lvl,ib,jb,kb))) continue;
+    ownedAfter++;
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      real r = Rho[(size_t)b*blockSizeTot + c];
+      if (!(r == r) || r <= 0) nanCells++;
+    }
+  }
+  printf("[zcurve-DIAG] rank %d ownedBefore=%d ownedAfter=%d badRho=%d\n",
+         part.rank, ownedBefore, ownedAfter, nanCells);
+  comm::barrier();
+}
+#endif
+
+#ifdef USE_MGPU
+// Count this rank's OWNED blocks (all levels) per level-0 base column,
+// allreduce so every rank has the global weights, and re-cut the Morton curve.
+void CompressibleSolver::rebalanceWeights(void) {
+  i32 n = part.nb[0]*part.nb[1]*part.nb[2];
+  if (!wBase) cudaMallocManaged(&wBase, (size_t)n*sizeof(double));
+  cudaMemset(wBase, 0, (size_t)n*sizeof(double));
+  countBaseWeightsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  comm::allreduceSum(wBase, n);
+  partitionByWeight(wBase);
+  derivePartition();
+  invalidateCommBuffers();     // neighbor set may have changed with the map
+  comm::barrier();
+}
+#endif
 
 // zero the shared bank so the LSRK accumulation (A_1 = 0) starts clean; the
 // NEVOLVE fields are contiguous slabs of fieldData
@@ -83,12 +303,33 @@ real CompressibleSolver::step(real tStep) {
     // dynamic wavelet adaptation; skipped for a static (fixed) refinement grid
     if (iter % 4 == 0 && nLvls > 1 && !staticGrid) {
 #ifdef USE_MGPU
+      // dynamic Z-curve rebalance BEFORE the adaptation: the cascade that
+      // follows (grading/reconstruction closure + rebuildGhosts) then builds
+      // the support structure for the migrated cut line -- running it after
+      // the adaptation would leave the new seam without manufactured support
+      // for 4 RK iterations (the virgin-seam failure mode).  The decision is
+      // replicated, so every rank takes this branch on the same iterations
+      // (the loopback comm backend barriers globally).
+      if (rebalanceEvery > 0 && iter > 0 && iter % (4*rebalanceEvery) == 0)
+        rebalancePartition();
       haloExchange(0, NEVOLVE);   // fill last cycle's ghosts before the detail computation
 #endif
       restrictFields();
       cudaDeviceSynchronize(); sub.tick();
       forwardWaveletTransform();
       cudaDeviceSynchronize(); sub.tock(); tForwardUs += sub.duration().count();
+#ifdef USE_MGPU
+      { // TEMP DIAG: post-threshold KEEP counts per level (owned only)
+        cudaDeviceSynchronize();
+        i32 kl[4] = {0,0,0,0};
+        for (i32 b = 0; b < hashTable.nKeys; b++) {
+          u64 loc = bLocList[b]; if (loc == kEmpty) continue;
+          i32 lvl=(i32)(loc>>60), kb=(i32)((loc>>40)&0xFFFFF)-1, jb=(i32)((loc>>20)&0xFFFFF)-1, ib=(i32)(loc&0xFFFFF)-1;
+          if (ib>=0 && jb>=0 && kb>=0 && lvl<4 && isOwnedBlock(lvl,ib,jb,kb) && bFlagsList[b] != DELETE) kl[lvl]++;
+        }
+        printf("THRESH iter=%d rank=%d keep=%d/%d/%d/%d\n", iter, part.rank, kl[0], kl[1], kl[2], kl[3]);
+      }
+#endif
       adaptGrid();
       // The inverse fills new owned blocks from the F_OLD snapshot via the
       // parents' (valid) neighbor indices.  The old ghost layer is kept through
@@ -111,6 +352,29 @@ real CompressibleSolver::step(real tStep) {
       // the wavelet snapshot / sort buffer dirtied the shared bank; the LSRK
       // accumulator must be zero when stage 1 begins (A_1 = 0)
       zeroAccumulator();
+#ifdef USE_MGPU
+      if (true) {   // TEMP DIAG: owned count per adaptation
+        cudaDeviceSynchronize();
+        i32 ol[8] = {0,0,0,0,0,0,0,0};
+        for (i32 b = 0; b < hashTable.nKeys; b++) {
+          u64 loc = bLocList[b]; if (loc == kEmpty) continue;
+          i32 lvl=(i32)(loc>>60), kb=(i32)((loc>>40)&0xFFFFF)-1, jb=(i32)((loc>>20)&0xFFFFF)-1, ib=(i32)(loc&0xFFFFF)-1;
+          if (ib>=0 && jb>=0 && kb>=0 && isOwnedBlock(lvl,ib,jb,kb) && lvl < 8) ol[lvl]++;
+        }
+        i32 g3 = 0, a3 = 0;   // rank-owned lvl-3 cells: GHOST vs total
+        for (i32 b = 0; b < hashTable.nKeys; b++) {
+          u64 loc = bLocList[b]; if (loc == kEmpty) continue;
+          i32 lvl=(i32)(loc>>60), kb=(i32)((loc>>40)&0xFFFFF)-1, jb=(i32)((loc>>20)&0xFFFFF)-1, ib=(i32)(loc&0xFFFFF)-1;
+          if (!(ib>=0 && jb>=0 && kb>=0 && lvl==3 && isOwnedBlock(lvl,ib,jb,kb))) continue;
+          for (i32 c = 0; c < blockSizeTot; c++) {
+            a3++;
+            if (cFlagsList[(size_t)b*blockSizeTot + c] == GHOST) g3++;
+          }
+        }
+        printf("ADAPT iter=%d rank=%d owned=%d/%d/%d/%d gs=%.3g ghostFrac3=%.3f\n", iter, part.rank,
+               ol[0], ol[1], ol[2], ol[3], (double)globalScale[0], a3 ? (double)g3/a3 : 0.0);
+      }
+#endif
     }
     cudaDeviceSynchronize();
     clock.tock();

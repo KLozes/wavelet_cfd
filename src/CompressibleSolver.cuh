@@ -122,6 +122,7 @@ public:
       greshoP0 = 0.0;
       staticGrid = 0;
       refineRadius = 0.4;
+      rebalanceEvery = 8;
 
       tGrid = 0.0;
       tSolver = 0.0;
@@ -138,6 +139,7 @@ public:
   }
 
   void initialize(void);
+  void buildInitialGrid(bool doPaint);   // base grid + IC + refine cascade
   real step(real dt);
   void sortFieldData(void);
   void setInitialConditions(void);
@@ -154,6 +156,13 @@ public:
 #ifdef USE_MGPU
   void haloExchange(i32 fOff, i32 nf);   // fill partition-boundary ghost blocks from owners
   void rebuildGhosts(void);              // recreate the 2-ring ghost layer from neighbors' directories
+  void rebalanceWeights(void);           // count owned blocks/base column, allreduce, re-cut the Morton curve
+  void rebalancePartition(void);         // dynamic: recount, re-cut, migrate (every rebalanceEvery adaptations)
+  void migrateBlocks(const i32 *newOwner);   // ship departing base columns to their new owners
+  void invalidateCommBuffers(void);      // re-size the directory/halo arrays after a map change
+  i32 *ownerScratch = nullptr;           // [nb0*nb1*nb2] candidate map for the re-cut
+  i32 rebalanceEvery;                    // rebalance period in adaptation cycles (0 = off)
+  double *wBase = nullptr;               // [nb0*nb1*nb2] per-base-column block weights (replicated after allreduce)
   void buildDirectories(void);           // build + exchange the per-neighbor boundary directories
   // Message-passing halo (no peer-memory access).  Per neighbor N, this PE sends
   // a DIRECTORY of the location codes of its owned blocks whose 2-ring reaches

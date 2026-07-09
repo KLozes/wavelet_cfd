@@ -38,6 +38,8 @@ __global__ void consumeDirKernel(CompressibleSolver &grid);
 __global__ void keepLocalSupportKernel(CompressibleSolver &grid);
 __global__ void packDirKernel(CompressibleSolver &grid, i32 fOff, i32 nf);
 __global__ void unpackDirKernel(CompressibleSolver &grid, i32 fOff, i32 nf);
+__global__ void countBaseWeightsKernel(CompressibleSolver &grid);
+__global__ void migrateInsertKernel(CompressibleSolver &grid, u64 *locs, i32 n, i32 *slots);
 #endif
 
 __global__ void copyToOldFieldsKernel(CompressibleSolver &grid);

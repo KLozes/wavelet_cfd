@@ -1915,3 +1915,39 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid) {
 
 
 
+
+#ifdef USE_MGPU
+// one weight per level-0 base column: the number of OWNED blocks (all levels)
+// whose footprint lies in that column -- the load metric for the Z-curve cut
+__global__ void countBaseWeightsKernel(CompressibleSolver &grid) {
+  START_BLOCK_LOOP
+    u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      i32 lvl, ib, jb, kb;
+      grid.decode(loc, lvl, ib, jb, kb);
+      if (grid.isOwnedBlock(lvl, ib, jb, kb)) {
+        i32 i = ib >> lvl, j = jb >> lvl, k = kb >> lvl;
+        atomicAdd(&grid.wBase[i + grid.part.nb[0]*(j + grid.part.nb[1]*k)], 1.0);
+      }
+    }
+  END_BLOCK_LOOP
+}
+#endif
+
+#ifdef USE_MGPU
+// insert migrated blocks: one thread per received block.  A block already
+// present locally (e.g. as a ghost mirror of its old owner) resolves to its
+// existing slot -- the caller then overwrites its fields with the shipped
+// (authoritative) data.  slots[t] = bEmpty if the pool is full (dropped).
+__global__ void migrateInsertKernel(CompressibleSolver &grid, u64 *locs, i32 n, i32 *slots) {
+  i32 t = blockIdx.x*blockDim.x + threadIdx.x;
+  if (t >= n) return;
+  i32 idx = grid.hashTable.insert(locs[t]);
+  if (idx != bEmpty) {
+    grid.bLocList[idx] = locs[t];
+    grid.bIdxList[idx] = idx;
+    atomicMax(&grid.bFlagsList[idx], KEEP);
+  }
+  slots[t] = idx;
+}
+#endif

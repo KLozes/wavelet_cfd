@@ -83,6 +83,8 @@ static void runRank(int argc, char* argv[]) {
   i32 mdFluxA  = argI("--mdflux", 0);                // 1 = multidimensional Osher-type corner flux (first-order states)
   real cflArg  = argF("--cfl", -1.0);                // CFL override (-1 = default 0.40; dt = cfl*min(dx/(|u|+c)))
   real advectA = argF("--advect", 0.0);              // isentropic-vortex (case 2) advection velocity u0=v0 (periodic seam-crossing test)
+  i32 zcurveA  = argI("--zcurve", 1);                // partition: 1 = Z-curve weight-balanced cut (default), 0 = box strips
+  i32 rebalA   = argI("--rebalance", 8);             // dynamic rebalance period (adaptation cycles; 0 = off)
 
   bool cube   = (testCase == 3);
   bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv);
@@ -107,6 +109,7 @@ static void runRank(int argc, char* argv[]) {
   real tEnd  = (testCase == 1 && sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin) : ((testCase == 2) ? 1.0 : (testCase == 3 ? 0.15 : (gresho ? 1.0 : (sodAmr ? 0.15 : (acoustic ? 0.35 : (acConv ? 2.0*acPeriod : 0.20))))));
   if (tEndArg > 0) tEnd = tEndArg;                   // CLI override (arg 10)
   real tStep = (testCase == 1) ? ((tEndArg > 0) ? tEnd/50.0 : ((sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin)/10.0 : 0.008)) : (testCase == 2 ? 0.1 : (testCase == 3 ? 0.03 : (gresho ? 0.1 : (sodAmr ? 0.02 : (acoustic ? 0.02 : (acConv ? tEnd : 0.01))))));
+  g_partMode = zcurveA;   // partition mode must be set before construction (initPartition runs in the ctor)
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls);
   solver->pseudo2D        = (baseGridSize[2] == blockSize) ? 1 : 0;  // collapse z (pseudo-2D)
@@ -122,6 +125,7 @@ static void runRank(int argc, char* argv[]) {
   solver->recon           = reconA;                     // face reconstruction (TVD / ROUND / LD-ROUND)
   solver->rt0Face         = rt0FaceA;                    // RT0 normal face: 0=linear modal, 1=c=1/6 parabola
   solver->mdFlux          = mdFluxA;                     // multidimensional Osher-type corner flux
+  solver->rebalanceEvery  = rebalA;                     // dynamic Z-curve rebalance period
   solver->immerserdBcType = 0;
   solver->initialize();
 
