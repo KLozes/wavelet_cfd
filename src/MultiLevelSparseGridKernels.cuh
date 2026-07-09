@@ -39,4 +39,8 @@ __global__ void checkTopologyKernel(MultiLevelSparseGrid &grid, i32 phaseTag);
 
 __global__ void checkFillSupportKernel(MultiLevelSparseGrid &grid, i32 level);
 
+#ifdef USE_MGPU
+__global__ void paintRankGridKernel(MultiLevelSparseGrid &grid, i32 level);
+#endif
+
 #endif

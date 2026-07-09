@@ -151,6 +151,7 @@ public:
   void paintField(i32 f, const char *fileName);  // render one field (or grid, f=-1) to a png
 #ifdef USE_MGPU
   void paintPartition(void);   // render the rank-ownership map (rank 0 writes output/partition_*.png)
+  void paintRankGrid(void);    // debug: per-rank owned+ghost block view (each rank writes rankgrid_r*.png)
 #endif
   virtual void computeImageData(i32 f);
 

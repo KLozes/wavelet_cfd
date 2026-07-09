@@ -583,3 +583,46 @@ __global__ void checkFillSupportKernel(MultiLevelSparseGrid &grid, i32 level) {
   END_BLOCK_LOOP
 #endif
 }
+
+#ifdef USE_MGPU
+// Per-rank grid render (debug): paint THIS rank's local blocks at one level --
+// owned blocks shaded by refinement level (1..nLvls), ghost (non-owned interior)
+// blocks in a bright band (nLvls+2 .. 2*nLvls+1).  Called coarse-to-fine so finer
+// blocks overwrite their parents; unpainted pixels stay 0 (not present locally).
+// The owned/ghost frontier in the image IS the partition boundary.
+__global__ void paintRankGridKernel(MultiLevelSparseGrid &grid, i32 level) {
+  START_CELL_LOOP
+    GET_CELL_INDICES
+
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb, kb;
+    grid.decode(loc, lvl, ib, jb, kb);
+
+    bool onMidPlane;
+    if (grid.pseudo2D) onMidPlane = (k == blockSize/2);
+    else {
+      i32 nPixelsZ = powi(2,(grid.nLvls - 1 - lvl));
+      i32 zMid = grid.baseGridSize[2]*powi(2, grid.nLvls-1) / 2;
+      i32 kLo = (kb*blockSize + k) * nPixelsZ;
+      onMidPlane = (zMid >= kLo && zMid < kLo + nPixelsZ);
+    }
+
+    if (loc != kEmpty && lvl == level && onMidPlane
+        && grid.isInteriorBlock(lvl, ib, jb, kb)) {
+      bool ghost = !grid.isOwnedBlock(lvl, ib, jb, kb);
+      real val = ghost ? (real)(grid.nLvls + 2 + lvl) : (real)(lvl + 1);
+      i32 nPixels = powi(2,(grid.nLvls - 1 - lvl));
+      for (i32 jj=0; jj<nPixels; jj++) {
+        for (i32 ii=0; ii<nPixels; ii++) {
+          i32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
+          i32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
+          if (iPxl < 0 || iPxl >= grid.imageSizeX[0] || jPxl < 0 || jPxl >= grid.imageSizeX[1]) continue;
+          grid.imageDataX[jPxl*grid.imageSizeX[0] + iPxl] =
+            (ii > 0 && jj > 0) ? (real)0 : val;   // gridlines like the grid render
+        }
+      }
+    }
+
+  END_CELL_LOOP
+}
+#endif

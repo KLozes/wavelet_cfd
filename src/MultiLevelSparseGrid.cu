@@ -575,8 +575,35 @@ void MultiLevelSparseGrid::paint(void) {
     else        sprintf(fileName, "output/grid_%05d.png", imageCounter);
     paintField(f, fileName);
   }
+#ifdef USE_MGPU
+  if (dbgChecks) paintRankGrid();   // per-rank owned+ghost view (debug)
+#endif
   imageCounter++;
 }
+
+#ifdef USE_MGPU
+// Per-rank local-grid render (debug): every rank writes its OWN full-domain
+// frame showing exactly the blocks it holds -- owned shaded by level (dark ->
+// mid grey), partition ghosts in a bright band, absent regions black.  The
+// owned/ghost frontier is the partition boundary; the ghost band width shows
+// the Chebyshev-2 halo the stencils require.
+void MultiLevelSparseGrid::paintRankGrid(void) {
+  i32 nPix = imageSizeX[0]*imageSizeX[1];
+  cudaMemset(imageDataX, 0, (size_t)nPix*sizeof(real));
+  for (i32 L = 0; L < nLvls; L++) {   // coarse -> fine: finer blocks overwrite parents
+    paintRankGridKernel<<<cudaGridSize, cudaBlockSize>>>(*this, L);
+    cudaDeviceSynchronize();
+  }
+  png::image<png::gray_pixel_16> image(imageSizeX[0], imageSizeX[1]);
+  real maxVal = (real)(2*nLvls + 1);  // fixed scale: 0 absent, 1..nLvls owned, nLvls+2.. ghosts
+  for (i32 j = 0; j < imageSizeX[1]; j++)
+    for (i32 i = 0; i < imageSizeX[0]; i++)
+      image[j][i] = (png::gray_pixel_16)(fmin(fmax(imageDataX[j*imageSizeX[0]+i], (real)0), maxVal) / maxVal * 65535);
+  char fileName[80];
+  sprintf(fileName, "output/rankgrid_r%d_%05d.png", part.rank, imageCounter);
+  image.write(fileName);
+}
+#endif
 
 void MultiLevelSparseGrid::computeImageData(i32 f) {
 
