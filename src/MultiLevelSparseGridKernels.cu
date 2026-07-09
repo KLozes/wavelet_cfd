@@ -624,8 +624,10 @@ __global__ void paintRankGridKernel(MultiLevelSparseGrid &grid, i32 level) {
           i32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
           i32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
           if (iPxl < 0 || iPxl >= grid.imageSizeX[0] || jPxl < 0 || jPxl >= grid.imageSizeX[1]) continue;
-          bool edge = (ii == 0 || jj == 0);   // per-CELL gridline (like the normal grid render)
-          grid.imageDataX[jPxl*grid.imageSizeX[0] + iPxl] = edge ? base*(real)0.45 : base;
+          // colour ONLY the grid lines (cell top/left edge); interior black -- the
+          // normal grid render.  Owned lines bright, ghost lines dark, absent = no
+          // lines (pure black), so the three are still distinguishable.
+          grid.imageDataX[jPxl*grid.imageSizeX[0] + iPxl] = (ii > 0 && jj > 0) ? (real)0 : base;
         }
       }
     }
