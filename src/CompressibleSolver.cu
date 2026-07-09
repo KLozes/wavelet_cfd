@@ -1179,6 +1179,13 @@ void CompressibleSolver::computeVortexError(void) {
       area  += cellA;
     }
   }
+#ifdef USE_MGPU
+  // global norm: each rank summed only its OWNED cells
+  double red[4] = {l2Rho, l2Vel, l2P, area};
+  comm::allreduceSum(red, 4);
+  l2Rho = red[0]; l2Vel = red[1]; l2P = red[2]; area = red[3];
+  if (part.rank != 0) return;
+#endif
   printf("---- vortex L2 error (vs exact stationary) ----\n");
   printf("  scheme %d   L2(rho) = %.4e   L2(|u|) = %.4e   L2(p) = %.4e\n",
          scheme, sqrt(l2Rho/area), sqrt(l2Vel/area), sqrt(l2P/area));
