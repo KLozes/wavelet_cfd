@@ -346,7 +346,7 @@ void MultiLevelSparseGrid::adaptGrid(void) {
     censusPrint1(*this, "post-fine");
     addAdjacentBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     censusPrint1(*this, "post-adjacent");
-    for(i32 lvl=nLvls-1; lvl>2; lvl--) {
+    for(i32 lvl=nLvls-1; lvl>1; lvl--) {   // lvl>1: level 1 is adaptive, build its ring for level-2 blocks
       setBlocksKeepKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
       addReconstructionBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     }

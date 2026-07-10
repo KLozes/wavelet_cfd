@@ -483,7 +483,7 @@ void CompressibleSolver::inverseWaveletTransform(void) {
 void CompressibleSolver::reconstituteOldSnapshot(void) {
   haloExchange(F_OLD, NEVOLVE);                 // ghosts of the dense levels get owners' snapshot
   setBoundaryConditions(F_OLD);                 // exterior taps must be BC-filled BEFORE prolongation reads them
-  for (i32 L = 2; L < nLvls; L++) {
+  for (i32 L = 1; L < nLvls; L++) {             // L=1: level 1 is adaptive now, new level-1 blocks need F_OLD prolonged from the dense level 0
     if (dbgChecks) {                            // debug: every fill target must have valid parent support
       cudaDeviceSynchronize(); cudaMemset(dbgCnt, 0, sizeof(i32));
       checkFillSupportKernel<<<cudaGridSize, cudaBlockSize>>>(*this, L);

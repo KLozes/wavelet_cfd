@@ -193,7 +193,12 @@ __global__ void addFineBlocksKernel(MultiLevelSparseGrid &grid) {
     refineBlk = refineBlk && grid.isOwnedBlock(lvl, ib, jb, kb);
 #endif
     if (refineBlk) {
-      if (lvl == 0 || grid.bFlagsList[bIdx] == REFINE) {
+      if (grid.bFlagsList[bIdx] == REFINE) {
+        // Level 0 -> 1 refinement now lives in waveletThresholdingKernel (the
+        // virtual-(-1) detail gate for dynamic grids, an unconditional spawn for
+        // static grids), so this kernel no longer force-spawns a dense level 1.
+        // REFINE is currently unused, so this body is effectively inert; kept so
+        // an explicit REFINE flag can drive block refinement again if reintroduced.
         // add finer blocks if not already on finest level
         grid.bFlagsList[bIdx] = KEEP;
         if (lvl < grid.nLvls-1) {
@@ -288,7 +293,11 @@ __global__ void addReconstructionBlocksKernel(MultiLevelSparseGrid &grid) {
     u64 loc = grid.bLocList[bIdx];
     grid.decode(loc, lvl, ib, jb, kb);
 
-    bool reconBlk = grid.isInteriorBlock(lvl, ib, jb, kb) && lvl > 2 && grid.bFlagsList[bIdx] == KEEP;
+    // lvl > 1: level 1 is now adaptive, so a level-2 block needs its level-1
+    // parent ring built as reconstruction support (level-1 support then
+    // reconstructs from the always-dense level 0).  Harmless for static grids
+    // (their level 1 is dense, so these activateBlock calls hit existing blocks).
+    bool reconBlk = grid.isInteriorBlock(lvl, ib, jb, kb) && lvl > 1 && grid.bFlagsList[bIdx] == KEEP;
     if (reconBlk) {
       // periodic: wrap the parent target so a near-seam block's coarse
       // reconstruction support is built on the opposite edge too (identity for

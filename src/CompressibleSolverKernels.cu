@@ -1776,6 +1776,38 @@ __global__ void inverseWaveletTransformKernel(CompressibleSolver &grid) {
   END_CELL_LOOP
 }
 
+// Virtual level-(-1) detail on the base grid.  Level 0 is the coarsest grid: it
+// has no parent to predict from, hence no wavelet detail and no inverse -- so on
+// its own it would have to be refined everywhere (a permanently dense level 1).
+// Instead synthesize a coarse prediction of a level-0 cell as the simple average
+// of its surrounding 5x5x5 box of level-0 cells (5x5 in pseudo-2D).  A symmetric
+// box average is exact for a linear field, so smooth flow yields ~0 detail while
+// curvature / a discontinuity yields a large one.  The returned signed deviation
+// (value - average) is used ONLY to decide whether to refine level 0 -> level 1;
+// it is never written back into the authoritative level-0 live data.  The +-2
+// reach lands one block away (haloSize 2 < blockSize 4) so every tap resolves
+// through getNbrIdx; a missing tap (the bEmpty trash slice, e.g. a domain corner)
+// is skipped so the mean is taken over present cells only.
+__device__ real virtualDetailLevel0(CompressibleSolver &grid, i32 f, i32 bIdx,
+                                     i32 i, i32 j, i32 k) {
+  real *Q = grid.getField(f);
+  real self = Q[grid.getNbrIdx(bIdx, i, j, k)];
+  i32 dkLim = grid.pseudo2D ? 0 : 2;
+  real sum = 0.0;
+  i32 cnt = 0;
+  for (i32 dk = -dkLim; dk <= dkLim; dk++) {
+    for (i32 dj = -2; dj <= 2; dj++) {
+      for (i32 di = -2; di <= 2; di++) {
+        i32 nIdx = grid.getNbrIdx(bIdx, i+di, j+dj, k+dk);
+        if (nIdx / blockSizeTot == bEmpty) continue;   // missing tap -> skip
+        sum += Q[nIdx];
+        cnt++;
+      }
+    }
+  }
+  return self - (cnt > 0 ? sum / (real)cnt : self);
+}
+
 __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
 
   START_CELL_LOOP
@@ -1785,7 +1817,11 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
 
-    bool keepCoarse = (lvl < 2);
+    // Dynamic (wavelet) grids force only level 0 dense; level 1 is now adaptive,
+    // driven by the virtual-(-1) detail below.  Static grids keep the old dense
+    // level 0 AND 1 (their level 1 is built full at init, see the refineBase
+    // branch) so those tests stay byte-identical.
+    bool keepCoarse = grid.staticGrid ? (lvl < 2) : (lvl < 1);
 #ifdef USE_MGPU
     keepCoarse = keepCoarse && grid.isOwnedBlock(lvl, ib, jb, kb);   // owned coarse only
     // no blanket ghost-KEEP: the ghost layer is rebuilt each cycle by the seam
@@ -1886,6 +1922,53 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
             }
           }
           grid.bFlagsList[bIdx] = KEEP;
+        }
+      }
+    }
+
+    // Level 0 -> level 1 refinement.  Level 0 has no parent, so it uses the
+    // virtual level-(-1) detail (5x5x5 base-grid average) instead of the wavelet
+    // detail: refine only where the base grid carries sub-cell structure.  This
+    // replaces addFineBlocksKernel's old unconditional "level 0 refines
+    // everywhere" so level 1 is adaptive.  staticGrid preserves the dense level 1
+    // by spawning every child (matches the old addFineBlocksKernel behavior).
+    bool refineBase = (lvl == 0 && grid.isInteriorBlock(lvl, ib, jb, kb));
+#ifdef USE_MGPU
+    refineBase = refineBase && grid.isOwnedBlock(lvl, ib, jb, kb);
+#endif
+    if (refineBase && grid.nLvls > 1) {
+      i32 bSize = blockSize/2;
+      i32 cx = 2*ib+i/bSize, cy = 2*jb+j/bSize;
+      i32 cz = grid.pseudo2D ? kb : (2*kb + k/bSize);
+      bool doRefine = false;
+      if (grid.staticGrid) {
+        doRefine = true;                                   // dense level 1 (static)
+      }
+      else {
+        for (i32 f = 0; f < NEVOLVE; f++) {
+          if (f >= F_GX) continue;                         // primary fields only
+          if (grid.pseudo2D && f == F_RHOW) continue;      // z-mom is 0 in 2D
+          i32 sc = (f == F_RHO) ? 0 : (f <= F_RHOW ? 1 : 2);
+          real mag = fmax(grid.globalScale[sc], (real)1e-32);
+          real vdet = virtualDetailLevel0(grid, f, bIdx, i, j, k);
+          if (abs(vdet/mag) > grid.waveletThresh*2 || abs(ls) < dx) { doRefine = true; break; }
+        }
+      }
+      if (doRefine) {
+        grid.activateBlock(1, cx, cy, cz);
+        if (grid.periodic && !grid.staticGrid) {
+          // refine the across-seam partner child in the same cycle (see the
+          // lvl>0 branch above); static grids spawn every child anyway.
+          i32 gcx = grid.baseGridSize[0]/blockSize*powi(2,1);
+          i32 gcy = grid.baseGridSize[1]/blockSize*powi(2,1);
+          i32 px = (cx==0) ? gcx-1 : (cx==gcx-1 ? 0 : cx);
+          i32 py = (cy==0) ? gcy-1 : (cy==gcy-1 ? 0 : cy);
+          i32 pz = cz;
+          if (!grid.pseudo2D) {
+            i32 gcz = grid.baseGridSize[2]/blockSize*powi(2,1);
+            pz = (cz==0) ? gcz-1 : (cz==gcz-1 ? 0 : cz);
+          }
+          if (px!=cx || py!=cy || pz!=cz) grid.activateBlock(1, px, py, pz);
         }
       }
     }
