@@ -1,0 +1,7 @@
+{
+  // extern/openmpi is a submodule we build in-place; its build artifacts are
+  // untracked noise. .gitmodules already sets `ignore = dirty` for the CLI, but
+  // VSCode opens submodules as their own repos in Source Control and ignores
+  // that flag, so turn off submodule detection to stop it nagging.
+  "git.detectSubmodules": false
+}
