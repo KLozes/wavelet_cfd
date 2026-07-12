@@ -7,6 +7,8 @@ __global__ void initGridKernel(MultiLevelSparseGrid &grid);
 
 __global__ void updateIndicesKernel(MultiLevelSparseGrid &grid);
 
+__global__ void buildSortKeysKernel(MultiLevelSparseGrid &grid);   // sortCurve: level-major Hilbert/Morton keys
+
 __global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid);
 
 __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid);

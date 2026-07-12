@@ -11,6 +11,8 @@ __global__ void initGridKernel(MultiLevelSparseGrid &grid) {
   bool inDomain = (i < grid.baseGridSize[0]/blockSize + 1 &&
                    j < grid.baseGridSize[1]/blockSize + 1 &&
                    k < grid.baseGridSize[2]/blockSize + 1);
+  // leaf-only grids never materialize the exterior ring (BCs are weak)
+  if (grid.leafMode && grid.isExteriorBlock(0, i, j, k)) inDomain = false;
 #ifdef USE_MGPU
   // this PE creates its owned base blocks plus a 1-block ghost ring (Chebyshev-1,
   // corners included): any candidate (interior, or the -1/nb domain-exterior
@@ -105,6 +107,42 @@ __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
 
 }
 
+// level-major space-filling-curve sort keys (sortCurve == 1): Hilbert in
+// pseudo2D (no diagonal jumps), Morton in 3D.  Dead slots sort last.
+__device__ static u64 devHilbert2D(i32 x, i32 y) {
+  u64 d = 0;
+  for (i32 s = 1 << 19; s > 0; s >>= 1) {
+    i32 rx = (x & s) ? 1 : 0;
+    i32 ry = (y & s) ? 1 : 0;
+    d += (u64)s * (u64)s * (u64)((3*rx) ^ ry);
+    if (ry == 0) {
+      if (rx == 1) { x = (1<<20)-1 - x; y = (1<<20)-1 - y; }
+      i32 t = x; x = y; y = t;
+    }
+  }
+  return d;
+}
+__device__ static u64 devMorton3D(i32 x, i32 y, i32 z) {
+  u64 m = 0;
+  for (i32 b = 0; b < 20; b++)
+    m |= ((u64)((x>>b)&1))<<(3*b) | ((u64)((y>>b)&1))<<(3*b+1) | ((u64)((z>>b)&1))<<(3*b+2);
+  return m;
+}
+
+__global__ void buildSortKeysKernel(MultiLevelSparseGrid &grid) {
+  START_BLOCK_LOOP
+    u64 loc = grid.bLocList[bIdx];
+    if (loc == kEmpty) {
+      grid.sortKeyList[bIdx] = kEmpty;   // dead slots sort last (as before)
+    } else {
+      i32 lvl, ib, jb, kb;
+      grid.decode(loc, lvl, ib, jb, kb);
+      u64 curve = grid.pseudo2D ? devHilbert2D(ib, jb) : devMorton3D(ib, jb, kb);
+      grid.sortKeyList[bIdx] = ((u64)lvl << 60) | curve;
+    }
+  END_BLOCK_LOOP
+}
+
 __global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid) {
 
   START_CELL_LOOP
@@ -114,7 +152,11 @@ __global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid) {
     u64 loc = grid.bLocList[bIdx];
     grid.decode(loc, lvl, ib, jb, kb);
 
-    if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
+    if (grid.leafMode) {
+      // leaf-only partition: every interior cell is a live solution node
+      grid.cFlagsList[cIdx] = grid.isInteriorBlock(lvl, ib, jb, kb) ? ACTIVE : GHOST;
+    }
+    else if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
 
       i32 cEmpty = bEmpty * blockSizeTot;
       grid.cFlagsList[cIdx] = ACTIVE;
@@ -150,6 +192,8 @@ __global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid) {
 }
 
 __global__ void flagParentCellsKernel(MultiLevelSparseGrid &grid) {
+
+  if (grid.leafMode) return;   // leaf-only grids have no parent blocks
 
   START_CELL_LOOP
     GET_CELL_INDICES

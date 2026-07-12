@@ -52,6 +52,16 @@ WAVEWSDF_OBJS = $(patsubst %,$(OBJ_DIR)/wavewsdf/%.cu.o,$(WAVEWSDF_SRCS))
 WAVE3D_DP_DEFS = -DUSE_DOUBLE
 WAVE3D_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_dp/%.cu.o,$(WAVE3D_SRCS))
 
+# multi-resolution DGSEM solver (leaf-only AMR, one block = one p=3 element of
+# 4^3 LGL nodes).  16M nodes = 250k elements; 17 node-fields ~ 1.1 GB fp32.
+# wavedg3d_dp: fp64 for conservation/convergence studies (halved node cap).
+WAVEDG_DEFS    = -DNCELLS_MAX=32000000 -DDG_ORDER=3
+WAVEDG_DP_DEFS = -DNCELLS_MAX=8000000 -DDG_ORDER=3 -DUSE_DOUBLE
+WAVEDG_SRCS = HashTable MultiLevelSparseGrid MultiLevelSparseGridKernels \
+              DgSolver DgSolverKernels DgMain
+WAVEDG_OBJS    = $(patsubst %,$(OBJ_DIR)/wavedg3d/%.cu.o,$(WAVEDG_SRCS))
+WAVEDG_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_dp/%.cu.o,$(WAVEDG_SRCS))
+
 # multi-GPU (domain-decomposed) Euler build.  Same solver + the Comm layer and a
 # comm-aware main; -DUSE_MGPU turns on the decomposition paths.  By default it
 # builds the LOOPBACK backend (single process/PE, no external deps) so it runs on
@@ -76,7 +86,7 @@ ifeq ($(USE_MPI),1)
   WAVE3D_MGPU_LDFLAGS = -L$(MPI_HOME)/lib -lmpi -Xlinker -rpath -Xlinker $(MPI_HOME)/lib
 endif
 
-all: wave3d wavesdf wavewsdf
+all: wave3d wavesdf wavewsdf wavedg3d
 
 wave3d: $(WAVE3D_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
@@ -88,6 +98,12 @@ wavewsdf: $(WAVEWSDF_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
 wave3d_dp: $(WAVE3D_DP_OBJS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
+
+wavedg3d: $(WAVEDG_OBJS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
+
+wavedg3d_dp: $(WAVEDG_DP_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
 wave3d_mgpu: $(WAVE3D_MGPU_OBJS)
@@ -106,15 +122,21 @@ $(OBJ_DIR)/wavewsdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavewsdf
 $(OBJ_DIR)/wave3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d_dp
 	$(NVCC) $(NVCCFLAGS) $(WAVE3D_DP_DEFS) -I./$(SRC_DIR) -dc $< -o $@
 
+$(OBJ_DIR)/wavedg3d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavedg3d
+	$(NVCC) $(NVCCFLAGS) $(WAVEDG_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+
+$(OBJ_DIR)/wavedg3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavedg3d_dp
+	$(NVCC) $(NVCCFLAGS) $(WAVEDG_DP_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+
 # --default-stream per-thread: the loopback backend runs one host thread per
 # logical PE, so give each thread its own default stream (independent syncs).
 $(OBJ_DIR)/wave3d_mgpu/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d_mgpu
 	$(NVCC) $(NVCCFLAGS) --default-stream per-thread $(WAVE3D_MGPU_DEFS) -I./$(SRC_DIR) -dc $< -o $@
 
-$(OBJ_DIR)/wave3d $(OBJ_DIR)/wavesdf $(OBJ_DIR)/wavewsdf $(OBJ_DIR)/wave3d_dp $(OBJ_DIR)/wave3d_mgpu:
+$(OBJ_DIR)/wave3d $(OBJ_DIR)/wavesdf $(OBJ_DIR)/wavewsdf $(OBJ_DIR)/wave3d_dp $(OBJ_DIR)/wave3d_mgpu $(OBJ_DIR)/wavedg3d $(OBJ_DIR)/wavedg3d_dp:
 	mkdir -p $@
 
 clean:
-	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf wave3d_dp wave3d_mgpu
+	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf wave3d_dp wave3d_mgpu wavedg3d wavedg3d_dp
 
 .PHONY: all clean

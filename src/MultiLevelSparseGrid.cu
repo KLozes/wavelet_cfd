@@ -59,12 +59,14 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   cudaMallocManaged(&bIdxList, nBlocksMax*sizeof(i32));
   cudaMallocManaged(&bFlagsList, nBlocksMax*sizeof(i32));
   cudaMallocManaged(&snapValidList, nBlocksMax*sizeof(i32));
+  cudaMallocManaged(&ibClassList, nBlocksMax*sizeof(i32));
   cudaMallocManaged(&dbgCnt, 64*sizeof(i32));   // [1] topo violations, or [3*lvl+{0,1,2}] ghost census
   cudaMallocManaged(&createdCnt, sizeof(i32));
   cudaMemset(bLocList, 0, nBlocksMax*sizeof(u64));
   cudaMemset(bIdxList, 0, nBlocksMax*sizeof(i32));
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(i32));
   cudaMemset(snapValidList, 0, nBlocksMax*sizeof(i32));
+  cudaMemset(ibClassList, 0, nBlocksMax*sizeof(i32));
   cudaMemset(dbgCnt, 0, sizeof(i32));
   cudaMemset(createdCnt, 0, sizeof(i32));
 
@@ -102,6 +104,7 @@ MultiLevelSparseGrid::~MultiLevelSparseGrid(void) {
   cudaFree(bLocList);
   cudaFree(bIdxList);
   cudaFree(snapValidList);
+  cudaFree(ibClassList);
   cudaFree(prntIdxList);
   cudaFree(nbrIdxList);
   cudaFree(cFlagsList);
@@ -295,7 +298,8 @@ void MultiLevelSparseGrid::initializeBaseGrid(void) {
                     baseGridSize[1]/blockSize/8+1, 
                     baseGridSize[2]/blockSize/8+1);
   initGridKernel<<<nCudaBlocks3, cudaBlockSize3>>>(*this);
-  addBoundaryBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  if (!leafMode)   // leaf-only grids have no exterior ghost blocks (weak BCs)
+    addBoundaryBlocksKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   nBlocks = hashTable.nKeys;
 
@@ -364,7 +368,20 @@ void MultiLevelSparseGrid::adaptGrid(void) {
 void MultiLevelSparseGrid::sortBlocks(void) {
 
   cudaDeviceSynchronize();
-  thrust::sort_by_key(thrust::device, bLocList, bLocList+hashTable.nKeys, bIdxList);
+  if (sortCurve) {
+    // sort along a level-major space-filling curve (Hilbert/Morton) instead of
+    // the row-major location code: face neighbors in all directions and sibling
+    // octets land close in memory (locality for gather-heavy solvers).  The loc
+    // codes ride along as values; all bindings are rebuilt below either way.
+    if (!sortKeyList)
+      cudaMalloc(&sortKeyList, (size_t)nBlocksMax*sizeof(u64));
+    buildSortKeysKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    cudaDeviceSynchronize();
+    thrust::sort_by_key(thrust::device, sortKeyList, sortKeyList+hashTable.nKeys,
+                        thrust::make_zip_iterator(thrust::make_tuple(bLocList, bIdxList)));
+  } else {
+    thrust::sort_by_key(thrust::device, bLocList, bLocList+hashTable.nKeys, bIdxList);
+  }
   sortFieldData();
   cudaDeviceSynchronize();
   hashTable.reset();
@@ -504,7 +521,7 @@ void MultiLevelSparseGrid::paintField(i32 f, const char *fileName) {
   // clear first: each PE paints only its owned cells, so unpainted pixels must
   // read 0 for the cross-PE sum (and a shrunk single-PE frame leaves no stale).
   cudaMemset(imageDataX, 0, (size_t)nPix*sizeof(real));
-  computeImageDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this, f);
+  computeImageData(f);   // virtual: DG overrides it to interpolate from LGL nodes
   cudaDeviceSynchronize();
 #ifdef USE_MGPU
   // combine the per-PE owned paints into one full-domain image (exactly one
@@ -619,45 +636,11 @@ void MultiLevelSparseGrid::paintRankGrid(void) {
 }
 #endif
 
+// default (finite-volume) image build: the GPU kernel that paintField used to
+// launch directly.  Virtual so the DG solver can substitute an LGL-interpolating
+// version (see DgSolver::computeImageData).
 void MultiLevelSparseGrid::computeImageData(i32 f) {
-
-  real *U;
-  if (f >= 0) {
-    U = getField(f);
-  }
-
-  bool gridOn = false;
-
-  // set the pixel values 
-  for (uint bIdx=0; bIdx < hashTable.nKeys; bIdx++) {
-    u64 loc = bLocList[bIdx];
-    i32 lvl, ib, jb, kb;
-    decode(loc, lvl, ib, jb, kb);
-    if (isInteriorBlock(lvl, ib, jb, kb) && loc != kEmpty) {
-      for (uint j = 0; j < blockSize; j++) {
-        for (uint i = 0; i < blockSize; i++) {
-          i32 idx = i + blockSize * j + bIdx*blockSizeTot;
-          i32 nPixels = powi(2,(nLvls - 1 - lvl));
-          for (uint jj=0; jj<nPixels; jj++) {
-            for (uint ii=0; ii<nPixels; ii++) {
-              i32 iPxl = ib*blockSize*nPixels + i*nPixels + ii;
-              i32 jPxl = jb*blockSize*nPixels + j*nPixels + jj;
-              if (f >= 0) {
-                imageDataX[jPxl*imageSizeX[0] + iPxl] = U[idx];
-              }
-              else {
-                i32 cFlag = cFlagsList[idx];
-                imageDataX[jPxl*imageSizeX[0] + iPxl] = lvl+1 - (2-cFlag)/2;
-              }
-              if (gridOn && ii > 0 && jj > 0) {
-                  imageDataX[jPxl*imageSizeX[0] + iPxl] = 0;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  computeImageDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this, f);
 }
 
 /*

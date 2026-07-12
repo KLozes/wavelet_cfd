@@ -44,6 +44,19 @@ public:
   // z-direction carries blockSize uniform cells that never refine, the
   // z-momentum is never updated, and no z fluxes/boundary blocks are created.
   i32 pseudo2D = 0;
+  // leafMode (the DG solver): the grid is a leaf-only PARTITION of the domain --
+  // no exterior boundary blocks, no parent blocks, no ghost cells.  BCs are
+  // imposed weakly inside the face kernels, so initializeBaseGrid skips the
+  // exterior ring and flagActiveCells marks every interior cell ACTIVE (the
+  // GHOST/PARENT machinery is meaningless without overlapping levels).
+  i32 leafMode = 0;
+  // memory-layout sort order: 0 = location code (level-major, row-major k,j,i --
+  // x-neighbors adjacent, y/z a row/plane apart); 1 = level-major space-filling
+  // curve (Hilbert in pseudo2D, Morton in 3D -- neighbors in ALL directions and
+  // sibling octets land close/contiguous in memory).  Pure locality choice:
+  // hash/nbr/prnt bindings are rebuilt order-agnostically after every sort.
+  i32 sortCurve = 0;
+  u64 *sortKeyList = nullptr;   // [nBlocksMax] scratch keys (lazily allocated)
   // periodic: treat the domain as a torus during refinement -- grading,
   // reconstruction and boundary-ghost activation wrap across the seam so the two
   // opposite edges stay refined to matching, graded levels, and every periodic
@@ -106,6 +119,8 @@ public:
   i32 *bFlagsList;      // block Flags
   i32 *cFlagsList;      // cell Flags
   i32 *snapValidList;   // 1 if this block held a valid F_OLD snapshot at copyToOld, else 0 (new/imported)
+  i32 *ibClassList;     // immersed-boundary class per block (IB_FLUID=0/IB_GHOST=1/IB_DEAD=2);
+                        // pure geometry -- recomputed after every sort, never permuted
   i32  dbgChecks = 0;   // runtime debug: topology/data-integrity assert kernels (--debug)
   i32 *dbgCnt = nullptr;      // [1] managed violation counter for the check kernels
   i32 *createdCnt = nullptr;  // [1] managed count of blocks CREATED (not touched) since last reset

@@ -19,6 +19,18 @@ void CompressibleSolver::initialize(void) {
     printf("[warn] multiD corner flux is implemented for pseudo-2D only; disabling\n");
     mdFlux = 0;
   }
+  // RT0 low-Mach CFL guard: below Ma ~ 0.09 (greshoP0 = 1/(gam Ma^2) > 100) the
+  // fp32 pressure-from-energy cancellation (E stores the O(1/Ma^2) background;
+  // face dp is O(1)) puts ~5% noise on the momentum forcing, which continuously
+  // seeds the RT0 slope DOFs' near-imaginary modes; at cfl 0.4 they are
+  // marginal (see the mdFlux==2 note above) and the Ma=0.01 Gresho blows up by
+  // t~0.3.  cfl <= 0.3 restores the damping margin (measured: L2(vel) 4.3e-3,
+  // KE 0.9998 at Ma=0.01; fp64 needs no cap).  Only fires for genuinely
+  // low-Mach configurations, so validated RT0 cases are untouched.
+  if (scheme == 1 && icType == 4 && greshoP0 > 100.0 && sizeof(real) == 4 && cfl > 0.3) {
+    printf("[warn] RT0 at low Mach (fp32): capping cfl %.2f -> 0.30 (slope-mode margin)\n", cfl);
+    cfl = 0.3;
+  }
   // (mdFlux == 2 with scheme 1: the Hancock predictor time-centres the slope
   // DOFs' feed -- face momentum fluxes and volume term -- making the g<->p
   // coupling a partitioned midpoint-like integration, unlike the old
