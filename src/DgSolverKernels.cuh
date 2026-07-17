@@ -5,9 +5,9 @@
 
 // host-side reference-element operator setup (builds in double, uploads to the
 // constant-memory symbols owned by DgSolverKernels.cu) and its self-check
-void dgUploadOperators(void);
-bool dgOperatorSelfTest(void);
-void dgGetHostOps(double *w, double *xi);
+void dgUploadOperators(i32 gauss, i32 frType);
+bool dgOperatorSelfTest(i32 gauss, i32 frType);
+void dgGetHostOps(double *w, double *xi, i32 gauss);
 
 // RHS kernel launch geometry: EPB elements of blockSizeTot nodes per CUDA
 // block.  The in-kernel working set is sW[EPB][5][64] + the AV gradient banks
@@ -31,14 +31,21 @@ static constexpr i32 DG_EPB = 4;
 
 __global__ void dgSetICKernel(DgSolver &grid);
 __global__ void dgRhsKernel(DgSolver &grid, real t);
+__global__ void dgRhsGaussKernel(DgSolver &grid, real t);   // Gauss-Legendre flux reconstruction (--gauss)
 __global__ void dgAvNuKernel(DgSolver &grid);   // per-element AV nu -> D_SCRATCH (face jump penalty)
 __global__ void dgRk3StageKernel(DgSolver &grid, i32 stage, real dt);
 __global__ void dgCopyQ0Kernel(DgSolver &grid);
 __global__ void dgPositivityKernel(DgSolver &grid);
+__global__ void dgEntropyLimitKernel(DgSolver &grid, real dt);  // ES limiter (docs/EntropyStableDG.pdf)
+__global__ void dgIbGhostClampKernel(DgSolver &grid);          // clamp ghost states to bounds
+__global__ void dgMoodResetKernel(DgSolver &grid);              // MOOD: alpha -> 0 (DG attempt)
+__global__ void dgMoodDetectKernel(DgSolver &grid, i32 stage, real dt);  // MOOD: flag failed cells
+__global__ void dgDpGammaKernel(DgSolver &grid);   // DP-SBP upwind parameters -> SCRATCH 8..12
 __global__ void dgLamKernel(DgSolver &grid);
 __global__ void dgSnapshotQ0Kernel(DgSolver &grid);
 __global__ void dgSortFieldDataKernel(DgSolver &grid);
 __global__ void dgPressureToScratchKernel(DgSolver &grid);
+__global__ void dgBrinkPhiToScratchKernel(DgSolver &grid);        // stage phi(x) for a paint
 __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f);   // LGL -> uniform-pixel interp
 
 // MRA indicator (leaf-only, transient restriction on the octet anchor)
@@ -54,8 +61,11 @@ __global__ void dgIbClassifyGeomKernel(DgSolver &grid);      // pass 1: SDF box 
 __global__ void dgIbPromoteKernel(DgSolver &grid);           // pass 2: DEAD facing FLUID -> GHOST
 __global__ void dgIbBandVoteKernel(DgSolver &grid);          // pin |phi| < band to the finest level
 __global__ void dgIbFillKernel(DgSolver &grid);              // wall-normal Hermite ghost fill
+__global__ void dgIbSolidFillKernel(DgSolver &grid);        // SBM cut-cell solid-node bilinear fill
 __global__ void dgIbCheckKernel(DgSolver &grid);             // --debug classification invariants
 __global__ void dgIbClassToScratchKernel(DgSolver &grid);    // debug paint staging
+__global__ void dgTroubledToScratchKernel(DgSolver &grid);   // troubled-element indicator paint
+__global__ void dgBoundaryMassFluxKernel(DgSolver &grid, real *bnd);  // domain boundary mass flux
 __global__ void dgIbSurfaceKernel(DgSolver &grid, i32 nTheta, real off, real *out);
 __global__ void dgIbStagLineKernel(DgSolver &grid, i32 nS, real *out);
 __global__ void dgStaticVoteKernel(DgSolver &grid);         // staticGrid target-level vote overrides

@@ -1399,6 +1399,12 @@ __device__ real CompressibleSolver::tvdRec(real &ul, real &uc, real &ur) {
       psi = (real)0.5*phi + (real)0.5;
     }
   }
+  else if (recon == 4) {
+    // van Leer harmonic limiter in NVD form: MUSCL face u_c + (B(r)/2)(u_c-u_l)
+    // with B(r) = 2r/(1+r) maps to psi = phi(2-phi) on 0 < phi < 1 (parabola
+    // through (0,0),(1,1)); outside the TVD region fall back to upwind (u_c).
+    psi = (phi > 0.0 && phi < 1.0) ? phi*((real)2.0 - phi) : phi;
+  }
   else if (recon == 3) {
     // unlimited 3rd-order upwind parabola (kappa = 1/3 MUSCL): the psi-line the
     // ROUND schemes blend toward, with no limiting at all.

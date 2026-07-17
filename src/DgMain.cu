@@ -62,12 +62,43 @@
 //   --ibr X        cylinder radius            (default 0.5)
 //   --mach X       freestream Mach, a_inf = 1 (default 3; 0 = rest-state gate)
 //   --ibband X     force-finest band, finest-element units    (default 3)
-//   --ibcurv N     1 = curvature wall-pressure dp/dn = rho vt^2/R (default 1)
-//   --ibord N      reconstruction order 1/2 (3 = unstable)    (default 2)
-//   --ibimagefac X image-distance floor, ghost-widths         (default 1.5)
-//   --ibtheta X    donor sensor theta forcing order-2 fallback (default 0.5)
+//   --ibcurv N     1 = curvature wall conditions du_t/ds = -u_t/R (default 1;
+//                  0 = flat-wall HO-i/f, low order on curved bodies)
+//   --ibtheta X    donor sensor theta forcing the LO fallback  (default 0.5)
 //   --ibpen X      ghost-face penalty fraction of lambda      (default 0)
 //   --ibgraze X    extra ghost margin, element units (default 0: center rule)
+//   The wall method is FRIB HO-i/c (docs/FRIB.pdf); other fills removed.
+//   --gauss N      1 = Gauss-Legendre solution points + flux reconstruction
+//                  (interior nodes, entropy-projected face traces, correction
+//                  functions); 0 = collocated Lobatto DGSEM         (default 0)
+//   --fr N         Gauss FR correction function: 0 = g_DG (Radau), 1 = g_HU
+//                  (Huynh, wider stability)                          (default 1)
+//   --nsfr X       NSFR residual filter sigma in [0,1) (arXiv 2507.09131):
+//                  ESFR-c top-mode residual damping -- free on smooth flow,
+//                  best shock profiles; 0 disables               (default 0.3)
+//   --bulk X       Ducros-gated bulk (dilatation-only) viscosity strength C_b
+//                  -- compression-only, shear/contact-transparent; complement
+//                  to --dpsbp for multi-D shocks                     (default 0)
+//   --dpsbp X      dual-pairing upwind SBP volume dissipation strength tau
+//                  (arXiv 2411.06629): intrinsic entropy-dissipative top-mode
+//                  volume upwinding.  Fixes the p3 1D Sod that pure DG cannot
+//                  run (--av 0 --subfv 0 --dpsbp 0.1) and cleans post-shock
+//                  ringing, but does NOT hold the 2D blast alone   (default 0)
+//   --dpface X     EXPERIMENTAL: replace HLLC with the paper's Gamma-upwind
+//                  interface flux -- UNSTABLE at strong fronts (measured, both
+//                  additive and replace forms); keep 0              (default 0)
+//   --eslim N      entropy-stable limiter: 1 = everywhere (p=3 M=3 needs
+//                  this), 2 = sensor-gated (smooth-exact)      (default 0)
+//   --mood N       1 = a-posteriori MOOD limiter (no a priori sensor/AV):
+//                  DG -> detect -> local first-order FV redo    (default 0)
+//   --rusface N    element-interface flux: 0 HLLC, 1 Rusanov (vacuum-robust),
+//                  2 Roe + Harten fix (the NSFR paper pairing)
+//   --subfv N      1 = subcell-FV shock capturing (docs/subcellFV.pdf);
+//                  alternative to AV -- try --av 0 --subfv 1    (default 0)
+//   --submax X     cap on the subcell-FV blend factor          (default 0.5)
+//   --subthr X     FV sensor deadband: below it pure high-order + NSFR filter;
+//                  above it alpha rescales to full blend at theta=1 (default 0)
+//   --subfloor X   amplitude floor for the shock sensor, rel.  (default 0.01)
 //   --debug N      1 = leaf-cover/integrity checks each adaptation
 //   --selftest     run the operator self-test and exit
 //
@@ -145,6 +176,49 @@ int main(int argc, char* argv[]) {
   solver->shockRefine  = argI("--shockrefine", 1);
   solver->shockThresh  = argF("--shockthresh", 0.5);
   solver->icDelta      = argF("--icdelta", 0.5);
+  solver->gauss       = argI("--gauss", 0);   // Gauss-Legendre pts + flux reconstruction
+  solver->frType      = argI("--fr", 1);      // 0 = g_DG (Radau), 1 = g_HU (Huynh)
+  solver->nsfr        = argF("--nsfr", 0.3);  // NSFR residual top-mode filter sigma (default ON)
+  solver->bulkC       = argF("--bulk", 0.0);  // Ducros-gated bulk viscosity C_b
+  solver->dpSbp       = argF("--dpsbp", 0.0); // dual-pairing SBP volume upwind tau
+  solver->dpFace      = argF("--dpface", 0.0);// DP interface upwind flux: >0 REPLACES
+                                              // HLLC with central + Gamma-upwind (paper Eq 17)
+                                              // (arXiv 2411.06629; try 0.1 with --av 0 --subfv 0)
+  solver->esLim       = argI("--eslim", 0);
+  solver->mood        = argI("--mood", 0);
+  solver->moodRho     = argF("--moodrho", 1e-6);
+  solver->moodP       = argF("--moodp", 1e-6);
+  solver->rusFace     = argI("--rusface", 0);
+  solver->ibLimit     = argI("--iblimit", 1);
+  solver->ibHO        = argI("--ibho", 1);   // 0 = first-order wall reconstruction
+  solver->ibSbm       = argI("--ibsbm", 0);   // 1 = shifted boundary wall (no ghosts)
+  solver->ibBrink     = argI("--ibbrink", 0);      // 1 = volume-penalization IB
+  solver->ibBrinkEps  = argF("--ibbrinkeps", 1e-4);
+  solver->ibBrinkDelta= argF("--ibbrinkdelta", 2.0);   // phi transition width in finest cells
+  solver->ibBrinkRate = argF("--ibbrinkrate", 1.0);    // Darcy drag rate / CFL-stable rate
+  solver->ibSbmCurv   = argF("--ibsbmcurv", 1.0);  // SBM wall curvature coefficient
+  solver->ibShift2    = argI("--ibshift2", 0);     // 2nd-order Taylor velocity shift
+  solver->ibSbmPen    = argF("--ibsbmpen", 0.2);   // SBM slip Nitsche penalty alpha
+  solver->ibSingle    = argI("--ibsingle", 0);    // 1 = single-IP state, 2 = +gradient
+  solver->ibRecon     = argI("--ibrecon", 1);      // 0 = H/S (paper) image line; 1 =
+                                                   // primitive (p,rho) DEFAULT 2026-07-15:
+                                                   // fixes p3-M3, Gauss-FRIB, high-res M=3
+  solver->ibPiston    = argI("--ibpiston", 1);     // 0 = no wall-Riemann star (LO instead)
+  solver->ibDil       = argF("--ibdil", 0.0);      // image-line length in h (0 = Eq-22 default)
+  solver->ibDbg       = getenv("DGDBG") ? 1 : 0;   // TEMP nose-ghost fill trace
+  solver->subFv       = argI("--subfv", (solver->mood || solver->gauss) ? 1 : 0);
+  // MOOD uses the FV volume; GAUSS FR requires it: the entropy-projected face
+  // trace overshoots at shocks and only the troubled-cell constant-extrapolation
+  // blend (keyed on slot-6 alpha) contains it -- AV alone blows up (measured).
+  solver->subThr      = argF("--subthr", 0.0);  // FV sensor deadband (see DgSolver.cuh)
+  solver->subMax      = argF("--submax", solver->gauss ? 1.0 : 0.5);
+  // GAUSS: a saturated sensor must drive the face trace to FULLY constant
+  // extrapolation -- a 0.5 cap leaves half the overshooting projected trace in
+  // f* and detonates at strong shocks (measured: adaptive Sod t=0.28).  The
+  // Lobatto trace is a nodal value, where the paper's 0.5 cap is fine.
+  solver->subFloor    = argF("--subfloor", 0.01);
+  solver->fluxAvgT0   = argF("--fluxavg0", 0.0);   // boundary-flux time-average
+  solver->fluxAvgT1   = argF("--fluxavg1", -1.0);  // window [t0,t1] (t1<=t0 off)
   solver->ecVolume    = argI("--ecflux", 1);
   solver->avOn        = argI("--av", 1);
   solver->avCav       = argF("--avcav", 0.5);
@@ -168,14 +242,20 @@ int main(int argc, char* argv[]) {
   solver->machInf     = argF("--mach", 3.0);
   solver->ibBand      = argF("--ibband", 3.0);
   solver->ibCurv      = argI("--ibcurv", 1);
-  solver->ibOrder     = argI("--ibord", 2);
-  solver->ibImageFac  = argF("--ibimagefac", 1.5);
   solver->ibShockTheta = argF("--ibtheta", 0.5);
   solver->ibPen       = argF("--ibpen", 0.0);
   solver->ibGraze     = argF("--ibgraze", 0.0);
   solver->ibFillEvery = argI("--ibfillstep", 0);
   solver->ibFilt      = argI("--ibfilt", 0);
   solver->ibCut       = argI("--ibcut", 1);
+  solver->ibEvolve    = argI("--ibevolve", 0);   // cut elements join the
+  // discretization (IB_CUT): fluid-side nodes evolve, solid nodes keep the
+  // FRIB fill sampled from NON-CUT fluid donors.  FRIB-path only.
+  if (solver->ibEvolve && (solver->ibSbm || solver->ibBrink || !solver->ibCut)) {
+    printf("--ibevolve requires the FRIB ghost path (--ibsbm 0 --ibbrink 0 "
+           "--ibcut 1); disabling ibevolve\n");
+    solver->ibEvolve = 0;
+  }
   solver->dbgChecks   = argI("--debug", 0);
   solver->sortCurve   = argI("--sortcurve", 1);
 
@@ -205,6 +285,14 @@ int main(int argc, char* argv[]) {
     delete solver;
     cudaDeviceReset();
     return ok ? 0 : 1;
+  }
+
+  if (solver->gauss && solver->esLim) {
+    // the Gauss RHS does not accumulate the entropy-flux bound (SCRATCH slots
+    // 3/4), so the ES limiter would read stale garbage -- refuse loudly
+    printf("[fatal] --eslim is not supported with --gauss (entropy-flux bound "
+           "not accumulated by dgRhsGaussKernel)\n");
+    return 1;
   }
 
   solver->initialize();
@@ -252,12 +340,39 @@ int main(int argc, char* argv[]) {
   while (t < tEnd - (real)0.01*tStep) {   // margin >> float accumulation error
     t += solver->step(tStep);
     solver->paint();
+    if (solver->ibBrink) {   // volume-fraction field alongside the flow frames
+      char fn[80]; sprintf(fn, "output/phi_%05d.png", solver->imageCounter-1);
+      solver->paintBrinkPhi(fn);
+    }
     double m, px, e;
     solver->dgTotalConserved(m, px, e);
     printf("n: %d, t = %f, nblocks = %d, dt = %e, dM/M0 = %+.3e, dE/E0 = %+.3e%s\n",
            solver->imageCounter, (double)t, solver->hashTable.nKeys,
            (double)solver->deltaT, (m-m0)/m0, (e-e0)/e0,
            solver->hashTable.nDropped ? "  [POOL FULL: blocks dropped!]" : "");
+    // silent-flatline guard: a NaN wave gets floored to near-vacuum by the
+    // sanitizer (fmax(nan, eps) = eps on CUDA), so a detonation can drain the
+    // domain WITHOUT collapsing dt and the run "completes" flat (measured:
+    // adaptive MOOD, dM/M0 -> -1.0, nan energy).  Closed-box cases conserve
+    // mass to ~1e-4, so a large drop is always a masked blow-up -- abort.
+    if (!solver->ibOn && solver->bcType != 3 && solver->bcType != 4
+        && solver->bcType != 5 && (m < 0.5*m0 || !std::isfinite(e))) {
+      printf("[fatal] mass/energy vanished (dM/M0 = %+.3e): a NaN detonation "
+             "was flattened by the sanitizer -- treat as blow-up\n", (m-m0)/m0);
+      fflush(stdout);
+      exit(2);
+    }
+    { // boundary mass-flux balance: inflow (x-lo), outflow (x-hi), y walls,
+      // and the net vs the actual d/dt(mass) -- the gap is IB non-conservation
+      double bnd[4]; solver->boundaryMassFlux(bnd);
+      static double mPrev = m0; static double tPrev = 0.0;
+      double dMdt = (t > tPrev) ? (m - mPrev)/((double)t - tPrev) : 0.0;
+      double netOut = bnd[0]+bnd[1]+bnd[2]+bnd[3];
+      printf("[flux] t=%.3f  in(x-lo)=%+.4e out(x-hi)=%+.4e  ywall=%+.2e,%+.2e"
+             "  netOut=%+.4e  dM/dt=%+.4e  IBsrc=%+.4e\n",
+             (double)t, -bnd[0], bnd[1], bnd[2], bnd[3], netOut, dMdt, dMdt + netOut);
+      mPrev = m; tPrev = (double)t;
+    }
     if (solver->hashTable.nDropped) {
       printf("[fatal] block pool exhausted (nBlocksMax=%d, dropped %d): the grid "
              "is inconsistent -- raise -DNCELLS_MAX or lower resolution\n",
@@ -277,6 +392,15 @@ int main(int argc, char* argv[]) {
   printf("done: t = %f after %d iters in %.1f ms\n", (double)t, solver->iter, wallMs);
   solver->printPerf();
 
+  if (solver->fluxAvgTime > 0.0) {   // time-averaged boundary mass flux
+    double *A = solver->fluxAvgAcc, T = solver->fluxAvgTime;
+    printf("[fluxavg] window [%.2f,%.2f] (dt-weighted, %.4f s):  <in x-lo>=%+.5e  "
+           "<out x-hi>=%+.5e  <net out>=%+.5e  imbalance=%.3f%% of inflow\n",
+           (double)solver->fluxAvgT0, (double)solver->fluxAvgT1, T,
+           -A[0]/T, A[1]/T, (A[0]+A[1]+A[2]+A[3])/T,
+           100.0*(A[0]+A[1]+A[2]+A[3])/fmax(-A[0], 1e-30));
+  }
+
   if (testCase == 0) solver->writeLineProfile("output/dg_sod_profile.dat");
   if (testCase == 2 || testCase == 7) solver->computeVortexError(t);
   if (testCase == 8) solver->computeGreshoError();
@@ -290,6 +414,7 @@ int main(int argc, char* argv[]) {
     solver->paintIbClass("output/ib_class.png");
   }
   solver->paintPressure("output/dg_pressure_final.png");
+  solver->paintTroubled("output/dg_troubled_final.png");
 
   cudaDeviceSynchronize();
   delete solver;

@@ -133,6 +133,22 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
       }
     }
 
+    if (grid.icType == 7) {
+      //
+      // DG-MATCHED circular Sod blast (comparison runs vs wavedg3d case 1):
+      // center of the domain, radius 0.25 L, dgsem strengths rho 11/0.125,
+      // p 10/0.1, tanh-smoothed with the DG run's ABSOLUTE width
+      // delta = 0.5 * L/1024 (icDelta 0.5 at 7 DG levels, 1024 elems/side).
+      //
+      real cx = 0.5*grid.domainSize[0], cy = 0.5*grid.domainSize[1];
+      real delta = 0.5*grid.domainSize[0]/1024.0;
+      real r = sqrt((pos[0]-cx)*(pos[0]-cx) + (pos[1]-cy)*(pos[1]-cy));
+      real phi = 0.5*(1.0 + tanh((0.25*grid.domainSize[0] - r)/delta));
+      Rho[cIdx] = 0.125 + (11.0 - 0.125)*phi;
+      U[cIdx] = 0.0; V[cIdx] = 0.0; W[cIdx] = 0.0;
+      P[cIdx]   = 0.1 + (10.0 - 0.1)*phi;
+    }
+
     if (grid.icType == 1) {
       //
       // 2D circular Sod explosion (uniform in z -> pseudo-2D).  A circular

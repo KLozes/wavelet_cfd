@@ -20,7 +20,7 @@ static void hostElemSize(const DgSolver &g, i32 lvl, double h[3]) {
  
 void DgSolver::initialize(void) {
   periodic = (bcType == 2);
-  dgUploadOperators();
+  dgUploadOperators(gauss, frType);
   buildInitialGrid(true);
 }
 
@@ -57,6 +57,8 @@ void DgSolver::buildInitialGrid(bool doPaint) {
   if (ibOn) {   // first ghost fill from the freshly sampled IC (SCRATCH is
     // zeroed at alloc, so the shocked-donor gate stays open -> full order)
     dgIbFillKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    if (ibSbm) dgIbSolidFillKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    if (mood) dgIbGhostClampKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     cudaDeviceSynchronize();
     if (dbgChecks >= 2) {   // fill exactness probe: uniform IC must refill
       // every ghost node to the IC state exactly (all BC data vanish)
@@ -135,6 +137,16 @@ void DgSolver::adaptLeaves(void) {
         dgRestrictToAnchorKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
         dgDetailNormKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
         dgVoteKernel<<<cudaGridSize, cudaBlockSize>>>(*this, epsFinest(), 1);
+        // refine-before-stabilize (subFv): the shock/smoothness sensor that
+        // drives the FV blend ALSO votes REFINE, amplitude-floored, so a
+        // troubled coarse cell is refined toward the finest level rather than
+        // stabilized in place -- the FV blend then only fires once it is
+        // finest (dgRhsKernel finest gate).  Layered on top of the validated
+        // MRA detail vote so smooth accuracy is unchanged.
+        if (subFv && !mood) {   // MOOD: no a priori sensor -- MRA detail (above)
+          dgAvNuKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this);   // drives refinement
+          dgSensorVoteKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+        }
     }
     // pull shocks to the finest level so they never cross a coarse/fine face
     if (shockRefine)
@@ -222,6 +234,8 @@ void DgSolver::adaptLeaves(void) {
   if (ibOn) {
     dgAvNuKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this);
     dgIbFillKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    if (ibSbm) dgIbSolidFillKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    if (mood) dgIbGhostClampKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   }
   cudaDeviceSynchronize();
   tSortUs += nowUs() - t3;
@@ -289,7 +303,11 @@ real DgSolver::step(real tStep) {
     // blow-up guard: a NaN/vacuum state caps velocities at the sanitizer bound
     // and collapses dt -- abort loudly (with the offending location) instead of
     // spinning forever
-    if (!(deltaT > (real)0.0) || deltaT < (real)1e-12) {
+    static real dtFloor = getenv("DGDTFLOOR") ? (real)atof(getenv("DGDTFLOOR"))
+                                              : (real)1e-12;   // env override:
+    // raise to abort-with-location on a dt CRAWL (positive but collapsing dt
+    // never trips the 1e-12 NaN guard; the crawl diagnosis lever)
+    if (!(deltaT > (real)0.0) || deltaT < dtFloor) {
       cudaDeviceSynchronize();
       real *lam = getField(D_LAM);
       i32 cMin = 0; real vMin = 1e30;
@@ -312,21 +330,103 @@ real DgSolver::step(real tStep) {
 
     long tRk0 = nowUs();
     dgCopyQ0Kernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    // Gauss-Legendre flux reconstruction (--gauss) vs collocated Lobatto DGSEM.
+    // dpSbp: the per-element DP-SBP upwind parameters (Gamma) must be fresh for
+    // every RHS evaluation -- they depend on the current state.
+    #define DG_RHS(T) do { \
+      if (dpSbp > (real)0.0) dgDpGammaKernel<<<cudaGridSize, cudaBlockSize>>>(*this); \
+      if (gauss) dgRhsGaussKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (T)); \
+      else dgRhsKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (T)); } while (0)
     for (i32 stage = 0; stage < 3; stage++) {
       // SSP-RK3 stage abscissae: t, t+dt, t+dt/2
       real stageT = simT + t + ((stage == 1) ? deltaT : ((stage == 2) ? (real)0.5*deltaT : (real)0.0));
-      if (avOn)   // per-element nu for the interface jump penalty (BR2-lite)
-        dgAvNuKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this);
-      dgRhsKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, stageT);
+      if (mood) {
+        // a-posteriori MOOD: attempt pure DG (alpha=0), detect failed cells,
+        // recompute ONLY those with the first-order FV volume (HLLC faces
+        // unchanged -> local).  No a priori sensor, no AV.
+        dgMoodResetKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+        if (bulkC > (real)0.0)   // bulk gate needs a fresh sensor even under MOOD
+          dgAvNuKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this);
+        DG_RHS(stageT);   // DG trial
+        dgMoodDetectKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage, deltaT);
+        DG_RHS(stageT);   // FV redo for flagged
+        dgRk3StageKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage, deltaT);
+        dgPositivityKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // last-resort net
+        if (ibOn && (ibFillEvery == 0 || stage == 2))
+          dgIbFillKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    if (ibSbm) dgIbSolidFillKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    if (mood) dgIbGhostClampKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+        continue;
+      }
+      if (avOn || subFv || bulkC > (real)0.0)   // per-element nu (AV jump
+        dgAvNuKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this);  // penalty),
+        // subcell-FV blend factor, and/or the bulk-viscosity gate (slot 1)
+      DG_RHS(stageT);
       dgRk3StageKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage, deltaT);
       dgPositivityKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+      if (esLim)   // ES limiter: bound the cell entropy by the RHS's slots 3/4
+        dgEntropyLimitKernel<<<cudaGridSize, cudaBlockSize>>>(*this, deltaT);
       if (ibOn && (ibFillEvery == 0 || stage == 2))   // refill ghosts from the
-        dgIbFillKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // post-stage
+        dgIbFillKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    if (ibSbm) dgIbSolidFillKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    if (mood) dgIbGhostClampKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // post-stage
         // fluid state, so the next stage's face lifts read a wall-consistent
         // trace (ibFillEvery 1: hold ghosts frozen across the step's stages)
     }
+    #undef DG_RHS
     cudaDeviceSynchronize();
     tRkUs += nowUs() - tRk0;
+
+    // ── TEMP blowup diagnostic (env DGDBG=1): track the nose detonation patch
+    // cell (lvl4 elem 105,213) and its face neighbours (flag ghosts) to catch
+    // the SEED -- a bad wall ghost vs the fluid patch growing on its own.
+    if (getenv("DGDBG") && iter >= 22 && iter <= 34) {
+      auto findBlk = [&](i32 L, i32 I, i32 J)->i32 {
+        for (i32 b = 0; b < hashTable.nKeys; b++) {
+          if (bLocList[b] == kEmpty) continue;
+          i32 l,ii,jj,kk; decode(bLocList[b], l,ii,jj,kk);
+          if (l==L && ii==I && jj==J) return b;
+        } return -1; };
+      auto cellStat = [&](i32 b, double &rmax, double &pmin)->void {
+        rmax=-1; pmin=1e300;
+        for (i32 nd=0; nd<blockSizeTot; nd++){ u64 cc=(u64)b*blockSizeTot+nd;
+          double r=getField(D_RHO)[cc];
+          double p=(dgGam-1.0)*(getField(D_RHOE)[cc]-0.5*(pow(getField(D_RHOU)[cc],2)
+                    +pow(getField(D_RHOV)[cc],2)+pow(getField(D_RHOW)[cc],2))/r);
+          if (r>rmax) rmax=r; if (p<pmin) pmin=p; } };
+      i32 bT = findBlk(4,111,182);
+      if (bT >= 0) {
+        double r0,p0; cellStat(bT,r0,p0);
+        // also the max |velocity| in the cell (this blowup is a velocity spike)
+        double vmax=0; for (i32 nd=0;nd<blockSizeTot;nd++){ u64 cc=(u64)bT*blockSizeTot+nd;
+          double r=fmax(getField(D_RHO)[cc],1e-30);
+          double sp=sqrt(pow(getField(D_RHOU)[cc],2)+pow(getField(D_RHOV)[cc],2)+pow(getField(D_RHOW)[cc],2))/r;
+          if (sp>vmax) vmax=sp; }
+        double mood = getField(D_SCRATCH)[(u64)bT*blockSizeTot + 6];
+        printf("[dbg] iter %d t=%.6e  (111,182) rhoMax=%.3e pMin=%.3e |v|max=%.3e mood=%.0f | nbrs:",
+               iter, (double)(simT+t), r0, p0, vmax, mood);
+        const i32 fslot[4] = {12,14,10,16}; const char *fn[4] = {"-x","+x","-y","+y"};
+        for (i32 f = 0; f < 4; f++) {
+          i32 nb = nbrIdxList[27*bT + fslot[f]];
+          if (nb == (i32)bEmpty || nb < 0 || nb >= hashTable.nKeys) { printf(" %s=none", fn[f]); continue; }
+          double nr,npm; cellStat(nb,nr,npm);
+          const char *cl = ibClassList[nb]==IB_FLUID?"F":(ibClassList[nb]==IB_GHOST?"G":"S");
+          printf(" %s[%s]r=%.2e,p=%.2e", fn[f], cl, nr, npm);
+        }
+        printf("\n"); fflush(stdout);
+      }
+    }
+
+    // boundary-flux time average over [fluxAvgT0, fluxAvgT1]: accumulate
+    // flux(t)*dt each timestep (dt-weighted -> a true time integral, so the
+    // unsteady-wake fluctuations average out).  ⟨in⟩ vs ⟨out⟩ over the window
+    // is the steady-state conservation check.
+    real tNow = simT + t + deltaT;
+    if (fluxAvgT1 > fluxAvgT0 && tNow >= fluxAvgT0 && tNow < fluxAvgT1) {
+      double b[4]; boundaryMassFlux(b);
+      for (i32 f = 0; f < 4; f++) fluxAvgAcc[f] += b[f]*(double)deltaT;
+      fluxAvgTime += (double)deltaT;
+    }
 
     t += deltaT;
     iter++;
@@ -343,7 +443,7 @@ real DgSolver::step(real tStep) {
 void DgSolver::dgTotalConserved(double &mass, double &momx, double &energy) {
   cudaDeviceSynchronize();
   double w[NNODE], xi[NNODE];
-  dgGetHostOps(w, xi);
+  dgGetHostOps(w, xi, gauss);
   mass = momx = energy = 0;
   for (i32 b = 0; b < hashTable.nKeys; b++) {
     u64 loc = bLocList[b];
@@ -366,7 +466,7 @@ void DgSolver::dgTotalConserved(double &mass, double &momx, double &energy) {
 void DgSolver::writeLineProfile(const char *fileName) {
   cudaDeviceSynchronize();
   double w[NNODE], xi[NNODE];
-  dgGetHostOps(w, xi);
+  dgGetHostOps(w, xi, gauss);
   double ymid = 0.5*domainSize[1], zmid = 0.5*domainSize[2];
 
   struct Row { double x, rho, u, p; };
@@ -415,7 +515,7 @@ void DgSolver::writeLineProfile(const char *fileName) {
 void DgSolver::computeVortexError(real t) {
   cudaDeviceSynchronize();
   double w[NNODE], xi[NNODE];
-  dgGetHostOps(w, xi);
+  dgGetHostOps(w, xi, gauss);
   double cx = 0.5*domainSize[0] + (double)vortexU0*t;
   double cy = 0.5*domainSize[1] + (double)vortexU0*t;
   // wrap the center into the periodic domain
@@ -455,7 +555,7 @@ void DgSolver::computeVortexError(real t) {
 void DgSolver::computeGreshoError(void) {
   cudaDeviceSynchronize();
   double w[NNODE], xi[NNODE];
-  dgGetHostOps(w, xi);
+  dgGetHostOps(w, xi, gauss);
   double cx = 0.5*domainSize[0], cy = 0.5*domainSize[1];
   double l2Vel = 0, keNum = 0, keExact = 0, area = 0;
 
@@ -516,7 +616,7 @@ real DgSolver::maxDeviationFromUniform(void) {
             i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
             double h[3]; hostElemSize(*this, lvl, h);
             i32 i = nd % NNODE, j = (nd/NNODE)%NNODE;
-            double w[NNODE], xi[NNODE]; dgGetHostOps(w, xi);
+            double w[NNODE], xi[NNODE]; dgGetHostOps(w, xi, gauss);
             double x = (ib + 0.5*(xi[i]+1.0))*h[0], y = (jb + 0.5*(xi[j]+1.0))*h[1];
             double phi = sqrt((x-ibX)*(x-ibX) + (y-ibY)*(y-ibY)) - ibR;
             printf("[ibrestLoc] q=%d lvl=%d elem(%d,%d) node(%d,%d) x=%.3f y=%.3f "
@@ -535,6 +635,12 @@ void DgSolver::paintPressure(const char *fileName) {
   paintField(D_SCRATCH, fileName);
 }
 
+void DgSolver::paintBrinkPhi(const char *fileName) {
+  dgBrinkPhiToScratchKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  paintField(D_SCRATCH, fileName);
+}
+
 void DgSolver::paintSensor(const char *fileName) {
   // D_LAM holds the per-node dt bound after a step (a proxy for lambda*h); the
   // useful sensor view is the refinement-level map, painted alongside
@@ -545,6 +651,28 @@ void DgSolver::paintIbClass(const char *fileName) {
   dgIbClassToScratchKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   cudaDeviceSynchronize();
   paintField(D_SCRATCH, fileName);
+}
+
+// outward numerical mass flux through each domain boundary (x-lo,x-hi,y-lo,
+// y-hi): positive = leaving.  -sum = discrete d/dt(fluid mass); comparing to
+// the actual dM/dt isolates the IB ghost non-conservation.
+void DgSolver::boundaryMassFlux(double bnd[4]) {
+  real *b;
+  cudaMallocManaged(&b, 4*sizeof(real));
+  cudaMemset(b, 0, 4*sizeof(real));
+  dgBoundaryMassFluxKernel<<<cudaGridSize, cudaBlockSize>>>(*this, b);
+  cudaDeviceSynchronize();
+  for (i32 f = 0; f < 4; f++) bnd[f] = (double)b[f];
+  cudaFree(b);
+}
+
+// troubled-element map: the shock-indicator / subcell-FV blend factor per
+// element (bright = FV-blended / sensor-flagged, dark = pure high-order DG)
+void DgSolver::paintTroubled(const char *fileName) {
+  dgAvNuKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this);   // fresh theta_e
+  dgTroubledToScratchKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  paintField(D_LAM, fileName);
 }
 
 // Cp(theta) sampled just off the surface; also prints the stagnation pressure
@@ -610,7 +738,21 @@ void DgSolver::computeIbGates(void) {
   cudaDeviceSynchronize();
   for (i32 t = 0; t < nS; t++)   // samples run inflow -> nose
     if (ls[3*t+1] > 2.0*pInf) { xShock = ls[3*t]; break; }
+  double xSurr = xNose;   // innermost active-fluid sample = the effective (surrogate) nose
+  for (i32 t = 0; t < nS; t++)
+    if (ls[3*t+1] > 0.0) xSurr = ls[3*t];   // last valid (largest-x) sample
+  // shock CENTRE = steepest pressure rise (vs the 2*pinf FOOT above)
+  double xShockG = -1, maxG = 0;
+  for (i32 t = 1; t < nS; t++)
+    if (ls[3*(t-1)+1] > 0 && ls[3*t+1] > 0) {
+      double g = (ls[3*t+1] - ls[3*(t-1)+1]);
+      if (g > maxG) { maxG = g; xShockG = 0.5*(ls[3*t] + ls[3*(t-1)]); }
+    }
   cudaFree(ls);
+  printf("[ibgeom] realNose=%.4f surrNose=%.4f (gap %.4f)  shockFoot=%.4f shockCtr=%.4f "
+         "standoff/D: foot=%.4f ctr=%.4f (Billig %.4f)\n", xNose, xSurr, xSurr - xNose,
+         xShock, xShockG, (xShock>0)?(xNose-xShock)/(2.0*ibR):-1,
+         (xShockG>0)?(xNose-xShockG)/(2.0*ibR):-1, 0.386*exp(4.67/(M*M))*0.5);
   double standoff = (xShock > 0) ? (xNose - xShock)/(2.0*ibR) : -1;
   double billig = 0.386*exp(4.67/(M*M))*ibR/(2.0*ibR);
 
@@ -619,12 +761,42 @@ void DgSolver::computeIbGates(void) {
          M, pStag, pPitot, 100.0*(pStag - pPitot)/pPitot,
          standoff, billig, (standoff > 0) ? 100.0*(standoff - billig)/billig : 0.0,
          cd);
-  printf("[ibcnt] nodonor=%d retry1=%d ordfallback=%d\n",
-         ibCnt[IB_CNT_NODONOR], ibCnt[IB_CNT_RETRY1], ibCnt[IB_CNT_FALLBACK]);
+
+  // entropy L2 (Funada & Imamura Eq 28): sqrt(<(P/Pinf (rhoinf/rho)^gam - 1)^2>)
+  // over the FLUID volume -- inviscid smooth flow conserves entropy exactly,
+  // so this is the wall-accuracy gate in the shock-free regime (M < ~0.7).
+  // Node-mean quadrature per element (a gate, not a paper-grade integral).
+  {
+    double sInt = 0, vInt = 0;
+    for (i32 b = 0; b < hashTable.nKeys; b++) {
+      u64 loc = bLocList[b];
+      if (loc == kEmpty || ibClassList[b] != IB_FLUID) continue;
+      i32 lvl, ib2, jb2, kb2;
+      decode(loc, lvl, ib2, jb2, kb2);
+      if (!isInteriorBlock(lvl, ib2, jb2, kb2)) continue;
+      double hE[3]; hostElemSize(*this, lvl, hE);
+      double vNode = hE[0]*hE[1]*(pseudo2D ? 1.0 : hE[2])/blockSizeTot;
+      for (i32 nd = 0; nd < blockSizeTot; nd++) {
+        i32 c = b*blockSizeTot + nd;
+        double rho = fmax((double)getField(D_RHO)[c], 1e-12);
+        double ke  = 0.5*((double)getField(D_RHOU)[c]*(double)getField(D_RHOU)[c]
+                        + (double)getField(D_RHOV)[c]*(double)getField(D_RHOV)[c]
+                        + (double)getField(D_RHOW)[c]*(double)getField(D_RHOW)[c])/rho;
+        double p   = (dgGam - 1.0)*((double)getField(D_RHOE)[c] - ke);
+        double s   = p/pInf*pow(1.0/rho, (double)dgGam) - 1.0;
+        sInt += vNode*s*s;
+        vInt += vNode;
+      }
+    }
+    printf("[ibentropy] L2 = %.6e  (fluid volume %.4f)\n",
+           (vInt > 0) ? sqrt(sInt/vInt) : -1.0, vInt);
+  }
+  printf("[ibcnt] nodonor=%d lofallback=%d shockgate=%d zsMeanFloor=%d\n",
+         ibCnt[IB_CNT_NODONOR], ibCnt[IB_CNT_RETRY1], ibCnt[IB_CNT_FALLBACK], ibCnt[3]);
 }
 
 bool DgSolver::selfTest(void) {
-  bool ok = dgOperatorSelfTest();
+  bool ok = dgOperatorSelfTest(gauss, frType);
   printf("[selftest] blockSize=%d NNODE=%d (p=%d), nBlocksMax=%d, fields=%d\n",
          blockSize, NNODE, dgOrder, nBlocksMax, nFields);
   return ok;

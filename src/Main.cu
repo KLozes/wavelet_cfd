@@ -113,7 +113,8 @@ int main(int argc, char* argv[]) {
   solver->cfl             = cfl;
   solver->waveletThresh   = wThresh;
   solver->scheme          = scheme;
-  solver->icType          = (testCase == 1 || sodAmr) ? 1 : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : 0)))));
+  solver->icType          = (testCase == 1 || sodAmr) ? (argI("--dgblast", 0) ? 7 : 1) : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : 0)))));
+  // --dgblast 1: DG-matched blast IC (icType 7) for wavedg3d comparison runs
   solver->bcType          = (bcArg >= 0) ? bcArg : ((acConv || testCase == 1) ? 2 : 3);   // periodic for the acoustic wave and circular Sod; else transmissive
   solver->vortexAdvect    = acConv ? Ma : (testCase == 2 ? advectA : sodPin);  // acConv: wave amplitude A; case 2: vortex advection; testCase 1: Sod inner pressure
   solver->greshoP0        = 1.0/(gam*Ma*Ma);            // Gresho background pressure -> Mach = Ma

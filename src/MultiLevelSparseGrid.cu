@@ -51,7 +51,15 @@ MultiLevelSparseGrid::MultiLevelSparseGrid(real *domainSize_, i32 *baseGridSize_
   // initializeBaseGrid, where that grid is actually materialized -- a sparse
   // user like the narrowband SDF never fills it and is bounded only by the
   // number of blocks it activates).
+  // Non-pow2 blockSize is fine for the leaf-only DG solver (blockSize == p+1,
+  // e.g. 3 for p=2): all cell indexing is plain div/mod, no bit tricks.  The
+  // FV halo/restriction machinery does assume even blockSize -- keep pow2 for
+  // the FV solvers (which always build with the default BLOCK_SIZE=4).
+#ifdef DG_ORDER
+  assert(blockSize == DG_ORDER + 1);
+#else
   assert(isPowerOf2(blockSize));
+#endif
 
   // always needed: block location codes / memory indices / flags (the hash table
   // is a member with its own allocation)

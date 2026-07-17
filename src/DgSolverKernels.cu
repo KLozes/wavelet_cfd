@@ -32,6 +32,23 @@ __constant__ real c_R [2][NNODE][NNODE]; // EXACT-L2 restriction (tensor 1D): co
 __constant__ real c_IbFilt[NNODE][NNODE]; // IB donor top-mode projection (see hIbFilt)
 __constant__ real c_Vinv[NNODE][NNODE]; // nodal -> orthonormal-Legendre modal transform (inverse
                                         // Vandermonde) for the Persson-Peraire smoothness sensor
+// ── Gauss-Legendre flux-reconstruction operators (only meaningful when the
+//    node set is Gauss; on Lobatto c_tL/c_tR are e_0/e_{N-1} and the g' vectors
+//    reduce to the boundary 1/w lift) ──────────────────────────────────────
+__constant__ real c_tL [NNODE];   // l_i(-1): interpolate a nodal field to the LEFT  face
+__constant__ real c_tR [NNODE];   // l_i(+1): interpolate a nodal field to the RIGHT face
+__constant__ real c_gpL[NNODE];   // g_L'(xi_i): left  correction-function derivative (FR lift)
+__constant__ real c_gpR[NNODE];   // g_R'(xi_i): right correction-function derivative (FR lift)
+__constant__ real c_ibLXi[NNODE]; // FRIB image-line node set: ALWAYS Lobatto (wall at
+                                  // xi_0 = -1 exactly), independent of the element node
+                                  // set -- on Gauss solution points the wall is not an
+                                  // element node and the phi_i(-1)=delta_i0 wall-solve
+                                  // shortcut only holds on the line's OWN LGL basis.
+__constant__ real c_ibLD0[NNODE]; // that Lobatto line basis' derivative row at xi=-1
+__constant__ real c_dpPhi[NNODE]; // orthonormal top Legendre mode P^_p(xi_i): the dual-
+                                  // pairing upwind operator (D+ - D-) = -tau*phi*(H phi)^T
+                                  // (arXiv 2411.06629 A.4).  sum_i w_i phi_i = 0 => the
+                                  // volume upwind term is exactly conservative (selftest)
 
 // LGL nodes / GLL weights for p = 1..3 (from dgsem_lobatto_2d.cu)
 static const double lgl_xi_tab[3][4] = {
@@ -44,6 +61,22 @@ static const double gll_w_tab[3][4] = {
     /* p=2 */ {0.33333333333333333, 1.33333333333333333, 0.33333333333333333},
     /* p=3 */ {0.16666666666666667, 0.83333333333333333,
                0.83333333333333333, 0.16666666666666667},
+};
+
+// Gauss-Legendre nodes / weights for p = 1..3 (NNODE = 2..4).  Interior points
+// (none coincide with +-1), so every face trace is an interpolation -- the
+// defining feature of Gauss flux reconstruction vs collocated Lobatto DGSEM.
+static const double gs_xi_tab[3][4] = {
+    /* p=1 */ {-0.5773502691896257,  0.5773502691896257},
+    /* p=2 */ {-0.7745966692414834,  0.0,                0.7745966692414834},
+    /* p=3 */ {-0.8611363115940526, -0.3399810435848563,
+                0.3399810435848563,  0.8611363115940526},
+};
+static const double gs_w_tab[3][4] = {
+    /* p=1 */ {1.0, 1.0},
+    /* p=2 */ {0.5555555555555556, 0.8888888888888888, 0.5555555555555556},
+    /* p=3 */ {0.3478548451374538, 0.6521451548625461,
+               0.6521451548625461, 0.3478548451374538},
 };
 
 // 8-point Gauss-Legendre on [-1,1] (exact to degree 15) for the L2 projections
@@ -107,6 +140,37 @@ static double hD[NNODE][NNODE], hI[2][NNODE][NNODE], hR[2][NNODE][NNODE];
 static double hVinv[NNODE][NNODE];
 static double hIbFilt[NNODE][NNODE];   // V diag(1,..,1,0) V^-1: zero the top mode
 static double hXi[NNODE], hW[NNODE];
+static double hTL[NNODE], hTR[NNODE];        // face interpolation l_i(-+1)
+static double hgpL[NNODE], hgpR[NNODE];      // FR correction derivatives g_{L,R}'(xi_i)
+static double hDpPhi[NNODE];                 // DP-SBP top orthonormal Legendre mode
+
+// Legendre L_k and L_k' at x (Bonnet recurrences) -- selftest support for the
+// Lobatto FR/DG equivalence identity
+static void dgLegendreAt(int k, double x, double &L, double &Lp) {
+  double L0 = 1.0, L1 = x, D0 = 0.0, D1 = 1.0;
+  if (k <= 0) { L = L0; Lp = D0; return; }
+  for (int j = 1; j < k; j++) {
+    double L2 = ((2.0*j + 1.0)*x*L1 - j*L0)/(j + 1.0);
+    double D2 = D0 + (2.0*j + 1.0)*L1;
+    L0 = L1; L1 = L2; D0 = D1; D1 = D2;
+  }
+  L = L1; Lp = D1;
+}
+
+// Huynh left correction function g_HU (FRIB.pdf Eq 10; k = NNODE SPs):
+//   g_HU(x) = ((-1)^k/2) [ ((k-1) L_k + k L_{k-2})/(2k-1) - L_{k-1} ]
+// with g(-1) = 1, g(+1) = 0 (exact by L_j(+-1) = (+-1)^j).  Value and
+// derivative from the recurrences.
+static void dgHuynhG(double x, double &g, double &gp) {
+  const int k = NNODE;
+  double Lk, Lkp, Lm1, Lm1p, Lm2, Lm2p;
+  dgLegendreAt(k,   x, Lk,  Lkp);
+  dgLegendreAt(k-1, x, Lm1, Lm1p);
+  dgLegendreAt(k-2, x, Lm2, Lm2p);
+  double s = (k % 2) ? -0.5 : 0.5;   // ((-1)^k)/2
+  g  = s*(((k - 1.0)*Lk  + k*Lm2 )/(2.0*k - 1.0) - Lm1);
+  gp = s*(((k - 1.0)*Lkp + k*Lm2p)/(2.0*k - 1.0) - Lm1p);
+}
 
 // orthonormal Legendre P^_m(x) = P_m(x) * sqrt((2m+1)/2), m = 0..3
 static double dgLegendreON(int m, double x) {
@@ -117,12 +181,73 @@ static double dgLegendreON(int m, double x) {
   return P * sqrt((2.0*m + 1.0)/2.0);
 }
 
-static void dgBuildOperators(void) {
-  const double *xi = lgl_xi_tab[dgOrder-1];
-  const double *w  = gll_w_tab[dgOrder-1];
+// host entropy variables v = dU/du for U = -rho s/(gam-1), s = ln p - gam ln rho
+// (selftest round-trip; the device twins dgEntVars/dgEntVarsToPrim drive the
+// Gauss FR surface).  Primitive I/O.
+static void dgEntVarsHost(const double W[5], double v[5]) {
+  double rho = W[0], p = W[4], q2 = W[1]*W[1]+W[2]*W[2]+W[3]*W[3];
+  double s = log(p) - (double)dgGam*log(rho);
+  v[0] = ((double)dgGam - s)/((double)dgGam-1.0) - rho*q2/(2.0*p);
+  v[1] = rho*W[1]/p; v[2] = rho*W[2]/p; v[3] = rho*W[3]/p; v[4] = -rho/p;
+}
+static void dgEntVarsToPrimHost(const double v[5], double W[5]) {
+  double g1 = (double)dgGam-1.0;
+  double vv2 = v[1]*v[1]+v[2]*v[2]+v[3]*v[3];
+  double s = (double)dgGam - g1*(v[0] - vv2/(2.0*v[4]));
+  double rho = pow(-v[4]*exp(s), -1.0/g1);
+  double p = -rho/v[4];
+  W[0]=rho; W[1]=v[1]/(-v[4]); W[2]=v[2]/(-v[4]); W[3]=v[3]/(-v[4]); W[4]=p;
+}
+
+static void dgBuildOperators(i32 gauss, i32 frType) {
+  const double *xi = gauss ? gs_xi_tab[dgOrder-1] : lgl_xi_tab[dgOrder-1];
+  const double *w  = gauss ? gs_w_tab [dgOrder-1] : gll_w_tab [dgOrder-1];
   for (int i = 0; i < NNODE; i++) { hXi[i] = xi[i]; hW[i] = w[i]; }
 
   dgBuildD(NNODE, xi, hD);
+
+  // ── flux-reconstruction operators ─────────────────────────────────────
+  // face interpolation vectors l_i(-+1): on Lobatto these are e_0 / e_{N-1}
+  // (boundary nodes sit on the faces); on Gauss they are dense (extrapolation).
+  for (int i = 0; i < NNODE; i++) {
+    hTL[i] = dgLagrange(NNODE, xi, i, -1.0);
+    hTR[i] = dgLagrange(NNODE, xi, i, +1.0);
+  }
+  // correction-function derivatives g_{L,R}'(xi_i).  g_DG (Radau) reproduces the
+  // nodal DG lift M^-1 E^T B: g_L' = -l_i(-1)/w_i, g_R' = l_i(+1)/w_i.  g_HU is
+  // Huynh's g2 (left correction from dgHuynhG; the right correction mirrors it,
+  // g_R(x) = g_HU(-x) -> g_R'(x) = -g_HU'(-x)).  On Lobatto BOTH collapse to the
+  // boundary 1/w0 lift (g_HU' vanishes at interior nodes) -- the FR/DGSEM
+  // equivalence proven in the selftest.
+  for (int i = 0; i < NNODE; i++) {
+    if (frType == 1) {          // g_HU (Huynh)
+      double gL, gpL, gR, gpR;
+      dgHuynhG( xi[i], gL, gpL);
+      dgHuynhG(-xi[i], gR, gpR);
+      hgpL[i] =  gpL;
+      hgpR[i] = -gpR;
+    } else {                    // g_DG (Radau) == nodal DG
+      hgpL[i] = -hTL[i]/w[i];
+      hgpR[i] =  hTR[i]/w[i];
+    }
+  }
+
+  // dual-pairing upwind SBP mode (arXiv 2411.06629): the rank-1 dissipation
+  // A = H(D+ - D-) = -tau*(H phi)(H phi)^T with phi the top ORTHONORMAL
+  // Legendre mode at the nodes.  A is symmetric negative semi-definite (A.4),
+  // Q+ + Q-^T = B is untouched (A.3, A symmetric), D+- stay degree p-1 exact
+  // (A.2: the quadrature projection of any lower mode vanishes), and
+  // sum_i w_i phi_i = 0 makes the volume upwind term exactly conservative.
+  for (int i = 0; i < NNODE; i++) hDpPhi[i] = dgLegendreON(dgOrder, xi[i]);
+  // discrete-normalize: sum w phi^2 = 1 under THIS node set's quadrature (on
+  // Lobatto the analytic normalization is off by the 2p-degree quadrature
+  // error), so the NSFR residual filter R - sigma*phi*(sum w phi R) removes
+  // EXACTLY the fraction sigma of the top mode.
+  {
+    double n2 = 0;
+    for (int i = 0; i < NNODE; i++) n2 += w[i]*hDpPhi[i]*hDpPhi[i];
+    for (int i = 0; i < NNODE; i++) hDpPhi[i] /= sqrt(n2);
+  }
 
   // half-interval interpolation: I[s][a][b] = l_b(xi mapped into half s)
   for (int s = 0; s < 2; s++)
@@ -197,8 +322,8 @@ static void dgBuildOperators(void) {
   }
 }
 
-void dgUploadOperators(void) {
-  dgBuildOperators();
+void dgUploadOperators(i32 gauss, i32 frType) {
+  dgBuildOperators(gauss, frType);
   real D[NNODE][NNODE], I2[2][NNODE][NNODE], R2[2][NNODE][NNODE];
   real xi[NNODE], w[NNODE], winv[NNODE];
   for (int i = 0; i < NNODE; i++) {
@@ -225,37 +350,46 @@ void dgUploadOperators(void) {
   for (int m = 0; m < NNODE; m++)
     for (int i = 0; i < NNODE; i++) Fl[m][i] = (real)hIbFilt[m][i];
   cudaMemcpyToSymbol(c_IbFilt, Fl, sizeof(Fl));
+  real tL[NNODE], tR[NNODE], gpL[NNODE], gpR[NNODE];
+  for (int i = 0; i < NNODE; i++) {
+    tL[i]=(real)hTL[i]; tR[i]=(real)hTR[i]; gpL[i]=(real)hgpL[i]; gpR[i]=(real)hgpR[i];
+  }
+  cudaMemcpyToSymbol(c_tL,  tL,  sizeof(tL));
+  cudaMemcpyToSymbol(c_tR,  tR,  sizeof(tR));
+  cudaMemcpyToSymbol(c_gpL, gpL, sizeof(gpL));
+  cudaMemcpyToSymbol(c_gpR, gpR, sizeof(gpR));
+  real dpPhi[NNODE];
+  for (int i = 0; i < NNODE; i++) dpPhi[i] = (real)hDpPhi[i];
+  cudaMemcpyToSymbol(c_dpPhi, dpPhi, sizeof(dpPhi));
+  // FRIB image-line basis: ALWAYS the Lobatto nodes (wall = node 0 at -1),
+  // regardless of the element node set (--gauss).  D0 = l_m'(-1) on that basis.
+  {
+    const double *lx = lgl_xi_tab[dgOrder-1];
+    real ibxi[NNODE], ibd0[NNODE];
+    for (int m = 0; m < NNODE; m++) {
+      double v = 0;
+      for (int l = 0; l < NNODE; l++) {
+        if (l == m) continue;
+        double t = 1.0;
+        for (int k2 = 0; k2 < NNODE; k2++)
+          if (k2 != m && k2 != l) t *= (-1.0 - lx[k2])/(lx[m] - lx[k2]);
+        v += t/(lx[m] - lx[l]);
+      }
+      ibxi[m] = (real)lx[m]; ibd0[m] = (real)v;
+    }
+    cudaMemcpyToSymbol(c_ibLXi, ibxi, sizeof(ibxi));
+    cudaMemcpyToSymbol(c_ibLD0, ibd0, sizeof(ibd0));
+  }
 }
 
 // host access to the reference-element weights/nodes (diagnostic integrals)
-void dgGetHostOps(double *w, double *xi) {
-  dgBuildOperators();
+void dgGetHostOps(double *w, double *xi, i32 gauss) {
+  dgBuildOperators(gauss, 1);
   for (int i = 0; i < NNODE; i++) { w[i] = hW[i]; xi[i] = hXi[i]; }
 }
 
-// host double-precision mirror of dgIbHermite for the selftest
-static double dgIbHermiteHost(int dirichlet, double bc,
-    double F, double hF1, double hF2, double sigma, int order) {
-  if (order <= 1)
-    return dirichlet ? (bc + (F - bc)*sigma) : (F + bc*(sigma - 1.0));
-  double b0, b1, b2, b3 = 0.0;
-  if (dirichlet) {
-    double A = F - bc;
-    b0 = bc;
-    if (order >= 3) { b3 = 0.5*hF2 - hF1 + A; b2 = hF1 - A - 2.0*b3; }
-    else            { b2 = hF1 - A; }
-    b1 = A - b2 - b3;
-  } else {
-    b1 = bc;
-    if (order >= 3) { b3 = (bc + hF2 - hF1)/3.0; b2 = 0.5*(hF2 - 6.0*b3); }
-    else            { b2 = 0.5*(hF1 - bc); }
-    b0 = F - bc - b2 - b3;
-  }
-  return b0 + sigma*(b1 + sigma*(b2 + sigma*b3));
-}
-
-bool dgOperatorSelfTest(void) {
-  dgBuildOperators();
+bool dgOperatorSelfTest(i32 gauss, i32 frType) {
+  dgBuildOperators(gauss, frType);
   bool ok = true;
   auto expect = [&](const char *name, double v, double tol) {
     if (fabs(v) > tol) { printf("[selftest] FAIL %s: |%.3e| > %.1e\n", name, v, tol); ok = false; }
@@ -300,36 +434,99 @@ bool dgOperatorSelfTest(void) {
       for (int a = 0; a < NNODE; a++) v += 0.5*hW[a]*hI[s][a][j];
     expect("mortar constant", v - hW[j], 1e-12);
   }
-  // IB wall-normal Hermite closed forms: reconstruct manufactured polynomials
-  // exactly (order 3 <-> cubics, order 2 <-> quadratics, order 1 <-> linears),
-  // both BC types, across the whole evaluation range sigma in [-1, 1]
-  for (int ord = 1; ord <= 3; ord++) {
-    double c[4] = {0.37, -1.21, 0.83, 0.59};        // f = c0 + c1 s + c2 s^2 + c3 s^3
-    for (int m = ord + 1; m < 4; m++) c[m] = 0.0;   // degree matches the order
-    double F  = c[0] + c[1] + c[2] + c[3];          // f(1)
-    double F1 = c[1] + 2*c[2] + 3*c[3];             // f'(1)
-    double F2 = 2*c[2] + 6*c[3];                    // f''(1)
-    for (int bc = 0; bc < 2; bc++) {                // 0 Neumann, 1 Dirichlet
-      double dat = bc ? c[0] : c[1];                // f(0) or f'(0)
-      for (double sg = -1.0; sg <= 1.001; sg += 0.25) {
-        double v = dgIbHermiteHost(bc, dat, F, F1, F2, sg, ord);
-        double e = c[0] + sg*(c[1] + sg*(c[2] + sg*c[3]));
-        expect("IB hermite", v - e, 1e-12);
-      }
+  // ── flux-reconstruction operator identities (any node set) ────────────
+  // face interpolation reproduces monomials up to degree p: sum_i tR[i] xi_i^m
+  // = 1, sum_i tL[i] xi_i^m = (-1)^m.
+  for (int m = 0; m <= dgOrder; m++) {
+    double vR = 0, vL = 0;
+    for (int i = 0; i < NNODE; i++) { vR += hTR[i]*pow(hXi[i], m); vL += hTL[i]*pow(hXi[i], m); }
+    expect("tR monomial", vR - 1.0, 1e-11);
+    expect("tL monomial", vL - ((m % 2) ? -1.0 : 1.0), 1e-11);
+  }
+  // correction conservation: sum_i w_i g_R'(xi_i) = g_R(1)-g_R(-1) = 1,
+  // sum_i w_i g_L'(xi_i) = g_L(1)-g_L(-1) = -1 (exact under the node quadrature
+  // for g' of degree <= 2N-1; holds for BOTH g_DG and g_HU, Lobatto or Gauss).
+  {
+    double sR = 0, sL = 0;
+    for (int i = 0; i < NNODE; i++) { sR += hW[i]*hgpR[i]; sL += hW[i]*hgpL[i]; }
+    expect("gR' conservation", sR - 1.0, 1e-11);
+    expect("gL' conservation", sL + 1.0, 1e-11);
+  }
+  // entropy variables round-trip: u -> v(u) -> u exactly (the Gauss FR surface
+  // interpolates entropy variables and converts back; this is that inverse).
+  {
+    double W[5] = {1.7, 0.3, -0.6, 0.2, 2.4}, v[5], W2[5];
+    dgEntVarsHost(W, v); dgEntVarsToPrimHost(v, W2);
+    for (int q = 0; q < 5; q++) expect("entvar roundtrip", W2[q] - W[q], 1e-10);
+  }
+  // dual-pairing SBP mode: sum_i w_i phi_i = 0 (the volume upwind term is
+  // exactly conservative) and phi kills every lower mode under the quadrature
+  // (degree p-1 exactness of D+-: sum_i w_i phi_i xi_i^m = 0 for m < p).
+  for (int m = 0; m < dgOrder; m++) {
+    double s = 0;
+    for (int i = 0; i < NNODE; i++) s += hW[i]*hDpPhi[i]*pow(hXi[i], m);
+    expect("dpPhi orthogonality", s, 1e-11);
+  }
+  { // discrete normalization: the NSFR filter removes EXACTLY sigma of the top mode
+    double n2 = 0;
+    for (int i = 0; i < NNODE; i++) n2 += hW[i]*hDpPhi[i]*hDpPhi[i];
+    expect("dpPhi norm", n2 - 1.0, 1e-12);
+  }
+  { // CH_RA flux consistency: F(W,W) = exact Euler flux
+    double W[5] = {1.3, 0.7, -0.4, 0.2, 2.1};
+    // host-side evaluation of eq 24-26 at WL=WR=W vs exact flux (x-dir)
+    double rho=W[0],u=W[1],v=W[2],w2=W[3],pp=W[4];
+    double h = pp/(rho*(1.4-1.0)) + 0.5*(u*u+v*v+w2*w2) + 2.0*pp/rho;
+    double FE = rho*u*h - u*pp;
+    double E  = pp/0.4 + 0.5*rho*(u*u+v*v+w2*w2);
+    expect("CH_RA consistency", FE - (E+pp)*u, 1e-12);
+  }
+
+  // The Lobatto FR/DG equivalence (default node set): Huynh's g_HU (docs/
+  // FRIB.pdf Eq 10) satisfies g(-1)=1, g(+1)=0, and on the LGL nodes its
+  // derivative VANISHES at every interior node and equals -1/w0 at the boundary
+  // -- so the FR correction distributed by -g_HU' is exactly the boundary 1/w
+  // lift, and FR-g_HU on Lobatto IS nodal DGSEM (Gauss breaks this: interior
+  // g_HU' != 0, so the correction genuinely distributes to every node).
+  if (!gauss) {
+    double g, gp;
+    dgHuynhG(-1.0, g, gp);
+    expect("g_HU(-1)-1", g - 1.0, 1e-12);
+    expect("g_HU'(-1)+1/w0", gp + 1.0/hW[0], 1e-11);
+    dgHuynhG(+1.0, g, gp);
+    expect("g_HU(+1)", g, 1e-12);
+    expect("g_HU'(+1)", gp, 1e-11);
+    for (int i = 1; i < NNODE-1; i++) {
+      dgHuynhG(hXi[i], g, gp);
+      expect("g_HU'(xi interior)", gp, 1e-11);
     }
   }
-  // physical-scaling sweep: reconstruct f(s) = 2 + 3 s^2 (Neumann, g0 = 0)
-  // through varying image distances d -- the normalized forms must be
-  // d-invariant (this is the fp32-conditioning property)
-  for (double d = 0.05; d < 3.01; d *= 2.0) {
-    double F  = 2.0 + 3.0*d*d;                      // f(d)
-    double hF1 = (6.0*d)*d;                         // f'(d) * d
-    double hF2 = 6.0*d*d;                           // f''(d) * d^2
-    for (double sg = -1.0; sg <= 1.001; sg += 0.5) {
-      double v = dgIbHermiteHost(0, 0.0, F, hF1, hF2, sg, 3);
-      double e = 2.0 + 3.0*(sg*d)*(sg*d);
-      expect("IB hermite scale", v - e, 1e-11);
+
+  // FRIB image-line wall solve (docs/FRIB.pdf Eq 18/19, LGL simplification):
+  // manufactured line data u_t(xi) with the exact wall condition must be
+  // reproduced by the solved wall value.  u_t(xi) = a + b(1+xi) satisfies
+  // du_t/ds(0) = -u_t(0)/R  <=>  (2/dIL) b = -a/R; solve for u_t(-1) = a
+  // from the sampled u_t(xi_m), m >= 1, and compare.
+  for (double dIL = 0.1; dIL < 1.01; dIL *= 2.0) {   // line basis is ALWAYS Lobatto
+    const double R = 0.5;
+    const double *lx = lgl_xi_tab[dgOrder-1];   // the line's OWN Lobatto nodes
+    double a = 1.7, b = -a*dIL/(2.0*R);
+    double D0[NNODE];
+    for (int m = 0; m < NNODE; m++) {   // phi_m'(-1) on the LINE (LGL) nodes
+      double v = 0;
+      for (int l = 0; l < NNODE; l++) {
+        if (l == m) continue;
+        double t = 1.0;
+        for (int k2 = 0; k2 < NNODE; k2++)
+          if (k2 != m && k2 != l) t *= (-1.0 - lx[k2])/(lx[m] - lx[k2]);
+        v += t/(lx[m] - lx[l]);
+      }
+      D0[m] = v;
     }
+    double sU = 0;
+    for (int m = 1; m < NNODE; m++) sU += D0[m]*(a + b*(1.0 + lx[m]));
+    double ut0 = -sU/(D0[0] + 0.5*dIL/R);
+    expect("FRIB wall u_t", ut0 - a, 1e-11);
   }
 
   if (ok) printf("[selftest] all operator identities pass (p=%d)\n", dgOrder);
@@ -401,6 +598,46 @@ __device__ __forceinline__ void dgEulerFluxAxis(const real W[5], i32 dir, real F
   F[4] = (E + W[4])*un;
 }
 
+// entropy variables v = dU/du for the entropy pair U = -rho s/(gam-1),
+// s = ln p - gam ln rho (same U as dgEntropyU).  On Gauss nodes the FR surface
+// interpolates THESE to the faces (not the conservative/primitive state) and
+// converts back -- the entropy projection that makes the split-form volume +
+// generalized-SBP surface discretely entropy conservative (Chan JCP 2018).
+__device__ __forceinline__ void dgEntVars(const real W[5], real v[5]) {
+  real rho = fmax(W[0], DG_EPSF), p = fmax(W[4], DG_EPSF);
+  real q2 = W[1]*W[1]+W[2]*W[2]+W[3]*W[3];
+  real s = log(p) - dgGam*log(rho);
+  v[0] = (dgGam - s)/(dgGam-(real)1.0) - rho*q2/((real)2.0*p);
+  v[1] = rho*W[1]/p; v[2] = rho*W[2]/p; v[3] = rho*W[3]/p; v[4] = -rho/p;
+}
+// inverse: entropy variables -> sanitized primitives
+__device__ __forceinline__ void dgEntVarsToPrim(const real v[5], real W[5]) {
+  real g1 = dgGam-(real)1.0;
+  real v5 = fmin(v[4], -DG_EPSF);              // v5 = -rho/p < 0
+  real vv2 = v[1]*v[1]+v[2]*v[2]+v[3]*v[3];
+  real s = dgGam - g1*(v[0] - vv2/((real)2.0*v5));
+  real rho = pow(-v5*exp(s), -(real)1.0/g1);
+  real p = -rho/v5;
+  W[0]=rho; W[1]=v[1]/(-v5); W[2]=v[2]/(-v5); W[3]=v[3]/(-v5); W[4]=p;
+  dgSanitizePrim(W);
+}
+
+// two-point Rusanov (local Lax-Friedrichs) flux in conservative variables --
+// the robust entropy-stable LOW-ORDER flux for the subcell-FV blending
+// (Hennemann/Gassner, docs/subcellFV.pdf): maximally dissipative, positivity-
+// friendly, provably entropy dissipative for a convex entropy.
+__device__ __forceinline__ void dgRusanovAxis(const real WL[5], const real WR[5],
+                                              i32 dir, real F[5]) {
+  real UL[5], UR[5], FL[5], FR[5];
+  dgP2C(WL, UL); dgP2C(WR, UR);
+  dgEulerFluxAxis(WL, dir, FL);
+  dgEulerFluxAxis(WR, dir, FR);
+  real lam = fmax(fabs(WL[1+dir]) + dgSoundSpeed(WL[4], WL[0]),
+                  fabs(WR[1+dir]) + dgSoundSpeed(WR[4], WR[0]));
+  for (i32 q = 0; q < 5; q++)
+    F[q] = (real)0.5*(FL[q] + FR[q]) - (real)0.5*lam*(UR[q] - UL[q]);
+}
+
 __device__ __forceinline__ real dgLogMean(real aL, real aR) {
   real d  = aL/aR;
   real f  = (d-(real)1.0)/(d+(real)1.0);
@@ -411,9 +648,36 @@ __device__ __forceinline__ real dgLogMean(real aL, real aR) {
   return (aL+aR)/((real)2.0*FF);
 }
 
-// Chandrashekar entropy-conservative two-point flux along axis dir (3D / 5 vars)
+// Chandrashekar entropy-conservative two-point flux along axis dir (3D / 5 vars).
+// chRa = true: the Ranocha pressure-equilibrium fix (CH_RA, arXiv 2507.09131
+// Eq 24-26): EC + KEP + PEP -- arithmetic-mean pressure p1 = {{p}}, enthalpy
+// h = 1/(p2(g-1)) + 1/2 sum(2{{vi}}^2 - {{vi^2}}) + 2 p1/rho_ln with
+// p2 = (rho/p)^ln, energy flux rho_ln un h - {{un p}}.  Consistent (WL=WR
+// recovers the exact flux) and pressure-equilibrium-preserving, which the
+// NSFR paper ties to the positivity CFL of the two-point flux.
 __device__ __forceinline__ void dgEcFluxAxis(const real WL[5], const real WR[5],
-                                             i32 dir, real F[5]) {
+                                             i32 dir, real F[5], bool chRa = false) {
+  if (chRa) {
+    real r_ln = dgLogMean(WL[0], WR[0]);
+    real u_av = (real)0.5*(WL[1]+WR[1]);
+    real v_av = (real)0.5*(WL[2]+WR[2]);
+    real w_av = (real)0.5*(WL[3]+WR[3]);
+    real p1   = (real)0.5*(WL[4]+WR[4]);
+    real p2   = dgLogMean(WL[0]/WL[4], WR[0]/WR[4]);
+    real k2   = (real)2.0*u_av*u_av - (real)0.5*(WL[1]*WL[1]+WR[1]*WR[1])
+              + (real)2.0*v_av*v_av - (real)0.5*(WL[2]*WL[2]+WR[2]*WR[2])
+              + (real)2.0*w_av*w_av - (real)0.5*(WL[3]*WL[3]+WR[3]*WR[3]);
+    real h    = (real)1.0/(p2*(dgGam-(real)1.0)) + (real)0.5*k2 + (real)2.0*p1/r_ln;
+    real un_av = (dir == 0) ? u_av : ((dir == 1) ? v_av : w_av);
+    real f1 = r_ln*un_av;
+    F[0] = f1;
+    F[1] = f1*u_av;
+    F[2] = f1*v_av;
+    F[3] = f1*w_av;
+    F[1+dir] += p1;
+    F[4] = f1*h - (real)0.5*(WL[1+dir]*WL[4] + WR[1+dir]*WR[4]);
+    return;
+  }
   real bL = (real)0.5*WL[0]/WL[4],  bR = (real)0.5*WR[0]/WR[4];
   real r_ln = dgLogMean(WL[0], WR[0]);
   real b_ln = dgLogMean(bL, bR);
@@ -434,6 +698,55 @@ __device__ __forceinline__ void dgEcFluxAxis(const real WL[5], const real WR[5],
   F[3] = f1*w_av;
   F[1+dir] += p_hat;
   F[4] = f1*e_int + F[1]*u_av + F[2]*v_av + F[3]*w_av;
+}
+
+// Roe flux along axis dir from primitives (standard Roe averages + Harten
+// entropy fix) -- the face dissipation the NSFR paper (arXiv 2507.09131) pairs
+// with the CH_RA two-point flux.  f = (fL+fR)/2 - (1/2) sum_k alpha_k|lam_k| r_k.
+__device__ void dgRoeAxis(const real WL[5], const real WR[5], i32 dir, real F[5]) {
+  const i32 n = 1+dir, t1 = 1+((dir+1)%3), t2 = 1+((dir+2)%3);
+  real rL = WL[0], rR = WR[0], pL = WL[4], pR = WR[4];
+  real sL = sqrt(rL), sR = sqrt(rR), si = (real)1.0/(sL+sR);
+  real u  = (sL*WL[n] + sR*WR[n])*si;          // Roe-avg normal velocity
+  real v1 = (sL*WL[t1] + sR*WR[t1])*si;        // tangential
+  real v2 = (sL*WL[t2] + sR*WR[t2])*si;
+  real q2L = WL[1]*WL[1]+WL[2]*WL[2]+WL[3]*WL[3];
+  real q2R = WR[1]*WR[1]+WR[2]*WR[2]+WR[3]*WR[3];
+  real HL = (pL*dgGam/(dgGam-(real)1.0) + (real)0.5*rL*q2L)/rL;
+  real HR = (pR*dgGam/(dgGam-(real)1.0) + (real)0.5*rR*q2R)/rR;
+  real H  = (sL*HL + sR*HR)*si;
+  real q2 = u*u + v1*v1 + v2*v2;
+  real a2 = (dgGam-(real)1.0)*fmax(H - (real)0.5*q2, DG_EPSF);
+  real a  = sqrt(a2);
+  // wave strengths (Toro ch. 11)
+  real dr = rR-rL, du = WR[n]-WL[n], dv1 = WR[t1]-WL[t1], dv2 = WR[t2]-WL[t2],
+       dp = pR-pL;
+  real rt = sL*sR;                             // Roe-average density
+  real w3 = dr - dp/a2;                        // entropy wave strength
+  real w1 = (dp - rt*a*du)/((real)2.0*a2);     // u - a acoustic
+  real w5 = (dp + rt*a*du)/((real)2.0*a2);     // u + a acoustic
+  // Harten entropy fix on the acoustic eigenvalues
+  const real dfix = (real)0.1*a;
+  auto efix = [&](real lam) {
+    real al = fabs(lam);
+    return (al < dfix) ? (real)0.5*(lam*lam/dfix + dfix) : al;
+  };
+  real l1 = efix(u - a), l3 = fabs(u), l5 = efix(u + a);
+  // dissipation, assembled in (rho, un, ut1, ut2, E) wave components
+  real D0 = w1*l1 + w3*l3 + w5*l5;
+  real Dn = w1*l1*(u-a) + w3*l3*u + w5*l5*(u+a);
+  real Dt1 = (w1*l1 + w3*l3 + w5*l5)*v1 + l3*rt*dv1;
+  real Dt2 = (w1*l1 + w3*l3 + w5*l5)*v2 + l3*rt*dv2;
+  real DE = w1*l1*(H-u*a) + w3*l3*(real)0.5*q2 + w5*l5*(H+u*a)
+          + l3*rt*(v1*dv1 + v2*dv2);
+  real FL[5], FR[5];
+  dgEulerFluxAxis(WL, dir, FL);
+  dgEulerFluxAxis(WR, dir, FR);
+  F[0]  = (real)0.5*(FL[0]+FR[0])   - (real)0.5*D0;
+  F[n]  = (real)0.5*(FL[n]+FR[n])   - (real)0.5*Dn;
+  F[t1] = (real)0.5*(FL[t1]+FR[t1]) - (real)0.5*Dt1;
+  F[t2] = (real)0.5*(FL[t2]+FR[t2]) - (real)0.5*Dt2;
+  F[4]  = (real)0.5*(FL[4]+FR[4])   - (real)0.5*DE;
 }
 
 // HLLC flux along axis dir from primitives (Toro star states, dgsem port)
@@ -514,6 +827,34 @@ __device__ __forceinline__ void dgElemSize(DgSolver &grid, i32 lvl, real h[3]) {
 __device__ __forceinline__ real dgNodePos(real hDir, i32 eb, i32 i) {
   return (eb + (c_xi[i] + (real)1.0)*(real)0.5) * hDir;
 }
+
+// ── immersed-boundary geometry helpers (used by classify/fill/RHS/RK) ──────
+// signed distance to the cylinder (axis along z): positive = fluid
+__device__ __forceinline__ real dgIbPhi(DgSolver &grid, real x, real y) {
+  real dx = x - grid.ibX, dy = y - grid.ibY;
+  return sqrt(dx*dx + dy*dy) - grid.ibR;
+}
+
+// live = the element integrates the DG RHS: fluid, or (--ibevolve) a CUT
+// element whose fluid-side nodes evolve.  IB_CUT stays NON-fluid for donor
+// sampling / MRA details / metrics -- only the evolution machinery widens.
+__device__ __forceinline__ bool dgIbLive(DgSolver &grid, i32 bIdx) {
+  i32 c = grid.ibClassList[bIdx];
+  return c == IB_FLUID || c == IB_CUT;
+}
+
+// exact SDF range over an axis-aligned box (circle-to-box distance bounds)
+__device__ __forceinline__ void dgIbPhiRangeBox(DgSolver &grid,
+    real x0, real x1, real y0, real y1, real &phiMin, real &phiMax) {
+  real cx = grid.ibX, cy = grid.ibY;
+  real dxlo = fmax((real)0.0, fmax(x0 - cx, cx - x1));
+  real dylo = fmax((real)0.0, fmax(y0 - cy, cy - y1));
+  real dxhi = fmax(fabs(x0 - cx), fabs(x1 - cx));
+  real dyhi = fmax(fabs(y0 - cy), fabs(y1 - cy));
+  phiMin = sqrt(dxlo*dxlo + dylo*dylo) - grid.ibR;
+  phiMax = sqrt(dxhi*dxhi + dyhi*dyhi) - grid.ibR;
+}
+
 
 // element node index from face coordinates: face-normal axis dir with normal
 // index nrm, tangential indices (a=t1, b=t2)
@@ -713,11 +1054,17 @@ __device__ __forceinline__ void dgBcState(DgSolver &grid, const real Win[5],
       }
       else { for (i32 q=0;q<5;q++) Wg[q]=Win[q]; }                        // z: transmissive
       break;
-    case 5:   // supersonic freestream: x-lo Dirichlet inflow (all
-              // characteristics incoming), everything else transmissive
+    case 5:   // freestream tunnel: x-lo Dirichlet inflow (all characteristics
+              // incoming at supersonic M), y-lo/hi SLIP WALLS (a wind-tunnel;
+              // the transmissive y/corner treatment is the measured M=0
+              // domain-corner mode and misbehaves subsonically), x-hi (and z)
+              // transmissive
       if (dir == 0 && side == 0) {
         Wg[0] = (real)1.0; Wg[1] = grid.machInf; Wg[2] = (real)0.0;
         Wg[3] = (real)0.0; Wg[4] = (real)1.0/dgGam;   // a_inf = 1, u = M
+      } else if (dir == 1) {
+        for (i32 q = 0; q < 5; q++) Wg[q] = Win[q];
+        Wg[2] = -Win[2];                               // slip wall
       } else {
         for (i32 q = 0; q < 5; q++) Wg[q] = Win[q];
       }
@@ -740,6 +1087,8 @@ __device__ __forceinline__ void dgBcState(DgSolver &grid, const real Win[5],
 __global__ void dgAvNuKernel(DgSolver &grid) {
   __shared__ real sV [DG_EPB][2][blockSizeTot];   // Ducros: u,v | Persson: rho, modal
   __shared__ real sRed[DG_EPB][2][blockSizeTot];  // theta|energy / lambda reduce
+  __shared__ real sPer[DG_EPB][3];                // Persson: [0]=thP shock(rho,p),
+                                                  // [1]=rho fluct, [2]=thP speed
 
   const i32 ell = threadIdx.x / blockSizeTot;
   const i32 nd  = threadIdx.x % blockSizeTot;
@@ -762,15 +1111,20 @@ __global__ void dgAvNuKernel(DgSolver &grid) {
     const bool doDucros  = (grid.sensorType != 1);
     const bool doPersson = (grid.sensorType >= 1);
 
-    real lamNode = 0, c2 = 0, rhoNode = 0;
+    real lamNode = 0, c2 = 0, rhoNode = 0, pNode = 0, velNode = 0;
     if (active) {
       real U[5], W[5];
       for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[(u64)bIdx*blockSizeTot + nd];
       dgConsToPrimSane(U, W);
       c2 = dgGam*W[4]/fmax(W[0], (real)1e-12);
       lamNode = fabs(W[1]) + fabs(W[2]) + fabs(W[3]) + sqrt(fmax(c2, (real)1e-14));
-      rhoNode = W[0];   // Persson senses DENSITY (pressure gets sanitizer-floored
-                        // to a constant in near-vacuum zones -> sensor blindness)
+      rhoNode = W[0];   // Persson senses DENSITY, PRESSURE, and SPEED (max):
+      pNode   = W[4];   // density stays sensitive in near-vacuum (p is
+                        // sanitizer-floored there), pressure catches shocks
+                        // density misses, and |u| catches the wake SHEAR
+                        // layers (a velocity feature, weak in rho/p) so they
+                        // drive refinement (user request 2026-07-13)
+      velNode = sqrt(W[1]*W[1] + W[2]*W[2] + W[3]*W[3]);
       sV[ell][0][nd] = W[1];
       sV[ell][1][nd] = W[2];
     }
@@ -813,21 +1167,53 @@ __global__ void dgAvNuKernel(DgSolver &grid) {
     }
 
     if (doPersson) {
-      // ── Persson-Peraire: energy fraction of the highest Legendre modes ──
-      sV[ell][0][nd] = rhoNode;
-      __syncthreads();
-      real a = 0;
-      if (active) {
-        for (i32 c = 0; c < NNODE; c++) {
-          real vc = c_Vinv[k][c];
-          for (i32 b = 0; b < NNODE; b++) {
-            real vb = c_Vinv[j][b]*vc;
-            for (i32 aa = 0; aa < NNODE; aa++)
-              a += c_Vinv[i][aa]*vb*sV[ell][0][aa + b*NNODE + c*NNODE*NNODE];
+      // ── Persson-Peraire modal indicator on DENSITY, PRESSURE, SPEED ──
+      // s = log10( top-mode modal energy / total ), a scale-free ratio.  The
+      // SHOCK sensor (rho,p -> the FV blend alpha + AV) and the REFINE sensor
+      // (that PLUS speed |u|) are kept SEPARATE: velocity shear (wake layers)
+      // must drive REFINEMENT but NOT alpha -- blending a smooth shear toward
+      // first-order FV would SMEAR it, not sharpen it (user call 2026-07-13).
+      // Three passes reuse the sV[0]/sRed[0] banks (barrier between).
+      real sShock = -30.0, sVel = -30.0;
+      for (i32 pass = 0; pass < 3; pass++) {
+        sV[ell][0][nd] = (pass == 0) ? rhoNode : (pass == 1) ? pNode : velNode;
+        __syncthreads();
+        real a = 0;
+        if (active) {
+          for (i32 c = 0; c < NNODE; c++) {
+            real vc = c_Vinv[k][c];
+            for (i32 b = 0; b < NNODE; b++) {
+              real vb = c_Vinv[j][b]*vc;
+              for (i32 aa = 0; aa < NNODE; aa++)
+                a += c_Vinv[i][aa]*vb*sV[ell][0][aa + b*NNODE + c*NNODE*NNODE];
+            }
           }
         }
+        sRed[ell][0][nd] = a*a;   // top-mode set = max(i,j,k)==p
+        __syncthreads();
+        if (active && nd == 0) {
+          real total = 0, top = 0;
+          for (i32 m = 0; m < blockSizeTot; m++) {
+            i32 mi = m % NNODE, mj = (m/NNODE) % NNODE, mk = m/(NNODE*NNODE);
+            total += sRed[ell][0][m];
+            if (mi == NNODE-1 || mj == NNODE-1 || mk == NNODE-1)
+              top += sRed[ell][0][m];
+          }
+          real s = log10(fmax(top/fmax(total, (real)1e-30), (real)1e-30));
+          if (pass < 2) sShock = fmax(sShock, s);   // rho, p -> shock sensor
+          else          sVel   = s;                 // |u| -> refine only
+          if (pass == 0)   // amplitude floor keys on the DENSITY fluctuation
+            sPer[ell][1] = total - sRed[ell][0][0];
+        }
+        __syncthreads();
       }
-      sRed[ell][0][nd] = a*a;   // top-mode set = max(i,j,k)==p
+      if (active && nd == 0) {
+        real s0 = grid.ppS0, kap = grid.ppKappa;
+        sPer[ell][0] = (sShock < s0-kap) ? (real)0.0 : (sShock > s0+kap) ? (real)1.0
+                     : (real)0.5*((real)1.0 + sin((real)0.5*(real)PI*(sShock - s0)/kap));
+        sPer[ell][2] = (sVel   < s0-kap) ? (real)0.0 : (sVel   > s0+kap) ? (real)1.0
+                     : (real)0.5*((real)1.0 + sin((real)0.5*(real)PI*(sVel   - s0)/kap));
+      }
       __syncthreads();
     }
 
@@ -835,26 +1221,40 @@ __global__ void dgAvNuKernel(DgSolver &grid) {
       real lam = 0;
       for (i32 m = 0; m < blockSizeTot; m++) lam = fmax(lam, sRed[ell][1][m]);
 
-      real th = thD;
+      // th = SHOCK sensor (Ducros + Persson rho,p): drives alpha, AV, face
+      // penalty (slot 1).  thRef = th plus the velocity/shear sensor: drives
+      // REFINEMENT only (slot 5, read by dgSensorVoteKernel).
+      real th = thD, thRef = thD;
+      real fluct = (real)1e30;
       if (doPersson) {
-        real total = 0, top = 0;
-        for (i32 m = 0; m < blockSizeTot; m++) {
-          i32 mi = m % NNODE, mj = (m/NNODE) % NNODE, mk = m/(NNODE*NNODE);
-          total += sRed[ell][0][m];
-          if (mi == NNODE-1 || mj == NNODE-1 || mk == NNODE-1)
-            top += sRed[ell][0][m];
-        }
-        real S = top/fmax(total, (real)1e-30);
-        real s = log10(fmax(S, (real)1e-30));
-        real s0 = grid.ppS0, kap = grid.ppKappa;
-        real thP = (s < s0-kap) ? (real)0.0
-                 : (s > s0+kap) ? (real)1.0
-                 : (real)0.5*((real)1.0 + sin((real)0.5*(real)PI*(s - s0)/kap));
-        th = fmax(th, thP);
-        // fluctuation modal energy (total minus the mean mode): the
-        // indicator-1 amplitude floor
-        grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 2] = total - sRed[ell][0][0];
+        th    = fmax(th, sPer[ell][0]);
+        thRef = fmax(fmax(thRef, sPer[ell][0]), sPer[ell][2]);
+        fluct = sPer[ell][1];
+        grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 2] = fluct;
       }
+      grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 5] = thRef;
+      // slot 6 = the SUBCELL-FV blend factor alpha (shock sensor theta only),
+      // stored per element so BOTH sides of a face read the same two alphas
+      // (max -> symmetric -> conservative face blend).  Shared by the volume
+      // FV (dgRhsKernel) and the Rusanov FACE-flux blend (dgFaceLift).
+      // NO amplitude floor here: the floor belongs on REFINEMENT (don't refine
+      // low-amplitude noise), NOT on stabilization -- the low-density M=3 rear
+      // has a real shock/expansion (high theta) but small density fluctuation,
+      // and flooring alpha there left it unstabilized -> near-vacuum undershoot
+      // -> dt collapse (high-res blowup).  fluct is unused now; kept for slot 2.
+      (void)fluct;
+      real alphaE = (real)0.0;
+      if (grid.subFv && dgIbLive(grid, bIdx)) {
+        // subThr deadband (relax the FV gate once NSFR carries the mild-
+        // ringing regime): theta <= subThr stays PURE high-order + filter;
+        // above it alpha rescales so a SATURATED sensor still reaches
+        // min(subMax, 1) -- the theta = 1 constant-extrapolation requirement
+        // (Gauss traces) is preserved by construction.
+        real thA = (th - grid.subThr)/fmax((real)1.0 - grid.subThr, DG_EPSF);
+        alphaE = fmin(grid.subMax, fmax(thA, (real)0.0));
+        if (alphaE < (real)1e-4) alphaE = (real)0.0;
+      }
+      grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 6] = alphaE;
       // face jump penalty scale: sensor-gated wavespeed theta_e * lambda_e
       // (Rusanov-type, bounded by the physical wavespeed => explicit-dt stable;
       // an IP-style (p+1)^2/h scaling blows up through the 1/w0 lift factor).
@@ -866,7 +1266,9 @@ __global__ void dgAvNuKernel(DgSolver &grid) {
       // lambda exceeds the explicit-dt penalty bound through the 1/w0 lift
       // (blowup at t~1).  theta (slab +1) stays 0 -- ghosts never gate
       // volume AV or the fill's donor-order fallback.
-      const bool ibFluid = (grid.ibClassList[bIdx] == IB_FLUID);
+      const bool ibFluid = dgIbLive(grid, bIdx);   // evolving IB_CUT elements
+      // publish a REAL sensor like fluid (their volume runs the same blended
+      // RHS); only pure ghosts publish theta = 0 + the ibPen scale.
       grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot]     = grid.avOn ? (ibFluid ? th*lam : grid.ibPen*lam) : (real)0.0;
       grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 1] = ibFluid ? th : (real)0.0;
     }
@@ -912,12 +1314,91 @@ __device__ __forceinline__ real dgPenaltySigma(DgSolver &grid, real sL, real sR,
   return grid.avPen * grid.avCav * (real)0.5 * fmax(fmax(sL, sR), thJ*lamF);
 }
 
+// physical entropy pair for the ES limiter (Liu/Guo/Jiang/Sun, docs/
+// EntropyStableDG.pdf): U = -rho s/(gam-1), s = ln p - gam ln rho; the
+// entropy flux is u U (entropy advects)
+__device__ __forceinline__ real dgEntropyU(const real W[5]) {
+  real s = log(fmax(W[4], DG_EPSF)) - dgGam*log(fmax(W[0], DG_EPSF));
+  return -W[0]*s/(dgGam - (real)1.0);
+}
+
+// proper numerical entropy flux (paper Eq 3.9, LF form) along +dir:
+//   F^ = 1/2 (un_L U_L + un_R U_R) - 1/2 alpha (U_R - U_L)
+__device__ __forceinline__ real dgEntFluxLF(const real WL[5], const real WR[5],
+                                            i32 dir) {
+  real UL = dgEntropyU(WL), UR = dgEntropyU(WR);
+  real al = fabs(WL[1+dir]) + dgSoundSpeed(WL[4], WL[0]);
+  real ar = fabs(WR[1+dir]) + dgSoundSpeed(WR[4], WR[0]);
+  return (real)0.5*(WL[1+dir]*UL + WR[1+dir]*UR)
+       - (real)0.5*fmax(al, ar)*(UR - UL);
+}
+
+// dual-pairing SBP INTERFACE upwind flux (arXiv 2411.06629 Eq 17/22, the
+// alpha (B_I + B_n) g surface half of the method).  The paper's interface flux
+// is the FLUX-SPLITTING upwind flux -- central average PLUS the Gamma-scaled
+// entropy-variable jump dissipation -- used INSTEAD of a Riemann solver:
+//   f* = (f(WL) + f(WR))/2 - (dpFace/2) * gam~_q * (g_q^R - g_q^L).
+// (An earlier ADDITIVE variant on top of HLLC double-dissipated and, through
+// the 1/w0 face lift, detonated a front node in ONE step -- the interface term
+// REPLACES the Riemann flux in this framework.)  gam~ = (gam-1)*gamma from
+// SCRATCH slots 8..12 (face value = max of both sides -> symmetric ->
+// conservative), pairing directly with dgEntVars.
+__device__ __forceinline__ void dgDpJumpPenalty(DgSolver &grid, i32 myIdx,
+    i32 nbrIdx, const real WL[5], const real WR[5], i32 dir, real fs[5]) {
+  real vL[5], vR[5], fL[5], fR[5];
+  dgEntVars(WL, vL);
+  dgEntVars(WR, vR);
+  dgEulerFluxAxis(WL, dir, fL);
+  dgEulerFluxAxis(WR, dir, fR);
+  for (i32 q = 0; q < 5; q++) {
+    real gml = grid.getField(D_SCRATCH)[(u64)myIdx*blockSizeTot + 8 + q];
+    real gmr = (nbrIdx >= 0)
+             ? grid.getField(D_SCRATCH)[(u64)nbrIdx*blockSizeTot + 8 + q] : gml;
+    fs[q] = (real)0.5*(fL[q] + fR[q])
+          - (real)0.5*grid.dpFace*fmax(gml, gmr)*(vR[q] - vL[q]);
+  }
+}
+
+// interface flux for the subcell-FV hybrid: HLLC blended toward Rusanov by
+// the face factor af = max(alpha_own, alpha_nbr) (both sides read the same
+// pair -> symmetric -> conservative).  In a TROUBLED cell the low-order FV
+// wants its ELEMENT-FACE flux to be the robust vacuum-safe Rusanov, not just
+// the interior subcell fluxes -- HLLC's intermediate-wave structure breaks
+// down at the near-vacuum M=3 rear (measured: high-res blowup there with
+// HLLC faces, every stabilizer).  af is passed with the SAME (WL,WR) axis
+// order the caller used, so both the average and the dissipation match.
+__device__ __forceinline__ void dgIfaceFlux(DgSolver &grid, const real WL[5],
+                                            const real WR[5],
+                                            i32 dir, real af, real fs[5]) {
+  if (grid.rusFace == 2) { dgRoeAxis(WL, WR, dir, fs); return; }  // NSFR pairing
+  dgHllcAxis(WL, WR, dir, fs);
+  if (af > (real)0.0) {
+    real fr[5];
+    dgRusanovAxis(WL, WR, dir, fr);
+    for (i32 q = 0; q < 5; q++) fs[q] = ((real)1.0-af)*fs[q] + af*fr[q];
+  }
+}
+
+// forward declarations (definitions later in this TU)
+__device__ real dgBasisAt(i32 a, real x);
+__device__ real dgIbLineBasisAt(i32 a, real x);
+__device__ void dgIbFluxTrace(DgSolver &grid, const real (*sWe)[blockSizeTot],
+    i32 bIdx, i32 lvl, i32 ib, i32 jb, const real h[3],
+    const real xs[3], real nx, real ny, real Wg[5]);
+
 // face lift for one face of one element, executed by that face's node threads.
-// sWe: this element's sanitized primitives (shared).  Adds into R[5].
+// sWe: this element's sanitized primitives (shared).  Adds into R[5]; when
+// the ES limiter is on it also accumulates this face node's share of the
+// outward proper-entropy-flux integral (1/V) closed-surface sum into *entAcc
+// (shared, atomic) -- the mean-entropy bound of the limiter.
+// NB the boundary 1/w lift IS the flux-reconstruction correction for this
+// node set: on Lobatto points Huynh's g_HU derivative vanishes at every
+// interior node and equals -1/w0 at the boundary (FR-g_HU == nodal DGSEM;
+// proven in the selftest) -- a correction-function knob would be vacuous.
 __device__ void dgFaceLift(DgSolver &grid, const real (*sWe)[blockSizeTot],
                            i32 bIdx, i32 lvl, i32 ib, i32 jb, i32 kb,
                            i32 dir, i32 side, i32 a, i32 b,
-                           const real h[3], real t, real R[5]) {
+                           const real h[3], real t, real R[5], real *entAcc) {
   const i32 faceSlot[3][2] = {{12,14},{10,16},{4,22}};
 
   const i32  nrm    = side ? (NNODE-1) : 0;         // my face-normal node index
@@ -925,12 +1406,22 @@ __device__ void dgFaceLift(DgSolver &grid, const real (*sWe)[blockSizeTot],
   const real jacDir = (real)2.0/h[dir];
   const real sgn    = side ? (real)-1.0 : (real)1.0;
   const bool zIdent = (grid.pseudo2D != 0) && (dir != 2);  // t2 axis is unrefined z
+  // outward face-quadrature weight of this node's entropy-flux share:
+  // (w_a w_b / 4) * (face area / V) = (w_a w_b / 4) / h[dir], outward sign
+  const real entW = (side ? (real)1.0 : (real)-1.0)
+                  * c_w[a]*c_w[b]*(real)0.25*(jacDir*(real)0.5);
 
   real Wme[5];
   for (i32 q = 0; q < 5; q++) Wme[q] = sWe[q][myNd];
   real fOwn[5];
   dgEulerFluxAxis(Wme, dir, fOwn);
   const real nuOwn = grid.avOn ? grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot] : (real)0.0;
+  // face-flux Rusanov fraction.  --rusface: full Rusanov everywhere (aOwn=1 ->
+  // dgIfaceFlux returns pure Rusanov).  Else MOOD keeps HLLC faces (aOwn=0) so
+  // a flagged cell's FV redo stays LOCAL (unchanged traces); only the non-MOOD
+  // subcell-FV path blends the face toward Rusanov by the sensor alpha.
+  const real aOwn  = (grid.rusFace == 1) ? (real)1.0
+                   : ((grid.subFv && !grid.mood) ? grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 6] : (real)0.0);
 
   // ── resolve the face topology ────────────────────────────────────────
   i32 nib = ib + ((dir==0) ? (side ? 1 : -1) : 0);
@@ -958,14 +1449,167 @@ __device__ void dgFaceLift(DgSolver &grid, const real (*sWe)[blockSizeTot],
       real Wg[5];
       dgBcState(grid, Wme, dir, side, xs[0], xs[1], t, Wg);
       real fs[5];
-      if (side) dgHllcAxis(Wme, Wg, dir, fs);
-      else      dgHllcAxis(Wg, Wme, dir, fs);
+      if (side) dgIfaceFlux(grid, Wme, Wg, dir, aOwn, fs);   // BC ghost: my own alpha
+      else      dgIfaceFlux(grid, Wg, Wme, dir, aOwn, fs);
       if (grid.avOn) {   // ghost shares my sensor; the jump self-gate sees the rest
         real sig = side ? dgPenaltySigma(grid, nuOwn, nuOwn, Wme, Wg)
                         : dgPenaltySigma(grid, nuOwn, nuOwn, Wg, Wme);
         if (side) dgJumpPenalty(Wme, Wg, sig, fs);
         else      dgJumpPenalty(Wg, Wme, sig, fs);
       }
+      if (grid.dpSbp > (real)0.0 && grid.dpFace > (real)0.0) {
+        if (side) dgDpJumpPenalty(grid, bIdx, -1, Wme, Wg, dir, fs);
+        else      dgDpJumpPenalty(grid, bIdx, -1, Wg, Wme, dir, fs);
+      }
+      if (grid.esLim)
+        atomicAdd(entAcc, entW*(side ? dgEntFluxLF(Wme, Wg, dir)
+                                     : dgEntFluxLF(Wg, Wme, dir)));
+      for (i32 q = 0; q < 5; q++) R[q] += sgn*jacDir*c_winv[nrm]*(fs[q] - fOwn[q]);
+      return;
+    }
+  }
+
+  // ── SBM surrogate wall: this face abuts an INACTIVE (cut/solid) element ──
+  // No ghost trace is read.  The wall is imposed as a reflective flux built
+  // from MY interior trace mirrored about the TRUE (radial) wall normal at this
+  // surrogate face node -- an impermeable slip wall sitting ~1 cell out in the
+  // fluid, so the flow stagnates against it and the bow-shock standoff forms
+  // without any reconstruction/piston.  (Zeroth-order shift: the face-node
+  // trace is used directly; the gradient shift p_wall = p + grad p . d is TODO.)
+  if (grid.ibSbm && !(grid.pseudo2D && dir == 2)) {
+    i32 nCls = -1;
+    if (nSame != bEmpty) nCls = grid.ibClassList[nSame];
+    else if (lvl > 0) {
+      i32 cI = grid.getBlockIdx(grid.encode(lvl-1, nib>>1, njb>>1,
+                                            grid.pseudo2D ? nkb : (nkb>>1)));
+      if (cI != bEmpty) nCls = grid.ibClassList[cI];
+    }
+    // wall ONLY if we POSITIVELY found an inactive (cut/solid) same-level or
+    // coarse-cover neighbor.  nCls == -1 means "no same/coarse neighbor" -- that
+    // is the coarse side of a fine interface (finer FLUID neighbors exist), NOT
+    // a wall; fall through to the finer-neighbor mortar branch.  (The near-wall
+    // band is finest-level, so surrogate faces are same-level -- inactive
+    // neighbours are always real blocks, never holes, under mark-inactive.)
+    bool wallFace = (nCls != -1) && (nCls != IB_FLUID);
+    if (wallFace) {
+      // ── SBM slip wall: HLLC against the TANGENTIAL wall state ──────────
+      // The ghost is the interior with the TRUE-normal velocity removed
+      // (u.n~ = 0), NOT mirrored -- so the axis HLLC lets the near-wall flow
+      // DECELERATE onto the wall (the SBM flow-through slip condition at the
+      // true wall) instead of hard-reflecting AT the surrogate face (a hard
+      // wall flattens the nose over a cell -> +18% standoff).  The HLLC keeps
+      // the upwind dissipation the central pressure/penalty flux lacked.
+      real xs[3];
+      xs[dir]  = (ib*(dir==0)+jb*(dir==1)+kb*(dir==2) + (side ? 1 : 0)) * h[dir];
+      i32 t1ax = (dir==0) ? 1 : 0, t2ax = (dir==2) ? 1 : 2;
+      i32 t1bb = (dir==0) ? jb : ib, t2bb = (dir==2) ? jb : kb;
+      xs[t1ax] = dgNodePos(h[t1ax], t1bb, a);
+      xs[t2ax] = dgNodePos(h[t2ax], t2bb, b);
+      real cxr = xs[0] - grid.ibX, cyr = xs[1] - grid.ibY;
+      real rr  = fmax(sqrt(cxr*cxr + cyr*cyr), (real)1e-30);
+      real nx  = cxr/rr, ny = cyr/rr;               // true outward wall normal
+      // ── LIMIT the DG basis feeding the wall, using ONLY FLUID DATA ──────
+      // A --ibcut 0 cut cell carries nodes INSIDE the solid (r < R) whose data
+      // is non-physical; the wall reconstruction / boundary shift must use only
+      // the FLUID nodes (r >= R) of the cell (user's call).  The cell mean is
+      // taken over fluid nodes only; then the p=2 face trace is Zhang-Shu-
+      // limited toward THAT mean so it cannot undershoot rho,p to vacuum (the
+      // solid-node contamination would otherwise poison the mean and the wall).
+      real Wbar[5] = {(real)0.0,(real)0.0,(real)0.0,(real)0.0,(real)0.0};
+      real wf = (real)0.0;
+      for (i32 nd = 0; nd < blockSizeTot; nd++) {
+        i32 i=nd%NNODE, j=(nd/NNODE)%NNODE, k=nd/(NNODE*NNODE);
+        real xn = dgNodePos(h[0], ib, i), yn = dgNodePos(h[1], jb, j);
+        real dxn = xn - grid.ibX, dyn = yn - grid.ibY;
+        if (dxn*dxn + dyn*dyn < grid.ibR*grid.ibR) continue;   // skip SOLID nodes
+        real wijk = (real)0.125*c_w[i]*c_w[j]*c_w[k];
+        for (i32 q = 0; q < 5; q++) Wbar[q] += wijk*sWe[q][nd];
+        wf += wijk;
+      }
+      if (wf > (real)0.0) { for (i32 q = 0; q < 5; q++) Wbar[q] /= wf; }
+      else                { for (i32 q = 0; q < 5; q++) Wbar[q] = Wme[q]; }
+      // if THIS face node is inside the solid, its trace is non-physical -- use
+      // the fluid mean instead of the trace as the wall reconstruction.
+      real rf2 = (xs[0]-grid.ibX)*(xs[0]-grid.ibX) + (xs[1]-grid.ibY)*(xs[1]-grid.ibY);
+      real Wface[5];
+      if (rf2 < grid.ibR*grid.ibR) { for (i32 q=0;q<5;q++) Wface[q] = Wbar[q]; }
+      else                         { for (i32 q=0;q<5;q++) Wface[q] = Wme[q]; }
+      real th = (real)1.0;
+      real fr0 = (real)0.2*Wbar[0], fr4 = (real)0.2*Wbar[4];
+      if (Wface[0] < fr0) th = fmin(th, (Wbar[0]-fr0)/fmax(Wbar[0]-Wface[0], DG_EPSF));
+      if (Wface[4] < fr4) th = fmin(th, (Wbar[4]-fr4)/fmax(Wbar[4]-Wface[4], DG_EPSF));
+      th = fmax(th, (real)0.0);
+      real Wl[5];
+      for (i32 q = 0; q < 5; q++) Wl[q] = Wbar[q] + th*(Wface[q]-Wbar[q]);
+      if (grid.ibSbm == 2) {
+        // ── Option A: LOCATION-shift flow-through ────────────────────────
+        // Impose u.n~ = 0 at the TRUE wall (d = (R-r) n~ inward toward the
+        // cylinder) instead of at the surrogate face: extrapolate the velocity
+        // inward with the element gradient, remove its normal component there,
+        // and HLLC the interior against that true-wall tangential state.  Moves
+        // the effective slip wall onto the circle (inward) -> smaller standoff.
+        real gcU[3], gcV[3];
+        {
+          real dU=0,t1U=0,t2U=0, dV=0,t1V=0,t2V=0;
+          for (i32 m = 0; m < NNODE; m++) {
+            i32 nA=dgFaceNode(dir,m,a,b), nB=dgFaceNode(dir,nrm,m,b), nC=dgFaceNode(dir,nrm,a,m);
+            dU+=c_D[nrm][m]*sWe[1][nA]; t1U+=c_D[a][m]*sWe[1][nB]; t2U+=c_D[b][m]*sWe[1][nC];
+            dV+=c_D[nrm][m]*sWe[2][nA]; t1V+=c_D[a][m]*sWe[2][nB]; t2V+=c_D[b][m]*sWe[2][nC];
+          }
+          gcU[dir]=jacDir*dU; gcU[t1ax]=((real)2.0/h[t1ax])*t1U; gcU[t2ax]=((real)2.0/h[t2ax])*t2U;
+          gcV[dir]=jacDir*dV; gcV[t1ax]=((real)2.0/h[t1ax])*t1V; gcV[t2ax]=((real)2.0/h[t2ax])*t2V;
+        }
+        real dseg = grid.ibR - rr;                    // inward to the true wall
+        real uG = Wl[1] + (gcU[0]*nx + gcU[1]*ny)*dseg;
+        real vG = Wl[2] + (gcV[0]*nx + gcV[1]*ny)*dseg;
+        real unG = uG*nx + vG*ny;                     // normal velocity AT the true wall
+        real W2[5] = { Wl[0], uG - unG*nx, vG - unG*ny, Wl[3], Wl[4] };  // tangential there
+        real fs[5];
+        if (side) dgIfaceFlux(grid, Wl, W2, dir, aOwn, fs);
+        else      dgIfaceFlux(grid, W2, Wl, dir, aOwn, fs);
+        for (i32 q = 0; q < 5; q++) R[q] += sgn*jacDir*c_winv[nrm]*(fs[q] - fOwn[q]);
+        return;
+      }
+      if (grid.ibSbm == 3) {
+        // ghost-free FRIB wall flux (see dgIbFluxTrace)
+        real WgF[5];
+        dgIbFluxTrace(grid, sWe, bIdx, lvl, ib, jb, h, xs, nx, ny, WgF);
+        real fs3[5];
+        if (side) dgIfaceFlux(grid, Wl, WgF, dir, aOwn, fs3);
+        else      dgIfaceFlux(grid, WgF, Wl, dir, aOwn, fs3);
+        for (i32 q = 0; q < 5; q++) R[q] += sgn*jacDir*c_winv[nrm]*(fs3[q] - fOwn[q]);
+        return;
+      }
+      // HARD reflective wall (best standoff for a SOLID body): zero mass/energy
+      // flux, momentum = wall star pressure p* in the FACE (dir) direction, p*
+      // resolved in the true normal (u_n = u.n~) from the LIMITED trace Wl --
+      // reflected-shock (piston) for inflow, rarefaction for outflow.  The
+      // flow-through slip form is softer and stands the shock off FURTHER
+      // (+26% vs +18%), so it is worse for a solid cylinder.
+      real un   = Wl[1]*nx + Wl[2]*ny;              // limited normal velocity
+      real rho  = fmax(Wl[0], DG_EPSF), pI = fmax(Wl[4], DG_EPSF);
+      real aI   = sqrt(dgGam*pI/rho);
+      real pstar;
+      if (un <= (real)0.0) {
+        real A  = (real)2.0/((dgGam+(real)1.0)*rho);
+        real Bc = (dgGam-(real)1.0)/(dgGam+(real)1.0)*pI;
+        real m2 = un*un;
+        real bq = (real)2.0*pI + m2/A, cq = pI*pI - m2*Bc/A;
+        pstar = (real)0.5*(bq + sqrt(fmax(bq*bq - (real)4.0*cq, (real)0.0)));
+      } else {
+        real base = (real)1.0 - (dgGam-(real)1.0)*(real)0.5*un/aI;
+        pstar = base > (real)0.0
+              ? pI*pow(base, (real)2.0*dgGam/(dgGam-(real)1.0)) : (real)0.0;
+      }
+      // curvature (centripetal) correction, FLUID-only u_t: flow curving around
+      // the convex wall lowers the wall pressure by rho u_t^2/R over the near-
+      // wall region (dp/dn = -rho u_t^2/R, the FRIB curvature term the flat
+      // reflected p* misses).  u_t is from the fluid-only limited state Wl.
+      real q2  = Wl[1]*Wl[1] + Wl[2]*Wl[2] + Wl[3]*Wl[3];
+      real ut2 = fmax(q2 - un*un, (real)0.0);
+      pstar -= grid.ibSbmCurv * rho * ut2 / fmax(grid.ibR, DG_EPSF) * h[0];
+      real fs[5] = {(real)0.0,(real)0.0,(real)0.0,(real)0.0,(real)0.0};
+      fs[1+dir] = fmax(pstar, DG_EPSF);
       for (i32 q = 0; q < 5; q++) R[q] += sgn*jacDir*c_winv[nrm]*(fs[q] - fOwn[q]);
       return;
     }
@@ -980,8 +1624,9 @@ __device__ void dgFaceLift(DgSolver &grid, const real (*sWe)[blockSizeTot],
     for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[nSame*blockSizeTot + nd];
     dgConsToPrimSane(U, Wn);
     real fs[5];
-    if (side) dgHllcAxis(Wme, Wn, dir, fs);
-    else      dgHllcAxis(Wn, Wme, dir, fs);
+    real afN = fmax(aOwn, grid.subFv ? grid.getField(D_SCRATCH)[(u64)nSame*blockSizeTot + 6] : (real)0.0);
+    if (side) dgIfaceFlux(grid, Wme, Wn, dir, afN, fs);
+    else      dgIfaceFlux(grid, Wn, Wme, dir, afN, fs);
     if (grid.avOn) {
       real nuN = grid.getField(D_SCRATCH)[(u64)nSame*blockSizeTot];
       real sig = side ? dgPenaltySigma(grid, nuOwn, nuN, Wme, Wn)
@@ -989,6 +1634,13 @@ __device__ void dgFaceLift(DgSolver &grid, const real (*sWe)[blockSizeTot],
       if (side) dgJumpPenalty(Wme, Wn, sig, fs);
       else      dgJumpPenalty(Wn, Wme, sig, fs);
     }
+    if (grid.dpSbp > (real)0.0 && grid.dpFace > (real)0.0) {
+        if (side) dgDpJumpPenalty(grid, bIdx, nSame, Wme, Wn, dir, fs);
+        else      dgDpJumpPenalty(grid, bIdx, nSame, Wn, Wme, dir, fs);
+      }
+    if (grid.esLim)
+      atomicAdd(entAcc, entW*(side ? dgEntFluxLF(Wme, Wn, dir)
+                                   : dgEntFluxLF(Wn, Wme, dir)));
     for (i32 q = 0; q < 5; q++) R[q] += sgn*jacDir*c_winv[nrm]*(fs[q] - fOwn[q]);
     return;
   }
@@ -1012,8 +1664,9 @@ __device__ void dgFaceLift(DgSolver &grid, const real (*sWe)[blockSizeTot],
                           // coarse (mortar) side sanitizes the identical value,
                           // so the twice-computed flux stays bitwise-consistent
     real fs[5];
-    if (side) dgHllcAxis(Wme, Wc, dir, fs);
-    else      dgHllcAxis(Wc, Wme, dir, fs);
+    real afC = fmax(aOwn, grid.subFv ? grid.getField(D_SCRATCH)[(u64)cIdxN*blockSizeTot + 6] : (real)0.0);
+    if (side) dgIfaceFlux(grid, Wme, Wc, dir, afC, fs);
+    else      dgIfaceFlux(grid, Wc, Wme, dir, afC, fs);
     if (grid.avOn) {
       real nuN = grid.getField(D_SCRATCH)[(u64)cIdxN*blockSizeTot];
       real sig = side ? dgPenaltySigma(grid, nuOwn, nuN, Wme, Wc)
@@ -1021,6 +1674,13 @@ __device__ void dgFaceLift(DgSolver &grid, const real (*sWe)[blockSizeTot],
       if (side) dgJumpPenalty(Wme, Wc, sig, fs);
       else      dgJumpPenalty(Wc, Wme, sig, fs);
     }
+    if (grid.dpSbp > (real)0.0 && grid.dpFace > (real)0.0) {
+        if (side) dgDpJumpPenalty(grid, bIdx, cIdxN, Wme, Wc, dir, fs);
+        else      dgDpJumpPenalty(grid, bIdx, cIdxN, Wc, Wme, dir, fs);
+      }
+    if (grid.esLim)
+      atomicAdd(entAcc, entW*(side ? dgEntFluxLF(Wme, Wc, dir)
+                                   : dgEntFluxLF(Wc, Wme, dir)));
     for (i32 q = 0; q < 5; q++) R[q] += sgn*jacDir*c_winv[nrm]*(fs[q] - fOwn[q]);
     return;
   }
@@ -1045,6 +1705,7 @@ __device__ void dgFaceLift(DgSolver &grid, const real (*sWe)[blockSizeTot],
       }
 
     real Fs[5] = {0,0,0,0,0};
+    real entF = (real)0.0;   // projected proper entropy flux (same R weights)
     const i32 s2max = zIdent ? 1 : 2;
     for (i32 s2 = 0; s2 < s2max; s2++)
       for (i32 s1 = 0; s1 < 2; s1++) {
@@ -1073,8 +1734,9 @@ __device__ void dgFaceLift(DgSolver &grid, const real (*sWe)[blockSizeTot],
             for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[fIdx*blockSizeTot + nd];
             dgConsToPrimSane(U, Wf);
             real fs[5];
-            if (side) dgHllcAxis(To, Wf, dir, fs);
-            else      dgHllcAxis(Wf, To, dir, fs);
+            real afF = fmax(aOwn, grid.subFv ? grid.getField(D_SCRATCH)[(u64)fIdx*blockSizeTot + 6] : (real)0.0);
+            if (side) dgIfaceFlux(grid, To, Wf, dir, afF, fs);
+            else      dgIfaceFlux(grid, Wf, To, dir, afF, fs);
             if (grid.avOn) {
               real nuF = grid.getField(D_SCRATCH)[(u64)fIdx*blockSizeTot];
               real sig = side ? dgPenaltySigma(grid, nuOwn, nuF, To, Wf)
@@ -1082,13 +1744,92 @@ __device__ void dgFaceLift(DgSolver &grid, const real (*sWe)[blockSizeTot],
               if (side) dgJumpPenalty(To, Wf, sig, fs);
               else      dgJumpPenalty(Wf, To, sig, fs);
             }
+            if (grid.dpSbp > (real)0.0 && grid.dpFace > (real)0.0) {
+              if (side) dgDpJumpPenalty(grid, bIdx, fIdx, To, Wf, dir, fs);
+              else      dgDpJumpPenalty(grid, bIdx, fIdx, Wf, To, dir, fs);
+            }
             real coef = c_R[s1][a][fa] * wtB;
             for (i32 q = 0; q < 5; q++) Fs[q] += coef*fs[q];
+            if (grid.esLim)
+              entF += coef*(side ? dgEntFluxLF(To, Wf, dir)
+                                 : dgEntFluxLF(Wf, To, dir));
           }
         }
       }
+    if (grid.esLim) atomicAdd(entAcc, entW*entF);
     for (i32 q = 0; q < 5; q++) R[q] += sgn*jacDir*c_winv[nrm]*(Fs[q] - fOwn[q]);
   }
+}
+
+// Boundary mass-flux diagnostic: integrate the numerical mass flux rho*u.n
+// through each DOMAIN boundary (bnd[0]=x-lo, 1=x-hi, 2=y-lo, 3=y-hi), signed
+// OUTWARD (positive = leaving the domain).  Uses the SAME weak-BC HLLC flux
+// the scheme applies, so the sum over boundaries equals -d/dt(fluid mass)
+// exactly IF the interior+IB are conservative -- any residual is the IB
+// ghost-fill non-conservation.  bnd must be pre-zeroed [4].
+__global__ void dgBoundaryMassFluxKernel(DgSolver &grid, real *bnd) {
+  DG_BLOCK_LOOP(bIdx) {
+    u64 loc = grid.bLocList[bIdx];
+    if (loc == kEmpty) continue;
+    if (grid.ibOn && grid.ibClassList[bIdx] != IB_FLUID) continue;
+    i32 lvl, ib, jb, kb;
+    grid.decode(loc, lvl, ib, jb, kb);
+    if (!grid.isInteriorBlock(lvl, ib, jb, kb)) continue;
+    real h[3]; dgElemSize(grid, lvl, h);
+    i32 nx = grid.baseGridSize[0]/blockSize*powi(2, lvl);
+    i32 ny = grid.baseGridSize[1]/blockSize*powi(2, lvl);
+    for (i32 face = 0; face < 4; face++) {
+      i32 dir = face/2, side = face%2;
+      bool onB = (dir == 0) ? (side ? ib == nx-1 : ib == 0)
+                            : (side ? jb == ny-1 : jb == 0);
+      if (!onB) continue;
+      i32 nrm = side ? (NNODE-1) : 0;
+      i32 t1ax = (dir == 0) ? 1 : 0;      // x-face spans (y,z); y-face spans (x,z)
+      i32 t1bb = (dir == 0) ? jb : ib;
+      real acc = 0;
+      for (i32 b = 0; b < NNODE; b++)
+        for (i32 a = 0; a < NNODE; a++) {
+          i32 nd = dgFaceNode(dir, nrm, a, b);
+          real U[5], Wme[5];
+          for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[bIdx*blockSizeTot + nd];
+          dgConsToPrimSane(U, Wme);
+          real xs[3];
+          xs[dir]  = ((dir==0?ib:jb) + (side?1:0))*h[dir];
+          xs[t1ax] = dgNodePos(h[t1ax], t1bb, a);
+          xs[2]    = dgNodePos(h[2], kb, b);
+          real Wg[5];
+          dgBcState(grid, Wme, dir, side, xs[0], xs[1], grid.simT, Wg);
+          real fs[5];
+          if (side) dgHllcAxis(Wme, Wg, dir, fs);
+          else      dgHllcAxis(Wg, Wme, dir, fs);
+          real wq = c_w[a]*(h[t1ax]*(real)0.5) * c_w[b]*(h[2]*(real)0.5);
+          acc += wq*fs[0];
+        }
+      real sgn = side ? (real)1.0 : (real)-1.0;
+      atomicAdd(&bnd[face], sgn*acc);
+    }
+  }
+}
+
+// pressure-tight volume penalization (Reiss 2021, docs/pressureTIghtBrinkman.pdf):
+// phi = eps inside the object, 1 in the fluid, smoothstep over [R-delta, R+delta].
+// Returns phi and writes grad phi (radial) into gp.
+__device__ __forceinline__ real dgBrinkPhi(DgSolver &grid, real x, real y, real gp[2]) {
+  real dx = x - grid.ibX, dy = y - grid.ibY;
+  real r  = sqrt(dx*dx + dy*dy);
+  // FULL width of the smooth transition = ibBrinkDelta finest elements, so the
+  // object edge is smeared over exactly ibBrinkDelta cells (default 2 -> a
+  // compact 2-element interface); d is the half-width used by the smoothstep.
+  real hF[3]; dgElemSize(grid, grid.nLvls-1, hF);
+  real d  = (real)0.5*grid.ibBrinkDelta*hF[0], eps = grid.ibBrinkEps, R = grid.ibR;
+  real tt = (r - (R - d))/((real)2.0*d);
+  if (tt <= (real)0.0) { gp[0]=gp[1]=(real)0.0; return eps; }
+  if (tt >= (real)1.0) { gp[0]=gp[1]=(real)0.0; return (real)1.0; }
+  real phi    = eps + ((real)1.0-eps)*tt*tt*((real)3.0-(real)2.0*tt);
+  real dphidr = ((real)1.0-eps)*(real)6.0*tt*((real)1.0-tt)/((real)2.0*d);
+  real ir = (real)1.0/fmax(r, (real)1e-12);
+  gp[0] = dphidr*dx*ir; gp[1] = dphidr*dy*ir;
+  return phi;
 }
 
 __global__ void dgRhsKernel(DgSolver &grid, real t) {
@@ -1097,6 +1838,11 @@ __global__ void dgRhsKernel(DgSolver &grid, real t) {
   __shared__ real sGy[DG_EPB][5][blockSizeTot];
   __shared__ real sGz[DG_EPB][5][blockSizeTot];
   __shared__ real sRed[DG_EPB][2][blockSizeTot];  // theta / lambda reductions
+  __shared__ real sEnt[DG_EPB];                   // ES limiter: outward proper-
+                                                  // entropy-flux integral (1/V)
+  __shared__ real sEntQ[DG_EPB][blockSizeTot];    // ES limiter: per-node GLL-
+                                                  // weighted entropy (quadrature
+                                                  // cell entropy of the input)
 
   const i32 ell = threadIdx.x / blockSizeTot;
   const i32 nd  = threadIdx.x % blockSizeTot;
@@ -1107,7 +1853,7 @@ __global__ void dgRhsKernel(DgSolver &grid, real t) {
     u64 loc = (bIdx < grid.hashTable.nKeys) ? grid.bLocList[bIdx] : kEmpty;
     // IB ghost/dead elements are never evolved (their nodal values are set by
     // the wall reconstruction); they still provide face traces to neighbors
-    const bool active = (loc != kEmpty) && (grid.ibClassList[bIdx] == IB_FLUID);
+    const bool active = (loc != kEmpty) && dgIbLive(grid, bIdx);
     i32 lvl = 0, ib = 0, jb = 0, kb = 0;
     if (active) grid.decode(loc, lvl, ib, jb, kb);
 
@@ -1121,8 +1867,23 @@ __global__ void dgRhsKernel(DgSolver &grid, real t) {
       for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[bIdx*blockSizeTot + nd];
       dgConsToPrimSane(U, W);
       for (i32 q = 0; q < 5; q++) sW[ell][q][nd] = W[q];
+      if (grid.esLim) {
+        // ES limiter: stash this node's GLL-weighted entropy; nd 0 reduces
+        // the QUADRATURE cell entropy of the stage input after the sync.  It
+        // must be the quadrature entropy, not U(mean): by Jensen the
+        // quadrature entropy exceeds the mean's by the intra-cell variance,
+        // and a mean-based bound clips smooth flow (measured: 58x vortex L2
+        // regression).
+        sEntQ[ell][nd] = (real)0.125*c_w[i]*c_w[j]*c_w[k]*dgEntropyU(W);
+        if (nd == 0) sEnt[ell] = (real)0.0;
+      }
     }
     __syncthreads();
+    if (active && grid.esLim && nd == 0) {
+      real E0 = (real)0.0;
+      for (i32 m = 0; m < blockSizeTot; m++) E0 += sEntQ[ell][m];
+      grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 3] = E0;
+    }
 
     real R[5] = {0,0,0,0,0};
     real lamNode = 0.0, thetaNode = 0.0;
@@ -1140,14 +1901,14 @@ __global__ void dgRhsKernel(DgSolver &grid, real t) {
         for (i32 m = 0; m < NNODE; m++) {
           real Wm[5], Fs[5];
           for (i32 q = 0; q < 5; q++) Wm[q] = sW[ell][q][ndX0 + m];
-          dgEcFluxAxis(Wi, Wm, 0, Fs);
+          dgEcFluxAxis(Wi, Wm, 0, Fs, grid.ecVolume == 2);
           for (i32 q = 0; q < 5; q++) ax[q] += c_D[i][m]*Fs[q];
           for (i32 q = 0; q < 5; q++) Wm[q] = sW[ell][q][ndY0 + m*NNODE];
-          dgEcFluxAxis(Wi, Wm, 1, Fs);
+          dgEcFluxAxis(Wi, Wm, 1, Fs, grid.ecVolume == 2);
           for (i32 q = 0; q < 5; q++) ay[q] += c_D[j][m]*Fs[q];
           if (!grid.pseudo2D) {
             for (i32 q = 0; q < 5; q++) Wm[q] = sW[ell][q][ndZ0 + m*NNODE*NNODE];
-            dgEcFluxAxis(Wi, Wm, 2, Fs);
+            dgEcFluxAxis(Wi, Wm, 2, Fs, grid.ecVolume == 2);
             for (i32 q = 0; q < 5; q++) az[q] += c_D[k][m]*Fs[q];
           }
         }
@@ -1170,14 +1931,124 @@ __global__ void dgRhsKernel(DgSolver &grid, real t) {
         }
       }
 
+      // ── phase 2b: SUBCELL-FV BLENDING (Hennemann/Gassner, docs/
+      //    subcellFV.pdf).  In a troubled element, blend the high-order DG
+      //    VOLUME with a first-order FV volume on the LGL subgrid:
+      //    R_vol = (1-a) R^DG_vol + a R^FV_vol,  a = min(subMax, theta_e).
+      //    The FV volume differences two-point Rusanov fluxes between adjacent
+      //    LGL nodes; at the boundary sub-interface the flux is the node's own
+      //    physical flux f(u) (paper Eq 18 f_0/f_N) -- the element-FACE
+      //    correction stays in the UNBLENDED surface term (phase 3), so the
+      //    blend is purely volume (paper Eq 20).  This is the direct
+      //    node-local form: constant-per-element a makes the flux-blend a
+      //    residual-blend, no subcell-flux reconstruction needed. ───────────
+      // The FV blend is the POSITIVITY-PRESERVING stabilizer and stays on at
+      // EVERY level a cell is troubled (a finest-only gate was tried and
+      // injected +7.7% mass: it left forming shocks running pure DG during
+      // the refine lag, their cell means went negative, and the Zhang-Shu
+      // mean-floor clamped them up -- non-conservatively).  The sensor-driven
+      // refinement (adapt step) runs IN PARALLEL: a troubled cell is both
+      // FV-stabilized now AND refined toward finest, so real features (the
+      // wake) get resolved while positivity is maintained throughout.
+      // Amplitude floor: a scale-free-high theta on a low-amplitude cell is
+      // not real trouble -- do not blend.
+      // alpha from slot 6 (dgAvNuKernel: min(subMax, shock theta) with the
+      // amplitude floor) -- the SAME factor the Rusanov face-flux blend uses
+      real alpha = (grid.subFv && active)
+                 ? grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 6] : (real)0.0;
+      if (alpha > (real)0.0) {
+        real Rfv[5] = {0,0,0,0,0};
+        real fL[5], fR[5], Wm[5];
+        // x subcell line
+        if (i == 0) dgEulerFluxAxis(Wi, 0, fL);
+        else { for (i32 q=0;q<5;q++) Wm[q]=sW[ell][q][ndX0+(i-1)]; dgRusanovAxis(Wm, Wi, 0, fL); }
+        if (i == NNODE-1) dgEulerFluxAxis(Wi, 0, fR);
+        else { for (i32 q=0;q<5;q++) Wm[q]=sW[ell][q][ndX0+(i+1)]; dgRusanovAxis(Wi, Wm, 0, fR); }
+        for (i32 q=0;q<5;q++) Rfv[q] -= jacx*c_winv[i]*(fR[q]-fL[q]);
+        // y subcell line
+        if (j == 0) dgEulerFluxAxis(Wi, 1, fL);
+        else { for (i32 q=0;q<5;q++) Wm[q]=sW[ell][q][ndY0+(j-1)*NNODE]; dgRusanovAxis(Wm, Wi, 1, fL); }
+        if (j == NNODE-1) dgEulerFluxAxis(Wi, 1, fR);
+        else { for (i32 q=0;q<5;q++) Wm[q]=sW[ell][q][ndY0+(j+1)*NNODE]; dgRusanovAxis(Wi, Wm, 1, fR); }
+        for (i32 q=0;q<5;q++) Rfv[q] -= jacy*c_winv[j]*(fR[q]-fL[q]);
+        // z subcell line
+        if (!grid.pseudo2D) {
+          if (k == 0) dgEulerFluxAxis(Wi, 2, fL);
+          else { for (i32 q=0;q<5;q++) Wm[q]=sW[ell][q][ndZ0+(k-1)*NNODE*NNODE]; dgRusanovAxis(Wm, Wi, 2, fL); }
+          if (k == NNODE-1) dgEulerFluxAxis(Wi, 2, fR);
+          else { for (i32 q=0;q<5;q++) Wm[q]=sW[ell][q][ndZ0+(k+1)*NNODE*NNODE]; dgRusanovAxis(Wi, Wm, 2, fR); }
+          for (i32 q=0;q<5;q++) Rfv[q] -= jacz*c_winv[k]*(fR[q]-fL[q]);
+        }
+        for (i32 q=0;q<5;q++) R[q] = ((real)1.0-alpha)*R[q] + alpha*Rfv[q];
+      }
+
+      // ── phase 2c: dual-pairing SBP volume upwinding (arXiv 2411.06629
+      //    Eq 22): R += (1/2) Gamma (D+ - D-) g per direction, with
+      //    (D+ - D-)g = -tau*phi*(sum_m w_m phi_m g_m) the rank-1 top-mode
+      //    damping and g the entropy variables.  Entropy-dissipative
+      //    (g^T H (D+-D-) g = -tau (sum w phi g)^2), exactly conservative
+      //    (sum w phi = 0), O(h^p) small on smooth data -- the paper's
+      //    intrinsic shock stabilizer, needing no AV/subcell-FV. ────────────
+      if (grid.dpSbp > (real)0.0) {
+        real gt[5];
+        for (i32 q = 0; q < 5; q++)
+          gt[q] = grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 8 + q];
+        real Sx[5] = {0,0,0,0,0}, Sy[5] = {0,0,0,0,0}, Sz[5] = {0,0,0,0,0};
+        for (i32 m = 0; m < NNODE; m++) {
+          real Wm[5], vm[5];
+          for (i32 q = 0; q < 5; q++) Wm[q] = sW[ell][q][ndX0 + m];
+          dgEntVars(Wm, vm);
+          for (i32 q = 0; q < 5; q++) Sx[q] += c_w[m]*c_dpPhi[m]*vm[q];
+          for (i32 q = 0; q < 5; q++) Wm[q] = sW[ell][q][ndY0 + m*NNODE];
+          dgEntVars(Wm, vm);
+          for (i32 q = 0; q < 5; q++) Sy[q] += c_w[m]*c_dpPhi[m]*vm[q];
+          if (!grid.pseudo2D) {
+            for (i32 q = 0; q < 5; q++) Wm[q] = sW[ell][q][ndZ0 + m*NNODE*NNODE];
+            dgEntVars(Wm, vm);
+            for (i32 q = 0; q < 5; q++) Sz[q] += c_w[m]*c_dpPhi[m]*vm[q];
+          }
+        }
+        for (i32 q = 0; q < 5; q++)
+          R[q] -= grid.dpSbp*gt[q]*(c_dpPhi[i]*Sx[q]/h[0] + c_dpPhi[j]*Sy[q]/h[1]
+                 + (grid.pseudo2D ? (real)0.0 : c_dpPhi[k]*Sz[q]/h[2]));
+      }
+
       // ── phase 3: face lifts (boundary-node threads only) ─────────────
-      if (i == 0)        dgFaceLift(grid, sW[ell], bIdx, lvl, ib, jb, kb, 0, 0, j, k, h, t, R);
-      if (i == NNODE-1)  dgFaceLift(grid, sW[ell], bIdx, lvl, ib, jb, kb, 0, 1, j, k, h, t, R);
-      if (j == 0)        dgFaceLift(grid, sW[ell], bIdx, lvl, ib, jb, kb, 1, 0, i, k, h, t, R);
-      if (j == NNODE-1)  dgFaceLift(grid, sW[ell], bIdx, lvl, ib, jb, kb, 1, 1, i, k, h, t, R);
+      if (i == 0)        dgFaceLift(grid, sW[ell], bIdx, lvl, ib, jb, kb, 0, 0, j, k, h, t, R, &sEnt[ell]);
+      if (i == NNODE-1)  dgFaceLift(grid, sW[ell], bIdx, lvl, ib, jb, kb, 0, 1, j, k, h, t, R, &sEnt[ell]);
+      if (j == 0)        dgFaceLift(grid, sW[ell], bIdx, lvl, ib, jb, kb, 1, 0, i, k, h, t, R, &sEnt[ell]);
+      if (j == NNODE-1)  dgFaceLift(grid, sW[ell], bIdx, lvl, ib, jb, kb, 1, 1, i, k, h, t, R, &sEnt[ell]);
       if (!grid.pseudo2D) {
-        if (k == 0)       dgFaceLift(grid, sW[ell], bIdx, lvl, ib, jb, kb, 2, 0, i, j, h, t, R);
-        if (k == NNODE-1) dgFaceLift(grid, sW[ell], bIdx, lvl, ib, jb, kb, 2, 1, i, j, h, t, R);
+        if (k == 0)       dgFaceLift(grid, sW[ell], bIdx, lvl, ib, jb, kb, 2, 0, i, j, h, t, R, &sEnt[ell]);
+        if (k == NNODE-1) dgFaceLift(grid, sW[ell], bIdx, lvl, ib, jb, kb, 2, 1, i, j, h, t, R, &sEnt[ell]);
+      }
+
+      // ── volume-penalization IB (Reiss 2021, pressureTIghtBrinkman.pdf).
+      //    Two bounded, non-stiff mechanisms are added to standard Euler:
+      //  (a) the flux-form momentum source p*grad(phi) in the smeared edge.
+      //      grad(phi) points OUT of the body, so p*grad(phi) is a wall
+      //      reaction pushing fluid away -- maximal at the stagnation point
+      //      where p peaks (this is what an earlier -rho u^2 grad(phi)/phi
+      //      source could NOT do: it vanished at u=0 and the nose leaked).
+      //  (b) Darcy drag -chi*(rho u) in the SOLID INTERIOR ONLY (the phi==eps
+      //      plateau, grad(phi)=0): it freezes the plug so the supersonic
+      //      stream cannot advect through.  chi is the CFL-stable rate
+      //      lam*NNODE/h times ibBrinkRate ("as big as the timestep permits");
+      //      the matching kinetic energy is removed so nothing piles up. ─────
+      if (grid.ibBrink) {
+        real xn = dgNodePos(h[0], ib, i), yn = dgNodePos(h[1], jb, j);
+        real gp[2]; real phi = dgBrinkPhi(grid, xn, yn, gp);
+        R[1] += Wi[4]*gp[0];                              // p d(phi)/dx
+        R[2] += Wi[4]*gp[1];                              // p d(phi)/dy
+        if (phi <= grid.ibBrinkEps) {                     // deep solid: Darcy drag
+          real cS   = dgSoundSpeed(Wi[4], Wi[0]);
+          real lamL = fabs(Wi[1]) + fabs(Wi[2]) + fabs(Wi[3]) + cS;
+          real hmn  = fmin(h[0], grid.pseudo2D ? h[0] : fmin(h[1], h[2]));
+          real chi  = grid.ibBrinkRate*lamL*(real)NNODE/hmn;
+          real U0[5]; dgP2C(Wi, U0);
+          R[1] -= chi*U0[1]; R[2] -= chi*U0[2]; R[3] -= chi*U0[3];
+          R[4] -= chi*(U0[1]*Wi[1] + U0[2]*Wi[2] + U0[3]*Wi[3]);  // kinetic drain
+        }
       }
 
       // ── phase 3.5: wave speed (the element sensor theta_e comes from
@@ -1190,10 +2061,12 @@ __global__ void dgRhsKernel(DgSolver &grid, real t) {
     sRed[ell][0][nd] = thetaNode;
     sRed[ell][1][nd] = lamNode;
     __syncthreads();
+    if (active && grid.esLim && nd == 0)   // face atomics complete at the sync
+      grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 4] = sEnt[ell];
     real lam_e = 0;
     for (i32 m = 0; m < blockSizeTot; m++)
       lam_e = fmax(lam_e, sRed[ell][1][m]);
-    real theta_e = (active && grid.avOn)
+    real theta_e = (active && (grid.avOn || grid.bulkC > (real)0.0))
                  ? grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 1] : (real)0.0;
 
     // ── phase 4: element-local artificial viscosity (two-pass) ────────
@@ -1243,6 +2116,90 @@ __global__ void dgRhsKernel(DgSolver &grid, real t) {
       }
     }
 
+    // ── phase 4b: sensor-gated BULK (dilatation) viscosity.  beta = bulkC *
+    //    theta_e * (h/N) * lam_e * rho (the AV magnitude, dilatation-only):
+    //    R[1+m] += d/dx_m [beta divu], R[4] += d/dx_m [beta divu u_m] through
+    //    the same weak-divergence operator as the AV.  Contacts and shear are
+    //    untouched; energy production = -int beta (divu)^2 <= 0. ─────────────
+    if (grid.bulkC > (real)0.0) {
+      __syncthreads();   // sGx reuse: AV phase 4 is done with it
+      if (active) {
+        const i32 ndX0 = j*NNODE + k*NNODE*NNODE;
+        const i32 ndY0 = i + k*NNODE*NNODE;
+        const i32 ndZ0 = i + j*NNODE;
+        real du = 0, dv = 0, dw = 0;
+        for (i32 m = 0; m < NNODE; m++) {
+          du += c_D[i][m]*sW[ell][1][ndX0 + m];
+          dv += c_D[j][m]*sW[ell][2][ndY0 + m*NNODE];
+          if (!grid.pseudo2D) dw += c_D[k][m]*sW[ell][3][ndZ0 + m*NNODE*NNODE];
+        }
+        real divu = jacx*du + jacy*dv + (grid.pseudo2D ? (real)0.0 : jacz*dw);
+        real lenp = h[0]/(real)(2*dgOrder+1);   // the AV length scale
+        real beta = grid.bulkC * theta_e * lenp * lam_e * sW[ell][0][nd];
+        sGx[ell][0][nd] = beta*divu;   // the staged dilatational flux scalar
+      }
+      __syncthreads();
+      if (active) {
+        const i32 ndX0 = j*NNODE + k*NNODE*NNODE;
+        const i32 ndY0 = i + k*NNODE*NNODE;
+        const i32 ndZ0 = i + j*NNODE;
+        real sxm = 0, sxe = 0, sym = 0, sye = 0, szm = 0, sze = 0;
+        for (i32 m = 0; m < NNODE; m++) {
+          real bx = sGx[ell][0][ndX0 + m];
+          sxm += c_w[m]*c_D[m][i]*bx;
+          sxe += c_w[m]*c_D[m][i]*bx*sW[ell][1][ndX0 + m];
+          real by = sGx[ell][0][ndY0 + m*NNODE];
+          sym += c_w[m]*c_D[m][j]*by;
+          sye += c_w[m]*c_D[m][j]*by*sW[ell][2][ndY0 + m*NNODE];
+          if (!grid.pseudo2D) {
+            real bz = sGx[ell][0][ndZ0 + m*NNODE*NNODE];
+            szm += c_w[m]*c_D[m][k]*bz;
+            sze += c_w[m]*c_D[m][k]*bz*sW[ell][3][ndZ0 + m*NNODE*NNODE];
+          }
+        }
+        R[1] -= jacx*c_winv[i]*sxm;
+        R[2] -= jacy*c_winv[j]*sym;
+        R[4] -= jacx*c_winv[i]*sxe + jacy*c_winv[j]*sye;
+        if (!grid.pseudo2D) {
+          R[3] -= jacz*c_winv[k]*szm;
+          R[4] -= jacz*c_winv[k]*sze;
+        }
+      }
+    }
+
+    // ── phase 5: NSFR residual filter (arXiv 2507.09131).  The ESFR K_m
+    //    correction is rank-1 per line, so (M+K)^-1 M reduces to removing the
+    //    fraction sigma of the residual's top Legendre mode per direction
+    //    (dimension-split; sum w phi = 0 keeps it exactly conservative).
+    //    Linear and state-independent -- the paper's shock recipe is this
+    //    filter + the positivity limiter, nothing else. ────────────────────
+    if (grid.nsfr > (real)0.0) {
+      // gate by (1 - alpha): the filter belongs to the HIGH-ORDER scheme only.
+      // Filtering the blended residual corrupts the top mode of the subcell-FV
+      // fallback exactly where positivity depends on it (measured: 5-level
+      // blast blew at t=0.70 with the unconditional filter, completes gated).
+      const real sigE = grid.nsfr*((real)1.0 - (grid.subFv && active
+                      ? grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 6] : (real)0.0));
+      const i32 nd3 = grid.pseudo2D ? 2 : 3;
+      for (i32 d3 = 0; d3 < nd3; d3++) {
+        __syncthreads();
+        if (active) for (i32 q = 0; q < 5; q++) sGx[ell][q][nd] = R[q];
+        __syncthreads();
+        if (active) {
+          const i32 idx  = (d3==0) ? i : ((d3==1) ? j : k);
+          const i32 base = (d3==0) ? (j*NNODE + k*NNODE*NNODE)
+                         : ((d3==1) ? (i + k*NNODE*NNODE) : (i + j*NNODE));
+          const i32 str  = (d3==0) ? 1 : ((d3==1) ? NNODE : NNODE*NNODE);
+          for (i32 q = 0; q < 5; q++) {
+            real S = 0;
+            for (i32 m = 0; m < NNODE; m++)
+              S += c_w[m]*c_dpPhi[m]*sGx[ell][q][base + m*str];
+            R[q] -= sigE*c_dpPhi[idx]*S;
+          }
+        }
+      }
+    }
+
     // ── write RHS + the per-node dt bound ──────────────────────────────
     if (active) {
       for (i32 q = 0; q < 5; q++) grid.getField(D_RHS+q)[bIdx*blockSizeTot + nd] = R[q];
@@ -1251,6 +2208,1076 @@ __global__ void dgRhsKernel(DgSolver &grid, real t) {
           hmin/(fmax(lam_e, (real)1e-10)*(real)NNODE);
     }
     __syncthreads();   // shared reused next grid-stride iteration
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * GAUSS-LEGENDRE FLUX RECONSTRUCTION RHS  (--gauss)
+ * ════════════════════════════════════════════════════════════════════════
+ * Solution points are Gauss-Legendre (interior, none on the faces), so unlike
+ * the collocated-Lobatto dgRhsKernel:
+ *   - the VOLUME is the same EC flux-differencing (2 sum_m D_im f_ec), valid on
+ *     any diagonal-norm SBP operator -- on Gauss Q+Q^T = tR tR^T - tL tL^T
+ *     (generalized SBP);
+ *   - every FACE trace is an INTERPOLATION of the ENTROPY VARIABLES to +-1
+ *     (Chan JCP 2018 entropy projection), converted back to primitives -- this
+ *     is what keeps the split-form scheme discretely entropy conservative;
+ *   - the interface correction distributes to ALL nodes on the normal line via
+ *     the correction-function derivative g'(xi_i) (c_gpL/c_gpR), not to a single
+ *     boundary node.  sum_i w_i g_R' = 1 (selftest) => cell-mean conservation
+ *     for BOTH g_DG and g_HU.
+ * Subcell-FV / MOOD: the FV subcells span [-1,1] by cumulative Gauss weights, so
+ * their two OUTER faces are the element interfaces -- and the flux there is the
+ * SHARED interface flux f* (identical on both elements), NOT an extrapolated
+ * nodal flux (the Gauss nodes never reach the face).  That is what keeps the FV
+ * blend conservative across a nonconforming alpha jump ("update the fluxes to
+ * neighbours because the FV doesn't extrapolate").
+ * SCOPE (v1, uniform/conforming mesh): same-level faces, weak BC, periodic.
+ * Nonconforming coarse/fine (mortar) faces are NOT yet ported -- guarded below.
+ */
+
+// interpolate a shared entropy-variable line to a face (weights t = c_tL/c_tR)
+// and convert to primitives -- MY side's entropy-projected face trace.  NOTE
+// the Gauss faces (+-1) lie OUTSIDE the node span, so this is an extrapolation:
+// a smooth curved profile legitimately overshoots the nodal range here, so NO
+// nodal clamp is applied (clamping wrecks smooth accuracy).  Robustness at
+// shocks comes from the constant-extrapolation trace blend in dgGaussFaceFlux
+// (a troubled cell presents its nearest-node state), not from clamping.
+__device__ __forceinline__ void dgGaussMyTrace(const real (*sV)[blockSizeTot],
+    const real (*sW)[blockSizeTot], i32 dir, i32 a, i32 b, const real *tvec,
+    i32 nn, real W[5]) {
+  real v[5] = {0,0,0,0,0};
+  real rlo=(real)1e30, rhi=(real)0.0, plo=(real)1e30, phi=(real)0.0;
+  for (i32 m = 0; m < NNODE; m++) {
+    i32 nd = dgFaceNode(dir, m, a, b);
+    for (i32 q = 0; q < 5; q++) v[q] += tvec[m]*sV[q][nd];
+    rlo = fmin(rlo, sW[0][nd]); rhi = fmax(rhi, sW[0][nd]);
+    plo = fmin(plo, sW[4][nd]); phi = fmax(phi, sW[4][nd]);
+  }
+  dgEntVarsToPrim(v, W);
+  // RELATIVE-bounds fallback (near-vacuum guard): the exp inverse map is
+  // hypersensitive at rho,p ~ 1e-5 -- a tiny wiggle in the interpolated s
+  // swings the trace density by orders of magnitude (measured: the M=3 rear
+  // stall).  A trace OUTSIDE [1/2, 2]x the line's nodal range is non-physical
+  // extrapolation ring, not resolution: present the nearest node instead.
+  // Smooth extrapolation overshoot is a few % -- never triggers (vortex
+  // regression-exact); unlike a hard clamp this changes nothing else.
+  if (W[0] > (real)2.0*rhi || W[0] < (real)0.5*rlo ||
+      W[4] > (real)2.0*phi || W[4] < (real)0.5*plo) {
+    i32 nd = dgFaceNode(dir, nn, a, b);
+    for (i32 q = 0; q < 5; q++) W[q] = sW[q][nd];
+  }
+}
+
+// a NEIGHBOUR block's entropy-projected face trace: read its normal line from
+// global, cons->prim->entropy vars, project with tvec (the neighbour's face
+// facing me: tL if its -1 side, tR if its +1 side).  Bitwise identical to what
+// the neighbour computes for the shared face -> f* matches on both sides.
+__device__ __forceinline__ void dgGaussNbrTrace(DgSolver &grid, i32 nbrIdx,
+    i32 dir, i32 a, i32 b, const real *tvec, i32 nn, real W[5]) {
+  real v[5] = {0,0,0,0,0};
+  real rlo=(real)1e30, rhi=(real)0.0, plo=(real)1e30, phi=(real)0.0;
+  real Wnn[5];
+  for (i32 m = 0; m < NNODE; m++) {
+    i32 nd = dgFaceNode(dir, m, a, b);
+    real U[5], Wm[5], vm[5];
+    for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[(u64)nbrIdx*blockSizeTot + nd];
+    dgConsToPrimSane(U, Wm);
+    dgEntVars(Wm, vm);
+    for (i32 q = 0; q < 5; q++) v[q] += tvec[m]*vm[q];
+    rlo = fmin(rlo, Wm[0]); rhi = fmax(rhi, Wm[0]);
+    plo = fmin(plo, Wm[4]); phi = fmax(phi, Wm[4]);
+    if (m == nn) for (i32 q = 0; q < 5; q++) Wnn[q] = Wm[q];
+  }
+  dgEntVarsToPrim(v, W);
+  if (W[0] > (real)2.0*rhi || W[0] < (real)0.5*rlo ||
+      W[4] > (real)2.0*phi || W[4] < (real)0.5*plo) {
+    for (i32 q = 0; q < 5; q++) W[q] = Wnn[q];   // near-vacuum guard (see MyTrace)
+  }
+}
+
+// the flux-differencing volume's BOUNDARY flux, the quantity the FR correction
+// must be referenced against for EXACT conservation.  The split-form volume
+// cell-mean telescopes (generalized SBP: Q+Q^T = tR tR^T - tL tL^T) to
+//   Gbnd_R - Gbnd_L,  Gbnd_{L/R} = sum_{a,b} t_{L/R}[a] t_{L/R}[b] f_S(u_a,u_b).
+// Using ftil = Gbnd here (NOT f(projected state)) makes R_surf = -jac g'(f*-ftil)
+// conservative for BOTH g_DG and g_HU, since sum_i w_i g' = +-1.  Consistent at
+// a uniform state (Gbnd = f(u)) so free-stream is preserved exactly.
+__device__ __forceinline__ void dgGaussBndFlux(const real (*sW)[blockSizeTot],
+    i32 dir, i32 a, i32 b, bool chRa, real fL[5], real fR[5]) {
+  for (i32 q = 0; q < 5; q++) { fL[q] = (real)0.0; fR[q] = (real)0.0; }
+  for (i32 p = 0; p < NNODE; p++)
+    for (i32 r = 0; r < NNODE; r++) {
+      real Wp[5], Wr[5], F[5];
+      i32 ndp = dgFaceNode(dir, p, a, b), ndr = dgFaceNode(dir, r, a, b);
+      for (i32 q = 0; q < 5; q++) { Wp[q] = sW[q][ndp]; Wr[q] = sW[q][ndr]; }
+      dgEcFluxAxis(Wp, Wr, dir, F, chRa);
+      for (i32 q = 0; q < 5; q++) {
+        fL[q] += c_tL[p]*c_tL[r]*F[q];
+        fR[q] += c_tR[p]*c_tR[r]*F[q];
+      }
+    }
+}
+
+// gather a block's FACE TRACE ARRAYS for the Gauss mortar: at each tangential
+// node pair (c1,c2), the PRIMITIVES of the entropy-projected face trace (tvec
+// along the normal, converted per tangential node -- the same construction the
+// block itself uses, so the values are bitwise identical to its own trace) and
+// the nearest-node-plane primitives (the constant-extrapolation trace of a
+// troubled cell).  Tangential interpolation to mortar points then happens in
+// PRIMITIVES via dgTraceAt + sanitize, matching the validated Lobatto mortar:
+// interpolating ENTROPY VARIABLES tangentially ACROSS a shock front and exp-
+// mapping back amplifies the interpolation overshoot into vacuum/detonation
+// states (measured: adaptive Sod blowup t=0.01), while primitive interpolation
+// overshoot is linear and the sanitize + subcell blend contain it.
+__device__ void dgGaussGatherFace(DgSolver &grid, i32 eIdx, i32 dir,
+    const real *tvec, i32 nrm, real Vcf[5][NNODE*NNODE], real Pcf[5][NNODE*NNODE]) {
+  for (i32 c2 = 0; c2 < NNODE; c2++)
+    for (i32 c1 = 0; c1 < NNODE; c1++) {
+      real v[5] = {0,0,0,0,0};
+      real rlo=(real)1e30, rhi=(real)0.0, plo=(real)1e30, phi=(real)0.0;
+      for (i32 m = 0; m < NNODE; m++) {
+        i32 nd = dgFaceNode(dir, m, c1, c2);
+        real U[5], Wm[5], vm[5];
+        for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[(u64)eIdx*blockSizeTot + nd];
+        dgConsToPrimSane(U, Wm);
+        dgEntVars(Wm, vm);
+        for (i32 q = 0; q < 5; q++) v[q] += tvec[m]*vm[q];
+        rlo = fmin(rlo, Wm[0]); rhi = fmax(rhi, Wm[0]);
+        plo = fmin(plo, Wm[4]); phi = fmax(phi, Wm[4]);
+        if (m == nrm) for (i32 q = 0; q < 5; q++) Pcf[q][c1 + NNODE*c2] = Wm[q];
+      }
+      real Wt[5];
+      dgEntVarsToPrim(v, Wt);
+      // near-vacuum/overflow guard (same as dgGaussMyTrace): the exp inverse
+      // can blow up to inf on line data the sanitizer floors -- fall back to
+      // the nearest-node plane value for this tangential position.
+      if (!(Wt[0] < (real)2.0*rhi) || Wt[0] < (real)0.5*rlo ||
+          !(Wt[4] < (real)2.0*phi) || Wt[4] < (real)0.5*plo)
+        for (i32 q = 0; q < 5; q++) Wt[q] = Pcf[q][c1 + NNODE*c2];
+      for (i32 q = 0; q < 5; q++) Vcf[q][c1 + NNODE*c2] = Wt[q];
+    }
+}
+
+
+// ── GHOST-FREE FRIB WALL FLUX (--ibsbm 3): the FRIB image-line solve done
+//    entirely from THE ELEMENT OWNING THE WALL FACE (its degree-p polynomial
+//    + the analytic levelset), evaluated AT the face point as the ghost
+//    trace.  No ghost fill, no donor locate/march (the measured stair-streak
+//    source), no nodonor path -- and image distances are FORCED small, the
+//    memory-endorsed stable regime.  Line: wall at xi=-1 (levelset foot
+//    through the face point), dIL = 2 sgF + h so the first interior sample
+//    sits mid-element; samples = MY polynomial (tensor Lagrange on sWe,
+//    MUSCL-limited); primitive (p,rho) wall solve with centripetal dp/dn and
+//    isentropic drho/dn; piston star / LO ladder kept as TRACE choices.
+__device__ void dgIbFluxTrace(DgSolver &grid, const real (*sWe)[blockSizeTot],
+    i32 bIdx, i32 lvl, i32 ib, i32 jb, const real h[3],
+    const real xs[3], real nx, real ny, real Wg[5]) {
+  real r   = fmax(sqrt((xs[0]-grid.ibX)*(xs[0]-grid.ibX)
+                     + (xs[1]-grid.ibY)*(xs[1]-grid.ibY)), (real)1e-30);
+  real sgF = r - grid.ibR;                       // face point to wall (>0 outside)
+  real xw  = grid.ibX + grid.ibR*nx, yw = grid.ibY + grid.ibR*ny;
+  real dIL = (real)2.0*fmax(sgF, (real)0.0) + h[0];
+  real tx = -ny, ty = nx;                        // wall tangent
+  real Un[NNODE], Ut[NNODE], Wt[NNODE], Pn[NNODE], Rn[NNODE];
+  real F1[5] = {0,0,0,0,0};                      // innermost sample
+  for (i32 m = 1; m < NNODE; m++) {
+    real sm = (c_ibLXi[m] + (real)1.0)*(real)0.5*dIL;
+    real xm = xw + sm*nx, ym = yw + sm*ny;
+    real zx = (real)2.0*(xm/h[0] - ib) - (real)1.0;   // MY element coords
+    real zy = (real)2.0*(ym/h[1] - jb) - (real)1.0;   // (mild extrapolation ok)
+    real W[5] = {(real)0.0,(real)0.0,(real)0.0,(real)0.0,(real)0.0};
+    for (i32 aa = 0; aa < NNODE; aa++) {
+      real La = dgBasisAt(aa, zx);
+      for (i32 bb = 0; bb < NNODE; bb++) {
+        real w2 = La*dgBasisAt(bb, zy);
+        i32 nd = aa + bb*NNODE;                  // pseudo-2D plane (k = 0)
+        for (i32 q = 0; q < 5; q++) W[q] += w2*sWe[q][nd];
+      }
+    }
+    dgSanitizePrim(W);
+    if (m == 1) for (i32 q = 0; q < 5; q++) F1[q] = W[q];
+    Un[m] = W[1]*nx + W[2]*ny;
+    Ut[m] = W[1]*tx + W[2]*ty;
+    Wt[m] = W[3];
+    Pn[m] = W[4];
+    Rn[m] = W[0];
+  }
+  real un1 = F1[1]*nx + F1[2]*ny;
+  real a1  = sqrt(dgGam*fmax(F1[4], DG_EPSF)/fmax(F1[0], DG_EPSF));
+  real th  = grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 1];
+  bool gated = (fabs(un1) > (real)0.3*a1) || (th > grid.ibShockTheta);
+  if (gated && un1 < (real)0.0) {
+    // arriving shock: exact wall-Riemann (piston) star TRACE -- the
+    // reflection BC (a smooth transpiration trace transmits; measured -88%)
+    real rhoI = fmax(F1[0], DG_EPSF), pIr = F1[4];
+    real pI = fmax(pIr, DG_EPSF), m2 = un1*un1;
+    real A  = (real)2.0/((dgGam+(real)1.0)*rhoI);
+    real Bc = (dgGam-(real)1.0)/(dgGam+(real)1.0)*pI;
+    real bq = (real)2.0*pI + m2/A, cq = pI*pI - m2*Bc/A;
+    real ps = (real)0.5*(bq + sqrt(fmax(bq*bq - (real)4.0*cq, (real)0.0)));
+    real pCap = (pIr > (real)0.0) ? pI : (real)0.5*rhoI*m2;
+    ps = fmin(ps, (real)50.0*pCap);
+    real g = (dgGam-(real)1.0)/(dgGam+(real)1.0), pr = ps/pI;
+    real rs = rhoI*(pr + g)/(g*pr + (real)1.0);
+    real ut1 = F1[1]*tx + F1[2]*ty;
+    Wg[0] = rs; Wg[1] = ut1*tx; Wg[2] = ut1*ty; Wg[3] = F1[3]; Wg[4] = ps;
+    dgSanitizePrim(Wg);
+    return;
+  }
+  if (gated) {
+    // outflow-gated: LO trace (u_n linear in wall distance, rest copied)
+    real s1 = (c_ibLXi[1] + (real)1.0)*(real)0.5*dIL;
+    real unF = un1*(fmax(sgF, (real)0.0)/fmax(s1, DG_EPSF));
+    real ut1 = F1[1]*tx + F1[2]*ty;
+    Wg[0] = F1[0]; Wg[1] = unF*nx + ut1*tx; Wg[2] = unF*ny + ut1*ty;
+    Wg[3] = F1[3]; Wg[4] = F1[4];
+    dgSanitizePrim(Wg);
+    return;
+  }
+  // HO: primitive wall solve (Neumann: centripetal dp, isentropic drho)
+  const real *D0 = c_ibLD0;
+  real sU=0, sW2=0, sP=0, sR=0;
+  for (i32 m = 1; m < NNODE; m++) {
+    sU += D0[m]*Ut[m]; sW2 += D0[m]*Wt[m];
+    sP += D0[m]*Pn[m]; sR  += D0[m]*Rn[m];
+  }
+  Un[0] = (real)0.0;
+  real ut1c = Ut[1];
+  real gp = grid.ibCurv
+          ? (real)0.5*dIL*Rn[1]*ut1c*ut1c/fmax(grid.ibR, DG_EPSF) : (real)0.0;
+  real a2 = dgGam*fmax(Pn[1], DG_EPSF)/fmax(Rn[1], DG_EPSF);
+  Pn[0] = (gp    - sP)/D0[0];
+  Rn[0] = (gp/a2 - sR)/D0[0];
+  real dnm = D0[0] + (grid.ibCurv ? (real)0.5*dIL/grid.ibR : (real)0.0);
+  Ut[0] = -sU/dnm;
+  Wt[0] = -sW2/D0[0];
+  real xiF = fmin(fmax((real)2.0*sgF/dIL - (real)1.0, (real)-1.35), (real)1.0);
+  real un=0, ut=0, wt=0, pw=0, rw=0;
+  for (i32 m = 0; m < NNODE; m++) {
+    real ph = dgIbLineBasisAt(m, xiF);
+    un += ph*Un[m]; ut += ph*Ut[m]; wt += ph*Wt[m];
+    pw += ph*Pn[m]; rw += ph*Rn[m];
+  }
+  if (grid.ibLimit) {   // MUSCL: no new extremum beyond wall+samples
+    real lo, hi;
+    lo=Un[0]; hi=Un[0]; for (i32 m=1;m<NNODE;m++){lo=fmin(lo,Un[m]);hi=fmax(hi,Un[m]);} un=fmin(fmax(un,lo),hi);
+    lo=Ut[0]; hi=Ut[0]; for (i32 m=1;m<NNODE;m++){lo=fmin(lo,Ut[m]);hi=fmax(hi,Ut[m]);} ut=fmin(fmax(ut,lo),hi);
+    lo=Wt[0]; hi=Wt[0]; for (i32 m=1;m<NNODE;m++){lo=fmin(lo,Wt[m]);hi=fmax(hi,Wt[m]);} wt=fmin(fmax(wt,lo),hi);
+    lo=Pn[0]; hi=Pn[0]; for (i32 m=1;m<NNODE;m++){lo=fmin(lo,Pn[m]);hi=fmax(hi,Pn[m]);} pw=fmin(fmax(pw,lo),hi);
+    lo=Rn[0]; hi=Rn[0]; for (i32 m=1;m<NNODE;m++){lo=fmin(lo,Rn[m]);hi=fmax(hi,Rn[m]);} rw=fmin(fmax(rw,lo),hi);
+  }
+  if (pw > (real)1e-3*Pn[1] && rw > (real)1e-3*Rn[1]) {
+    Wg[0] = rw; Wg[1] = un*nx + ut*tx; Wg[2] = un*ny + ut*ty;
+    Wg[3] = wt; Wg[4] = pw;
+    dgSanitizePrim(Wg);
+    return;
+  }
+  // inadmissible: LO
+  {
+    real s1 = (c_ibLXi[1] + (real)1.0)*(real)0.5*dIL;
+    real unF = un1*(fmax(sgF, (real)0.0)/fmax(s1, DG_EPSF));
+    real ut1 = F1[1]*tx + F1[2]*ty;
+    Wg[0] = F1[0]; Wg[1] = unF*nx + ut1*tx; Wg[2] = unF*ny + ut1*ty;
+    Wg[3] = F1[3]; Wg[4] = F1[4];
+    dgSanitizePrim(Wg);
+  }
+}
+
+// fluid-only cell mean of an arbitrary block (GSBM cut-cell trace: solid-
+// filled nodes are excluded and the GLL weights renormalised -- the Lobatto
+// ibcut-0 "fluid nodes only" rule, applied to the Gauss traces)
+__device__ void dgGaussFluidMean(DgSolver &grid, i32 idx, i32 blvl,
+    i32 bib, i32 bjb, const real hb[3], real Wbar[5]) {
+  real acc[5] = {0,0,0,0,0}, wf = (real)0.0;
+  for (i32 nd = 0; nd < blockSizeTot; nd++) {
+    i32 ii=nd%NNODE, jj=(nd/NNODE)%NNODE, kk=nd/(NNODE*NNODE);
+    real xn = dgNodePos(hb[0], bib, ii), yn = dgNodePos(hb[1], bjb, jj);
+    real dxn = xn - grid.ibX, dyn = yn - grid.ibY;
+    if (dxn*dxn + dyn*dyn < grid.ibR*grid.ibR) continue;
+    real U[5], W[5];
+    for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[(u64)idx*blockSizeTot+nd];
+    dgConsToPrimSane(U, W);
+    real wijk = (real)0.125*c_w[ii]*c_w[jj]*c_w[kk];
+    for (i32 q = 0; q < 5; q++) acc[q] += wijk*W[q];
+    wf += wijk;
+  }
+  if (wf > (real)0.0) for (i32 q = 0; q < 5; q++) Wbar[q] = acc[q]/wf;
+  else {   // fully-solid (shouldn't be active): fall back to raw mean node 0
+    real U[5];
+    for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[(u64)idx*blockSizeTot];
+    dgConsToPrimSane(U, Wbar);
+  }
+}
+
+// resolve one face's SHARED interface flux f* for the Gauss FR surface.
+//   Wp  = MY high-order entropy-projected face trace
+//   Wnn = MY nearest-node value (CONSTANT extrapolation of the boundary subcell)
+// A TROUBLED cell (subcell-FV blend alpha>0, or MOOD-flagged) presents the
+// constant-extrapolated boundary-subcell state at the face, not the high-order
+// trace -- "the FV doesn't extrapolate".  The face state is blended
+//   Wface = (1-af) Wp + af Wnn,   af = max(alpha_me, alpha_nbr),
+// with af taken as the MAX of both sides so BOTH elements build the identical
+// blended traces and hence the identical f* (single-valued interface flux ->
+// conservative even across an alpha jump; this is "update the fluxes to the
+// neighbour").  fs = f*; WmeB returns MY blended trace (for the FR correction
+// f* - f(WmeB) and the FV boundary subcell flux).
+__device__ void dgGaussFaceFlux(DgSolver &grid,
+    const real (*sVe)[blockSizeTot], const real (*sWe)[blockSizeTot],
+    i32 bIdx, i32 lvl, i32 ib, i32 jb, i32 kb, i32 dir, i32 side, i32 a, i32 b,
+    const real Wp[5], const real Wnn[5], const real h[3], real t,
+    real fs[5], real WmeB[5]) {
+  const i32 faceSlot[3][2] = {{12,14},{10,16},{4,22}};
+  const real aOwn  = grid.subFv ? grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 6] : (real)0.0;
+  const real nuOwn = grid.avOn  ? grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot] : (real)0.0;
+
+  i32 nib = ib + ((dir==0) ? (side ? 1 : -1) : 0);
+  i32 njb = jb + ((dir==1) ? (side ? 1 : -1) : 0);
+  i32 nkb = kb + ((dir==2) ? (side ? 1 : -1) : 0);
+  i32 nSame = grid.nbrIdxList[27*bIdx + faceSlot[dir][side]];
+  const real *tNbr = side ? c_tL : c_tR;   // neighbour's facing side: my +side -> its -1 -> tL
+  const i32 nnNbr = side ? 0 : (NNODE-1);  // neighbour's nearest node to the shared face
+
+  if (nSame == bEmpty && grid.isExteriorBlock(lvl, nib, njb, nkb)) {
+    if (grid.bcType == 2) {
+      grid.wrapBlockPeriodic(lvl, nib, njb, nkb);
+      nSame = grid.getBlockIdx(grid.encode(lvl, nib, njb, nkb));
+    } else {
+      // weak BC: no neighbour alpha -- blend by my own alpha, ghost from Wface
+      real af = (grid.rusFace == 1) ? (real)1.0 : aOwn;
+      for (i32 q = 0; q < 5; q++) WmeB[q] = ((real)1.0-af)*Wp[q] + af*Wnn[q];
+      real xs[3];
+      xs[dir] = (ib*(dir==0)+jb*(dir==1)+kb*(dir==2) + (side ? 1 : 0)) * h[dir];
+      i32 t1ax = (dir==0) ? 1 : 0, t2ax = (dir==2) ? 1 : 2;
+      i32 t1bb = (dir==0) ? jb : ib, t2bb = (dir==2) ? jb : kb;
+      xs[t1ax] = dgNodePos(h[t1ax], t1bb, a);
+      xs[t2ax] = dgNodePos(h[t2ax], t2bb, b);
+      real Wg[5];
+      dgBcState(grid, WmeB, dir, side, xs[0], xs[1], t, Wg);
+      if (side) dgIfaceFlux(grid, WmeB, Wg, dir, af, fs);
+      else      dgIfaceFlux(grid, Wg, WmeB, dir, af, fs);
+      if (grid.avOn) {
+        real sig = side ? dgPenaltySigma(grid, nuOwn, nuOwn, WmeB, Wg)
+                        : dgPenaltySigma(grid, nuOwn, nuOwn, Wg, WmeB);
+        if (side) dgJumpPenalty(WmeB, Wg, sig, fs);
+        else      dgJumpPenalty(Wg, WmeB, sig, fs);
+      }
+      if (grid.dpSbp > (real)0.0 && grid.dpFace > (real)0.0) {
+        if (side) dgDpJumpPenalty(grid, bIdx, -1, WmeB, Wg, dir, fs);
+        else      dgDpJumpPenalty(grid, bIdx, -1, Wg, WmeB, dir, fs);
+      }
+      return;
+    }
+  }
+
+  // ── SBM surrogate wall on GAUSS points (port of the dgFaceLift branch) ────
+  // This face abuts an INACTIVE (cut/solid) element: no ghost data is read --
+  // the wall is a pure star-pressure flux built from MY OWN limited trace.
+  // Ghost-free by construction, so there is no reconstruction contract for the
+  // Gauss extrapolation to break (the FRIB slam ladder's failure).  The trace
+  // is the entropy-projected Wp, Zhang-Shu-limited toward the FLUID-ONLY cell
+  // mean (solid nodes of --ibcut 0 cut cells carry non-physical fill data).
+  if (grid.ibSbm && !(grid.pseudo2D && dir == 2)) {
+    i32 nCls = -1;
+    if (nSame != bEmpty) nCls = grid.ibClassList[nSame];
+    else if (lvl > 0) {
+      i32 cI = grid.getBlockIdx(grid.encode(lvl-1, nib>>1, njb>>1,
+                                            grid.pseudo2D ? nkb : (nkb>>1)));
+      if (cI != bEmpty) nCls = grid.ibClassList[cI];
+    }
+    bool wallFace = (nCls != -1) && (nCls != IB_FLUID);
+    if (wallFace) {
+      real xs[3];
+      xs[dir]  = (ib*(dir==0)+jb*(dir==1)+kb*(dir==2) + (side ? 1 : 0)) * h[dir];
+      i32 t1ax = (dir==0) ? 1 : 0, t2ax = (dir==2) ? 1 : 2;
+      i32 t1bb = (dir==0) ? jb : ib, t2bb = (dir==2) ? jb : kb;
+      xs[t1ax] = dgNodePos(h[t1ax], t1bb, a);
+      xs[t2ax] = dgNodePos(h[t2ax], t2bb, b);
+      real cxr = xs[0] - grid.ibX, cyr = xs[1] - grid.ibY;
+      real rr  = fmax(sqrt(cxr*cxr + cyr*cyr), (real)1e-30);
+      real nx  = cxr/rr, ny = cyr/rr;               // true outward wall normal
+      // fluid-only cell mean (skip solid nodes r < R)
+      real Wbar[5] = {(real)0.0,(real)0.0,(real)0.0,(real)0.0,(real)0.0};
+      real wf = (real)0.0;
+      for (i32 nd = 0; nd < blockSizeTot; nd++) {
+        i32 ii=nd%NNODE, jj=(nd/NNODE)%NNODE, kk=nd/(NNODE*NNODE);
+        real xn = dgNodePos(h[0], ib, ii), yn = dgNodePos(h[1], jb, jj);
+        real dxn = xn - grid.ibX, dyn = yn - grid.ibY;
+        if (dxn*dxn + dyn*dyn < grid.ibR*grid.ibR) continue;
+        real wijk = (real)0.125*c_w[ii]*c_w[jj]*c_w[kk];
+        for (i32 q = 0; q < 5; q++) Wbar[q] += wijk*sWe[q][nd];
+        wf += wijk;
+      }
+      if (wf > (real)0.0) { for (i32 q = 0; q < 5; q++) Wbar[q] /= wf; }
+      else                { for (i32 q = 0; q < 5; q++) Wbar[q] = Wp[q]; }
+      // face state: my projected trace, or the fluid mean if the face point
+      // itself is inside the solid; Zhang-Shu-limit toward the fluid mean
+      real rf2 = (xs[0]-grid.ibX)*(xs[0]-grid.ibX) + (xs[1]-grid.ibY)*(xs[1]-grid.ibY);
+      real Wface[5];
+      // nearest-node, NOT the projection: a --ibcut 0 cut cell's projected
+      // trace extrapolates THROUGH its solid-filled nodes (rest-gate amplifier)
+      if (rf2 < grid.ibR*grid.ibR) { for (i32 q=0;q<5;q++) Wface[q] = Wbar[q]; }
+      else                         { for (i32 q=0;q<5;q++) Wface[q] = Wnn[q]; }
+      real th = (real)1.0;
+      real fr0 = (real)0.2*Wbar[0], fr4 = (real)0.2*Wbar[4];
+      if (Wface[0] < fr0) th = fmin(th, (Wbar[0]-fr0)/fmax(Wbar[0]-Wface[0], DG_EPSF));
+      if (Wface[4] < fr4) th = fmin(th, (Wbar[4]-fr4)/fmax(Wbar[4]-Wface[4], DG_EPSF));
+      th = fmax(th, (real)0.0);
+      real Wl[5];
+      for (i32 q = 0; q < 5; q++) Wl[q] = Wbar[q] + th*(Wface[q]-Wbar[q]);
+      if (grid.ibSbm == 3) {
+        // ghost-free FRIB wall flux: the image-line trace from MY polynomial
+        real WgF[5];
+        dgIbFluxTrace(grid, sWe, bIdx, lvl, ib, jb, h, xs, nx, ny, WgF);
+        real fsw3[5];
+        if (side) dgIfaceFlux(grid, Wl, WgF, dir, aOwn, fsw3);
+        else      dgIfaceFlux(grid, WgF, Wl, dir, aOwn, fsw3);
+        for (i32 q = 0; q < 5; q++) { fs[q] = fsw3[q]; WmeB[q] = Wp[q]; }
+        return;
+      }
+      // GAUSS wall flux: axis-mirror HLLC, NOT the Lobatto pure-pressure flux.
+      // fs = p*.e_dir has ZERO dissipation in the mass/tangential/energy rows;
+      // Lobatto tolerates that because the correction is confined to the face
+      // node by the 1/w0 lift, but on Gauss the g'-distributed correction
+      // feeds interior nodes and the undamped reflection loop has gain > 1
+      // (measured: rest gate 0.13-0.64 across every stabilizer combo).  The
+      // mirror HLLC keeps the exact zero dir-mass-flux AND upwinds every row.
+      real Wg[5] = { Wl[0], Wl[1], Wl[2], Wl[3], Wl[4] };
+      Wg[1+dir] = -Wg[1+dir];
+      // curvature (centripetal) pressure shift: the ghost presents the TRUE-
+      // WALL pressure p_w = p - rho u_t^2/R * (r - R) (normal momentum balance
+      // dp/dn = rho u_t^2/R integrated over THIS point's own distance).  u_t
+      // from the limited trace; u_t = 0 at rest/stagnation -> exact no-op
+      // there (never touches the nose standoff, per the Lobatto law).
+      if (grid.ibSbmCurv > (real)0.0) {
+        real unT = Wl[1]*nx + Wl[2]*ny;
+        real q2t = Wl[1]*Wl[1] + Wl[2]*Wl[2] + Wl[3]*Wl[3];
+        real ut2 = fmax(q2t - unT*unT, (real)0.0);
+        real dpw = grid.ibSbmCurv * Wl[0] * ut2 / fmax(grid.ibR, DG_EPSF)
+                 * fmax(rr - grid.ibR, (real)0.0);
+        Wg[4] = fmax(Wg[4] - dpw, (real)1e-3*Wl[4]);   // floor: never vacuum ghost
+      } else if (grid.ibSbmCurv < (real)0.0) {
+        // A/B variant: TAYLOR-gradient pressure shift p_w = p - (r-R)(n~.grad p)
+        // from the sampled element gradient (vs the centripetal closure above)
+        const i32 nrmB = side ? (NNODE-1) : 0;
+        real dP=0, t1P=0;
+        for (i32 m = 0; m < NNODE; m++) {
+          dP  += c_D[nrmB][m]*sWe[4][dgFaceNode(dir, m, a, b)];
+          t1P += c_D[a][m]  *sWe[4][dgFaceNode(dir, nrmB, m, b)];
+        }
+        i32 t1x = (dir==0) ? 1 : 0;
+        real gpx = (dir==0) ? ((real)2.0/h[0])*dP  : ((real)2.0/h[t1x])*t1P;
+        real gpy = (dir==0) ? ((real)2.0/h[t1x])*t1P : ((real)2.0/h[1])*dP;
+        real dpw = -grid.ibSbmCurv * (rr - grid.ibR) * (gpx*nx + gpy*ny);
+        Wg[4] = fmax(Wg[4] - dpw, (real)1e-3*Wl[4]);
+      }
+      if (grid.ibSbmCurv != (real)0.0) {   // limit BOTH pressure variants to the
+        real pLo=(real)1e30, pHi=(real)-1e30;          // line's nodal range
+        for (i32 m = 0; m < NNODE; m++) {
+          i32 nA = dgFaceNode(dir, m, a, b);
+          pLo = fmin(pLo, sWe[4][nA]); pHi = fmax(pHi, sWe[4][nA]);
+        }
+        Wg[4] = fmin(fmax(Wg[4], fmax((real)0.5*pLo, (real)1e-3*Wl[4])), pHi);
+      }
+      real fsw[5];
+      if (side) dgIfaceFlux(grid, Wl, Wg, dir, aOwn, fsw);
+      else      dgIfaceFlux(grid, Wg, Wl, dir, aOwn, fsw);
+      // ── the SHIFT (what makes this SBM rather than a staircase wall):
+      // enforce u.n~ = 0 AT THE TRUE WALL, Taylor-shifted to the surrogate
+      // face: u_n,true ~ (u + (d.grad)u).n~ with d = -(r-R) n~ (inward).
+      // Imposed as a Nitsche-type JUMP PENALTY against the n~-shifted-mirror
+      // state: its mass row is IDENTICALLY zero (same rho), so the axis-face
+      // mass consistency that a hard n~-mirror violates (the measured Lobatto
+      // leak/blowup) is preserved, and the base mirror-HLLC keeps its exact
+      // zero dir-mass-flux and upwind dissipation.  At the nose (n~ ~ e_dir)
+      // the base flux already enforces it and the penalty is ~0; at OBLIQUE
+      // shoulder faces it supplies the true-normal condition the staircase
+      // misses -- the standoff/bluntness driver.  u = 0 => exact no-op (rest
+      // gate untouched).
+      if (grid.ibSbmPen > (real)0.0) {
+        // element velocity gradients at this face node's line (as ibSbm==2)
+        real gcU[3] = {0,0,0}, gcV[3] = {0,0,0};
+        const i32 nrmA = side ? (NNODE-1) : 0;
+        {
+          real dU=0,t1U=0,t2U=0, dV=0,t1V=0,t2V=0;
+          for (i32 m = 0; m < NNODE; m++) {
+            i32 nA=dgFaceNode(dir,m,a,b), nB=dgFaceNode(dir,nrmA,m,b), nC=dgFaceNode(dir,nrmA,a,m);
+            dU+=c_D[nrmA][m]*sWe[1][nA]; t1U+=c_D[a][m]*sWe[1][nB]; t2U+=c_D[b][m]*sWe[1][nC];
+            dV+=c_D[nrmA][m]*sWe[2][nA]; t1V+=c_D[a][m]*sWe[2][nB]; t2V+=c_D[b][m]*sWe[2][nC];
+          }
+          i32 t1x = (dir==0) ? 1 : 0, t2x = (dir==2) ? 1 : 2;
+          gcU[dir]=((real)2.0/h[dir])*dU; gcU[t1x]=((real)2.0/h[t1x])*t1U; gcU[t2x]=((real)2.0/h[t2x])*t2U;
+          gcV[dir]=((real)2.0/h[dir])*dV; gcV[t1x]=((real)2.0/h[t1x])*t1V; gcV[t2x]=((real)2.0/h[t2x])*t2V;
+        }
+        real dseg = grid.ibR - rr;                     // inward to the true wall
+        real uS = Wl[1] + (gcU[0]*nx + gcU[1]*ny)*dseg;
+        real vS = Wl[2] + (gcV[0]*nx + gcV[1]*ny)*dseg;
+        if (grid.ibShift2) {
+          // 2nd-order Taylor: + 1/2 dseg^2 (n~.grad)^2 u from the element
+          // polynomial's Hessian at this face node (A/B vs the measured FRIB
+          // noise-amplification lesson).
+          const i32 t1x = (dir==0) ? 1 : 0;
+          real ndir = (dir==0) ? nx : ny;             // n~ along the face axis
+          real ntan = (dir==0) ? ny : nx;             // n~ along t1
+          real jn = (real)2.0/h[dir], jt = (real)2.0/h[t1x];
+          real Hnn_u=0, Htt_u=0, Hnt_u=0, Hnn_v=0, Htt_v=0, Hnt_v=0;
+          for (i32 m = 0; m < NNODE; m++) {
+            real d2n = 0, d2t = 0;                    // D^2 rows via nested D
+            for (i32 l = 0; l < NNODE; l++) {
+              d2n += c_D[nrmA][l]*c_D[l][m];
+              d2t += c_D[a][l]*c_D[l][m];
+            }
+            i32 nA = dgFaceNode(dir, m, a, b);        // normal line
+            i32 nB = dgFaceNode(dir, nrmA, m, b);     // t1 line
+            Hnn_u += d2n*sWe[1][nA]; Htt_u += d2t*sWe[1][nB];
+            Hnn_v += d2n*sWe[2][nA]; Htt_v += d2t*sWe[2][nB];
+            for (i32 l = 0; l < NNODE; l++) {         // cross term
+              i32 nC = dgFaceNode(dir, l, m, b);
+              Hnt_u += c_D[nrmA][l]*c_D[a][m]*sWe[1][nC];
+              Hnt_v += c_D[nrmA][l]*c_D[a][m]*sWe[2][nC];
+            }
+          }
+          real d2u = ndir*ndir*jn*jn*Hnn_u + (real)2.0*ndir*ntan*jn*jt*Hnt_u
+                   + ntan*ntan*jt*jt*Htt_u;
+          real d2v = ndir*ndir*jn*jn*Hnn_v + (real)2.0*ndir*ntan*jn*jt*Hnt_v
+                   + ntan*ntan*jt*jt*Htt_v;
+          uS += (real)0.5*dseg*dseg*d2u;
+          vS += (real)0.5*dseg*dseg*d2v;
+        }
+        // MUSCL-style limiter on the SHIFT (the FRIB --iblimit rule): the
+        // wall-extrapolated velocity may not create a NEW extremum beyond the
+        // normal line's nodal range -- 2nd-order/gradient noise gets clipped
+        // instead of detonating, while in-range corrections pass untouched.
+        {
+          real uLo=(real)1e30,uHi=(real)-1e30,vLo=(real)1e30,vHi=(real)-1e30;
+          for (i32 m = 0; m < NNODE; m++) {
+            i32 nA = dgFaceNode(dir, m, a, b);
+            uLo=fmin(uLo,sWe[1][nA]); uHi=fmax(uHi,sWe[1][nA]);
+            vLo=fmin(vLo,sWe[2][nA]); vHi=fmax(vHi,sWe[2][nA]);
+          }
+          uS = fmin(fmax(uS, uLo), uHi);
+          vS = fmin(fmax(vS, vLo), vHi);
+        }
+        real unS = uS*nx + vS*ny;                      // shifted true-normal velocity
+        real WgN[5] = { Wl[0], Wl[1] - (real)2.0*unS*nx,
+                               Wl[2] - (real)2.0*unS*ny, Wl[3], Wl[4] };
+        real lamW = fabs(Wl[1]) + fabs(Wl[2]) + fabs(Wl[3])
+                  + dgSoundSpeed(Wl[4], Wl[0]);
+        real sig = grid.ibSbmPen * (real)0.5 * lamW;
+        if (side) dgJumpPenalty(Wl, WgN, sig, fsw);    // mass row exactly 0
+        else      dgJumpPenalty(WgN, Wl, sig, fsw);
+      }
+      for (i32 q = 0; q < 5; q++) { fs[q] = fsw[q]; WmeB[q] = Wp[q]; }
+      return;
+    }
+  }
+
+  if (nSame != bEmpty) {
+    real Wnp[5], Wnnn[5];                 // neighbour projected + nearest-node
+    { i32 ndn = dgFaceNode(dir, nnNbr, a, b); real U[5];
+      for (i32 q=0;q<5;q++) U[q]=grid.getField(D_RHO+q)[(u64)nSame*blockSizeTot+ndn];
+      dgConsToPrimSane(U, Wnnn); }
+    // SBM cut cells (class IB_FLUID but phiMin < 0): entropy-projected traces
+    // extrapolate through their solid-filled nodes -- present nearest-node
+    // instead (both sides symmetric: each side applies the same rule to its
+    // own data, so the shared f* stays single-valued).
+    real WpEff[5], WnnEff[5];
+    for (i32 q = 0; q < 5; q++) { WpEff[q] = Wp[q]; WnnEff[q] = Wnn[q]; }
+    bool nbrCutNN = false;
+    if (grid.ibSbm) {
+      real pmn, pmx;
+      dgIbPhiRangeBox(grid, ib*h[0], (ib+1)*h[0], jb*h[1], (jb+1)*h[1], pmn, pmx);
+      if (pmn < (real)0.0)
+        for (i32 q = 0; q < 5; q++) WpEff[q] = Wnn[q];   // cut: nearest-node trace
+      real x0 = nib*h[0], y0 = njb*h[1];
+      dgIbPhiRangeBox(grid, x0, x0+h[0], y0, y0+h[1], pmn, pmx);
+      nbrCutNN = (pmn < (real)0.0);
+    }
+    // --ibevolve: an IB_CUT element COMPUTES its own face fluxes (unlike a
+    // pure ghost), so any face touching a cut element must see the IDENTICAL
+    // state pair from both sides or f* stops being single-valued
+    // (conservation).  Rule: either side IB_CUT -> BOTH states nearest-node
+    // (the entropy-projected extrapolation through mixed evolved/filled cut
+    // nodes is exactly the trace the slam fix distrusts anyway).
+    if (grid.ibEvolve && (grid.ibClassList[bIdx] == IB_CUT ||
+                          grid.ibClassList[nSame] == IB_CUT)) {
+      for (i32 q = 0; q < 5; q++) WpEff[q] = Wnn[q];
+      nbrCutNN = true;
+    }
+    if (grid.ibOn && grid.ibClassList[nSame] != IB_FLUID) {
+      // IB GHOST neighbour: present its NEAREST-NODE state as the trace.  The
+      // FRIB fill constructs the wall state the face Riemann must see; on
+      // Lobatto the boundary node IS that state, but the entropy-projected
+      // extrapolation through a ghost's interior Gauss nodes re-rings the
+      // piston/star data at the impulsive start (measured: M=3 iter-2
+      // detonation).  Constant extrapolation costs O(0.1h) wall offset and
+      // keeps the contract.
+      for (i32 q = 0; q < 5; q++) Wnp[q] = Wnnn[q];
+    } else if (nbrCutNN) {
+      for (i32 q = 0; q < 5; q++) Wnp[q] = Wnnn[q];
+    } else
+    dgGaussNbrTrace(grid, nSame, dir, a, b, tNbr, nnNbr, Wnp);
+    real aN = grid.subFv ? grid.getField(D_SCRATCH)[(u64)nSame*blockSizeTot + 6] : (real)0.0;
+    real af = fmax(aOwn, aN);                    // symmetric -> identical on both sides
+    real WnB[5];
+    for (i32 q = 0; q < 5; q++) {
+      WmeB[q] = ((real)1.0-af)*WpEff[q] + af*WnnEff[q];
+      WnB[q]  = ((real)1.0-af)*Wnp[q]   + af*Wnnn[q];
+    }
+    real afFl = (grid.rusFace == 1) ? (real)1.0 : af;   // troubled -> Rusanov interface flux
+    if (side) dgIfaceFlux(grid, WmeB, WnB, dir, afFl, fs);
+    else      dgIfaceFlux(grid, WnB, WmeB, dir, afFl, fs);
+    if (grid.avOn) {
+      real nuN = grid.getField(D_SCRATCH)[(u64)nSame*blockSizeTot];
+      real sig = side ? dgPenaltySigma(grid, nuOwn, nuN, WmeB, WnB)
+                      : dgPenaltySigma(grid, nuOwn, nuN, WnB, WmeB);
+      if (side) dgJumpPenalty(WmeB, WnB, sig, fs);
+      else      dgJumpPenalty(WnB, WmeB, sig, fs);
+    }
+    if (grid.dpSbp > (real)0.0 && grid.dpFace > (real)0.0) {
+        if (side) dgDpJumpPenalty(grid, bIdx, nSame, WmeB, WnB, dir, fs);
+        else      dgDpJumpPenalty(grid, bIdx, nSame, WnB, WmeB, dir, fs);
+      }
+    return;
+  }
+
+  // ── nonconforming 2:1 faces (Gauss mortar) ──────────────────────────────
+  // Same protocol as the Lobatto dgFaceLift mortar, with the face traces built
+  // by ENTROPY-VARIABLE normal extrapolation first: the coarse side's trace at
+  // a fine point is the tangential c_I interpolation of its entropy face array
+  // (identical on both sides -> pointwise f* matches bitwise); the coarse face
+  // flux is the exact-L2 c_R projection of the pointwise mortar fluxes (mean-
+  // adjoint identity holds on the Gauss weights -> discretely conservative).
+  // Troubled-cell constant extrapolation rides along: each side's nearest-node
+  // -plane array is tangentially interpolated the same way and blended by
+  // af = max(alpha_coarse, alpha_fine) -- symmetric, single-valued f*.
+  const i32 t1b = (dir==0) ? njb : nib;
+  const i32 t2b = (dir==2) ? njb : nkb;
+  const bool zIdent = (grid.pseudo2D != 0) && (dir != 2);
+  const real *tvecMe = side ? c_tR : c_tL;    // MY trace projection toward this face
+  const i32  nnMe    = side ? (NNODE-1) : 0;  // my nearest-node plane
+
+  // ── coarser neighbour: I am the fine side ────────────────────────────────
+  i32 cIdxN = (lvl > 0) ? grid.getBlockIdx(grid.encode(lvl-1, nib>>1, njb>>1,
+                                           grid.pseudo2D ? nkb : (nkb>>1)))
+                        : bEmpty;
+  if (cIdxN != bEmpty) {
+    const i32 s1 = t1b & 1;
+    const i32 s2 = zIdent ? 0 : (t2b & 1);
+    real Vcf[5][NNODE*NNODE], Pcf[5][NNODE*NNODE];
+    dgGaussGatherFace(grid, cIdxN, dir, tNbr, nnNbr, Vcf, Pcf);
+    real WcH[5], WcN[5];
+    dgTraceAt(Vcf, s1, s2, a, b, zIdent, WcH);   // primitive tangential interp
+    dgSanitizePrim(WcH);                         // (can overshoot at shocks)
+    dgTraceAt(Pcf, s1, s2, a, b, zIdent, WcN);
+    dgSanitizePrim(WcN);
+    real aN = grid.subFv ? grid.getField(D_SCRATCH)[(u64)cIdxN*blockSizeTot + 6] : (real)0.0;
+    real af = fmax(aOwn, aN);
+    real Wc[5];
+    for (i32 q = 0; q < 5; q++) {
+      WmeB[q] = ((real)1.0-af)*Wp[q]  + af*Wnn[q];
+      Wc[q]   = ((real)1.0-af)*WcH[q] + af*WcN[q];
+    }
+    real afFl = (grid.rusFace == 1) ? (real)1.0 : af;
+    if (side) dgIfaceFlux(grid, WmeB, Wc, dir, afFl, fs);
+    else      dgIfaceFlux(grid, Wc, WmeB, dir, afFl, fs);
+    if (grid.avOn) {
+      real nuN = grid.getField(D_SCRATCH)[(u64)cIdxN*blockSizeTot];
+      real sig = side ? dgPenaltySigma(grid, nuOwn, nuN, WmeB, Wc)
+                      : dgPenaltySigma(grid, nuOwn, nuN, Wc, WmeB);
+      if (side) dgJumpPenalty(WmeB, Wc, sig, fs);
+      else      dgJumpPenalty(Wc, WmeB, sig, fs);
+    }
+    if (grid.dpSbp > (real)0.0 && grid.dpFace > (real)0.0) {
+        if (side) dgDpJumpPenalty(grid, bIdx, cIdxN, WmeB, Wc, dir, fs);
+        else      dgDpJumpPenalty(grid, bIdx, cIdxN, Wc, WmeB, dir, fs);
+      }
+    return;
+  }
+
+  // ── finer neighbours: I am the coarse (mortar) side ──────────────────────
+  {
+    // my own face arrays from shared -- the SAME construction the fine sides
+    // gather from global (dgConsToPrimSane -> dgEntVars -> tvec), so the
+    // pointwise traces match bitwise.
+    real Vcf[5][NNODE*NNODE], Pcf[5][NNODE*NNODE];
+    for (i32 c2 = 0; c2 < NNODE; c2++)
+      for (i32 c1 = 0; c1 < NNODE; c1++) {
+        real v[5] = {0,0,0,0,0};
+        for (i32 m = 0; m < NNODE; m++) {
+          i32 nd = dgFaceNode(dir, m, c1, c2);
+          for (i32 q = 0; q < 5; q++) v[q] += tvecMe[m]*sVe[q][nd];
+        }
+        real Wt[5];
+        dgEntVarsToPrim(v, Wt);                  // prim face trace (as the gather)
+        i32 ndn = dgFaceNode(dir, nnMe, c1, c2);
+        real rlo=(real)1e30, rhi=(real)0.0, plo=(real)1e30, phi=(real)0.0;
+        for (i32 m = 0; m < NNODE; m++) {
+          i32 nd = dgFaceNode(dir, m, c1, c2);
+          rlo=fmin(rlo,sWe[0][nd]); rhi=fmax(rhi,sWe[0][nd]);
+          plo=fmin(plo,sWe[4][nd]); phi=fmax(phi,sWe[4][nd]);
+        }
+        if (!(Wt[0] < (real)2.0*rhi) || Wt[0] < (real)0.5*rlo ||
+            !(Wt[4] < (real)2.0*phi) || Wt[4] < (real)0.5*plo)
+          for (i32 q = 0; q < 5; q++) Wt[q] = sWe[q][ndn];   // overflow guard
+        for (i32 q = 0; q < 5; q++) {
+          Vcf[q][c1 + NNODE*c2] = Wt[q];
+          Pcf[q][c1 + NNODE*c2] = sWe[q][ndn];
+        }
+      }
+
+    real Fs[5] = {0,0,0,0,0};
+    const i32 s2max = zIdent ? 1 : 2;
+    for (i32 s2 = 0; s2 < s2max; s2++)
+      for (i32 s1 = 0; s1 < 2; s1++) {
+        i32 cib, cjb, ckb;
+        if (dir == 0)      { cib = 2*nib + (side ? 0 : 1); cjb = 2*t1b + s1;
+                             ckb = grid.pseudo2D ? nkb : 2*t2b + s2; }
+        else if (dir == 1) { cjb = 2*njb + (side ? 0 : 1); cib = 2*t1b + s1;
+                             ckb = grid.pseudo2D ? nkb : 2*t2b + s2; }
+        else               { ckb = 2*nkb + (side ? 0 : 1); cib = 2*t1b + s1;
+                             cjb = 2*t2b + s2; }
+        i32 fIdx = grid.getBlockIdx(grid.encode(lvl+1, cib, cjb, ckb));
+        if (fIdx == bEmpty) continue;   // grading guarantees existence; guard anyway
+
+        real aF = grid.subFv ? grid.getField(D_SCRATCH)[(u64)fIdx*blockSizeTot + 6] : (real)0.0;
+        real af = fmax(aOwn, aF);
+        real afFl = (grid.rusFace == 1) ? (real)1.0 : af;
+        real nuF = grid.avOn ? grid.getField(D_SCRATCH)[(u64)fIdx*blockSizeTot] : (real)0.0;
+
+        for (i32 fb = (zIdent ? b : 0); fb < (zIdent ? b+1 : NNODE); fb++) {
+          real wtB = zIdent ? (real)1.0 : c_R[s2][b][fb];
+          for (i32 fa = 0; fa < NNODE; fa++) {
+            // my trace at the fine point (H-O + nearest-node, blended)
+            real ToH[5], ToN[5], To[5];
+            dgTraceAt(Vcf, s1, s2, fa, fb, zIdent, ToH);
+            dgSanitizePrim(ToH);
+            dgTraceAt(Pcf, s1, s2, fa, fb, zIdent, ToN);
+            dgSanitizePrim(ToN);
+            // the fine element's own face trace (H-O projected + nearest node)
+            real WfH[5], WfN[5], Wf[5];
+            dgGaussNbrTrace(grid, fIdx, dir, fa, fb, tNbr, nnNbr, WfH);
+            { i32 ndn = dgFaceNode(dir, nnNbr, fa, fb); real U[5];
+              for (i32 q=0;q<5;q++) U[q]=grid.getField(D_RHO+q)[(u64)fIdx*blockSizeTot+ndn];
+              dgConsToPrimSane(U, WfN); }
+            for (i32 q = 0; q < 5; q++) {
+              To[q] = ((real)1.0-af)*ToH[q] + af*ToN[q];
+              Wf[q] = ((real)1.0-af)*WfH[q] + af*WfN[q];
+            }
+            real fsp[5];
+            if (side) dgIfaceFlux(grid, To, Wf, dir, afFl, fsp);
+            else      dgIfaceFlux(grid, Wf, To, dir, afFl, fsp);
+            if (grid.avOn) {
+              real sig = side ? dgPenaltySigma(grid, nuOwn, nuF, To, Wf)
+                              : dgPenaltySigma(grid, nuOwn, nuF, Wf, To);
+              if (side) dgJumpPenalty(To, Wf, sig, fsp);
+              else      dgJumpPenalty(Wf, To, sig, fsp);
+            }
+            if (grid.dpSbp > (real)0.0 && grid.dpFace > (real)0.0) {
+              if (side) dgDpJumpPenalty(grid, bIdx, fIdx, To, Wf, dir, fsp);
+              else      dgDpJumpPenalty(grid, bIdx, fIdx, Wf, To, dir, fsp);
+            }
+            if (grid.dbgChecks >= 3) {
+              bool bad = false;
+              for (i32 q = 0; q < 5; q++) bad = bad || !isfinite(fsp[q]);
+              if (bad && atomicCAS(grid.nanCnt, 0, 2) == 0)
+                printf("[nanprobe-mortar] dir %d side %d sub(%d,%d) fp(%d,%d) "
+                       "To=%.3e,%.3e,%.3e,%.3e,%.3e Wf=%.3e,%.3e,%.3e,%.3e,%.3e af=%.2f\n",
+                       dir, side, s1, s2, fa, fb,
+                       (double)To[0],(double)To[1],(double)To[2],(double)To[3],(double)To[4],
+                       (double)Wf[0],(double)Wf[1],(double)Wf[2],(double)Wf[3],(double)Wf[4],
+                       (double)af);
+            }
+            real coef = c_R[s1][a][fa] * wtB;
+            for (i32 q = 0; q < 5; q++) Fs[q] += coef*fsp[q];
+          }
+        }
+      }
+    for (i32 q = 0; q < 5; q++) { fs[q] = Fs[q]; WmeB[q] = Wp[q]; }
+  }
+}
+
+__global__ void dgRhsGaussKernel(DgSolver &grid, real t) {
+  __shared__ real sW  [DG_EPB][5][blockSizeTot];   // sanitized primitives
+  __shared__ real sV  [DG_EPB][5][blockSizeTot];   // entropy variables (face projection)
+  __shared__ real sLam[DG_EPB][blockSizeTot];      // per-node wave speed (dt reduce)
+
+  const i32 ell = threadIdx.x / blockSizeTot;
+  const i32 nd  = threadIdx.x % blockSizeTot;
+  const i32 i = nd % NNODE, j = (nd/NNODE) % NNODE, k = nd/(NNODE*NNODE);
+
+  for (i32 base = blockIdx.x*DG_EPB; base < grid.hashTable.nKeys; base += gridDim.x*DG_EPB) {
+    const i32 bIdx = base + ell;
+    u64 loc = (bIdx < grid.hashTable.nKeys) ? grid.bLocList[bIdx] : kEmpty;
+    const bool active = (loc != kEmpty) && dgIbLive(grid, bIdx);
+    i32 lvl = 0, ib = 0, jb = 0, kb = 0;
+    if (active) grid.decode(loc, lvl, ib, jb, kb);
+    real h[3] = {1,1,1};
+    if (active) dgElemSize(grid, lvl, h);
+    const real jacx = (real)2.0/h[0], jacy = (real)2.0/h[1], jacz = (real)2.0/h[2];
+
+    // ── phase 1: load, sanitize, primitives + entropy variables -> shared ──
+    if (active) {
+      real U[5], W[5], v[5];
+      for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[bIdx*blockSizeTot + nd];
+      dgConsToPrimSane(U, W);
+      dgEntVars(W, v);
+      for (i32 q = 0; q < 5; q++) { sW[ell][q][nd] = W[q]; sV[ell][q][nd] = v[q]; }
+    }
+    __syncthreads();
+
+    real R[5] = {0,0,0,0,0};
+    real lamNode = 0.0;
+
+    // first-NaN probe (--debug 3): phase-tagged, first-wins, prints once.
+    // 0 = state entering the RHS, 1 = volume+DP, 2/3/4 = x/y/z faces (+FV),
+    // 5 = bulk, 6 = NSFR filter.
+    #define DG_NANPROBE(PH) do { \
+      if (grid.dbgChecks >= 3 && active) { \
+        bool bad = false; \
+        for (i32 q = 0; q < 5; q++) bad = bad || !isfinite(R[q]); \
+        if (bad && atomicCAS(grid.nanCnt, 0, 1) == 0) { \
+          i32 lvv, ibb, jbb, kbb; grid.decode(grid.bLocList[bIdx], lvv, ibb, jbb, kbb); \
+          printf("[nanprobe] iter %d phase %d lvl %d elem(%d,%d) node %d " \
+                 "R=%.3e,%.3e,%.3e,%.3e,%.3e U=%.3e,%.3e,%.3e,%.3e,%.3e\n", \
+                 grid.iter, (PH), lvv, ibb, jbb, nd, \
+                 (double)R[0],(double)R[1],(double)R[2],(double)R[3],(double)R[4], \
+                 (double)grid.getField(D_RHO)[bIdx*blockSizeTot+nd], \
+                 (double)grid.getField(D_RHOU)[bIdx*blockSizeTot+nd], \
+                 (double)grid.getField(D_RHOV)[bIdx*blockSizeTot+nd], \
+                 (double)grid.getField(D_RHOW)[bIdx*blockSizeTot+nd], \
+                 (double)grid.getField(D_RHOE)[bIdx*blockSizeTot+nd]); \
+        } \
+      } \
+    } while (0)
+    if (grid.dbgChecks >= 3 && active) {
+      bool badU = false;
+      for (i32 q = 0; q < 5; q++)
+        badU = badU || !isfinite(grid.getField(D_RHO+q)[bIdx*blockSizeTot+nd]);
+      if (badU && atomicCAS(grid.nanCnt, 0, 1) == 0) {
+        i32 lvv, ibb, jbb, kbb; grid.decode(grid.bLocList[bIdx], lvv, ibb, jbb, kbb);
+        printf("[nanprobe] iter %d phase 0 (STATE) lvl %d elem(%d,%d) node %d cls %d\n",
+               grid.iter, lvv, ibb, jbb, nd, grid.ibClassList[bIdx]);
+      }
+    }
+
+    if (active) {
+      real Wi[5];
+      for (i32 q = 0; q < 5; q++) Wi[q] = sW[ell][q][nd];
+      const i32 ndX0 = j*NNODE + k*NNODE*NNODE;
+      const i32 ndY0 = i + k*NNODE*NNODE;
+      const i32 ndZ0 = i + j*NNODE;
+
+      // ── volume: EC flux differencing (generalized-SBP D) ────────────────
+      real ax[5]={0,0,0,0,0}, ay[5]={0,0,0,0,0}, az[5]={0,0,0,0,0};
+      for (i32 m = 0; m < NNODE; m++) {
+        real Wm[5], Fs[5];
+        for (i32 q = 0; q < 5; q++) Wm[q] = sW[ell][q][ndX0 + m];
+        dgEcFluxAxis(Wi, Wm, 0, Fs, grid.ecVolume == 2);
+        for (i32 q = 0; q < 5; q++) ax[q] += c_D[i][m]*Fs[q];
+        for (i32 q = 0; q < 5; q++) Wm[q] = sW[ell][q][ndY0 + m*NNODE];
+        dgEcFluxAxis(Wi, Wm, 1, Fs, grid.ecVolume == 2);
+        for (i32 q = 0; q < 5; q++) ay[q] += c_D[j][m]*Fs[q];
+        if (!grid.pseudo2D) {
+          for (i32 q = 0; q < 5; q++) Wm[q] = sW[ell][q][ndZ0 + m*NNODE*NNODE];
+          dgEcFluxAxis(Wi, Wm, 2, Fs, grid.ecVolume == 2);
+          for (i32 q = 0; q < 5; q++) az[q] += c_D[k][m]*Fs[q];
+        }
+      }
+      for (i32 q = 0; q < 5; q++)
+        R[q] = -(real)2.0*(jacx*ax[q] + jacy*ay[q] + jacz*az[q]);
+
+      // ── dual-pairing SBP volume upwinding (see dgRhsKernel phase 2c;
+      //    identical construction -- sV already holds the entropy vars) ─────
+      if (grid.dpSbp > (real)0.0) {
+        real gt[5];
+        for (i32 q = 0; q < 5; q++)
+          gt[q] = grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 8 + q];
+        for (i32 q = 0; q < 5; q++) {
+          real Sx = 0, Sy = 0, Sz = 0;
+          for (i32 m = 0; m < NNODE; m++) {
+            real wp = c_w[m]*c_dpPhi[m];
+            Sx += wp*sV[ell][q][ndX0 + m];
+            Sy += wp*sV[ell][q][ndY0 + m*NNODE];
+            if (!grid.pseudo2D) Sz += wp*sV[ell][q][ndZ0 + m*NNODE*NNODE];
+          }
+          R[q] -= grid.dpSbp*gt[q]*(c_dpPhi[i]*Sx/h[0] + c_dpPhi[j]*Sy/h[1]
+                 + (grid.pseudo2D ? (real)0.0 : c_dpPhi[k]*Sz/h[2]));
+        }
+      }
+
+      DG_NANPROBE(1);
+
+      // ── surface (FR correction, all nodes) + subcell-FV volume ──────────
+      const real alpha = grid.subFv
+                       ? grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 6] : (real)0.0;
+      real Rfv[5] = {0,0,0,0,0};
+      real Wm[5];
+
+      // x faces (tangential j,k; correction weights gpL[i]/gpR[i])
+      {
+        real WmeL[5], WmeR[5], LnnL[5], LnnR[5], WbL[5], WbR[5];
+        real ftL[5], ftR[5], fL[5], fR[5];
+        dgGaussMyTrace(sV[ell], sW[ell], 0, j, k, c_tL, 0, WmeL);
+        dgGaussMyTrace(sV[ell], sW[ell], 0, j, k, c_tR, NNODE-1, WmeR);
+        for (i32 q=0;q<5;q++){ LnnL[q]=sW[ell][q][ndX0+0]; LnnR[q]=sW[ell][q][ndX0+(NNODE-1)]; }
+        dgGaussFaceFlux(grid, sV[ell], sW[ell], bIdx, lvl, ib, jb, kb, 0, 0, j, k, WmeL, LnnL, h, t, fL, WbL);
+        dgGaussFaceFlux(grid, sV[ell], sW[ell], bIdx, lvl, ib, jb, kb, 0, 1, j, k, WmeR, LnnR, h, t, fR, WbR);
+        dgGaussBndFlux(sW[ell], 0, j, k, grid.ecVolume == 2, ftL, ftR);
+        for (i32 q = 0; q < 5; q++)
+          R[q] += -jacx*(c_gpL[i]*(fL[q]-ftL[q]) + c_gpR[i]*(fR[q]-ftR[q]));
+        if (alpha > (real)0.0) {
+          real fLs[5], fRs[5];
+          if (i == 0) { for (i32 q=0;q<5;q++) fLs[q]=fL[q]; }
+          else { for (i32 q=0;q<5;q++) Wm[q]=sW[ell][q][ndX0+(i-1)]; dgRusanovAxis(Wm, Wi, 0, fLs); }
+          if (i == NNODE-1) { for (i32 q=0;q<5;q++) fRs[q]=fR[q]; }
+          else { for (i32 q=0;q<5;q++) Wm[q]=sW[ell][q][ndX0+(i+1)]; dgRusanovAxis(Wi, Wm, 0, fRs); }
+          for (i32 q=0;q<5;q++) Rfv[q] -= jacx*c_winv[i]*(fRs[q]-fLs[q]);
+        }
+      }
+      DG_NANPROBE(2);
+      // y faces (tangential i,k; weights gpL[j]/gpR[j])
+      {
+        real WmeL[5], WmeR[5], LnnL[5], LnnR[5], WbL[5], WbR[5];
+        real ftL[5], ftR[5], fL[5], fR[5];
+        dgGaussMyTrace(sV[ell], sW[ell], 1, i, k, c_tL, 0, WmeL);
+        dgGaussMyTrace(sV[ell], sW[ell], 1, i, k, c_tR, NNODE-1, WmeR);
+        for (i32 q=0;q<5;q++){ LnnL[q]=sW[ell][q][ndY0+0]; LnnR[q]=sW[ell][q][ndY0+(NNODE-1)*NNODE]; }
+        dgGaussFaceFlux(grid, sV[ell], sW[ell], bIdx, lvl, ib, jb, kb, 1, 0, i, k, WmeL, LnnL, h, t, fL, WbL);
+        dgGaussFaceFlux(grid, sV[ell], sW[ell], bIdx, lvl, ib, jb, kb, 1, 1, i, k, WmeR, LnnR, h, t, fR, WbR);
+        dgGaussBndFlux(sW[ell], 1, i, k, grid.ecVolume == 2, ftL, ftR);
+        for (i32 q = 0; q < 5; q++)
+          R[q] += -jacy*(c_gpL[j]*(fL[q]-ftL[q]) + c_gpR[j]*(fR[q]-ftR[q]));
+        if (alpha > (real)0.0) {
+          real fLs[5], fRs[5];
+          if (j == 0) { for (i32 q=0;q<5;q++) fLs[q]=fL[q]; }
+          else { for (i32 q=0;q<5;q++) Wm[q]=sW[ell][q][ndY0+(j-1)*NNODE]; dgRusanovAxis(Wm, Wi, 1, fLs); }
+          if (j == NNODE-1) { for (i32 q=0;q<5;q++) fRs[q]=fR[q]; }
+          else { for (i32 q=0;q<5;q++) Wm[q]=sW[ell][q][ndY0+(j+1)*NNODE]; dgRusanovAxis(Wi, Wm, 1, fRs); }
+          for (i32 q=0;q<5;q++) Rfv[q] -= jacy*c_winv[j]*(fRs[q]-fLs[q]);
+        }
+      }
+      DG_NANPROBE(3);
+      // z faces (tangential i,j; weights gpL[k]/gpR[k]) -- 3D only
+      if (!grid.pseudo2D) {
+        real WmeL[5], WmeR[5], LnnL[5], LnnR[5], WbL[5], WbR[5];
+        real ftL[5], ftR[5], fL[5], fR[5];
+        dgGaussMyTrace(sV[ell], sW[ell], 2, i, j, c_tL, 0, WmeL);
+        dgGaussMyTrace(sV[ell], sW[ell], 2, i, j, c_tR, NNODE-1, WmeR);
+        for (i32 q=0;q<5;q++){ LnnL[q]=sW[ell][q][ndZ0+0]; LnnR[q]=sW[ell][q][ndZ0+(NNODE-1)*NNODE*NNODE]; }
+        dgGaussFaceFlux(grid, sV[ell], sW[ell], bIdx, lvl, ib, jb, kb, 2, 0, i, j, WmeL, LnnL, h, t, fL, WbL);
+        dgGaussFaceFlux(grid, sV[ell], sW[ell], bIdx, lvl, ib, jb, kb, 2, 1, i, j, WmeR, LnnR, h, t, fR, WbR);
+        dgGaussBndFlux(sW[ell], 2, i, j, grid.ecVolume == 2, ftL, ftR);
+        for (i32 q = 0; q < 5; q++)
+          R[q] += -jacz*(c_gpL[k]*(fL[q]-ftL[q]) + c_gpR[k]*(fR[q]-ftR[q]));
+        if (alpha > (real)0.0) {
+          real fLs[5], fRs[5];
+          if (k == 0) { for (i32 q=0;q<5;q++) fLs[q]=fL[q]; }
+          else { for (i32 q=0;q<5;q++) Wm[q]=sW[ell][q][ndZ0+(k-1)*NNODE*NNODE]; dgRusanovAxis(Wm, Wi, 2, fLs); }
+          if (k == NNODE-1) { for (i32 q=0;q<5;q++) fRs[q]=fR[q]; }
+          else { for (i32 q=0;q<5;q++) Wm[q]=sW[ell][q][ndZ0+(k+1)*NNODE*NNODE]; dgRusanovAxis(Wi, Wm, 2, fRs); }
+          for (i32 q=0;q<5;q++) Rfv[q] -= jacz*c_winv[k]*(fRs[q]-fLs[q]);
+        }
+      }
+
+      if (alpha > (real)0.0)
+        for (i32 q = 0; q < 5; q++) R[q] = ((real)1.0-alpha)*R[q] + alpha*Rfv[q];
+      DG_NANPROBE(4);
+
+      real c = dgSoundSpeed(Wi[4], Wi[0]);
+      lamNode = fabs(Wi[1]) + fabs(Wi[2]) + fabs(Wi[3]) + c;
+    }
+
+    sLam[ell][nd] = lamNode;
+    __syncthreads();
+    real lam_e = 0;
+    for (i32 m = 0; m < blockSizeTot; m++) lam_e = fmax(lam_e, sLam[ell][m]);
+
+    // ── sensor-gated BULK (dilatation) viscosity (see dgRhsKernel phase 4b;
+    //    identical construction, sV reused as the staging slab -- the surface
+    //    and DP phases are done with it) ──────────────────────────────────────
+    if (grid.bulkC > (real)0.0) {
+      const i32 ndX0 = j*NNODE + k*NNODE*NNODE;
+      const i32 ndY0 = i + k*NNODE*NNODE;
+      const i32 ndZ0 = i + j*NNODE;
+      real theta_e = active
+                   ? grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 1] : (real)0.0;
+      if (active) {
+        real du = 0, dv = 0, dw = 0;
+        for (i32 m = 0; m < NNODE; m++) {
+          du += c_D[i][m]*sW[ell][1][ndX0 + m];
+          dv += c_D[j][m]*sW[ell][2][ndY0 + m*NNODE];
+          if (!grid.pseudo2D) dw += c_D[k][m]*sW[ell][3][ndZ0 + m*NNODE*NNODE];
+        }
+        real divu = jacx*du + jacy*dv + (grid.pseudo2D ? (real)0.0 : jacz*dw);
+        real lenp = h[0]/(real)(2*dgOrder+1);   // the AV length scale
+        real beta = grid.bulkC * theta_e * lenp * lam_e * sW[ell][0][nd];
+        sV[ell][0][nd] = beta*divu;
+      }
+      __syncthreads();
+      if (active) {
+        real sxm = 0, sxe = 0, sym = 0, sye = 0, szm = 0, sze = 0;
+        for (i32 m = 0; m < NNODE; m++) {
+          real bx = sV[ell][0][ndX0 + m];
+          sxm += c_w[m]*c_D[m][i]*bx;
+          sxe += c_w[m]*c_D[m][i]*bx*sW[ell][1][ndX0 + m];
+          real by = sV[ell][0][ndY0 + m*NNODE];
+          sym += c_w[m]*c_D[m][j]*by;
+          sye += c_w[m]*c_D[m][j]*by*sW[ell][2][ndY0 + m*NNODE];
+          if (!grid.pseudo2D) {
+            real bz = sV[ell][0][ndZ0 + m*NNODE*NNODE];
+            szm += c_w[m]*c_D[m][k]*bz;
+            sze += c_w[m]*c_D[m][k]*bz*sW[ell][3][ndZ0 + m*NNODE*NNODE];
+          }
+        }
+        R[1] -= jacx*c_winv[i]*sxm;
+        R[2] -= jacy*c_winv[j]*sym;
+        R[4] -= jacx*c_winv[i]*sxe + jacy*c_winv[j]*sye;
+        if (!grid.pseudo2D) {
+          R[3] -= jacz*c_winv[k]*szm;
+          R[4] -= jacz*c_winv[k]*sze;
+        }
+      }
+    }
+
+    DG_NANPROBE(5);
+    // ── NSFR residual filter (see dgRhsKernel phase 5; sV reused as staging) ──
+    if (grid.nsfr > (real)0.0) {
+      // gate by (1 - alpha): the filter belongs to the HIGH-ORDER scheme only.
+      // Filtering the blended residual corrupts the top mode of the subcell-FV
+      // fallback exactly where positivity depends on it (measured: 5-level
+      // blast blew at t=0.70 with the unconditional filter, completes gated).
+      const real sigE = grid.nsfr*((real)1.0 - (grid.subFv && active
+                      ? grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 6] : (real)0.0));
+      const i32 nd3 = grid.pseudo2D ? 2 : 3;
+      for (i32 d3 = 0; d3 < nd3; d3++) {
+        __syncthreads();
+        if (active) for (i32 q = 0; q < 5; q++) sV[ell][q][nd] = R[q];
+        __syncthreads();
+        if (active) {
+          const i32 idx  = (d3==0) ? i : ((d3==1) ? j : k);
+          const i32 base = (d3==0) ? (j*NNODE + k*NNODE*NNODE)
+                         : ((d3==1) ? (i + k*NNODE*NNODE) : (i + j*NNODE));
+          const i32 str  = (d3==0) ? 1 : ((d3==1) ? NNODE : NNODE*NNODE);
+          for (i32 q = 0; q < 5; q++) {
+            real S = 0;
+            for (i32 m = 0; m < NNODE; m++)
+              S += c_w[m]*c_dpPhi[m]*sV[ell][q][base + m*str];
+            R[q] -= sigE*c_dpPhi[idx]*S;
+          }
+        }
+      }
+    }
+
+    DG_NANPROBE(6);
+    #undef DG_NANPROBE
+    if (active) {
+      for (i32 q = 0; q < 5; q++) grid.getField(D_RHS+q)[bIdx*blockSizeTot + nd] = R[q];
+      real hmin = fmin(h[0], grid.pseudo2D ? h[0] : fmin(h[1], h[2]));
+      grid.getField(D_LAM)[bIdx*blockSizeTot + nd] =
+          hmin/(fmax(lam_e, (real)1e-10)*(real)NNODE);
+    }
+    __syncthreads();
   }
 }
 
@@ -1269,7 +3296,20 @@ __global__ void dgCopyQ0Kernel(DgSolver &grid) {
 __global__ void dgRk3StageKernel(DgSolver &grid, i32 stage, real dt) {
   DG_CELL_LOOP(cIdx, bIdx) {
     if (grid.bLocList[bIdx] == kEmpty) continue;
-    if (grid.ibClassList[bIdx] != IB_FLUID) continue;   // ghosts hold their fill
+    i32 cls = grid.ibClassList[bIdx];
+    if (cls != IB_FLUID && cls != IB_CUT) continue;   // ghosts hold their fill
+    if (cls == IB_CUT) {
+      // evolving cut element (--ibevolve): only the FLUID-side nodes (phi > 0,
+      // split EXACTLY at 0 -- a sliver margin measured TRANSPARENT: mixed
+      // constructions along one face defeat the reflection) integrate; the
+      // solid-side nodes keep the FRIB fill applied after this stage.
+      GET_CELL_INDICES
+      i32 lvl, ib, jb, kb;
+      grid.decode(grid.bLocList[bIdx], lvl, ib, jb, kb);
+      real h[3]; dgElemSize(grid, lvl, h);
+      if (dgIbPhi(grid, dgNodePos(h[0], ib, i), dgNodePos(h[1], jb, j))
+          <= (real)0.0) continue;
+    }
     real U[5];
     for (i32 q = 0; q < 5; q++) {
       real q0 = grid.getField(D_Q0+q)[cIdx];
@@ -1284,12 +3324,117 @@ __global__ void dgRk3StageKernel(DgSolver &grid, i32 stage, real dt) {
   }
 }
 
+// MOOD: reset the per-element blend factor alpha (slot 6) to 0 -> the pure
+// DG attempt.  Detection then raises it to 1 (first-order FV) where needed.
+__global__ void dgMoodResetKernel(DgSolver &grid) {
+  DG_BLOCK_LOOP(bIdx) {
+    if (grid.bLocList[bIdx] == kEmpty) continue;
+    grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 6] = (real)0.0;
+  }
+}
+
+// MOOD detection: form the candidate RK update from (Q0, RHO, RHS) WITHOUT
+// committing it (RHO stays the stage-start), and flag the element for the
+// first-order FV redo (slot 6 = 1) if ANY node is non-finite or has density/
+// pressure below the relative floors.  A cell already at FV (alpha==1) is not
+// re-flagged -- that is the bottom of the DG->FV cascade.  Reads only local
+// (own-element) DOF; the redo stays local because HLLC faces are unchanged.
+__global__ void dgMoodDetectKernel(DgSolver &grid, i32 stage, real dt) {
+  const real rhoLo = grid.moodRho * grid.cScale[0];           // undershoot floor
+  const real pLo   = grid.moodP   * ((real)1.0/dgGam);        // freestream p ref
+  const real rhoHi = (real)100.0  * grid.cScale[0];           // OVERshoot cap: a
+  const real pHi   = (real)1000.0 * ((real)1.0/dgGam);        // real M=3 shock is
+  // rho~4x, p~10x -- 100x/1000x safely catches Gibbs overshoots the positivity
+  // floor misses (measured: rho->1e11 at a forming shock), fully local (no
+  // neighbour reads), so the FV redo stays local.
+  DG_BLOCK_LOOP(bIdx) {
+    if (grid.bLocList[bIdx] == kEmpty) continue;
+    const i32 cls = grid.ibClassList[bIdx];
+    if (cls != IB_FLUID && cls != IB_CUT) continue;
+    if (grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 6] > (real)0.5) continue;  // already FV
+    i32 lvlC = 0, ibC = 0, jbC = 0, kbC = 0;
+    real hC[3] = {1,1,1};
+    if (cls == IB_CUT) {   // test only the EVOLVED (fluid-side) nodes: the
+      // solid-side candidate update is meaningless (the fill overwrites it)
+      grid.decode(grid.bLocList[bIdx], lvlC, ibC, jbC, kbC);
+      dgElemSize(grid, lvlC, hC);
+    }
+    bool bad = false;
+    for (i32 nd = 0; nd < blockSizeTot && !bad; nd++) {
+      if (cls == IB_CUT) {
+        i32 i = nd % NNODE, j = (nd/NNODE)%NNODE;
+        if (dgIbPhi(grid, dgNodePos(hC[0], ibC, i), dgNodePos(hC[1], jbC, j))
+            <= (real)0.0) continue;
+      }
+      i32 c = bIdx*blockSizeTot + nd;
+      real U[5];
+      for (i32 q = 0; q < 5; q++) {
+        real q0 = grid.getField(D_Q0+q)[c];
+        real qc = grid.getField(D_RHO+q)[c];
+        real L  = grid.getField(D_RHS+q)[c];
+        if (stage == 0)      U[q] = q0 + dt*L;
+        else if (stage == 1) U[q] = (real)0.75*q0 + (real)0.25*(qc + dt*L);
+        else                 U[q] = (real)(1.0/3.0)*q0 + (real)(2.0/3.0)*(qc + dt*L);
+      }
+      real p = dgPressureFromCons(U);
+      if (!isfinite(U[0]) || !isfinite(U[4]) || !isfinite(p)
+          || U[0] < rhoLo || U[0] > rhoHi || p < pLo || p > pHi)
+        bad = true;
+    }
+    if (bad) grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 6] = (real)1.0;
+  }
+}
+
+// dual-pairing SBP upwind parameters (arXiv 2411.06629 Appendix C): per element,
+//   gamma_1 = max_x lam/(d2eta/drho2),  gamma_(1+m) = max_x lam/(d2eta/dm_m2),
+//   gamma_5 = max_x 2 M^2 lam / ((1+M^2) d2eta/dE2),
+// lam = |u| + c, M^2 = |u|^2 rho/(gam p), eta = -rho ln(p/rho^gam) the
+// THERMODYNAMIC entropy.  Diagonal Hessian entries (derived from the entropy
+// variables g = d eta/dU):
+//   d2eta/drho2 = gam/rho + (gam-1)^2 rho q^4/(4 p^2),   q^2 = |u|^2
+//   d2eta/dm_m2 = (gam-1)/p * (1 + (gam-1) rho u_m^2 / p)
+//   d2eta/dE2   = (gam-1)^2 rho / p^2.
+// Gamma must be CONSTANT per element (the conservation proof pairs
+// (D+-D-)^T 1 against Gamma g).  Stored as gamma~_q = (gam-1)*gamma_q in
+// SCRATCH slots 8..12 so the RHS can pair them directly with dgEntVars (our
+// entropy vars are eta/(gam-1); the product Gamma*g is scale-invariant).
+__global__ void dgDpGammaKernel(DgSolver &grid) {
+  const real g1 = dgGam - (real)1.0;
+  DG_BLOCK_LOOP(bIdx) {
+    if (grid.bLocList[bIdx] == kEmpty) continue;
+    if (!dgIbLive(grid, bIdx)) continue;
+    real gam[5] = {0,0,0,0,0};
+    for (i32 nd = 0; nd < blockSizeTot; nd++) {
+      real U[5], W[5];
+      for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[(u64)bIdx*blockSizeTot + nd];
+      dgConsToPrimSane(U, W);
+      real rho = W[0], p = W[4];
+      real q2  = W[1]*W[1] + W[2]*W[2] + W[3]*W[3];
+      real c   = dgSoundSpeed(p, rho);
+      real lam = sqrt(q2) + c;
+      real Hrho = dgGam/rho + g1*g1*rho*q2*q2/((real)4.0*p*p);
+      gam[0] = fmax(gam[0], lam/Hrho);
+      for (i32 m = 0; m < 3; m++) {
+        real Hm = g1/p*((real)1.0 + g1*rho*W[1+m]*W[1+m]/p);
+        gam[1+m] = fmax(gam[1+m], lam/Hm);
+      }
+      real HE = g1*g1*rho/(p*p);
+      real M2 = q2*rho/(dgGam*p);
+      gam[4] = fmax(gam[4], (real)2.0*M2*lam/(((real)1.0+M2)*HE));
+    }
+    for (i32 q = 0; q < 5; q++)
+      grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 8 + q] = g1*gam[q];
+  }
+}
+
 __global__ void dgPositivityKernel(DgSolver &grid) {
   const real eps_rho = 1e-12, eps_p = 1e-12;
   DG_BLOCK_LOOP(bIdx) {
     if (grid.bLocList[bIdx] == kEmpty) continue;
-    if (grid.ibClassList[bIdx] != IB_FLUID) continue;   // ghost fills are
-    // non-conservative by design: never Zhang-Shu-limit them
+    if (!dgIbLive(grid, bIdx)) continue;   // ghost fills are non-conservative
+    // by design: never Zhang-Shu-limit them.  Evolving IB_CUT elements ARE
+    // limited (their fluid-side nodes integrate; the fill re-writes the
+    // solid side right after, so scaling those toward the mean is harmless).
     real *F[5];
     for (i32 q = 0; q < 5; q++) F[q] = grid.getField(D_RHO+q) + (u64)bIdx*blockSizeTot;
 
@@ -1300,38 +3445,106 @@ __global__ void dgPositivityKernel(DgSolver &grid) {
       real wijk = (real)0.125*c_w[i]*c_w[j]*c_w[k];
       for (i32 q = 0; q < 5; q++) Ubar[q] += wijk*F[q][nd];
     }
+    // NB: flooring the cell MEAN is the ONLY non-conservative step in the
+    // solver (node scaling toward the mean below is conservative).  Count it
+    // (ibCnt[3]) to attribute any mass/energy drift.
+    if (Ubar[0] < eps_rho) atomicAdd(&grid.ibCnt[3], 1);
     Ubar[0] = fmax(Ubar[0], eps_rho);
     {
       real p = dgPressureFromCons(Ubar);
-      if (p < eps_p)
+      if (p < eps_p) {
+        atomicAdd(&grid.ibCnt[3], 1);
         Ubar[4] = eps_p/(dgGam-(real)1.0)
                 + (real)0.5*(Ubar[1]*Ubar[1]+Ubar[2]*Ubar[2]+Ubar[3]*Ubar[3])/Ubar[0];
+      }
     }
 
-    // theta1: density
+    const real epsR = eps_rho, epsP = eps_p;
+
+    // --ibevolve IB_CUT: the min/bisection sets take EVOLVED (phi > 0) nodes
+    // only -- a near-vacuum solid-side FILL node would drive theta -> 0 and
+    // flatten the whole evolved band to its mean every stage (measured: the
+    // p3 M=3 shoulder mass drain).  Solid nodes are re-filled right after
+    // this kernel; the final scaling still moves them, harmlessly.
+    const bool isCut = (grid.ibClassList[bIdx] == IB_CUT);
+    bool ndOk[blockSizeTot];
+    if (isCut) {
+      i32 lvlC, ibC, jbC, kbC;
+      grid.decode(grid.bLocList[bIdx], lvlC, ibC, jbC, kbC);
+      real hC[3]; dgElemSize(grid, lvlC, hC);
+      for (i32 nd = 0; nd < blockSizeTot; nd++) {
+        i32 i = nd % NNODE, j = (nd/NNODE)%NNODE;
+        ndOk[nd] = dgIbPhi(grid, dgNodePos(hC[0], ibC, i),
+                                 dgNodePos(hC[1], jbC, j)) > (real)0.0;
+      }
+    } else for (i32 nd = 0; nd < blockSizeTot; nd++) ndOk[nd] = true;
+
+    // theta1: density.  On GAUSS solution points also bound the FACE TRACES
+    // (tL/tR extrapolations along every line): the RHS reads those, and they
+    // can be negative while every node is positive -- the multi-node-set
+    // limiter modification of arXiv 2507.09131 (their PPL checks the
+    // face-reaching quadrature sets for exactly this reason).  Scaling toward
+    // the mean bounds traces too (they are linear in the nodal values).
     real rhoMin = (real)1e30;
-    for (i32 nd = 0; nd < blockSizeTot; nd++) rhoMin = fmin(rhoMin, F[0][nd]);
+    for (i32 nd = 0; nd < blockSizeTot; nd++)
+      if (ndOk[nd]) rhoMin = fmin(rhoMin, F[0][nd]);
+    if (grid.gauss && !isCut) {   // cut-element traces mix solid fills; their
+      // faces present nearest-node states anyway (the symmetric-NN rule)
+      for (i32 d = 0; d < (grid.pseudo2D ? 2 : 3); d++)
+        for (i32 b = 0; b < NNODE; b++)
+          for (i32 a = 0; a < NNODE; a++) {
+            real rL = 0, rR = 0;
+            for (i32 m = 0; m < NNODE; m++) {
+              real v = F[0][dgFaceNode(d, m, a, b)];
+              rL += c_tL[m]*v; rR += c_tR[m]*v;
+            }
+            rhoMin = fmin(rhoMin, fmin(rL, rR));
+          }
+    }
     real tRho = 1.0;
-    if (rhoMin < eps_rho)
-      tRho = (Ubar[0]-eps_rho)/fmax(Ubar[0]-rhoMin, (real)1e-30);
+    if (rhoMin < epsR)
+      tRho = (Ubar[0]-epsR)/fmax(Ubar[0]-rhoMin, (real)1e-30);
     tRho = fmax((real)0.0, fmin((real)1.0, tRho));
 
-    // theta2: pressure (bisection per offending node)
+    // theta2: pressure (bisection per offending candidate).  Candidates =
+    // solution nodes, plus (GAUSS) the face traces of the CONSERVATIVE state
+    // along every line -- the states the face fluxes are actually built from.
     real theta = tRho;
-    for (i32 nd = 0; nd < blockSizeTot; nd++) {
-      real U[5], Ud[5];
-      for (i32 q = 0; q < 5; q++) U[q] = F[q][nd];
+    auto pBisect = [&](const real U[5]) {
+      real Ud[5];
       for (i32 q = 0; q < 5; q++) Ud[q] = Ubar[q] + tRho*(U[q]-Ubar[q]);
-      if (dgPressureFromCons(Ud) < eps_p) {
+      if (dgPressureFromCons(Ud) < epsP) {
         real lo = 0, hi = tRho;
         for (i32 it = 0; it < 20; it++) {
           real tm = (real)0.5*(lo+hi);
           real Um[5];
           for (i32 q = 0; q < 5; q++) Um[q] = Ubar[q] + tm*(U[q]-Ubar[q]);
-          if (dgPressureFromCons(Um) >= eps_p) lo = tm; else hi = tm;
+          if (dgPressureFromCons(Um) >= epsP) lo = tm; else hi = tm;
         }
         theta = fmin(theta, lo);
       }
+    };
+    for (i32 nd = 0; nd < blockSizeTot; nd++) {
+      if (!ndOk[nd]) continue;
+      real U[5];
+      for (i32 q = 0; q < 5; q++) U[q] = F[q][nd];
+      pBisect(U);
+    }
+    if (grid.gauss && !isCut) {
+      for (i32 d = 0; d < (grid.pseudo2D ? 2 : 3); d++)
+        for (i32 b = 0; b < NNODE; b++)
+          for (i32 a = 0; a < NNODE; a++) {
+            real UL[5] = {0,0,0,0,0}, UR[5] = {0,0,0,0,0};
+            for (i32 m = 0; m < NNODE; m++) {
+              i32 nd = dgFaceNode(d, m, a, b);
+              for (i32 q = 0; q < 5; q++) {
+                UL[q] += c_tL[m]*F[q][nd];
+                UR[q] += c_tR[m]*F[q][nd];
+              }
+            }
+            pBisect(UL);
+            pBisect(UR);
+          }
     }
 
     if (theta < (real)1.0) {
@@ -1342,12 +3555,97 @@ __global__ void dgPositivityKernel(DgSolver &grid) {
   }
 }
 
+// fully-discrete entropy-stable limiter (Liu/Guo/Jiang/Sun, docs/
+// EntropyStableDG.pdf): after each RK stage, the candidate QUADRATURE cell
+// entropy is bounded by the stage input's quadrature cell entropy minus dt
+// times the outward proper-entropy-flux integral (slots 3/4, accumulated by
+// the RHS with the paper's Eq-3.9 LF entropy flux at the SAME traces the
+// face fluxes used) -- the discrete d/dt int U <= -surf F^ statement -- and
+// enforced by a Zhang-Shu-type conservative scaling toward the cell mean
+// (scaling toward the mean cannot increase cell entropy by convexity, so
+// theta is found by bisection).  With Shu-Osher stage combinations and HLLC
+// (not LF) mass/momentum fluxes the bound is a SOFT stabilizer, not the
+// paper's theorem -- the relative slack absorbs the mismatch; a candidate
+// whose MEAN already violates (pure flux-form mismatch) is flattened.
+__global__ void dgEntropyLimitKernel(DgSolver &grid, real dt) {
+  DG_BLOCK_LOOP(bIdx) {
+    if (grid.bLocList[bIdx] == kEmpty) continue;
+    if (grid.ibClassList[bIdx] != IB_FLUID) continue;
+    // --eslim 1: limit EVERYWHERE (the paper's robust form).  Needed for
+    // p=3 M=3: the rear crisis builds in sub-threshold NEIGHBORS before
+    // flooding the flagged element -- a sensor-gated run died at t=1.09
+    // with the dying element itself at theta 0.865.  Costs smooth accuracy
+    // (bound mismatch accumulates: 13x M=0.3 entropy, 7% vortex).
+    // --eslim 2: sensor-gated (only shock-flagged elements limited) --
+    // smooth cost eliminated (vortex bit-recovered), but does NOT hold the
+    // p=3 M=3 rear.  With --av 0 the sensor slab is stale and mode 2 limits
+    // everywhere -- moot anyway: limiter-only M=3 dies at the startup slam
+    // (iter ~20, both orders; the limiter caps CELL entropy and cannot see
+    // single-node vacuum spikes -- AV interface damping stays required).
+    if (grid.esLim == 2 && grid.avOn &&
+        grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 1] <= grid.ibShockTheta)
+      continue;
+    real *F[5];
+    for (i32 q = 0; q < 5; q++) F[q] = grid.getField(D_RHO+q) + (u64)bIdx*blockSizeTot;
+    real bound = grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 3]
+               - dt*grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 4];
+    bound += (real)1e-4*fmax((real)1.0, fabs(bound));
+
+    real Ubar[5] = {0,0,0,0,0};
+    for (i32 nd = 0; nd < blockSizeTot; nd++) {
+      i32 i = nd % NNODE, j = (nd/NNODE)%NNODE, k = nd/(NNODE*NNODE);
+      real wijk = (real)0.125*c_w[i]*c_w[j]*c_w[k];
+      for (i32 q = 0; q < 5; q++) Ubar[q] += wijk*F[q][nd];
+    }
+    auto cellEnt = [&](real th) {
+      real E = (real)0.0;
+      for (i32 nd = 0; nd < blockSizeTot; nd++) {
+        i32 i = nd % NNODE, j = (nd/NNODE)%NNODE, k = nd/(NNODE*NNODE);
+        real wijk = (real)0.125*c_w[i]*c_w[j]*c_w[k];
+        real U[5], W[5];
+        for (i32 q = 0; q < 5; q++) U[q] = Ubar[q] + th*(F[q][nd] - Ubar[q]);
+        dgConsToPrimSane(U, W);
+        E += wijk*dgEntropyU(W);
+      }
+      return E;
+    };
+    if (cellEnt((real)1.0) <= bound) continue;
+    real th = (real)0.0;
+    if (cellEnt((real)0.0) <= bound) {
+      real lo = (real)0.0, hi = (real)1.0;
+      for (i32 it = 0; it < 16; it++) {
+        real tm = (real)0.5*(lo + hi);
+        if (cellEnt(tm) <= bound) lo = tm; else hi = tm;
+      }
+      th = lo;
+    }
+    for (i32 nd = 0; nd < blockSizeTot; nd++)
+      for (i32 q = 0; q < 5; q++)
+        F[q][nd] = Ubar[q] + th*(F[q][nd] - Ubar[q]);
+  }
+}
+
 __global__ void dgLamKernel(DgSolver &grid) {
   DG_CELL_LOOP(cIdx, bIdx) {
     u64 loc = grid.bLocList[bIdx];
-    if (loc == kEmpty || grid.ibClassList[bIdx] != IB_FLUID) {
+    if (loc == kEmpty || !dgIbLive(grid, bIdx)) {
       grid.getField(D_LAM)[cIdx] = 1e30;   // IB ghost/dead never bound dt
       continue;
+    }
+    if (grid.ibClassList[bIdx] == IB_CUT) {
+      // only the EVOLVED (phi > 0) nodes bound dt: a solid-side node is a
+      // FILL OUTPUT, overwritten every stage -- a near-vacuum fill there
+      // (c ~ 1e6) would collapse dt for a node the integrator never owns
+      // (measured: p3 M=3 dt crawl at the shoulder, iter 134)
+      GET_CELL_INDICES
+      i32 lvlC, ibC, jbC, kbC;
+      grid.decode(loc, lvlC, ibC, jbC, kbC);
+      real hC[3]; dgElemSize(grid, lvlC, hC);
+      if (dgIbPhi(grid, dgNodePos(hC[0], ibC, i), dgNodePos(hC[1], jbC, j))
+          <= (real)0.0) {
+        grid.getField(D_LAM)[cIdx] = 1e30;
+        continue;
+      }
     }
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
@@ -1387,18 +3685,61 @@ __global__ void dgPressureToScratchKernel(DgSolver &grid) {
   }
 }
 
+// stage the Brinkman volume fraction phi(x) into SCRATCH for a paint pass
+__global__ void dgBrinkPhiToScratchKernel(DgSolver &grid) {
+  DG_CELL_LOOP(cIdx, bIdx) {
+    u64 loc = grid.bLocList[bIdx];
+    if (loc == kEmpty) continue;
+    i32 lvl, ib, jb, kb;
+    grid.decode(loc, lvl, ib, jb, kb);
+    real h[3]; dgElemSize(grid, lvl, h);
+    i32 nd = cIdx % blockSizeTot;
+    i32 in = nd % NNODE, jn = (nd/NNODE) % NNODE;
+    real gp[2];
+    grid.getField(D_SCRATCH)[cIdx] =
+        dgBrinkPhi(grid, dgNodePos(h[0], ib, in), dgNodePos(h[1], jb, jn), gp);
+  }
+}
+
 /* ════════════════════════════════════════════════════════════════════════
- * Image build: evaluate the DG polynomial at the uniform pixel centers
- * (Lagrange interpolation from the LGL solution nodes), not nearest-node fill
+ * Image build: evaluate the solution at the uniform pixel centers by
+ * piecewise-linear interpolation between the LGL solution nodes (hat basis;
+ * the full Lagrange polynomial Gibbs-rings at shocks), not nearest-node fill
  * ════════════════════════════════════════════════════════════════════════ */
 
 // Lagrange basis l_a(x) on the LGL nodes (constant memory c_xi)
-__device__ __forceinline__ real dgBasisAt(i32 a, real x) {
+__device__ real dgBasisAt(i32 a, real x) {
   real v = 1.0;
   for (i32 m = 0; m < NNODE; m++)
     if (m != a) v *= (x - c_xi[m])/(c_xi[a] - c_xi[m]);
   return v;
 }
+
+// Lagrange basis of the FRIB image line (its OWN Lobatto node set -- valid on
+// any element node set; see c_ibLXi)
+__device__ real dgIbLineBasisAt(i32 a, real x) {
+  real v = (real)1.0;
+  for (i32 m = 0; m < NNODE; m++)
+    if (m != a) v *= (x - c_ibLXi[m])/(c_ibLXi[a] - c_ibLXi[m]);
+  return v;
+}
+
+// piecewise-linear "hat" basis on the LGL nodes: paints monotone between
+// nodes.  The full Lagrange polynomial rings at shocks (Gibbs), and the
+// per-element overshoot pattern reads as blocky staircases in the image.
+__device__ __forceinline__ real dgHatAt(i32 a, real x) {
+  if (x <= c_xi[a]) {
+    if (a == 0) return 1.0;
+    real t = (x - c_xi[a-1])/(c_xi[a] - c_xi[a-1]);
+    return t > (real)0.0 ? t : (real)0.0;
+  }
+  if (a == NNODE-1) return 1.0;
+  real t = (c_xi[a+1] - x)/(c_xi[a+1] - c_xi[a]);
+  return t > (real)0.0 ? t : (real)0.0;
+}
+
+__device__ i32 dgIbLocateLeaf(DgSolver &grid, real x, real y, real z,
+                              i32 &lvl, i32 &ib, i32 &jb, i32 &kb);   // fwd (defined with the IB fill)
 
 __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
   real *U = (f >= 0) ? grid.getField(f) : nullptr;
@@ -1410,6 +3751,73 @@ __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
     if (!grid.isInteriorBlock(lvl, ib, jb, kb)) continue;
+    // field views paint FLUID elements only: ghost/cut elements hold the
+    // wall-reconstruction node data, not the flow field -- painting it draws
+    // an element-granular collar at the wall that reads as a solution
+    // artifact.  (Grid view f<0 still shows every element.)
+    if (f >= 0 && grid.ibOn && grid.ibClassList[bIdx] != IB_FLUID) {
+      // SDF-aware wall paint (kills the staircase VISUAL): a pixel of an
+      // inactive element inside the TRUE circle stays 0 (the body renders as
+      // a clean disc); a pixel in the staircase GAP (inactive element, phi>0)
+      // samples the field at its wall-normal pushed-out point from the
+      // nearest ACTIVE leaf -- the smooth near-wall flow, not element zeros.
+      real h[3]; dgElemSize(grid, lvl, h);
+      i32 nPix = powi(2, grid.nLvls-1-lvl);
+      i32 span = blockSize*nPix;
+      for (i32 py = 0; py < span; py++) {
+        i32 jPxl = jb*span + py;
+        if (jPxl < 0 || jPxl >= grid.imageSizeX[1]) continue;
+        real y = (jb + (py + (real)0.5)/span)*h[1];
+        for (i32 px = 0; px < span; px++) {
+          i32 iPxl = ib*span + px;
+          if (iPxl < 0 || iPxl >= grid.imageSizeX[0]) continue;
+          real x = (ib + (px + (real)0.5)/span)*h[0];
+          real phi = dgIbPhi(grid, x, y);
+          if (phi < (real)0.0) continue;              // true body: leave 0
+          // --ibevolve: an IB_CUT element's fluid-side pixels hold REAL
+          // evolved data -- paint the element's own polynomial (shows the
+          // evolved band directly); only solid-side pixels stay body-0.
+          if (grid.ibClassList[bIdx] == IB_CUT) {
+            real zx = (real)2.0*(px + (real)0.5)/span - (real)1.0;
+            real zy = (real)2.0*(py + (real)0.5)/span - (real)1.0;
+            real acc = (real)0.0;
+            for (i32 aa = 0; aa < NNODE; aa++)
+              for (i32 bb = 0; bb < NNODE; bb++)
+                acc += dgHatAt(aa, zx)*dgHatAt(bb, zy)
+                     * U[(u64)bIdx*blockSizeTot + aa + bb*NNODE];
+            grid.imageDataX[(u64)jPxl*grid.imageSizeX[0] + iPxl] = acc;
+            continue;
+          }
+          real dxc = x - grid.ibX, dyc = y - grid.ibY;
+          real rr = fmax(sqrt(dxc*dxc + dyc*dyc), (real)1e-30);
+          real nx = dxc/rr, ny = dyc/rr;
+          real val = (real)0.0;
+          real s = phi + (real)0.35*h[0];
+          for (i32 t2 = 0; t2 < 6; t2++) {            // outward march to fluid
+            real xs = grid.ibX + (grid.ibR + s)*nx;
+            real ys = grid.ibY + (grid.ibR + s)*ny;
+            i32 ml=0, mib=0, mjb=0, mkb=0;
+            i32 idx = dgIbLocateLeaf(grid, xs, ys, (real)0.5*grid.domainSize[2],
+                                     ml, mib, mjb, mkb);
+            if (idx != bEmpty && grid.ibClassList[idx] == IB_FLUID) {
+              real hm[3]; dgElemSize(grid, ml, hm);
+              real zx = (real)2.0*(xs/hm[0] - mib) - (real)1.0;
+              real zy = (real)2.0*(ys/hm[1] - mjb) - (real)1.0;
+              real acc = (real)0.0;
+              for (i32 aa = 0; aa < NNODE; aa++)
+                for (i32 bb = 0; bb < NNODE; bb++)
+                  acc += dgHatAt(aa, zx)*dgHatAt(bb, zy)
+                       * U[(u64)idx*blockSizeTot + aa + bb*NNODE];
+              val = acc;
+              break;
+            }
+            s += (real)0.35*h[0];
+          }
+          grid.imageDataX[(u64)jPxl*grid.imageSizeX[0] + iPxl] = val;
+        }
+      }
+      continue;
+    }
 
     // this element must intersect the mid-z slice
     real h[3]; dgElemSize(grid, lvl, h);
@@ -1426,7 +3834,7 @@ __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
     // contract the z-direction once: plane[a][b] = sum_c l_c(zeta) U[a,b,c]
     real Lz[NNODE], plane[NNODE][NNODE];
     if (f >= 0) {
-      for (i32 c = 0; c < NNODE; c++) Lz[c] = dgBasisAt(c, zeta);
+      for (i32 c = 0; c < NNODE; c++) Lz[c] = dgHatAt(c, zeta);
       for (i32 b = 0; b < NNODE; b++)
         for (i32 a = 0; a < NNODE; a++) {
           real s = 0.0;
@@ -1439,7 +3847,7 @@ __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
     for (i32 py = 0; py < span; py++) {
       real eta = (real)2.0*(py + (real)0.5)/span - (real)1.0;
       real Ly[NNODE];
-      for (i32 b = 0; b < NNODE; b++) Ly[b] = dgBasisAt(b, eta);
+      for (i32 b = 0; b < NNODE; b++) Ly[b] = dgHatAt(b, eta);
       i32 jPxl = jb*span + py;
       if (jPxl < 0 || jPxl >= grid.imageSizeX[1]) continue;
 
@@ -1451,7 +3859,7 @@ __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
           real xi = (real)2.0*(px + (real)0.5)/span - (real)1.0;
           real acc = 0.0;
           for (i32 a = 0; a < NNODE; a++) {
-            real Lxa = dgBasisAt(a, xi);
+            real Lxa = dgHatAt(a, xi);
             for (i32 b = 0; b < NNODE; b++) acc += Lxa*Ly[b]*plane[a][b];
           }
           val = acc;
@@ -1698,9 +4106,9 @@ __global__ void dgVoteKernel(DgSolver &grid, real epsL, i32 allowRefine) {
 
     i32 ibc = grid.ibClassList[bIdx];
     if (ibc == IB_DEAD) continue;      // stays DELETE: solid interior cascades to base
-    if (ibc == IB_GHOST) {             // never coarsen a ghost (band pins it finest)
-      atomicMax(&grid.bFlagsList[bIdx], KEEP);
-      continue;
+    if (ibc == IB_GHOST || ibc == IB_CUT) {   // never coarsen a ghost or an
+      atomicMax(&grid.bFlagsList[bIdx], KEEP); // evolving cut element (band
+      continue;                                // pins them finest)
     }
 
     i32 aib = ib & ~1, ajb = jb & ~1, akb = grid.pseudo2D ? kb : (kb & ~1);
@@ -1768,11 +4176,17 @@ __global__ void dgSensorVoteKernel(DgSolver &grid) {
     grid.decode(loc, lvl, ib, jb, kb);
     if (lvl == 0) atomicMax(&grid.bFlagsList[bIdx], KEEP);
 
-    real th = grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 1];
-    if (grid.sensorType == 1) {   // amplitude floor (Persson theta is scale-free)
+    // slot 5 = the REFINE sensor (shock + velocity/shear); slot 1 (alpha/AV)
+    // deliberately excludes velocity so shear refines but is not FV-smeared
+    real th = grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 5];
+    // amplitude floor (ALWAYS: the Persson theta is a scale-free modal-energy
+    // RATIO and fires on roundoff-level wiggle in near-constant regions -- the
+    // low-amplitude wake would otherwise refine on noise).  Refine only where
+    // the fluctuation modal energy is real signal.
+    if (grid.sensorType >= 1) {   // slot 2 (fluct) valid only with Persson
       real fluct = grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 2];
-      real floor2 = (real)1e-12*grid.cScale[0]*grid.cScale[0];
-      if (fluct < floor2) continue;   // quiescent: leave at DELETE (coarsenable)
+      real fl = grid.subFloor*grid.cScale[0];
+      if (fluct < fl*fl) continue;   // quiescent: leave at DELETE (coarsenable)
     }
     i32 vote = DELETE;
     if (th > grid.ppRefine && lvl < grid.nLvls-1) vote = REFINE;
@@ -1790,29 +4204,14 @@ __global__ void dgSensorVoteKernel(DgSolver &grid) {
  * derivatives at the image point and the slip-wall BC at the boundary point.
  * ════════════════════════════════════════════════════════════════════════ */
 
-// signed distance to the cylinder (axis along z): positive = fluid
-__device__ __forceinline__ real dgIbPhi(DgSolver &grid, real x, real y) {
-  real dx = x - grid.ibX, dy = y - grid.ibY;
-  return sqrt(dx*dx + dy*dy) - grid.ibR;
-}
-
-// exact SDF range over an axis-aligned box (circle-to-box distance bounds)
-__device__ __forceinline__ void dgIbPhiRangeBox(DgSolver &grid,
-    real x0, real x1, real y0, real y1, real &phiMin, real &phiMax) {
-  real cx = grid.ibX, cy = grid.ibY;
-  real dxlo = fmax((real)0.0, fmax(x0 - cx, cx - x1));
-  real dylo = fmax((real)0.0, fmax(y0 - cy, cy - y1));
-  real dxhi = fmax(fabs(x0 - cx), fabs(x1 - cx));
-  real dyhi = fmax(fabs(y0 - cy), fabs(y1 - cy));
-  phiMin = sqrt(dxlo*dxlo + dylo*dylo) - grid.ibR;
-  phiMax = sqrt(dxhi*dxhi + dyhi*dyhi) - grid.ibR;
-}
-
 // pass 1: geometric class from the element box's exact SDF range
 __global__ void dgIbClassifyGeomKernel(DgSolver &grid) {
   DG_BLOCK_LOOP(bIdx) {
     u64 loc = grid.bLocList[bIdx];
     if (loc == kEmpty) { grid.ibClassList[bIdx] = IB_FLUID; continue; }
+    // volume penalization: the object is the phi field, not a class -- every
+    // element is solved (no ghosts, no cut cells).
+    if (grid.ibBrink) { grid.ibClassList[bIdx] = IB_FLUID; continue; }
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
     real h[3]; dgElemSize(grid, lvl, h);
@@ -1848,16 +4247,21 @@ __global__ void dgIbClassifyGeomKernel(DgSolver &grid) {
       real cxE = (ib + (real)0.5)*h[0], cyE = (jb + (real)0.5)*h[1];
       solidish = (dgIbPhi(grid, cxE, cyE) < graze);
     }
+    // --ibevolve: a genuinely CUT ghost (has fluid-side nodes) joins the
+    // discretization as IB_CUT -- fluid-side nodes evolve, solid nodes keep
+    // the FRIB fill.  Fully-solid elements stay DEAD (-> promoted GHOST).
     grid.ibClassList[bIdx] = !solidish ? ((phiMax <= (real)0.0) ? IB_DEAD : IB_FLUID)
-                           : ((phiMax <= (real)0.0) ? IB_DEAD : IB_GHOST);
+                           : ((phiMax <= (real)0.0) ? IB_DEAD
+                              : (grid.ibEvolve ? IB_CUT : IB_GHOST));
   }
 }
 
-// pass 2: a fully-solid element with any FLUID face neighbor (same level,
-// coarser cover, or finer children -- the face-topology dispatch) becomes a
-// GHOST, so no fluid face ever resolves to an unfilled DEAD element.  In-place
-// and race-free: only rewrites DEAD -> GHOST and only reads "== IB_FLUID",
-// which pass 1 fixed and this pass never changes.
+// pass 2: a fully-solid element with any LIVE face neighbor (fluid, or an
+// evolving IB_CUT element under --ibevolve; same level, coarser cover, or
+// finer children -- the face-topology dispatch) becomes a GHOST, so no live
+// face ever resolves to an unfilled DEAD element.  In-place and race-free:
+// only rewrites DEAD -> GHOST and only reads fluid/cut classes, which pass 1
+// fixed and this pass never changes.
 __global__ void dgIbPromoteKernel(DgSolver &grid) {
   DG_BLOCK_LOOP(bIdx) {
     u64 loc = grid.bLocList[bIdx];
@@ -1874,14 +4278,14 @@ __global__ void dgIbPromoteKernel(DgSolver &grid) {
         if (grid.isExteriorBlock(lvl, nib, njb, nkb)) continue;
         i32 nIdx = grid.getBlockIdx(grid.encode(lvl, nib, njb, nkb));
         if (nIdx != bEmpty) {
-          touchesFluid = (grid.ibClassList[nIdx] == IB_FLUID);
+          touchesFluid = dgIbLive(grid, nIdx);
           continue;
         }
         if (lvl > 0) {   // coarser cover
           nIdx = grid.getBlockIdx(grid.encode(lvl-1, nib>>1, njb>>1,
                                               grid.pseudo2D ? nkb : (nkb>>1)));
           if (nIdx != bEmpty) {
-            touchesFluid = (grid.ibClassList[nIdx] == IB_FLUID);
+            touchesFluid = dgIbLive(grid, nIdx);
             continue;
           }
         }
@@ -1899,7 +4303,7 @@ __global__ void dgIbPromoteKernel(DgSolver &grid) {
               else { ckb = 2*nkb + (side ? 0 : 1); cib = 2*t1b + s1; cjb = 2*t2b + s2; }
               i32 cIdxN = grid.getBlockIdx(grid.encode(lvl+1, cib, cjb, ckb));
               if (cIdxN != bEmpty)
-                touchesFluid = (grid.ibClassList[cIdxN] == IB_FLUID);
+                touchesFluid = dgIbLive(grid, cIdxN);
             }
         }
       }
@@ -2037,53 +4441,97 @@ __device__ void dgIbDonorEval(DgSolver &grid, i32 dIdx, const real hd[3],
       }
 }
 
-// wall-normal Hermite in the normalized coordinate sigma = s/d_i (wall at 0,
-// image at 1): f = b0 + b1 s + b2 s^2 + b3 s^3.  Conditions: value/1st/2nd
-// derivative at sigma=1 (F, hF1 = F1*d_i, hF2 = F2*d_i^2) plus the wall BC at
-// sigma=0 -- Dirichlet f(0)=bc, or Neumann f'(0)=bc (bc pre-scaled by d_i).
-// All coefficients are O(field): no 1/d^k term survives (fp32-safe).
-__device__ __forceinline__ real dgIbHermite(i32 dirichlet, real bc,
-    real F, real hF1, real hF2, real sigma, i32 order) {
-  // The ghost element holds the MIRROR WORLD about the wall: every node --
-  // including the fluid-side nodes of cut elements, which are exactly the
-  // face nodes its fluid neighbor reads -- carries the BC-reflected state,
-  //   Dirichlet f0:  ghost = 2 f0 - f(|sigma|)     (odd about the wall value)
-  //   Neumann  g0:   ghost = f(|sigma|) - 2|sigma| hg0   (even, slope-corrected)
-  // with the Hermite polynomial always evaluated INSIDE its data interval
-  // [0,1] (|sigma| <= 1 by the mirror-with-floor rule).  Two measured failure
-  // modes forced this form: (a) filling fluid-side face nodes with the plain
-  // interpolant f(sigma) makes the wall TRANSPARENT (p_stag 0.80 vs pitot 8.6
-  // at M=3 -- HLLC transmits into the non-conservative ghost instead of
-  // reflecting; pinned-freestream ghosts give exactly p_inf, so the faces do
-  // couple); (b) raw polynomial extrapolation at sigma < 0 is the order-3
-  // rest-state instability (e-folding ~0.06) and gives +9-instead-of-+3
-  // startup jets at order 2.
-  real a = fabs(sigma), v;
-  if (order <= 1)
-    v = dirichlet ? (bc + (F - bc)*a) : (F + bc*(a - (real)1.0));
-  else {
-    real b0, b1, b2, b3 = 0.0;
-    if (dirichlet) {
-      real A = F - bc;
-      b0 = bc;
-      if (order >= 3) { b3 = (real)0.5*hF2 - hF1 + A; b2 = hF1 - A - (real)2.0*b3; }
-      else            { b2 = hF1 - A; }
-      b1 = A - b2 - b3;
-    } else {
-      b1 = bc;
-      if (order >= 3) { b3 = (bc + hF2 - hF1)*(real)(1.0/3.0); b2 = (real)0.5*(hF2 - (real)6.0*b3); }
-      else            { b2 = (real)0.5*(hF1 - bc); }
-      b0 = F - bc - b2 - b3;
-    }
-    v = b0 + a*(b1 + a*(b2 + a*b3));
-  }
-  return dirichlet ? ((real)2.0*bc - v) : (v - (real)2.0*a*bc);
-}
-
 // the ghost fill: one thread per ghost node
-__global__ void dgIbFillKernel(DgSolver &grid) {
+// hard two-sided clamp on the filled ghost states: NO ghost node may present
+// density/pressure outside [moodRho,100]*cScale / [moodP,1000]*pinf to the
+// wall face flux.  A safety net for the extreme high-res FRIB reconstruction
+// (any path) that would otherwise feed an unbounded state into the adjacent
+// fluid cell.  Only garbage (>100x) is touched; physical states pass through.
+__global__ void dgIbGhostClampKernel(DgSolver &grid) {
+  const real rLo = grid.moodRho*grid.cScale[0], rHi = (real)100.0*grid.cScale[0];
+  const real pLo = grid.moodP/dgGam,            pHi = (real)1000.0/dgGam;
   DG_CELL_LOOP(cIdx, bIdx) {
     if (grid.ibClassList[bIdx] != IB_GHOST) continue;
+    if (grid.bLocList[bIdx] == kEmpty) continue;
+    real U[5], W[5];
+    for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[cIdx];
+    dgConsToPrimSane(U, W);
+    real rc = fmin(fmax(W[0], rLo), rHi), pc = fmin(fmax(W[4], pLo), pHi);
+    if (rc != W[0] || pc != W[4]) {
+      W[0] = rc; W[4] = pc;
+      dgP2C(W, U);
+      for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = U[q];
+    }
+  }
+}
+
+// SBM cut-cell SOLID-NODE ghost fill (user call): a --ibcut 0 cut cell carries
+// nodes INSIDE the solid (r<R) whose evolved data is non-physical.  Instead FILL
+// them as ghost nodes -- reflect the node across the wall to an image point in
+// the fluid and BILINEARLY interpolate the fluid state there (dgHatAt, piecewise
+// linear -> no high-order Gibbs overshoot, the thing that made the FRIB high-
+// order fill blow up), then apply the slip-wall reflection u_n -> -u_n.  Gives
+// the cut cell a physical near-wall extension so its FLUID nodes' volume
+// derivative sees a real state, not garbage.  Fluid nodes (r>=R) are untouched.
+__global__ void dgIbSolidFillKernel(DgSolver &grid) {
+  DG_CELL_LOOP(cIdx, bIdx) {
+    if (grid.ibClassList[bIdx] != IB_FLUID) continue;
+    u64 loc = grid.bLocList[bIdx];
+    if (loc == kEmpty) continue;
+    GET_CELL_INDICES
+    i32 lvl, ib, jb, kb;
+    grid.decode(loc, lvl, ib, jb, kb);
+    real h[3]; dgElemSize(grid, lvl, h);
+    real x = dgNodePos(h[0], ib, i), y = dgNodePos(h[1], jb, j);
+    real dxc = x - grid.ibX, dyc = y - grid.ibY;
+    real r  = sqrt(dxc*dxc + dyc*dyc);
+    if (r >= grid.ibR) continue;                   // fluid node: leave it to evolve
+    real nx = dxc/fmax(r, (real)1e-12), ny = dyc/fmax(r, (real)1e-12);
+    real ri = (real)2.0*grid.ibR - r;              // reflected image radius (> R)
+    real xi = grid.ibX + ri*nx, yi = grid.ibY + ri*ny;
+    real z  = dgNodePos(h[2], kb, k);
+    i32 dl, dib, djb, dkb;
+    i32 lidx = dgIbLocateLeaf(grid, xi, yi, z, dl, dib, djb, dkb);
+    if (lidx == bEmpty || grid.ibClassList[lidx] != IB_FLUID) continue;   // keep previous
+    real hd[3]; dgElemSize(grid, dl, hd);
+    real zeta[3] = { (real)2.0*(xi/hd[0]-dib)-(real)1.0,
+                     (real)2.0*(yi/hd[1]-djb)-(real)1.0,
+                     grid.pseudo2D ? (real)0.0 : (real)2.0*(z/hd[2]-dkb)-(real)1.0 };
+    real W[5] = {(real)0.0,(real)0.0,(real)0.0,(real)0.0,(real)0.0};
+    real wsum = (real)0.0;
+    i32 cmax = grid.pseudo2D ? 1 : NNODE;
+    for (i32 c = 0; c < cmax; c++)
+      for (i32 b = 0; b < NNODE; b++)
+        for (i32 a = 0; a < NNODE; a++) {
+          // FLUID DONOR NODES ONLY (renormalised): a donor's own solid-filled
+          // nodes must never feed the fill -- on Gauss the clamped hat gives an
+          // edge-gap image point 100% weight on the nearest node, which on the
+          // wall side IS a solid node: a filled->filled copy loop around the
+          // ring that never touches evolved fluid (the ibcut-0 rest-gate
+          // instability, finally localized).
+          real wv = dgHatAt(a, zeta[0])*dgHatAt(b, zeta[1])
+                  * (grid.pseudo2D ? (real)1.0 : dgHatAt(c, zeta[2]));
+          i32 nd = a + NNODE*(b + NNODE*c);
+          real U[5], Wp[5];
+          for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[(u64)lidx*blockSizeTot + nd];
+          dgConsToPrimSane(U, Wp);
+          for (i32 q = 0; q < 5; q++) W[q] += wv*Wp[q];
+          wsum += wv;
+        }
+    if (wsum < (real)0.05) continue;                // no meaningful fluid support: keep previous
+    for (i32 q = 0; q < 5; q++) W[q] /= wsum;
+    real un = W[1]*nx + W[2]*ny;                    // slip-wall reflection
+    real Wg[5] = { W[0], W[1]-(real)2.0*un*nx, W[2]-(real)2.0*un*ny, W[3], W[4] };
+    dgSanitizePrim(Wg);
+    real Ug[5]; dgP2C(Wg, Ug);
+    for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = Ug[q];
+  }
+}
+
+__global__ void dgIbFillKernel(DgSolver &grid) {
+  DG_CELL_LOOP(cIdx, bIdx) {
+    const i32 cls = grid.ibClassList[bIdx];
+    if (cls != IB_GHOST && cls != IB_CUT) continue;
     u64 loc = grid.bLocList[bIdx];
     if (loc == kEmpty) continue;
     GET_CELL_INDICES
@@ -2098,78 +4546,525 @@ __global__ void dgIbFillKernel(DgSolver &grid) {
     real r  = fmax(sqrt(dxc*dxc + dyc*dyc), (real)1e-12*grid.ibR);
     real n[3] = { dxc/r, dyc/r, (real)0.0 };  // outward wall normal
     real sg = r - grid.ibR;                   // signed distance (< 0 inside)
+    // --ibevolve: the fluid-side nodes of a CUT element EVOLVE -- fill only
+    // its solid-side nodes (exact phi = 0 split, complement of the RK mask).
+    // The image line below samples only NON-CUT fluid donors (the march
+    // skips IB_CUT like any non-fluid class), so no partially-filled cut
+    // data ever enters a reconstruction.
+    if (cls == IB_CUT && sg > (real)0.0) continue;
     real xb = x - sg*n[0], yb = y - sg*n[1];  // boundary foot
 
-    // image point: mirror with a floor, pushed out until its leaf is FLUID
-    real di = fmax(fabs(sg), grid.ibImageFac*h[0]);
-    i32 dIdx = bEmpty, dl = 0, dib = 0, djb = 0, dkb = 0;
-    for (i32 t = 0; t < 8; t++) {
-      i32 idx = dgIbLocateLeaf(grid, xb + di*n[0], yb + di*n[1], z, dl, dib, djb, dkb);
-      if (idx != bEmpty && grid.ibClassList[idx] == IB_FLUID) { dIdx = idx; break; }
-      di += (real)0.5*h[0];
-    }
-    if (dIdx == bEmpty) {   // geometrically (near-)impossible for a convex body:
-      atomicAdd(&grid.ibCnt[IB_CNT_NODONOR], 1);   // keep previous values, count it
+    // FRIB HO-i/c (Funada & Imamura 2023, docs/FRIB.pdf) -- THE wall method.
+    // (The mirror-world Hermite fill and the --ibevolve per-node hybrid were
+    // REMOVED at user direction 2026-07-13; the project notes keep their
+    // measured matrix and reimplementation keys.)
+    // Reconstruct (u_n, H, S, u_t) along the wall-normal image line through
+    // this node: wall at xi=-1, fluid end at xi=+1, length dIL sized so the
+    // FIRST INTERIOR LGL position clears the cut layer (paper Eq 22).  The
+    // outer image points SAMPLE the fluid-cell polynomials; the wall point
+    // (exactly xi=-1 = c_xi[0], so phi_i(-1) = delta_i0) is SOLVED from
+    //   u_n(-1) = 0,  dH/dxi(-1) = 0,  dS/dxi(-1) = 0,
+    //   du_t/ds(0) = -u_t(0)/R   (outward s; potential-flow sign, --ibcurv)
+    // and the node value is the line polynomial at its own xi -- NO mirror:
+    // the face Riemann carries the consistent transpiration of the true
+    // sub-face wall.  Deep nodes evaluate the near-wall xi = -1.35 state
+    // (mixing constructions along one fluid-facing face is the measured
+    // coherence-killer).
+    // Fallback ladder: a shocked donor (H and S are interpolated as SMOOTH
+    // invariants -- across an unsteady shock both jump; the raw
+    // reconstruction died at iter 5 of the M=3 impulsive start), an
+    // unsampleable image point, or an inadmissible state drops the node to
+    // the paper's LO method (single image point, Eq 16: u_n scaled linearly
+    // in wall distance, rho/p/u_t copied -- first-order, bounded); with no
+    // donor at all the node keeps its previous value (counted).
+    // ── SINGLE-IP FRIB (--ibsingle): one donor element, IP at MAXIMUM DEPTH
+    //    along the wall-normal ray inside it (92% of the ray's box exit).
+    //    Variant 1: per-field LINEAR lines (wall BC <-> IP state).
+    //    Variant 2: per-field QUADRATIC Hermite (wall BC + IP value + IP
+    //    normal slope) -- the mirror-era measured-optimal order, primitives.
+    //    One clean donor: no multi-element seams, no march flips, and Eq 22's
+    //    lower limit dissolves (samples are inside a guaranteed-uncut cell).
+    if (grid.ibSingle > 0) {
+      // find the FIRST fluid element along the ray, then push the IP deep
+      i32 ml = 0, mib = 0, mjb = 0, mkb = 0, mIdx = bEmpty;
+      real tFind = (real)0.35*h[0];
+      for (i32 t = 0; t < 8; t++) {
+        i32 idx = dgIbLocateLeaf(grid, xb + tFind*n[0], yb + tFind*n[1], z,
+                                 ml, mib, mjb, mkb);
+        if (idx != bEmpty && grid.ibClassList[idx] == IB_FLUID) { mIdx = idx; break; }
+        tFind += (real)0.25*h[0];
+      }
+      if (mIdx == bEmpty) { atomicAdd(&grid.ibCnt[IB_CNT_NODONOR], 1); continue; }
+      real hm[3]; dgElemSize(grid, ml, hm);
+      // ray-box exit distance from the wall foot (xb,yb) along n
+      real tExit = (real)1e30;
+      if (fabs(n[0]) > (real)1e-12) {
+        real b0 = mib*hm[0], b1 = (mib+1)*hm[0];
+        real tc = ((n[0] > 0 ? b1 : b0) - xb)/n[0];
+        if (tc > (real)0.0) tExit = fmin(tExit, tc);
+      }
+      if (fabs(n[1]) > (real)1e-12) {
+        real b0 = mjb*hm[1], b1 = (mjb+1)*hm[1];
+        real tc = ((n[1] > 0 ? b1 : b0) - yb)/n[1];
+        if (tc > (real)0.0) tExit = fmin(tExit, tc);
+      }
+      // ibSingle 3/4 = same as 1/2 but FIXED depth d = 1.2h (smooth in node
+      // position -- the max-depth box exit is DISCONTINUOUS as the normal
+      // sweeps donor corners, an element-granular roughness source)
+      real d = (grid.ibSingle >= 3) ? (real)1.2*h[0]
+             : fmax((real)0.92*tExit, tFind);          // IP depth from the wall
+      real xI = xb + d*n[0], yI = yb + d*n[1];
+      real zetam[3] = { (real)2.0*(xI/hm[0] - mib) - (real)1.0,
+                        (real)2.0*(yI/hm[1] - mjb) - (real)1.0,
+                        grid.pseudo2D ? (real)0.0
+                                      : (real)2.0*(z/hm[2] - mkb) - (real)1.0 };
+      real F[5], F1[5], F2[5];
+      dgIbDonorEval(grid, mIdx, hm, zetam, n, F, F1, F2);
+      // gates (same ladder): arriving shock -> piston star; outflow -> LO
+      real aI = sqrt(dgGam*fmax(F[4], DG_EPSF)/fmax(F[0], DG_EPSF));
+      real unI = F[1]*n[0] + F[2]*n[1];
+      real thD = grid.getField(D_SCRATCH)[(u64)mIdx*blockSizeTot + 1];
+      bool gated = (fabs(unI) > (real)0.3*aI) || (thD > grid.ibShockTheta);
+      real tx = -n[1], ty = n[0];
+      real utI = F[1]*tx + F[2]*ty;
+      if (gated) {
+        atomicAdd(&grid.ibCnt[IB_CNT_FALLBACK], 1);
+        if (unI < (real)0.0) {   // piston star
+          real rhoI = fmax(F[0], DG_EPSF), pIr = F[4];
+          real pI = fmax(pIr, DG_EPSF), m2 = unI*unI;
+          real A  = (real)2.0/((dgGam+(real)1.0)*rhoI);
+          real Bc = (dgGam-(real)1.0)/(dgGam+(real)1.0)*pI;
+          real bq = (real)2.0*pI + m2/A, cq = pI*pI - m2*Bc/A;
+          real ps = (real)0.5*(bq + sqrt(fmax(bq*bq - (real)4.0*cq, (real)0.0)));
+          real pCap = (pIr > (real)0.0) ? pI : (real)0.5*rhoI*m2;
+          ps = fmin(ps, (real)50.0*pCap);
+          real g = (dgGam-(real)1.0)/(dgGam+(real)1.0), pr = ps/pI;
+          real rs = rhoI*(pr + g)/(g*pr + (real)1.0);
+          real W[5] = { rs, utI*tx, utI*ty, F[3], ps };
+          dgSanitizePrim(W);
+          real U[5]; dgP2C(W, U);
+          for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = U[q];
+          continue;
+        }
+        real sEv = fmax(sg, (real)0.0);
+        real W[5] = { F[0], unI*(sEv/d)*n[0] + utI*tx,
+                            unI*(sEv/d)*n[1] + utI*ty, F[3], F[4] };
+        dgSanitizePrim(W);
+        real U[5]; dgP2C(W, U);
+        for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = U[q];
+        continue;
+      }
+      // wall values with primitive BCs (curvature-gated)
+      real utW, pW, rhoW;
+      real curvOn = grid.ibCurv ? (real)1.0 : (real)0.0;
+      real fac = (real)1.0 - curvOn*d/fmax(grid.ibR, DG_EPSF);
+      utW = (fac > (real)0.2) ? utI/fac : utI;         // du_t/ds(0) = -u_t/R
+      real gp = curvOn*F[0]*utW*utW/fmax(grid.ibR, DG_EPSF);
+      real a2 = dgGam*fmax(F[4], DG_EPSF)/fmax(F[0], DG_EPSF);
+      real sEv = fmax(sg, (real)-0.175*d);             // eval depth (clamped)
+      real un, ut, pv, rv, wv;
+      if (grid.ibSingle == 1 || grid.ibSingle == 3) {
+        // linear per-field lines
+        un = unI*(sEv/d);
+        ut = utW + (utI - utW)*(sEv/d);
+        pv = (F[4] - gp*d) + gp*sEv;                   // p_w + gp*s
+        rv = (F[0] - gp/a2*d) + gp/a2*sEv;
+        wv = F[3];
+      } else {
+        // quadratic Hermite: wall BC + IP value + IP normal slope
+        real unp = F1[1]*n[0] + F1[2]*n[1];
+        real utp = F1[1]*tx + F1[2]*ty;
+        real ppn = F1[4], rpn = F1[0];
+        // u_n: a=0; b d + c d^2 = unI; b + 2 c d = unp
+        real cN = (unp*d - unI)/(d*d), bN = (real)2.0*unI/d - unp;
+        un = bN*sEv + cN*sEv*sEv;
+        // u_t: b = -a/R (curv); a(1 - d/R) + c d^2 = utI; -a/R + 2 c d = utp
+        real R  = fmax(grid.ibR, DG_EPSF);
+        real A11 = (real)1.0 - curvOn*d/R, A12 = d*d;
+        real A21 = -curvOn/R,              A22 = (real)2.0*d;
+        real det = A11*A22 - A12*A21;
+        real aT, cT;
+        if (fabs(det) > (real)1e-12) {
+          aT = ( utI*A22 - A12*utp)/det;
+          cT = ( A11*utp - A21*utI)/det;
+        } else { aT = utI; cT = (real)0.0; }
+        real bT = -curvOn*aT/R;
+        ut = aT + bT*sEv + cT*sEv*sEv;
+        // p: b = gp; c = (p' - b)/(2d); a = pI - b d - c d^2
+        real cP = (ppn - gp)/((real)2.0*d);
+        real aP = F[4] - gp*d - cP*d*d;
+        pv = aP + gp*sEv + cP*sEv*sEv;
+        real gr = gp/a2;
+        real cR = (rpn - gr)/((real)2.0*d);
+        real aR = F[0] - gr*d - cR*d*d;
+        rv = aR + gr*sEv + cR*sEv*sEv;
+        // w: linear value+slope
+        wv = F[3] + F1[3]*(sEv - d);
+        if (grid.ibLimit) {   // no new extremum beyond {wall, IP}
+          real lo, hi;
+          lo=fmin((real)0.0,unI); hi=fmax((real)0.0,unI); un=fmin(fmax(un,lo),hi);
+          lo=fmin(aT,utI);        hi=fmax(aT,utI);        ut=fmin(fmax(ut,lo),hi);
+          lo=fmin(aP,F[4]);       hi=fmax(aP,F[4]);       pv=fmin(fmax(pv,lo),hi);
+          lo=fmin(aR,F[0]);       hi=fmax(aR,F[0]);       rv=fmin(fmax(rv,lo),hi);
+        }
+      }
+      if (pv > (real)1e-3*F[4] && rv > (real)1e-3*F[0]) {
+        real W[5] = { rv, un*n[0] + ut*tx, un*n[1] + ut*ty, wv, pv };
+        dgSanitizePrim(W);
+        real U[5]; dgP2C(W, U);
+        for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = U[q];
+      } else {
+        atomicAdd(&grid.ibCnt[IB_CNT_RETRY1], 1);
+        real sEv2 = fmax(sg, (real)0.0);
+        real W[5] = { F[0], unI*(sEv2/d)*n[0] + utI*tx,
+                            unI*(sEv2/d)*n[1] + utI*ty, F[3], F[4] };
+        dgSanitizePrim(W);
+        real U[5]; dgP2C(W, U);
+        for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = U[q];
+      }
       continue;
     }
-    real xi = xb + di*n[0], yi = yb + di*n[1];
 
-    real hd[3]; dgElemSize(grid, dl, hd);
-    real zeta[3] = { (real)2.0*(xi/hd[0] - dib) - (real)1.0,
-                     (real)2.0*(yi/hd[1] - djb) - (real)1.0,
-                     grid.pseudo2D ? (real)0.0
-                                   : (real)2.0*(z/hd[2] - dkb) - (real)1.0 };
+    // image-line length: paper Eq 22 (3h at p=2 / 5.5h at p=3, sized so the
+    // first interior line node clears the cut layer).  --ibdil overrides (in
+    // units of h) -- the ibevolve line-shortening experiments: with the cut
+    // element evolving, how much of the long line is still load-bearing?
+    real dIL = ((grid.ibDil > (real)0.0) ? grid.ibDil
+              : ((NNODE >= 4) ? (real)5.5 : (real)3.0))*h[0];
+    real xiN = fmax((real)2.0*sg/dIL - (real)1.0, (real)-1.35);
+    real Un[NNODE], Ut[NNODE], Wt[NNODE], Hn[NNODE], Sn[NNODE];
+    real rho1 = 0, p1 = 0;
+    real ipS = (real)1.0, ipF[5] = {0,0,0,0,0};   // first sampled IP (fallbacks)
+    bool haveIp = false, shocked = false;
+    {
+      {
+        bool ok = true;
+        for (i32 m = 1; m < NNODE; m++) {
+          real sm = (c_ibLXi[m] + (real)1.0)*(real)0.5*dIL;   // LINE node (Lobatto)
+          // push-out march (mirror-fill style): an IP landing in a non-FLUID
+          // leaf steps outward in fine 0.25h increments -- an instant
+          // per-node fallback flips neighbouring nodes between schemes as
+          // leaves re-adapt (element-granular trace jumps, the wall
+          // stair-step source).  The marched sample is used AT the basis
+          // position (O(0.25h) smooth-field inconsistency, continuous in
+          // space/time -- preferable to a scheme flip).
+          i32 ml = 0, mib = 0, mjb = 0, mkb = 0;
+          i32 mIdx = bEmpty;
+          for (i32 t = 0; t < 6; t++) {
+            i32 idx = dgIbLocateLeaf(grid, xb + sm*n[0], yb + sm*n[1], z,
+                                     ml, mib, mjb, mkb);
+            if (idx != bEmpty && grid.ibClassList[idx] == IB_FLUID) { mIdx = idx; break; }
+            sm += (real)0.25*h[0];
+          }
+          if (mIdx == bEmpty) { ok = false; break; }
+          real hm[3]; dgElemSize(grid, ml, hm);
+          real xm = xb + sm*n[0], ym = yb + sm*n[1];
+          real zetam[3] = { (real)2.0*(xm/hm[0] - mib) - (real)1.0,
+                            (real)2.0*(ym/hm[1] - mjb) - (real)1.0,
+                            grid.pseudo2D ? (real)0.0
+                                          : (real)2.0*(z/hm[2] - mkb) - (real)1.0 };
+          real F[5], F1[5], F2[5];
+          dgIbDonorEval(grid, mIdx, hm, zetam, n, F, F1, F2);
+          if (!haveIp) {   // keep the innermost sample for the fallbacks
+            haveIp = true; ipS = sm;
+            for (i32 q = 0; q < 5; q++) ipF[q] = F[q];
+            // normal-Mach gate, sensor-INDEPENDENT and SYMMETRIC: |u_n| >
+            // 0.3 a at the image point violates the smooth-wall assumption
+            // in either direction -- inflow is a forming wall shock (star
+            // fallback), outflow at the M=3 startup rear band swings the
+            // u_n line polynomial 0 -> 3 and the |u|^2 back-conversion
+            // overshoots H (LO fallback).  The theta sensor alone LAGS the
+            // impulsive start by a few steps, and raw FRIB inside that
+            // window is an fp knife edge (identical-digit iter-2 blowups
+            // that recompiles tip either way).  In settled flow -- subsonic
+            // OR behind the bow shock -- near-wall u_n is small and FRIB
+            // stays engaged.
+            real aI = sqrt(dgGam*fmax(F[4], DG_EPSF)/fmax(F[0], DG_EPSF));
+            if (fabs(F[1]) > (real)0.3*aI) {
+              ok = false;
+              shocked = true;
+              atomicAdd(&grid.ibCnt[IB_CNT_FALLBACK], 1);
+              break;
+            }
+          }
+          // shock gate AFTER sampling (the shocked-node fallback reuses the
+          // sample): H and S are interpolated as SMOOTH invariants -- both
+          // jump across an unsteady shock (raw FRIB died at M=3 iter 5).
+          // Behind the settled bow shock the wall band is smooth subsonic
+          // and the full reconstruction re-engages.
+          if (grid.getField(D_SCRATCH)[(u64)mIdx*blockSizeTot + 1]
+              > grid.ibShockTheta) {
+            ok = false;
+            shocked = true;
+            atomicAdd(&grid.ibCnt[IB_CNT_FALLBACK], 1);
+            break;
+          }
+          real q2 = F[1]*F[1] + F[2]*F[2] + F[3]*F[3];
+          Un[m] = F[1];
+          Ut[m] = F[2];
+          Wt[m] = F[3];
+          if (grid.ibRecon == 1) {          // PRIMITIVE line: p, rho directly
+            Hn[m] = F[4];                    // (Hn slot carries p)
+            Sn[m] = F[0];                    // (Sn slot carries rho)
+          } else {
+            Hn[m] = dgGam/(dgGam - (real)1.0)*F[4]/fmax(F[0], DG_EPSF) + (real)0.5*q2;
+            Sn[m] = F[4]/pow(fmax(F[0], DG_EPSF), dgGam);
+          }
+          if (m == 1) { rho1 = F[0]; p1 = F[4]; }
+        }
+        if (grid.ibHO == 2) {
+          // ── PAPER WALL MODEL (Qi, Wang, Zhu, Tian, Zhao 2024, Eq 19) ──────
+          // Pure form: EVERY ghost node (smooth, shocked, expansion) takes this
+          // robust reconstruction -- NO piston, NO LO.  Survives the full
+          // high-res M=3 impulsive start, but UNDER-REFLECTS the bow shock
+          // (measured standoff -97%, p_stag -88%): the linear-u_n + centripetal
+          // pressure cannot present the strong reflected-shock state, which is
+          // exactly what the piston provides.  Re-introducing the piston for
+          // shocked nodes recovers the standoff but reactivates its gain-loop
+          // blowup at the turning shoulder -- the open design problem.
+          // ONE near-wall image point + an ALGEBRAIC curvature correction,
+          // evaluated at the CLAMPED near-wall trace.  Deliberately NOT the
+          // deep image-line polynomial and NOT the H/S smooth-invariant
+          // reconstruction.  Robust by construction: u_n is linear-to-zero at
+          // the wall and clamped to |u_n,image| (no deep extrapolation
+          // overshoot -> no velocity blowup); the wall pressure rises by the
+          // centripetal balance dP/dn = -rho u_t^2/R from a POSITIVE
+          // (Gibbs-floored) image pressure -> no vacuum ghost; rho follows
+          // isentropically -> stays positive.  This handles the smooth and
+          // EXPANSION nodes; SHOCKED COMPRESSION nodes fall through to the
+          // (vacuum-cap-fixed) piston below, which alone presents the strong
+          // reflected-shock state the M=3 standoff needs -- pure paper mode
+          // under-reflects it by ~90%.  keep-previous if no donor at all.
+          if (haveIp) {
+            real rI  = fmax(ipF[0], DG_EPSF);
+            // floor the sampled image pressure to a dynamic-pressure scale: a
+            // startup DG Gibbs dip drives it <= 0, and the whole point of this
+            // model is to never turn that into a non-physical ghost.
+            real PI  = fmax(ipF[4], (real)1e-3*(real)0.5*rI*ipF[1]*ipF[1]);
+            PI = fmax(PI, DG_EPSF);
+            real unI = ipF[1], utI = ipF[2], wtI = ipF[3];
+            real sgEff = fmax(sg, -ipS);              // clamp to <= 1 image spacing
+            real un = unI*(sgEff/ipS);                // linear to 0 at wall, reflected
+            real dn = ipS - sgEff;                     // wall-normal span, in (ipS, 2 ipS]
+            real Pn = PI + rI*utI*utI/fmax(grid.ibR, DG_EPSF)*dn;  // centripetal rise
+            real rhon = rI*pow(Pn/PI, (real)1.0/dgGam);            // isentropic density
+            real W[5] = { rhon, un*n[0] - utI*n[1], un*n[1] + utI*n[0], wtI, Pn };
+            dgSanitizePrim(W);
+            real U[5];
+            dgP2C(W, U);
+            for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = U[q];
+            atomicAdd(&grid.ibCnt[IB_CNT_RETRY1], 1);
+            continue;
+          }
+          atomicAdd(&grid.ibCnt[IB_CNT_NODONOR], 1);   // no donor: keep previous
+          continue;
+        }
+        if (ok) {
+          real un, ut, wt, Hh, Ss;
+          if (grid.ibHO == 1) {
+            const real *D0 = c_ibLD0;   // line-basis derivative row at the wall
+            real sH = 0, sS = 0, sU = 0, sW = 0;
+            for (i32 m = 1; m < NNODE; m++) {
+              sH += D0[m]*Hn[m]; sS += D0[m]*Sn[m];
+              sU += D0[m]*Ut[m]; sW += D0[m]*Wt[m];
+            }
+            Un[0] = (real)0.0;
+            if (grid.ibRecon == 1) {
+              // primitive wall BCs (in line coords, d/dxi = (dIL/2) d/dn):
+              //   dp/dn   = rho u_t^2 / R  (centripetal; ibCurv gates it)
+              //   drho/dn = dp/dn / a^2    (linearized isentropy -- no powers)
+              // coefficients from the innermost sample (first-order lag).
+              real ut1 = Ut[1];
+              real gp  = grid.ibCurv
+                       ? (real)0.5*dIL * rho1*ut1*ut1/fmax(grid.ibR, DG_EPSF)
+                       : (real)0.0;
+              real a2  = dgGam*fmax(p1, DG_EPSF)/fmax(rho1, DG_EPSF);
+              Hn[0] = (gp      - sH)/D0[0];          // p_wall
+              Sn[0] = (gp/a2   - sS)/D0[0];          // rho_wall
+            } else {
+              Hn[0] = -sH/D0[0];
+              Sn[0] = -sS/D0[0];
+            }
+            Wt[0] = -sW/D0[0];
+            real dnm = D0[0] + (grid.ibCurv ? (real)0.5*dIL/grid.ibR : (real)0.0);
+            Ut[0] = -sU/dnm;
+            un = 0; ut = 0; wt = 0; Hh = 0; Ss = 0;
+            for (i32 m = 0; m < NNODE; m++) {
+              real ph = dgIbLineBasisAt(m, xiN);   // LINE basis, not the element's
+              un += ph*Un[m]; ut += ph*Ut[m]; wt += ph*Wt[m];
+              Hh += ph*Hn[m]; Ss += ph*Sn[m];
+            }
+            // MUSCL monotonicity limiter: clamp each reconstructed field to the
+            // range of the WALL value (m=0) + the sampled image points (m>=1),
+            // so the high-order polynomial cannot create a NEW extremum -- the
+            // ring in H/S that detonates the near-vacuum/high-res wall.  H,S are
+            // smooth invariants so no new extremum is physical; the stagnation
+            // pressure rise SURVIVES (it comes from |u| -> 0 at the wall, where
+            // un=0 is in the data, not from H overshooting).
+            if (grid.ibLimit) {
+              real unL=Un[0],unH=Un[0],utL=Ut[0],utH=Ut[0],wtL=Wt[0],wtH=Wt[0];
+              real HL=Hn[0],HH=Hn[0],SL=Sn[0],SH=Sn[0];
+              for (i32 m = 1; m < NNODE; m++) {
+                unL=fmin(unL,Un[m]); unH=fmax(unH,Un[m]);
+                utL=fmin(utL,Ut[m]); utH=fmax(utH,Ut[m]);
+                wtL=fmin(wtL,Wt[m]); wtH=fmax(wtH,Wt[m]);
+                HL =fmin(HL, Hn[m]); HH =fmax(HH, Hn[m]);
+                SL =fmin(SL, Sn[m]); SH =fmax(SH, Sn[m]);
+              }
+              un=fmin(fmax(un,unL),unH); ut=fmin(fmax(ut,utL),utH); wt=fmin(fmax(wt,wtL),wtH);
+              Hh=fmin(fmax(Hh,HL),HH);   Ss=fmin(fmax(Ss,SL),SH);
+            }
+          } else {
+            // FIRST ORDER (--ibho 0): the interpolated image point + the wall
+            // boundary value, NO SLOPE.  H,S held CONSTANT at the image value
+            // (dH/dn = dS/dn = 0 with no slope term -> constant); u_n LINEAR
+            // from 0 at the wall (sg = 0) to the image value, via the geometric
+            // wall-distance ratio sg/ipS; u_t,w_t = image (no curvature slope).
+            // rho,p fall out of (H,S,|u|) below, so |u| -> 0 at the wall still
+            // lifts the stagnation pressure -- but a 2-point line CANNOT ring,
+            // so the near-vacuum/high-res wall stays bounded.  ipF/ipS = the
+            // innermost fluid image point (the same sample the LO fallback uses).
+            un = ipF[1]*(sg/ipS);
+            ut = ipF[2]; wt = ipF[3];
+            real q2i = ipF[1]*ipF[1] + ipF[2]*ipF[2] + ipF[3]*ipF[3];
+            Hh = dgGam/(dgGam - (real)1.0)*ipF[4]/fmax(ipF[0], DG_EPSF) + (real)0.5*q2i;
+            Ss = ipF[4]/pow(fmax(ipF[0], DG_EPSF), dgGam);
+          }
+          real q2n = un*un + ut*ut + wt*wt;
+          real Tst, SsEff;
+          if (grid.ibRecon == 1) {
+            // direct primitives: no H - q^2/2 cancellation, no power law.
+            real pw = Hh, rw = Ss;
+            if (pw > (real)1e-3*p1 && rw > (real)1e-3*rho1 &&
+                pw < (real)1000.0/dgGam && rw < (real)100.0*grid.cScale[0]) {
+              real W[5] = { rw, un*n[0] - ut*n[1], un*n[1] + ut*n[0], wt, pw };
+              dgSanitizePrim(W);
+              real U[5];
+              dgP2C(W, U);
+              for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = U[q];
+              continue;
+            }
+            Tst = (real)-1.0; SsEff = (real)-1.0;   // inadmissible -> fallback ladder
+          } else {
+            Tst = (dgGam - (real)1.0)/dgGam*(Hh - (real)0.5*q2n);   // p/rho
+            SsEff = Ss;
+          }
+          (void)SsEff;
+          if (grid.ibDbg && grid.iter>=14 && grid.iter<=21 && lvl==4 && ib==106 && jb==213)
+            printf("[fill rec] ijk(%d,%d,%d) xiN=%.2f Tst=%.3e Ss=%.3e Hh=%.3e q2n=%.3e un=%.3e ipF4=%.3e\n",
+                   i,j,k,(double)xiN,(double)Tst,(double)Ss,(double)Hh,(double)q2n,(double)un,(double)ipF[4]);
+          if (Tst > (real)0.0 && Ss > (real)0.0) {
+            real rho = pow(Tst/fmax(Ss, DG_EPSF), (real)1.0/(dgGam - (real)1.0));
+            real p   = Tst*rho;
+            // a-posteriori-limited FRIB: the HO reconstruction is accepted
+            // only if TWO-SIDED admissible (the MOOD bounds).  The lower
+            // bound is positivity; the UPPER bound (100x rho, 1000x p) rejects
+            // the extreme high-res reconstruction that feeds a bad wall state
+            // into the fluid through the face flux (the high-res nose/rear
+            // blowup no fluid-side limiter could reach) -- it drops to the
+            // bounded LO fallback instead ("low order FRIB when troubled").
+            real rHi = (real)100.0*grid.cScale[0], pHi = (real)1000.0/dgGam;
+            if (rho > (real)1e-3*rho1 && p > (real)1e-3*p1 && rho < rHi && p < pHi) {
+              real W[5] = { rho,
+                            un*n[0] - ut*n[1],
+                            un*n[1] + ut*n[0],
+                            wt,
+                            p };
+              if (grid.ibDbg && grid.iter>=14 && grid.iter<=21 && lvl==4 && ib==106 && jb==213)
+                printf("[fill HO ] ijk(%d,%d,%d) xiN=%.2f p=%.3e rho=%.3e Hh=%.3e q2n=%.3e\n",
+                       i,j,k,(double)xiN,(double)p,(double)rho,(double)Hh,(double)q2n);
+              dgSanitizePrim(W);
+              real U[5];
+              dgP2C(W, U);
+              for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = U[q];
+              continue;
+            }
+          }
+        }
+      }
+    }
 
-    i32 ord = grid.ibOrder;
-    if (ord == 0) {   // diagnostic mode: pin ghosts to the freestream state
-      real Wc[5] = { (real)1.0, grid.machInf, (real)0.0, (real)0.0, (real)1.0/dgGam };
-      real Uc[5];
-      dgP2C(Wc, Uc);
-      for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = Uc[q];
+    // shocked COMPRESSION node: EXACT WALL-RIEMANN (piston) trace.  The FRIB
+    // trace is a transpiration wall -- it presents no jump to the face
+    // Riemann solver, so an arriving shock transmits instead of reflecting
+    // (measured: standoff -89% with a plain LO fallback).  Here the node
+    // presents the exact post-reflection star state of the arriving
+    // image-point flow: reflected shock, p* from the Rankine-Hugoniot piston
+    // relation (closed-form positive quadratic root), rho* from the shock
+    // density ratio; u_n = 0, tangential velocity passes through (contact).
+    // Exact across shocks, per node, no smooth-invariant interpolation; it
+    // degrades continuously into the smooth-wall state as u_n -> 0-.
+    // COMPRESSION ONLY (u_n < 0): the expansion analogue (reflected
+    // rarefaction) prescribes near-vacuum at the M=3 startup rear band
+    // (p* = p (1-0.2 M)^7 ~ 1e-3 p) and detonates by iter 2 -- outflow
+    // regions transpire through the LO fallback instead.
+    if (grid.ibPiston && shocked && haveIp && ipF[1] < (real)0.0) {
+      real rhoI = fmax(ipF[0], DG_EPSF), unI = ipF[1];
+      real pIraw = ipF[4];
+      real pI = fmax(pIraw, DG_EPSF);
+      real m2 = unI*unI;
+      real A  = (real)2.0/((dgGam + (real)1.0)*rhoI);
+      real B  = (dgGam - (real)1.0)/(dgGam + (real)1.0)*pI;
+      real b  = (real)2.0*pI + m2/A;
+      real c  = pI*pI - m2*B/A;
+      real ps = (real)0.5*(b + sqrt(fmax(b*b - (real)4.0*c, (real)0.0)));
+      // cap the reflection at 50x the image pressure: the legitimate M=3
+      // head-on reflection is ps/pI ~ 17; unbounded, a transient |u_n| spike
+      // at the p=3 rear recompression feeds a gain>1 loop (star p -> face
+      // flux -> larger u_n at the image -> larger star: explosion at t=1.09,
+      // elem (64,61), rho 3e8) that p=2's dissipation damps.  BUT a startup DG
+      // Gibbs dip drives the sampled image pressure <= 0 at the high-res nose;
+      // fmax(.,DG_EPSF) then makes 50*pI ~ 1e-11 and the cap collapses the star
+      // to a VACUUM wall ghost, which drains the near-wall fluid to a detonation
+      // (cell 105,213, t~0.003).  When the image pressure is non-physical, cap
+      // against the incoming DYNAMIC pressure (1/2 rho u_n^2) -- the physical
+      // scale of the piston reflection -- so the ghost is a real stagnation
+      // wall, not vacuum.  Healthy (pIraw > 0) behaviour is byte-identical.
+      real pCap = (pIraw > (real)0.0) ? pI : (real)0.5*rhoI*m2;
+      ps = fmin(ps, (real)50.0*pCap);
+      real g  = (dgGam - (real)1.0)/(dgGam + (real)1.0);
+      real pr = ps/pI;
+      real rs = rhoI*(pr + g)/(g*pr + (real)1.0);
+      real W[5] = { rs,
+                    -ipF[2]*n[1],          // u_n = 0; tangential passes through
+                     ipF[2]*n[0],
+                     ipF[3],
+                     ps };
+      if (grid.ibDbg && grid.iter>=14 && grid.iter<=21 && lvl==4 && ib==106 && jb==213)
+        printf("[fill STAR] ijk(%d,%d,%d) ps=%.3e rs=%.3e (ipF: rho=%.3e un=%.3e p=%.3e)\n",
+               i,j,k,(double)ps,(double)rs,(double)ipF[0],(double)ipF[1],(double)ipF[4]);
+      dgSanitizePrim(W);
+      real U[5];
+      dgP2C(W, U);
+      for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = U[q];
       continue;
     }
-    if (ord > 2 &&
-        grid.getField(D_SCRATCH)[(u64)dIdx*blockSizeTot + 1] > grid.ibShockTheta) {
-      ord = 2;   // shocked donor: its 2nd derivatives are oscillation, drop them
-      atomicAdd(&grid.ibCnt[IB_CNT_FALLBACK], 1);
-    }
 
-    real F[5], F1[5], F2[5];
-    dgIbDonorEval(grid, dIdx, hd, zeta, n, F, F1, F2);
-
-    real sigma = sg/di;   // in [-1, 1] by the mirror-with-floor construction
-    real d2 = di*di;
-    // curvature-consistent wall pressure gradient dp/dn = rho v_t^2 / R
-    real g0p = grid.ibCurv ? F[0]*(F[2]*F[2] + F[3]*F[3])/grid.ibR : (real)0.0;
-
-    // diagnostic sub-modes (--ibord): 4 = order 1 with v_n hard-zeroed;
-    // 5 = order 1 with rho/vt/p pinned to freestream (v_n reconstructed);
-    // used to bisect the reconstruction feedback channel by channel
-    i32 dbgMode = ord;
-    if (ord >= 4) ord = 1;
-    real Wf[5];
-    for (i32 pass = 0; pass < 2; pass++) {
-      Wf[0] = dgIbHermite(0, (real)0.0, F[0], F1[0]*di, F2[0]*d2, sigma, ord); // rho: dn = 0
-      Wf[1] = dgIbHermite(1, (real)0.0, F[1], F1[1]*di, F2[1]*d2, sigma, ord); // v_n = 0
-      Wf[2] = dgIbHermite(0, (real)0.0, F[2], F1[2]*di, F2[2]*d2, sigma, ord); // v_t1: dn = 0
-      Wf[3] = dgIbHermite(0, (real)0.0, F[3], F1[3]*di, F2[3]*d2, sigma, ord); // v_t2: dn = 0
-      Wf[4] = dgIbHermite(0, g0p*di,    F[4], F1[4]*di, F2[4]*d2, sigma, ord); // p: curvature
-      if (dbgMode == 4) Wf[1] = (real)0.0;
-      if (dbgMode == 5) { Wf[0] = (real)1.0; Wf[2] = Wf[3] = (real)0.0; Wf[4] = (real)1.0/dgGam; }
-      if (Wf[0] > DG_EPSF && Wf[4] > DG_EPSF) break;
-      ord = 1;   // inadmissible: retry linear (monotone between BC and image)
+    // LO fallback (paper Eq 16): single image point, u_n scaled linearly in
+    // the signed wall distance (solid nodes get the sign flip for free),
+    // rho/p/u_t copied.  First-order and bounded by a real sampled state.
+    if (haveIp) {
       atomicAdd(&grid.ibCnt[IB_CNT_RETRY1], 1);
+      real un = (sg/ipS)*ipF[1];
+      real W[5] = { ipF[0],
+                    un*n[0] - ipF[2]*n[1],
+                    un*n[1] + ipF[2]*n[0],
+                    ipF[3],
+                    ipF[4] };
+      if (grid.ibDbg && grid.iter>=14 && grid.iter<=21 && lvl==4 && ib==106 && jb==213)
+        printf("[fill LO  ] ijk(%d,%d,%d) sg=%.3e ipS=%.3e un=%.3e (ipF: rho=%.3e p=%.3e) shocked=%d\n",
+               i,j,k,(double)sg,(double)ipS,(double)un,(double)ipF[0],(double)ipF[4],(int)shocked);
+      dgSanitizePrim(W);
+      real U[5];
+      dgP2C(W, U);
+      for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = U[q];
+      continue;
     }
-
-    real W[5] = { Wf[0],
-                  Wf[1]*n[0] - Wf[2]*n[1],
-                  Wf[1]*n[1] + Wf[2]*n[0],
-                  Wf[3],
-                  Wf[4] };
-    dgSanitizePrim(W);
-    real U[5];
-    dgP2C(W, U);
-    for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = U[q];
+    if (grid.ibDbg && lvl==4 && ib==106 && jb==213)
+      printf("[fill KEEP] ijk(%d,%d,%d) haveIp=%d shocked=%d  (keeping rho=%.3e rhoE=%.3e)\n",
+             i,j,k,(int)haveIp,(int)shocked,
+             (double)grid.getField(D_RHO)[cIdx], (double)grid.getField(D_RHOE)[cIdx]);
+    atomicAdd(&grid.ibCnt[IB_CNT_NODONOR], 1);   // no donor at all: keep previous values
   }
 }
 
@@ -2179,7 +5074,8 @@ __global__ void dgIbFillKernel(DgSolver &grid) {
 __global__ void dgIbCheckKernel(DgSolver &grid) {
   DG_BLOCK_LOOP(bIdx) {
     u64 loc = grid.bLocList[bIdx];
-    if (loc == kEmpty || grid.ibClassList[bIdx] != IB_FLUID) continue;
+    if (loc == kEmpty || !dgIbLive(grid, bIdx)) continue;   // live faces
+    // (fluid + evolving cut) must never resolve to an unfilled DEAD element
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
 
@@ -2270,6 +5166,20 @@ __global__ void dgIbClassToScratchKernel(DgSolver &grid) {
   DG_CELL_LOOP(cIdx, bIdx) {
     if (grid.bLocList[bIdx] == kEmpty) continue;
     grid.getField(D_SCRATCH)[cIdx] = (real)grid.ibClassList[bIdx];
+  }
+}
+
+// troubled-element indicator paint: copy the per-element blend/sensor value
+// (theta_e in SCRATCH slot 1, filled by dgAvNuKernel) to every node of D_LAM
+// (a DIFFERENT array -- reading SCRATCH while writing SCRATCH would race the
+// node-1 slot).  Under subFv this is the FV blend factor a = min(subMax,
+// theta); otherwise the raw sensor.  IB ghost/dead elements paint 0.
+__global__ void dgTroubledToScratchKernel(DgSolver &grid) {
+  DG_CELL_LOOP(cIdx, bIdx) {
+    if (grid.bLocList[bIdx] == kEmpty) { grid.getField(D_LAM)[cIdx] = (real)0.0; continue; }
+    real th = (grid.ibOn && !dgIbLive(grid, bIdx))
+            ? (real)0.0 : grid.getField(D_SCRATCH)[(u64)bIdx*blockSizeTot + 1];
+    grid.getField(D_LAM)[cIdx] = grid.subFv ? fmin(grid.subMax, th) : th;
   }
 }
 

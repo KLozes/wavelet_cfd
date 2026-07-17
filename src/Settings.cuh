@@ -2,7 +2,12 @@
 #define SETTINGS_H
 
 // compile time simulation settings
-static constexpr int blockSize = 4;
+// Overridable per build: the DG solver requires blockSize == p+1, so a p=2
+// build compiles with -DDG_ORDER=2 -DBLOCK_SIZE=3 (FV solvers keep 4).
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 4
+#endif
+static constexpr int blockSize = BLOCK_SIZE;
 static constexpr int haloSize = 2;
 static constexpr int cudaBlockSize = 256;
 static constexpr int cudaGridSize = 1000;
