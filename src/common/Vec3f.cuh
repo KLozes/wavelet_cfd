@@ -8,7 +8,11 @@
 #include <cuda_runtime.h>
 #include <cmath>
 
-typedef float real;
+// `real` is the solver precision (Settings.cuh; float unless -DUSE_DOUBLE).  The
+// float3 math below is float either way -- the geometry (STL vertices, BVH,
+// distances) is fp32 by construction -- but the typedef must agree with
+// Settings.cuh so an fp64 solver (e.g. wavefem_dp) can include both.
+#include "Settings.cuh"
 
 __host__ __device__ inline float3 operator+(float3 a, float3 b) {
   return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);

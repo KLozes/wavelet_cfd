@@ -15,3 +15,13 @@ wave3d_mgpu
 wave3d_dp
 wavedg3d
 wavedg3d_dp
+wavefem
+wavefem_dp
+wavewsdf
+wavedg3d_p2
+saye_test
+qp_test
+qpe_test
+qp_mms
+sbm_shift_test
+sbm_mms

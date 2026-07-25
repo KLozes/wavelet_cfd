@@ -14,7 +14,7 @@ Added `shallow = true`.  After a fresh clone:
 ## Why this is here
 
 The solver's multi-GPU path (`-DUSE_MGPU`) talks only to the `comm::` abstraction
-(`src/Comm.{cuh,cu}`).  It has two backends:
+(`src/common/Comm.{cuh,cu}`).  It has two backends:
 
 - **loopback** (default) — single process, P threads on one GPU, no external
   deps.  It runs the *same* message-passing code path (`neighborExchange` +
@@ -45,7 +45,7 @@ matching transports (UCX + GDRCopy) in the script.
 
 This was set up on a single GTX 1650 (sm_75, no NVLink) where the toolchain
 above is not installed, so the MPI build has **not been compiled or run here** —
-the backend code in `src/Comm.cu` under `#ifdef USE_MPI` is unverified until
+the backend code in `src/common/Comm.cu` under `#ifdef USE_MPI` is unverified until
 built on suitable hardware.  The loopback backend runs the identical messaging
 code path, so its P=2 validation is strong evidence the MPI path is correct up to
 the transport itself.

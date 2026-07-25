@@ -184,6 +184,34 @@ __host__ __device__ inline bool insideRayCast(const BvhNode *nodes, const i32 *o
   return (hits & 1) != 0;
 }
 
+//
+// Signed distance whose SIGN comes from the angle-weighted PSEUDONORMAL of the
+// closest feature (Baerentzen & Aanaes 2005) rather than from ray parity.
+//
+// Exact for a watertight mesh and free of the parity test's failure mode: a ray
+// that grazes a shared edge is counted once instead of zero or twice, which
+// flips the sign at isolated points.  On a structured loft -- long strips of
+// near-coplanar triangles -- that is not rare, and each flip puts a spurious
+// island or hole in the level set.  The pseudonormals are already carried in
+// TriFeat, and closestPtTriangle already reports which feature won, so the sign
+// costs one extra closest-point evaluation and no traversal.
+//
+__host__ __device__ inline float signedDistancePseudo(const BvhNode *nodes, const i32 *order,
+                                                      const TriFeat *tris,
+                                                      float3 x, float3 &grad) {
+  float3 q; i32 fid;
+  float d = sqrtf(nearestTri(nodes, order, tris, x, q, fid));
+  const TriFeat &t = tris[fid];
+  int region;
+  float3 qq = closestPtTriangle(x, t.v0, t.v1, t.v2, region);
+  float3 n = (region == 0) ? t.vn0 : (region == 1) ? t.vn1 : (region == 2) ? t.vn2
+           : (region == 3) ? t.en0 : (region == 4) ? t.en1 : (region == 5) ? t.en2
+           : t.fn;
+  float s = (dot(x - qq, n) < 0.0f) ? -1.0f : 1.0f;
+  grad = (d > 1e-7f) ? (x - qq) * (s / d) : normalize(n);
+  return s * d;
+}
+
 // signed distance + unit gradient at x.  distance from the BVH nearest feature;
 // sign from a ray-cast parity test by default (exact + fast for clean watertight
 // meshes), or the generalized winding number with -DWSDF_SIGN_WINDING (robust to

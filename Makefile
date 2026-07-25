@@ -1,10 +1,27 @@
-# Build for both solvers, which share the MultiLevelSparseGrid wavelet AMR core:
+# Build for the solvers, which share the MultiLevelSparseGrid wavelet AMR core:
 #   wave3d   - the compressible Euler flow solver        (16 fields/block)
 #   wavesdf  - the narrowband signed distance field gen   (2 fields/block)
-# Both executables are placed in this (root) directory and write to ./output.
+#   wavedg3d - the multi-resolution DGSEM solver
+#   wavefem  - CutFEM linear elasticity on a cut/immersed STL body
+# archived (still builds via `make wavewsdf`, not part of `all`):
+#   wavewsdf - the wavelet / BVH-oracle SDF + dual contour
+# All executables are placed in this (root) directory and write to ./output.
 #
-# The shared core is compiled separately per executable (obj/wave3d, obj/wavesdf)
-# so each can set its own block-capacity cap (NCELLS_MAX): the SDF stores only 2
+# Sources are split one directory per solver, plus src/common for the shared
+# core (grid, hash table, comm, geometry/BVH helpers):
+#   src/common      - Settings/Util/Vec3f, HashTable, MultiLevelSparseGrid, Comm,
+#                     Stl/Features/Bvh/BvhQuery
+#   src/fv          - CompressibleSolver + Main/MainMgpu       (wave3d*)
+#   src/sdf         - SignedDistanceSolver + MainSdf           (wavesdf)
+#   src/dg          - DgSolver + DgMain                        (wavedg3d*)
+#   src/fem         - CutFemSolver + FemMain                   (wavefem*)
+#   src/archive     - retired solvers, kept buildable but out of `all`
+#     archive/waveletsdf - WaveletSdfSolver, DualContour, NodalOctree (wavewsdf)
+# Each executable sees only src/common and its own directory on the include
+# path, so a solver cannot reach into another solver's headers.
+#
+# The shared core is compiled separately per executable (obj/<exe>/...) so each
+# can set its own block-capacity cap (NCELLS_MAX): the SDF stores only 2
 # fields/block vs the Euler solver's 16, so it fits ~8x more narrowband blocks in
 # the same VRAM and is built with a larger cap for fine-resolution narrowbands.
 
@@ -18,6 +35,14 @@ ARCH      = sm_75
 STD       = c++17
 NVCCFLAGS = -O2 -std=$(STD) -arch=$(ARCH)
 LDFLAGS   = -lpng -lz
+
+# include paths: shared core + the solver's own directory
+INC_COMMON    = -I./$(SRC_DIR)/common
+WAVE3D_INC    = $(INC_COMMON) -I./$(SRC_DIR)/fv
+WAVESDF_INC   = $(INC_COMMON) -I./$(SRC_DIR)/sdf
+WAVEWSDF_INC  = $(INC_COMMON) -I./$(SRC_DIR)/archive/waveletsdf
+WAVEDG_INC    = $(INC_COMMON) -I./$(SRC_DIR)/dg
+WAVEFEM_INC   = $(INC_COMMON) -I./$(SRC_DIR)/fem
 
 # per-executable cell cap (blocks = NCELLS_MAX/blockSizeTot).  wave3d gets 64M
 # cells (30 fields x 4B -> ~7.7 GB, fits the 16 GB card) for high-resolution
@@ -33,16 +58,28 @@ WAVESDF_DEFS = -DNCELLS_MAX=384000000
 # narrowband, so 64M cells (1M blocks, ~1 GB) is ample even at high res and fits a
 # 3 GB card.
 WAVEWSDF_DEFS = -DNCELLS_MAX=64000000
+# wavefem materializes the FULL bounding-box background grid before pruning it
+# down to the blocks the body actually touches, so the cap must cover the DENSE
+# grid, not the active mesh: res^3 cells at the longest axis.  256M cells allows
+# res ~ 512 on a cube-ish bbox.  The FEM data itself (24x24 per CUT element,
+# 12 reals per stabilized face) scales with the SURFACE, so it is never the
+# binding constraint.
+WAVEFEM_DEFS  = -DNCELLS_MAX=256000000
 
 # headers (no automatic dependency tracking, so rebuild on any header change)
-HDRS = $(wildcard $(SRC_DIR)/*.cuh) $(wildcard $(SRC_DIR)/*.h)
+HDRS = $(wildcard $(SRC_DIR)/*/*.cuh) $(wildcard $(SRC_DIR)/*/*.h) \
+       $(wildcard $(SRC_DIR)/*/*/*.cuh) $(wildcard $(SRC_DIR)/*/*/*.h)
 
-WAVE3D_SRCS  = HashTable MultiLevelSparseGrid MultiLevelSparseGridKernels \
-               CompressibleSolver CompressibleSolverKernels Main
-WAVESDF_SRCS = HashTable MultiLevelSparseGrid MultiLevelSparseGridKernels \
-               SignedDistanceSolver SignedDistanceSolverKernels MainSdf
-WAVEWSDF_SRCS = HashTable MultiLevelSparseGrid MultiLevelSparseGridKernels \
-               WaveletSdfSolver WaveletSdfSolverKernels DualContourGpu NodalOctree MainWaveSdf
+COMMON_SRCS  = common/HashTable common/MultiLevelSparseGrid common/MultiLevelSparseGridKernels
+
+WAVE3D_SRCS  = $(COMMON_SRCS) \
+               fv/CompressibleSolver fv/CompressibleSolverKernels fv/Main
+WAVESDF_SRCS = $(COMMON_SRCS) \
+               sdf/SignedDistanceSolver sdf/SignedDistanceSolverKernels sdf/MainSdf
+WAVEWSDF_SRCS = $(COMMON_SRCS) \
+               archive/waveletsdf/WaveletSdfSolver archive/waveletsdf/WaveletSdfSolverKernels \
+               archive/waveletsdf/DualContourGpu archive/waveletsdf/NodalOctree \
+               archive/waveletsdf/MainWaveSdf
 
 WAVE3D_OBJS  = $(patsubst %,$(OBJ_DIR)/wave3d/%.cu.o,$(WAVE3D_SRCS))
 WAVESDF_OBJS = $(patsubst %,$(OBJ_DIR)/wavesdf/%.cu.o,$(WAVESDF_SRCS))
@@ -59,11 +96,20 @@ WAVE3D_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_dp/%.cu.o,$(WAVE3D_SRCS))
 WAVEDG_DEFS    = -DNCELLS_MAX=32000000 -DDG_ORDER=3
 WAVEDG_DP_DEFS = -DNCELLS_MAX=8000000 -DDG_ORDER=3 -DUSE_DOUBLE
 WAVEDG_P2_DEFS = -DNCELLS_MAX=32000000 -DDG_ORDER=2 -DBLOCK_SIZE=3
-WAVEDG_SRCS = HashTable MultiLevelSparseGrid MultiLevelSparseGridKernels \
-              DgSolver DgSolverKernels DgMain
+WAVEDG_SRCS = $(COMMON_SRCS) \
+              dg/DgSolver dg/DgSolverKernels dg/DgMain
 WAVEDG_OBJS    = $(patsubst %,$(OBJ_DIR)/wavedg3d/%.cu.o,$(WAVEDG_SRCS))
 WAVEDG_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_dp/%.cu.o,$(WAVEDG_SRCS))
 WAVEDG_P2_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_p2/%.cu.o,$(WAVEDG_SRCS))
+
+# CutFEM linear elasticity (steady, matrix-free CG -- the only implicit solver
+# here).  wavefem_dp is the fp64 build: the convergence study needs errors well
+# below the ~1e-5 relative floor fp32 CG leaves.
+WAVEFEM_SRCS = $(COMMON_SRCS) \
+               fem/CutFemSolver fem/CutFemSolverKernels fem/CutFemQp fem/CutFemSbm fem/FemMain
+WAVEFEM_OBJS    = $(patsubst %,$(OBJ_DIR)/wavefem/%.cu.o,$(WAVEFEM_SRCS))
+WAVEFEM_DP_DEFS = $(WAVEFEM_DEFS) -DUSE_DOUBLE
+WAVEFEM_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wavefem_dp/%.cu.o,$(WAVEFEM_SRCS))
 
 # multi-GPU (domain-decomposed) Euler build.  Same solver + the Comm layer and a
 # comm-aware main; -DUSE_MGPU turns on the decomposition paths.  By default it
@@ -73,8 +119,8 @@ WAVEDG_P2_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_p2/%.cu.o,$(WAVEDG_SRCS))
 # one process, so keep P*fieldData within the dev GPU (8M cells -> ~0.5 GB/PE).
 # Physics is cap-independent, so this still A/B's against the 64M wave3d build.
 WAVE3D_MGPU_DEFS = -DNCELLS_MAX=8000000 -DUSE_MGPU
-WAVE3D_MGPU_SRCS = HashTable MultiLevelSparseGrid MultiLevelSparseGridKernels \
-                   CompressibleSolver CompressibleSolverKernels Comm MainMgpu
+WAVE3D_MGPU_SRCS = $(COMMON_SRCS) common/Comm \
+                   fv/CompressibleSolver fv/CompressibleSolverKernels fv/MainMgpu
 WAVE3D_MGPU_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_mgpu/%.cu.o,$(WAVE3D_MGPU_SRCS))
 
 # CUDA-aware MPI backend (opt-in: `make wave3d_mgpu USE_MPI=1`).  Uses the
@@ -89,7 +135,7 @@ ifeq ($(USE_MPI),1)
   WAVE3D_MGPU_LDFLAGS = -L$(MPI_HOME)/lib -lmpi -Xlinker -rpath -Xlinker $(MPI_HOME)/lib
 endif
 
-all: wave3d wavesdf wavewsdf wavedg3d
+all: wave3d wavesdf wavedg3d wavefem
 
 wave3d: $(WAVE3D_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
@@ -112,40 +158,91 @@ wavedg3d_dp: $(WAVEDG_DP_OBJS)
 wavedg3d_p2: $(WAVEDG_P2_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
+wavefem: $(WAVEFEM_OBJS)
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -fopenmp $^ -o $@ $(LDFLAGS)
+
+wavefem_dp: $(WAVEFEM_DP_OBJS)
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -fopenmp $^ -o $@ $(LDFLAGS)
+
 wave3d_mgpu: $(WAVE3D_MGPU_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS) $(WAVE3D_MGPU_LDFLAGS)
 
 # ---- build rules (one per executable, so each gets its own NCELLS_MAX) ------
-$(OBJ_DIR)/wave3d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d
-	$(NVCC) $(NVCCFLAGS) $(WAVE3D_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+# obj/<exe>/ mirrors the src/<dir>/ layout, so the recipe makes the subdirectory.
+$(OBJ_DIR)/wave3d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVE3D_DEFS) $(WAVE3D_INC) -dc $< -o $@
 
-$(OBJ_DIR)/wavesdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavesdf
-	$(NVCC) $(NVCCFLAGS) $(WAVESDF_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+$(OBJ_DIR)/wavesdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVESDF_DEFS) $(WAVESDF_INC) -dc $< -o $@
 
-$(OBJ_DIR)/wavewsdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavewsdf
-	$(NVCC) $(NVCCFLAGS) $(WAVEWSDF_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+$(OBJ_DIR)/wavewsdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVEWSDF_DEFS) $(WAVEWSDF_INC) -dc $< -o $@
 
-$(OBJ_DIR)/wave3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d_dp
-	$(NVCC) $(NVCCFLAGS) $(WAVE3D_DP_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+$(OBJ_DIR)/wave3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVE3D_DP_DEFS) $(WAVE3D_INC) -dc $< -o $@
 
-$(OBJ_DIR)/wavedg3d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavedg3d
-	$(NVCC) $(NVCCFLAGS) $(WAVEDG_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+$(OBJ_DIR)/wavedg3d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVEDG_DEFS) $(WAVEDG_INC) -dc $< -o $@
 
-$(OBJ_DIR)/wavedg3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavedg3d_dp
-	$(NVCC) $(NVCCFLAGS) $(WAVEDG_DP_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+$(OBJ_DIR)/wavedg3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVEDG_DP_DEFS) $(WAVEDG_INC) -dc $< -o $@
 
-$(OBJ_DIR)/wavedg3d_p2/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wavedg3d_p2
-	$(NVCC) $(NVCCFLAGS) $(WAVEDG_P2_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+$(OBJ_DIR)/wavedg3d_p2/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVEDG_P2_DEFS) $(WAVEDG_INC) -dc $< -o $@
+
+# -Xcompiler -fopenmp: the Qp path (CutFemQp.cu) parallelizes its host assembly /
+# CG over cores.  The p=1 sources have no OpenMP pragmas, so their generated code
+# is unchanged; only libgomp is linked in.
+$(OBJ_DIR)/wavefem/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -fopenmp $(WAVEFEM_DEFS) $(WAVEFEM_INC) -dc $< -o $@
+
+$(OBJ_DIR)/wavefem_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -fopenmp $(WAVEFEM_DP_DEFS) $(WAVEFEM_INC) -dc $< -o $@
 
 # --default-stream per-thread: the loopback backend runs one host thread per
 # logical PE, so give each thread its own default stream (independent syncs).
-$(OBJ_DIR)/wave3d_mgpu/%.cu.o: $(SRC_DIR)/%.cu $(HDRS) | $(OBJ_DIR)/wave3d_mgpu
-	$(NVCC) $(NVCCFLAGS) --default-stream per-thread $(WAVE3D_MGPU_DEFS) -I./$(SRC_DIR) -dc $< -o $@
+$(OBJ_DIR)/wave3d_mgpu/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) --default-stream per-thread $(WAVE3D_MGPU_DEFS) $(WAVE3D_INC) -dc $< -o $@
 
-$(OBJ_DIR)/wave3d $(OBJ_DIR)/wavesdf $(OBJ_DIR)/wavewsdf $(OBJ_DIR)/wave3d_dp $(OBJ_DIR)/wave3d_mgpu $(OBJ_DIR)/wavedg3d $(OBJ_DIR)/wavedg3d_dp $(OBJ_DIR)/wavedg3d_p2:
-	mkdir -p $@
+# higher-order (Qp) CutFEM verification drivers: standalone single-file host
+# tests (fp64) for the Saye cut quadrature + Qp matrix-free operator being
+# developed toward the wavefem higher-order upgrade.  Each is self-checking and
+# prints PASS/FAIL or a convergence table; not part of `all`.
+#   saye_test - O(h^{p+1}) cut volume/area on a sphere + torus (SayeQuad.h)
+#   qp_test   - Qp basis: diff matrix, off-node eval/grad, GLL quadrature
+#   qpe_test  - Qp element operator patch test (symmetry, rigid null, const strain)
+#   qp_mms    - end-to-end Qp CutFEM MMS convergence (bulk + Nitsche + ghost pen.)
+# -Xcompiler -fopenmp: qp_mms parallelizes its host CG operator apply / reductions
+# (the other three have no OpenMP pragmas, so the flag is harmless there).
+FEMTEST_FLAGS = -O2 -std=$(STD) -arch=$(ARCH) -Xcompiler -fopenmp -DUSE_DOUBLE $(WAVEFEM_INC)
+
+saye_test: $(SRC_DIR)/fem/SayeTest.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) $< -o $@
+qp_test: $(SRC_DIR)/fem/QpTest.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) $< -o $@
+qpe_test: $(SRC_DIR)/fem/QpElemTest.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) $< -o $@
+qp_mms: $(SRC_DIR)/fem/QpMms.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) $< -o $@
+sbm_shift_test: $(SRC_DIR)/fem/SbmShiftTest.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) $< -o $@
+sbm_mms: $(SRC_DIR)/fem/SbmMms.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) $< -o $@
+
+femtests: saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
 clean:
-	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf wave3d_dp wave3d_mgpu wavedg3d wavedg3d_dp wavedg3d_p2
+	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf wave3d_dp wave3d_mgpu wavedg3d wavedg3d_dp wavedg3d_p2 \
+	       wavefem wavefem_dp saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
-.PHONY: all clean
+.PHONY: all clean femtests
