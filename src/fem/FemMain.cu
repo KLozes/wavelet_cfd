@@ -129,7 +129,7 @@ int main(int argc, char *argv[]) {
     else if (s == "--nosector")  noSector = 1;
     else if (s == "--res")       res = atoi(next());
     else if (s == "--p")         femOrder = atoi(next());
-    else if (s == "--method")  { std::string v=next(); femMethod = (v=="sbm") ? 1 : 0; }
+    else if (s == "--method")  { std::string v=next(); femMethod = (v=="sbm") ? 1 : (v=="density"||v=="dens") ? 2 : 0; }
     else if (s == "--case")      caseName = next();
     else if (s == "--E")         E = (real)atof(next());
     else if (s == "--nu")        nu = (real)atof(next());

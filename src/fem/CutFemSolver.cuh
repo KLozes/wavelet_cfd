@@ -198,6 +198,7 @@ public:
   void run(void);                   // mesh -> dofs -> assemble -> solve
   void runQp(void);                 // higher-order path (CutFemQp.cu)
   void runSbm(void);                // shifted-boundary path (CutFemSbm.cu)
+  void runDensity(void);            // ersatz tanh(phi) density-mask path (CutFemSbm.cu)
 
   void buildMesh(void);             // dense base grid -> prune to the active set
   void setupDofs(void);             // elements, nodes, neighbours, stabilized faces
