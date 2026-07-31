@@ -36,11 +36,16 @@ struct QpBasis {
     // GLL nodes on [0,1]
     if (p == 1) { t[0]=0; t[1]=1; }
     else if (p == 2) { t[0]=0; t[1]=(real)0.5; t[2]=1; }
-    else { t[0]=0; t[1]=(real)0.2763932023; t[2]=(real)0.7236067977; t[3]=1; }
+    else if (p == 3) { t[0]=0; t[1]=(real)0.2763932023; t[2]=(real)0.7236067977; t[3]=1; }
+    // p=4: 5-pt GLL, [-1,1] nodes {-1,-sqrt(3/7),0,sqrt(3/7),1} mapped to [0,1]
+    else { t[0]=0; t[1]=(real)0.1726731646; t[2]=(real)0.5; t[3]=(real)0.8273268354; t[4]=1; }
     // GLL quadrature weights on [0,1]  (= 1/2 * the [-1,1] weights)
     if (p == 1) { wq[0]=(real)0.5; wq[1]=(real)0.5; }
     else if (p == 2) { wq[0]=(real)(1.0/6); wq[1]=(real)(4.0/6); wq[2]=(real)(1.0/6); }
-    else { wq[0]=(real)(1.0/12); wq[1]=(real)(5.0/12); wq[2]=(real)(5.0/12); wq[3]=(real)(1.0/12); }
+    else if (p == 3) { wq[0]=(real)(1.0/12); wq[1]=(real)(5.0/12); wq[2]=(real)(5.0/12); wq[3]=(real)(1.0/12); }
+    // p=4: [-1,1] weights {1/10, 49/90, 32/45, 49/90, 1/10}, halved for [0,1]
+    else { wq[0]=(real)(1.0/20); wq[1]=(real)(49.0/180); wq[2]=(real)(16.0/45);
+           wq[3]=(real)(49.0/180); wq[4]=(real)(1.0/20); }
     // barycentric weights  bw[j] = 1 / prod_{k!=j} (t_j - t_k)
     for (i32 j = 0; j < n; j++) {
       real prod = 1;

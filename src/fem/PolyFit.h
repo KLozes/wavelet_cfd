@@ -14,11 +14,15 @@
 
 #include "Poly.h"
 
-// GLL nodes on [0,1] for p = 1..3 (matches the Qp basis)
+// GLL nodes on [0,1] for p = 1..4.  MUST match QpBasis::init exactly -- these are the
+// FEM solution points, and the cut-cell detector samples the level set at them.  A stale
+// `else` here silently returned the p=3 nodes (and left t[4] uninitialised) for p=4, so the
+// deg-4 fit was built on a degenerate node set and Saye returned an EMPTY rule.
 __host__ __device__ inline void gllNodes(i32 p, real t[PNC]) {
   if (p == 1) { t[0]=0; t[1]=1; }
   else if (p == 2) { t[0]=0; t[1]=(real)0.5; t[2]=1; }
-  else { t[0]=0; t[1]=(real)0.2763932023; t[2]=(real)0.7236067977; t[3]=1; }
+  else if (p == 3) { t[0]=0; t[1]=(real)0.2763932023; t[2]=(real)0.7236067977; t[3]=1; }
+  else { t[0]=0; t[1]=(real)0.1726731646; t[2]=(real)0.5; t[3]=(real)0.8273268354; t[4]=1; }
 }
 
 // invert the (p+1)x(p+1) Vandermonde  V[i][j] = t_i^j  ->  Vinv (row-major)

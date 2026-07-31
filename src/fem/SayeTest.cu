@@ -167,7 +167,7 @@ void runCreaseTest(i32 p) {
 
 int main() {
   Sphere s{0.03125, 0.015625, 0.0234375, 0.75};   // off-grid center, R=0.75
-  for (i32 p : {1, 2, 3})
+  for (i32 p : {1, 2, 3, 4})
     runVolumeArea("sphere SDF", s, p, -1.0, 1.0, s.vol(), s.area());
 
   for (i32 p : {1, 2, 3}) runCreaseTest(p);
