@@ -19,7 +19,9 @@
 
 #include "Util.cuh"
 
-static constexpr i32 QP_MAX = 3;          // max supported order
+static constexpr i32 QP_MAX = 4;          // max supported order (p4: 5 nodes THROUGH THICKNESS in one
+                                          // element -- p>=4 is where shear locking in thin structures
+                                          // essentially vanishes, Szabo-Babuska p-version result)
 static constexpr i32 QN_MAX = QP_MAX + 1; // nodes per axis
 
 struct QpBasis {

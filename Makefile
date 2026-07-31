@@ -34,7 +34,7 @@ OBJ_DIR = obj
 ARCH      = sm_75
 STD       = c++17
 NVCCFLAGS = -O2 -std=$(STD) -arch=$(ARCH)
-LDFLAGS   = -lpng -lz
+LDFLAGS   = -lpng -lz -lcusolver -lcusparse
 
 # include paths: shared core + the solver's own directory
 INC_COMMON    = -I./$(SRC_DIR)/common

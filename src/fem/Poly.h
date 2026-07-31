@@ -21,7 +21,7 @@
 
 #include "Util.cuh"
 
-static constexpr i32 PDEG   = 3;            // max polynomial degree per axis
+static constexpr i32 PDEG   = 4;            // max polynomial degree per axis
 static constexpr i32 PNC    = PDEG + 1;     // coefficients per axis
 static constexpr i32 PMAXRT = PDEG;         // max real roots of a 1-D poly
 
