@@ -245,6 +245,10 @@ sbm_mms: $(SRC_DIR)/fem/SbmMms.cu $(HDRS)
 dgcut_test: $(SRC_DIR)/dg/DgCutTest.cu $(HDRS)
 	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
 
+# S1 gate: cut-element operators (boundary-derived moments -> free-stream)
+dgcutelem_test: $(SRC_DIR)/dg/DgCutElemTest.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
+
 # state redistribution gate: conservation, polynomial exactness, contractivity
 dgsrd_test: $(SRC_DIR)/dg/DgSrdTest.cu $(HDRS)
 	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@

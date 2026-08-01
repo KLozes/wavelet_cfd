@@ -34,7 +34,14 @@
 static inline void legShift(double x,int K,double*P){ double t=2*x-1; P[0]=1; if(K>=1)P[1]=t;
   for(int k=1;k<K;k++) P[k+1]=((2*k+1)*t*P[k]-k*P[k-1])/(k+1); }
 // matrix (rebuilt only on the rare backtracking removal).  w has <= m nonzeros.
-static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,int n,std::vector<double>&w){
+// gtol: gradient threshold for admitting a column (ABSOLUTE).  The default
+// 1e-9 is what the FEM compression path has always used and is kept so that
+// path is bit-identical; the cut-element fit passes a value scaled to its own
+// data.  nOuter caps the passive set; default m reproduces the old behaviour.
+static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,int n,std::vector<double>&w,
+                 double gtol=1e-9, int nOuter=-1){
+  if (nOuter<0 || nOuter>m) nOuter=m;   // G/L are m x m: the passive set
+                                       // cannot exceed m columns
   w.assign(n,0.0); std::vector<char> P(n,0); std::vector<double> r(b),z(n),zk(m),y(m);
   std::vector<int> idx; idx.reserve(m);
   std::vector<double> G((size_t)m*m,0.0), L((size_t)m*m,0.0), rhs(m,0.0); int k=0;
@@ -53,8 +60,8 @@ static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,i
     rhs[k]=dot(Aj,b.data()); idx.push_back(jn); k++; };
   auto solveLS=[&](){ for(int i=0;i<k;i++){ double s=rhs[i]; for(int q=0;q<i;q++) s-=L[(size_t)i*m+q]*y[q]; y[i]=s/L[(size_t)i*m+i]; }
     for(int i=k-1;i>=0;i--){ double s=y[i]; for(int q=i+1;q<k;q++) s-=L[(size_t)q*m+i]*zk[q]; zk[i]=s/L[(size_t)i*m+i]; } };
-  for(int outer=0;outer<m;outer++){
-    int jm=-1; double gm=1e-9;
+  for(int outer=0;outer<nOuter;outer++){
+    int jm=-1; double gm=gtol;
     for(int j=0;j<n;j++) if(!P[j]){ double g=dot(&A[(size_t)j*m],r.data()); if(g>gm){gm=g;jm=j;} }
     if(jm<0) break; P[jm]=1; addcol(jm);
     for(int inner=0;inner<3*n;inner++){
