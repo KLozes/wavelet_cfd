@@ -21,6 +21,13 @@
 
 #include "Util.cuh"
 
+// NOTE: this header, PolyFit.h, SayeQuad.h and CutQuadCompress.h form the
+// SOLVER-AGNOSTIC cut-quadrature module.  They live in common/ so any method
+// that must integrate over an implicitly-defined cut cell can use them --
+// the immersed IGA CutFEM (src/fem) today, a cut-cell DG (src/dg) next.
+// Nothing here knows about a solution basis, a dof numbering, or an equation:
+// input is a level set, output is points and weights on {phi<0} and on {phi=0}.
+
 static constexpr i32 PDEG   = 4;            // max polynomial degree per axis
 static constexpr i32 PNC    = PDEG + 1;     // coefficients per axis
 static constexpr i32 PMAXRT = PDEG;         // max real roots of a 1-D poly
