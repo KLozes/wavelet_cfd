@@ -239,6 +239,12 @@ sbm_shift_test: $(SRC_DIR)/fem/SbmShiftTest.cu $(HDRS)
 sbm_mms: $(SRC_DIR)/fem/SbmMms.cu $(HDRS)
 	$(NVCC) $(FEMTEST_FLAGS) $< -o $@
 
+# cut-cell DG gate: the discrete divergence theorem on a cut element.  Needs the
+# fem include path only for LagrangeBasis.h (the DGSEM nodal basis); the cut
+# quadrature itself is in common/.
+dgcut_test: $(SRC_DIR)/dg/DgCutTest.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
+
 femtests: saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
 clean:

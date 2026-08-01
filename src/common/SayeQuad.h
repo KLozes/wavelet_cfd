@@ -66,10 +66,55 @@ struct SayeArena {
   }
 };
 
-// -------- Gauss-Legendre on [0,1], up to 5 points --------------------------
-struct GaussRule { i32 n; real x[5]; real w[5]; };
+// -------- Gauss-Legendre on [0,1], up to 10 points -------------------------
+// 6..10 were added for the cut-cell DG gate: the discrete divergence theorem
+// needs the base-direction rule to integrate the height-function composition,
+// and with only 5 points cfg.ng was SILENTLY CLAMPED, so convergence studies in
+// ng measured nothing.  Default cfg.ng is still 5 (unchanged for every existing
+// caller); raising it is now actually possible.
+static constexpr i32 GAUSS_MAX = 10;
+struct GaussRule { i32 n; real x[GAUSS_MAX]; real w[GAUSS_MAX]; };
 __host__ __device__ inline GaussRule gaussLegendre(i32 n) {
   GaussRule g; g.n = n;
+  if (n > GAUSS_MAX) { n = GAUSS_MAX; g.n = n; }
+  if (n == 6) {
+    const real X[6]={(real)0.0337652429,(real)0.1693953068,(real)0.3806904070,
+                     (real)0.6193095930,(real)0.8306046932,(real)0.9662347571};
+    const real W[6]={(real)0.0856622462,(real)0.1803807865,(real)0.2339569673,
+                     (real)0.2339569673,(real)0.1803807865,(real)0.0856622462};
+    for (i32 i=0;i<6;i++){ g.x[i]=X[i]; g.w[i]=W[i]; } return g;
+  }
+  if (n == 7) {
+    const real X[7]={(real)0.0254460438,(real)0.1292344072,(real)0.2970774243,(real)0.5,
+                     (real)0.7029225757,(real)0.8707655928,(real)0.9745539562};
+    const real W[7]={(real)0.0647424831,(real)0.1398526957,(real)0.1909150253,(real)0.2089795918,
+                     (real)0.1909150253,(real)0.1398526957,(real)0.0647424831};
+    for (i32 i=0;i<7;i++){ g.x[i]=X[i]; g.w[i]=W[i]; } return g;
+  }
+  if (n == 8) {
+    const real X[8]={(real)0.0198550718,(real)0.1016667613,(real)0.2372337950,(real)0.4082826788,
+                     (real)0.5917173212,(real)0.7627662050,(real)0.8983332387,(real)0.9801449282};
+    const real W[8]={(real)0.0506142681,(real)0.1111905172,(real)0.1568533229,(real)0.1813418917,
+                     (real)0.1813418917,(real)0.1568533229,(real)0.1111905172,(real)0.0506142681};
+    for (i32 i=0;i<8;i++){ g.x[i]=X[i]; g.w[i]=W[i]; } return g;
+  }
+  if (n == 9) {
+    const real X[9]={(real)0.0159198802,(real)0.0819844464,(real)0.1933142836,(real)0.3378732883,
+                     (real)0.5,(real)0.6621267117,(real)0.8066857164,(real)0.9180155536,(real)0.9840801198};
+    const real W[9]={(real)0.0406371942,(real)0.0903240804,(real)0.1303053482,(real)0.1561735385,
+                     (real)0.1651196775,(real)0.1561735385,(real)0.1303053482,(real)0.0903240804,
+                     (real)0.0406371942};
+    for (i32 i=0;i<9;i++){ g.x[i]=X[i]; g.w[i]=W[i]; } return g;
+  }
+  if (n >= 10) {
+    const real X[10]={(real)0.0130467357,(real)0.0674683167,(real)0.1602952159,(real)0.2833023029,
+                      (real)0.4255628305,(real)0.5744371695,(real)0.7166976971,(real)0.8397047841,
+                      (real)0.9325316833,(real)0.9869532643};
+    const real W[10]={(real)0.0333356722,(real)0.0747256746,(real)0.1095431813,(real)0.1346333597,
+                      (real)0.1477621124,(real)0.1477621124,(real)0.1346333597,(real)0.1095431813,
+                      (real)0.0747256746,(real)0.0333356722};
+    g.n=10; for (i32 i=0;i<10;i++){ g.x[i]=X[i]; g.w[i]=W[i]; } return g;
+  }
   if (n <= 1) { g.n=1; g.x[0]=(real)0.5; g.w[0]=1; return g; }
   if (n == 2) {
     g.x[0]=(real)0.2113248654; g.x[1]=(real)0.7886751346;
@@ -406,6 +451,39 @@ __host__ __device__ inline void sayeSurface(const PolyND &phi, SayeSet *out,
                                            const SayeCfg &cfg = SayeCfg::def()) {
   real lo[3] = {0,0,0}, hi[3] = {1,1,1}; bool act[3] = {true,true,true};
   sayeSurfaceRec(phi, lo, hi, act, out, ar, cfg, 0);
+}
+
+// ---------------------------------------------------------------------------
+//  public: rule for the part of a CELL FACE inside {phi < 0}
+//
+//  d = face axis (0,1,2), side = 0 (x_d = 0) or 1 (x_d = 1).  Weights are the
+//  2-D area measure on that face; nodes carry the fixed coordinate so they can
+//  be evaluated with the same 3-D basis as the volume rule.
+//
+//  Needed by DISCONTINUOUS methods and not by continuous ones, which is why it
+//  did not exist before: a cut-cell DG integrates a numerical flux over the
+//  fluid part of each cell face, whereas the continuous CutFEM only ever needed
+//  {phi<0} volumes, the {phi=0} wall, and full (uncut) faces for ghost penalty.
+//
+//  The arrangement recursion already supports it -- deactivating axis d and
+//  pinning lo[d]=hi[d] reduces it to the 2-D case -- so this is a wrapper, not
+//  new quadrature machinery.
+// ---------------------------------------------------------------------------
+__host__ __device__ inline void sayeFace(const PolyND &phi, i32 d, i32 side,
+                                         SayeSet *out, SayeArena *ar,
+                                         const SayeCfg &cfg = SayeCfg::def()) {
+  real v = side ? (real)1 : (real)0;
+  real lo[3] = {0,0,0}, hi[3] = {1,1,1};
+  bool act[3] = {true,true,true};
+  lo[d] = hi[d] = v; act[d] = false;
+  i32 m0 = ar->mark();
+  i32 half = (ar->cap - ar->top) / 2;
+  SayeSet all = ar->span(half);
+  arrangementRule(&phi, 1, lo, hi, act, &all, ar, cfg, 0);
+  if (all.ovf) out->ovf = true;
+  for (i32 i = 0; i < all.n; i++)
+    if (phi.eval(all.p[i].x) < 0) out->add(all.p[i]);
+  ar->release(m0);
 }
 
 // ---------------------------------------------------------------------------
