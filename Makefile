@@ -245,6 +245,10 @@ sbm_mms: $(SRC_DIR)/fem/SbmMms.cu $(HDRS)
 dgcut_test: $(SRC_DIR)/dg/DgCutTest.cu $(HDRS)
 	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
 
+# state redistribution gate: conservation, polynomial exactness, contractivity
+dgsrd_test: $(SRC_DIR)/dg/DgSrdTest.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
+
 femtests: saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
 clean:
