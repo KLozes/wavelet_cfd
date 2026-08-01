@@ -27,17 +27,17 @@
 // the reference shift vector dref); host+device.
 //
 
-#include "QpBasis.h"
+#include "LagrangeBasis.h"
 #include "PolyFit.h"    // vandermondeInv
 
 // monomial coefficients of the 1-D Lagrange basis: Vm[k][a] = coeff of x^k in l_a.
 // (l_a interpolates e_a, so its coeffs are column a of the inverse Vandermonde.)
-__host__ __device__ inline void sbmDerivMatrix(const QpBasis &B, real Vm[QN_MAX][QN_MAX]) {
+__host__ __device__ inline void sbmDerivMatrix(const LagrangeBasis &B, real Vm[QN_MAX][QN_MAX]) {
   vandermondeInv(B.p, B.t, Vm);   // Vm[k][a] = (V^{-1})[k][a]
 }
 
 // out[a] = l_a^{(m)}(x)  for all a  (m-th derivative of each 1-D basis at x)
-__host__ __device__ inline void deriv1(const QpBasis &B, const real Vm[QN_MAX][QN_MAX],
+__host__ __device__ inline void deriv1(const LagrangeBasis &B, const real Vm[QN_MAX][QN_MAX],
                                        real x, i32 m, real out[QN_MAX]) {
   i32 n = B.n, p = B.p;
   for (i32 a = 0; a < n; a++) {
@@ -55,7 +55,7 @@ __host__ __device__ inline void deriv1(const QpBasis &B, const real Vm[QN_MAX][Q
 // S_h phi_a for every basis a=(i,j,k) at surrogate ref point xr[3] with reference
 // shift dref[3] (= physical distance vector / h).  out has (p+1)^3 entries.
 // Truncated Taylor at total order p (|alpha| <= p) -> O(h^{p+1}).
-__host__ __device__ inline void sbmShiftAll(const QpBasis &B, const real Vm[QN_MAX][QN_MAX],
+__host__ __device__ inline void sbmShiftAll(const LagrangeBasis &B, const real Vm[QN_MAX][QN_MAX],
                                             const real xr[3], const real dref[3],
                                             real *out) {
   i32 n = B.n, p = B.p;

@@ -2,7 +2,7 @@
 // End-to-end MMS convergence test for the higher-order (Qp) CutFEM method, on a
 // STANDALONE structured cut mesh -- the decisive gate before wiring into the
 // production sparse-grid solver.  Reuses the three verified modules:
-//   QpBasis.h  (basis)   QpElem.h/SayeQuad.h (bulk + cut quadrature)  PolyFit.h
+//   LagrangeBasis.h  (basis)   QpElem.h/SayeQuad.h (bulk + cut quadrature)  PolyFit.h
 //
 // Domain: a sphere immersed in a uniform N^3 grid of Q_p cubes over [-1,1]^3.
 // Whole boundary Gamma = {sphere} is Dirichlet, imposed weakly by Nitsche.
@@ -19,10 +19,10 @@
 #include <cstdlib>
 #include <cmath>
 #include <vector>
-#include "QpElem.h"
+#include "IgaElem.h"
 
 // CG vector precision: -DFP32CG stores the CG vectors in float (fp32) while
-// keeping fp64 dot-product accumulators -- mirrors the production runQp fp32 path,
+// keeping fp64 dot-product accumulators -- mirrors the production runIga fp32 path,
 // so we can check the fp32 mixed-precision CG converges (host-run, no GPU needed).
 #ifdef FP32CG
 typedef float  cgv;
@@ -70,7 +70,7 @@ int main(int argc, char** argv){
   for (int a=2; a<argc; a++) Ns.push_back(atoi(argv[a]));
   if (Ns.empty()) Ns = {8,16,32};
 
-  QpBasis B; B.init(p);
+  LagrangeBasis B; B.init(p);
   int n=B.n, ndof=n*n*n;
   double gammaD = 100.0*(2*MU+LAM)*p*p;   // Nitsche penalty
   double gammaG = 0.1*(2*MU+LAM);         // ghost-penalty coefficient gamma_l

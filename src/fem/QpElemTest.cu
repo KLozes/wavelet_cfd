@@ -11,7 +11,7 @@
 
 #include <cstdio>
 #include <cmath>
-#include "QpElem.h"
+#include "IgaElem.h"
 #include "PolyFit.h"
 
 static const real MU = (real)0.8, LAM = (real)1.7, H = (real)0.37;
@@ -44,7 +44,7 @@ int main() {
   double worst = 0;
 
   for (int p = 1; p <= 3; p++) {
-    QpBasis B; B.init(p);
+    LagrangeBasis B; B.init(p);
     int n = B.n, ndof = n*n*n, m = 3*ndof;
 
     for (int cutCase = 0; cutCase < 2; cutCase++) {

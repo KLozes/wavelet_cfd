@@ -72,19 +72,19 @@ public:
   LevelSet   ls;
   real domainOrigin[3] = {0,0,0};   // world position of grid corner (0,0,0)
 
-  // ---- higher order (Qp) --------------------------------------------------
+  // ---- higher order (immersed IGA) ----------------------------------------
   // femOrder 1 = the p=1 GPU path (everything below).  femOrder >= 2 dispatches
-  // to runQp() (CutFemQp.cu): a self-contained host-assembled Qp CutFEM using
-  // Saye cut quadrature on a level set sampled at the Qp solution nodes.  It
-  // reuses buildMesh() (the sparse octree + oracle) but does its own Qp dof
-  // numbering, assembly and CG.  Cartesian only for now.
+  // to runIga() (CutFemIga.cu): a self-contained host-assembled IMMERSED
+  // ISOGEOMETRIC CutFEM on uniform C^{p-1} B-splines, with Saye cut quadrature
+  // on a level set sampled at GLL points.  It reuses buildMesh() (the sparse
+  // octree + oracle) but does its own control-point numbering, assembly and CG.
+  //
+  // The C^0 Lagrange Q_p solution basis it replaced was removed outright: at p2
+  // splines matched its accuracy on ~6x fewer dofs with ~5x fewer CG iterations
+  // on the blade, and at p3 Q_p failed to converge there at all (20000 it, rel
+  // res 1e-3 with IC) where splines converge in ~1200.  LagrangeBasis.h keeps
+  // the C^0 collocation machinery, which the shifted-boundary paths still need.
   i32         femOrder = 1;
-  i32         femBasis = 0;    // solution basis inside runQp():
-                               // 0 = C^0 Lagrange Q_p (--basis fem, the default
-                               //     and the only validated path),
-                               // 1 = C^{p-1} uniform B-spline (--basis iga):
-                               //     immersed isogeometric / finite-cell.  Same
-                               //     geometry (level set + Saye), ~p^3 fewer dofs.
   i32         femMethod = 0;   // 0 = cut-cell (Saye) -- the default;
                                // 1 = GSBM shifted boundary (runSbm, CutFemSbm.cu):
                                //     surrogate domain of FULL cells, shifted
@@ -185,7 +185,7 @@ public:
   // prntIdxList, cFlagsList).  Pass lean=false to keep the 27-entry per-block
   // neighbour table -- what the grid-native IGA layout gathers through.  It must
   // be a CONSTRUCTOR argument because sortBlocks() decides whether to populate
-  // the table long before femBasis could be assigned to the object.
+  // the table long before any member could be assigned to the object.
   CutFemSolver(real *domainSize_, i32 *baseGridSize_, bool lean_ = true) :
     MultiLevelSparseGrid(domainSize_, baseGridSize_, 1, nFemFields, lean_) {
     leafMode  = 1;         // leaf-only: no exterior ring, no parent blocks
@@ -207,7 +207,7 @@ public:
   // ---- driver -------------------------------------------------------------
   void initialize(void);            // reference element matrix, default gamma_a
   void run(void);                   // mesh -> dofs -> assemble -> solve
-  void runQp(void);                 // higher-order path (CutFemQp.cu)
+  void runIga(void);                // higher-order path (CutFemIga.cu)
   void runSbm(void);                // shifted-boundary path (CutFemSbm.cu)
   void runDensity(void);            // ersatz tanh(phi) density-mask path (CutFemSbm.cu)
 

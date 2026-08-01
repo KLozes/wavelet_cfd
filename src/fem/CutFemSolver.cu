@@ -739,7 +739,7 @@ void CutFemSolver::computeErrors(void) {
 void CutFemSolver::run(void) {
   if (femMethod == 1) { runSbm(); return; }  // shifted boundary (CutFemSbm.cu)
   if (femMethod == 2) { runDensity(); return; }  // ersatz density mask (CutFemSbm.cu)
-  if (femOrder > 1) { runQp(); return; }   // higher-order host path (CutFemQp.cu)
+  if (femOrder > 1) { runIga(); return; }   // higher-order host path (CutFemIga.cu)
   initialize();
   buildMesh();
   setupDofs();

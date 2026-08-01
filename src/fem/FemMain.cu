@@ -107,9 +107,10 @@ int main(int argc, char *argv[]) {
   i32   nSectors = 0, nSpanLoft = 96, noPlatform = 0, noSector = 0, doSlice = 0, cylMode = 0, noPeriodic = 0;
   i32   sbmP = 0, sbmRes = 0; std::vector<i32> sbmResList;
   double fitSliceZ = -1e30; i32 fitNF = 700, fitDeg = 2;
+  double fitWin[3] = {0,0,-1};     // --fitwin cx,cy,half : zoom sub-box for the slice
   double sbmBox[4] = {0,0,0,-1};   // cx,cy,cz,half : solve a SUB-BOX instead of the whole model
   double sbmK = 0;                 // MMS wave number (0 => one wavelength across the box)
-  i32   femMethod = 0, femBasis = 0;
+  i32   femMethod = 0;
   i32   nCopies = 1, spdCheck = 0, isoN = 0, rangeTest = 0, femOrder = 1, reconP = 0, recon3dP = 0;
   real  E = 1, nu = (real)0.3, rhoMat = 1, margin = (real)0.05, refine = 1;
   real  gammaD = 1000, gammaA = -1, tol = (real)1e-10;
@@ -134,7 +135,6 @@ int main(int argc, char *argv[]) {
     else if (s == "--nosector")  noSector = 1;
     else if (s == "--res")       res = atoi(next());
     else if (s == "--p")         femOrder = atoi(next());
-    else if (s == "--basis")   { std::string v=next(); femBasis = (v=="iga"||v=="spline") ? 1 : 0; }
     else if (s == "--method")  { std::string v=next(); femMethod = (v=="sbm") ? 1 : (v=="density"||v=="dens") ? 2 : 0; }
     else if (s == "--case")      caseName = next();
     else if (s == "--E")         E = (real)atof(next());
@@ -169,6 +169,11 @@ int main(int argc, char *argv[]) {
     else if (s == "--fitslice")  fitSliceZ = atof(next());  // dump fitted vs true zero contour
     else if (s == "--fitnf")     fitNF = atoi(next());
     else if (s == "--fitdeg")    fitDeg = atoi(next());
+    else if (s == "--fitwin") { std::string v=next(); size_t q=0; int c3=0;
+      while(q<v.size()&&c3<3){ size_t c=v.find(',',q);
+        std::string t=v.substr(q,c==std::string::npos?c:c-q);
+        if(!t.empty()) fitWin[c3++]=atof(t.c_str());
+        if(c==std::string::npos) break; q=c+1; } }
     else if (s == "--sbmres") { std::string v=next(); size_t q=0;
       while(q<v.size()){ size_t c=v.find(',',q); std::string t=v.substr(q,c==std::string::npos?c:c-q);
         if(!t.empty()) sbmResList.push_back(atoi(t.c_str()));
@@ -489,15 +494,21 @@ int main(int argc, char *argv[]) {
     FILE *fp = fopen(fn.c_str(), "w");
     fprintf(fp, "# z=%.8f  res=%d  h=%.8f  deg=%d  lo=%.8f %.8f %.8f  L=%.8f\n",
             fitSliceZ, N, h, fitDeg, lo3[0], lo3[1], lo3[2], L);
+    fprintf(fp, "# gridlo=%.8f %.8f  gridh=%.8f\n", lo3[0], lo3[1], h);
     fprintf(fp, "# x y phi_true phi_fit\n");
     // cache one fitted polynomial per (cx,cy) column at this z-layer
     std::vector<PolyND> cache((size_t)N*N);
     std::vector<char> have((size_t)N*N, 0);
     double z0c = lo3[2] + kz*h;
+    // optional zoom window --fitwin cx,cy,half : sample a sub-box instead of the
+    // whole slice.  Needed for the ROOT FILLET, whose radius is a fraction of a
+    // cell -- at full-slice extent it is a couple of pixels wide.
+    double wx0 = lo3[0], wy0 = lo3[1], wL = L;
+    if (fitWin[2] > 0) { wx0 = fitWin[0]-fitWin[2]; wy0 = fitWin[1]-fitWin[2]; wL = 2*fitWin[2]; }
     for (i32 j = 0; j < fitNF; j++) {
-      double y = lo3[1] + L*(j + 0.5)/fitNF;
+      double y = wy0 + wL*(j + 0.5)/fitNF;
       for (i32 i = 0; i < fitNF; i++) {
-        double x = lo3[0] + L*(i + 0.5)/fitNF;
+        double x = wx0 + wL*(i + 0.5)/fitNF;
         i32 cx = (i32)floor((x - lo3[0])/h), cy = (i32)floor((y - lo3[1])/h);
         if (cx < 0) cx = 0; if (cx >= N) cx = N-1;
         if (cy < 0) cy = 0; if (cy >= N) cy = N-1;
@@ -619,12 +630,7 @@ int main(int argc, char *argv[]) {
   // -------------------------------------------------------------------------
   //  solver
   // -------------------------------------------------------------------------
-  // Stays LEAN.  The plan had IGA gather through the grid's 27-entry per-block
-  // neighbour table (lean=false allocates nbrIdxList), but runQp's node numbering
-  // and ghost pairing are HOST-side and now index a dense lattice table directly,
-  // which needs no neighbour list at all.  Allocating one nothing reads would be
-  // cargo cult; flip this to `femBasis == 0` if a device-side gather ever lands.
-  CutFemSolver *S = new CutFemSolver(domainSize, baseGridSize, /*lean=*/true);
+  CutFemSolver *S = new CutFemSolver(domainSize, baseGridSize);
   for (i32 d = 0; d < 3; d++) S->domainOrigin[d] = origin[d];
   S->ls = sdf;
 
@@ -648,7 +654,6 @@ int main(int argc, char *argv[]) {
   S->prob.tracX0 = domLo[0] + (real)0.85*ext[0];
 
   S->femOrder    = (femOrder < 1) ? 1 : femOrder;
-  S->femBasis    = femBasis;
   S->femMethod   = femMethod;
   S->outTag      = tag;
   S->wantVtu     = !novtu;
@@ -850,7 +855,7 @@ int main(int argc, char *argv[]) {
   //
   // On constant-radius airfoil planes (arc, z), dump the TRUE level set (oracle)
   // and the per-cell degree-p polynomial reconstruction that the Qp cut
-  // quadrature fits (fitPoly3, same as runQp).  Overlaying their zero contours
+  // quadrature fits (fitPoly3, same as runIga).  Overlaying their zero contours
   // shows exactly where the smooth polynomial fit matches the geometry and where
   // it oscillates -- the creases (sharp TE/tip, CSG kinks).
   if (reconP >= 1) {

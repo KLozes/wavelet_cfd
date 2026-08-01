@@ -1,9 +1,10 @@
 //
-// Higher-order (Qp) path of the CutFEM solver -- CutFemSolver::runQp().
+// Higher-order path of the CutFEM solver -- CutFemSolver::runIga():
+// IMMERSED ISOGEOMETRIC analysis on uniform C^{p-1} B-splines.
 //
 // Production realization of the method verified standalone in QpMms.cu, reusing
 // the sparse octree + oracle (buildMesh) for the active block set and the
-// verified modules QpBasis / PolyFit / SayeQuad / QpElem.  The p=1 GPU path
+// verified modules IgaBasis / PolyFit / SayeQuad / IgaElem.  The p=1 GPU path
 // (run()) is untouched; run() dispatches here when femOrder>=2.
 //
 // Two geometry modes:
@@ -34,10 +35,10 @@
 #include <cusparse.h>
 
 #include "CutFemSolver.cuh"
-#include "QpBasis.h"
+#include "IgaBasis.h"
 #include "PolyFit.h"
 #include "SayeQuad.h"
-#include "QpElem.h"
+#include "IgaElem.h"
 
 static inline u64 qpKey(i32 I, i32 J, i32 K) {
   return (u64)I | ((u64)J << 21) | ((u64)K << 42);
@@ -159,7 +160,7 @@ static double compressVolUniform(const SayeNode*sayeIn,int nSaye,const PolyND&ph
 }
 
 // =====================================================================
-//  GPU solve for the Cartesian Qp cut-cell operator (CUT_GPU=1).  Reuses runQp's
+//  GPU solve for the Cartesian cut-cell operator (CUT_GPU=1).  Reuses runIga's
 //  host setup verbatim -- the continuous nodal dofs live in flat device arrays,
 //  and the operator is: interior cells share one reference matrix K_ref (dense
 //  matvec), cut cells RE-QUADRATURE from their stored Saye rule (volume stiffness
@@ -206,7 +207,7 @@ static bool invertSPD(double *A, int n) {
 }
 // =====================================================================
 struct CutDev {
-  QpBasis B; i32 nE,nCut,nGFQ,nNode,ndof,ndof3,mG;
+  IgaBasis B; i32 nE,nCut,nGFQ,nNode,ndof,ndof3,mG;
   real h, mu, lam, gammaD;
   const i32 *eNode, *nMap; const char *nRot; real cph, sph;
   const i32 *intList, *cutElem;                    // interior cells; cut-cell -> element
@@ -261,7 +262,7 @@ __global__ void cutInteriorK(CutDev S,const real*xn,real*yn){ i32 ndof=S.ndof,m3
 // cut cells: re-quadrature the Saye rule (volume stiffness + Nitsche surface).
 // BLOCK per cut cell, THREAD per quadrature point: ul/yl live in shared memory
 // (no per-thread element-size spill), points accumulate into yl via shared atomics.
-__global__ void cutCellK(CutDev S,const real*xn,real*yn){ QpBasis B=S.B; i32 ndof=S.ndof,ndof3=S.ndof3;
+__global__ void cutCellK(CutDev S,const real*xn,real*yn){ IgaBasis B=S.B; i32 ndof=S.ndof,ndof3=S.ndof3;
   extern __shared__ real sh[]; real*ul=sh,*yl=sh+ndof3;                 // ul[ndof3] + yl[ndof3]
   for(i32 c=blockIdx.x;c<S.nCut;c+=gridDim.x){ i32 e=S.cutElem[c]; const i32*nod=S.eNode+(size_t)e*ndof;
     for(i32 a=threadIdx.x;a<ndof;a+=blockDim.x){ i32 nd=nod[a]; ul[3*a]=xn[3*nd]; ul[3*a+1]=xn[3*nd+1]; ul[3*a+2]=xn[3*nd+2]; }
@@ -316,7 +317,7 @@ __device__ inline void cutMetric(const CutDev& S,i32 e,const real xr[3],double J
   detJ=inv3(J,Jinv); }
 // CYLINDRICAL operator: block per element (ALL elements re-quadrature the analytic metric;
 // interior = tensor-GLL, cut = Saye), + Nanson Nitsche on cut Dirichlet faces.
-__global__ void cutCylK(CutDev S,const real*xn,real*yn){ QpBasis B=S.B; i32 ndof=S.ndof,ndof3=S.ndof3,n=B.n;
+__global__ void cutCylK(CutDev S,const real*xn,real*yn){ IgaBasis B=S.B; i32 ndof=S.ndof,ndof3=S.ndof3,n=B.n;
   extern __shared__ real sh[]; real*ul=sh,*yl=sh+ndof3;
   for(i32 e=blockIdx.x;e<S.nE;e+=gridDim.x){ const i32*nod=S.eNode+(size_t)e*ndof; i32 c=S.eCut[e]; bool cut=(c>=0);
     for(i32 a=threadIdx.x;a<ndof;a+=blockDim.x){ i32 nd=nod[a]; ul[3*a]=xn[3*nd]; ul[3*a+1]=xn[3*nd+1]; ul[3*a+2]=xn[3*nd+2]; }
@@ -410,9 +411,9 @@ __global__ void cutPRestrictWK(const i32*col,const real*W,i32 w,const real*fn,re
   for(i32 f=CUT_STRIDE;f<nFine;f+=gridDim.x*blockDim.x){ real f0=fn[3*f],f1=fn[3*f+1],f2=fn[3*f+2];
     for(i32 k=0;k<w;k++){ real ww=W[(size_t)w*f+k]; i32 c=col[(size_t)w*f+k]; atomicAdd(&ec[3*c],ww*f0);atomicAdd(&ec[3*c+1],ww*f1);atomicAdd(&ec[3*c+2],ww*f2); } } }
 
-void CutFemSolver::runQp(void) {
+void CutFemSolver::runIga(void) {
   const i32 p = femOrder;
-  QpBasis Bp; Bp.initBasis(p, femBasis);
+  IgaBasis Bp; Bp.init(p);
   const i32 n = p+1, ndof = n*n*n, ndof3 = 3*ndof, mG = 2*ndof3;
   const real h = cellSize();
   const double mu = prob.mu, lam = prob.lam;
@@ -428,11 +429,11 @@ void CutFemSolver::runQp(void) {
   const double cph = cos((double)pitchAngle), sph = sin((double)pitchAngle);
 
   if (ls.coordMode != 0 && !cyl) {
-    printf("ERROR: Qp path supports coordMode 0 (Cartesian) or 1 (cylindrical) only\n"); return; }
+    printf("ERROR: IGA path supports coordMode 0 (Cartesian) or 1 (cylindrical) only\n"); return; }
   if (p > QP_MAX) { printf("ERROR: femOrder %d exceeds QP_MAX=%d\n", p, QP_MAX); return; }
 
-  printf("higher : Qp CutFEM (Saye cut quadrature), p=%d  %s%s  gammaD=%.4g gammaG=%.4g\n",
-         p, cyl?"CYLINDRICAL isoparametric":"Cartesian", per?" + cyclic pitch tie":"",
+  printf("higher : immersed IGA CutFEM, C^%d B-spline (Saye cut quadrature), p=%d  %s%s  gammaD=%.4g gammaG=%.4g\n",
+         p-1, p, cyl?"CYLINDRICAL isoparametric":"Cartesian", per?" + cyclic pitch tie":"",
          gammaD_, gammaG_);
 
   long t0 = qpNowUs(); long tSolveEnd = 0;
@@ -487,7 +488,7 @@ void CutFemSolver::runQp(void) {
   // node lattice is p-times finer than the cell grid.  The p+1 B-splines nonzero
   // on span ci are exactly ci..ci+p, so the control-point lattice has STRIDE 1 --
   // nCells+p per axis instead of p*nCells+1, which is the whole dof-count win.
-  const i32 lstr = Bp.iga ? 1 : p;
+  const i32 lstr = 1;
   auto gcoord=[&](const QElem&E,i32 a,i32&I,i32&J,i32&K){ i32 i=a%n,j=(a/n)%n,k=a/(n*n);
     I=lstr*E.ci+i; J=lstr*E.cj+j; K=lstr*E.ck+k; };
   // ---- GRID-NATIVE node numbering ----------------------------------------
@@ -541,7 +542,7 @@ void CutFemSolver::runQp(void) {
     else { realIdx[nd]=realIdx[mst]; rotFlag[nd]=1; nTie++; }
   }
   const i32 nDofQ=3*nDofNode;
-  if (per) printf("cyclic : %d Qp nodes tied across the pitch (%d unmatched kept free), %d -> %d dofs\n",
+  if (per) printf("cyclic : %d control points tied across the pitch (%d unmatched kept free), %d -> %d dofs\n",
                   nTie, nOrphan, 3*nNodeQ, nDofQ);
 
   // gather/scatter with the pitch rotation (identity when non-periodic).
@@ -655,21 +656,8 @@ void CutFemSolver::runQp(void) {
   // ghost-penalty face traces: Dl0[l][a] / Dl1[l][a] = l-th reference derivative
   // of 1-D basis function a at xi=0 / xi=1.
   double Dl0[QP_MAX+1][QN_MAX], Dl1[QP_MAX+1][QN_MAX];
-  if (Bp.iga) {
-    // C^{p-1} splines: derivatives of order l<p are CONTINUOUS across the face,
-    // so their jump -- and hence the whole l<p penalty term -- vanishes
-    // identically.  Zero them rather than relying on numerical cancellation.
-    // Only l==p survives, and there the p-th derivative is the piecewise
-    // constant (-1)^(p-a) C(p,a), the same value at both faces.
-    for (i32 l=1;l<=p;l++) for (i32 a=0;a<n;a++){
-      real v=Bp.dlFaceSpline(l,a); Dl0[l][a]=(double)v; Dl1[l][a]=(double)v; }
-  } else {
-    double Dp[QN_MAX][QN_MAX];
-    for (i32 i=0;i<n;i++) for (i32 a=0;a<n;a++) Dp[i][a]=Bp.D[i][a];
-    for (i32 l=1;l<=p;l++){ for (i32 a=0;a<n;a++){ Dl0[l][a]=Dp[0][a]; Dl1[l][a]=Dp[n-1][a]; }
-      if (l<p){ double Nw[QN_MAX][QN_MAX];
-        for (i32 i=0;i<n;i++) for (i32 a=0;a<n;a++){ double s=0; for(i32 m=0;m<n;m++) s+=Dp[i][m]*Bp.D[m][a]; Nw[i][a]=s; }
-        for (i32 i=0;i<n;i++) for (i32 a=0;a<n;a++) Dp[i][a]=Nw[i][a]; } } }
+  for (i32 l=1;l<=p;l++) for (i32 a=0;a<n;a++){
+    real v=Bp.dlFace(l,a); Dl0[l][a]=(double)v; Dl1[l][a]=(double)v; }
 
   auto physOf=[&](const QElem&E,const real xr[3],real X[3]){
     ls.toPhys((E.ci+xr[0])*h,(E.cj+xr[1])*h,(E.ck+xr[2])*h,X[0],X[1],X[2]); };
@@ -1059,7 +1047,7 @@ void CutFemSolver::runQp(void) {
       // ---- p-multigrid p-hierarchy (p -> p-1 -> ... -> 1); NODE-space V-cycle; non-periodic only ----
       #define MAXLEV 10
       i32 nLev=1; real *d_diagN=nullptr,*d_cz=nullptr,*d_cp=nullptr,*d_cAp=nullptr,*d_cr=nullptr;
-      CutDev Slev[MAXLEV]{}; QpBasis Blev[MAXLEV];
+      CutDev Slev[MAXLEV]{}; IgaBasis Blev[MAXLEV];
       i32 nNodeLev[MAXLEV]={0}, nNLev[MAXLEV]={0}, ndofLev[MAXLEV]={0}, nd3Lev[MAXLEV]={0}, mGLev[MAXLEV]={0}, wLev[MAXLEV]={0}, nDofNodeLev[MAXLEV]={0};
       real *d_diagNLev[MAXLEV]={0}, *d_xLev[MAXLEV]={0}, *d_rLev[MAXLEV]={0}, *d_tmpLev[MAXLEV]={0}, *d_resLev[MAXLEV]={0}, *d_dirLev[MAXLEV]={0}, *d_pwLev[MAXLEV]={0};
       real *d_mult3Lev[MAXLEV]={0}, *d_projLev[MAXLEV]={0}, *d_ptmpLev[MAXLEV]={0};   // per-level pitch-tie projection (dof buffer, mult, node scratch)
@@ -1077,7 +1065,7 @@ void CutFemSolver::runQp(void) {
       i32 cDeg=3,cMaxit=100; double cTol=5e-2; { const char*e; if((e=getenv("CUT_CHEBDEG")))cDeg=atoi(e); if((e=getenv("CUT_CMAXIT")))cMaxit=atoi(e); if((e=getenv("CUT_CTOL")))cTol=atof(e); }
       if (pcMode==3) {
         nLev=p;   // p3 -> {p3,p2,p1}; p2 -> {p2,p1}
-        auto buildLevel=[&](i32 pc,i32 L){ QpBasis Bc; Bc.init(pc); Blev[L]=Bc; i32 nc=pc+1,ndc=nc*nc*nc,nd3c=3*ndc,mGc=2*nd3c;
+        auto buildLevel=[&](i32 pc,i32 L){ IgaBasis Bc; Bc.init(pc); Blev[L]=Bc; i32 nc=pc+1,ndc=nc*nc*nc,nd3c=3*ndc,mGc=2*nd3c;
           ndofLev[L]=ndc; nd3Lev[L]=nd3c; mGLev[L]=mGc;
           std::unordered_map<u64,i32> nid; nid.reserve((size_t)nE*ndc); std::vector<i32>& en=eNodeLev[L]; en.assign((size_t)nE*ndc,0); i32 nn=0;
           for(i32 e=0;e<nE;e++)for(i32 a=0;a<ndc;a++){ i32 i=a%nc,j=(a/nc)%nc,k=a/(nc*nc); i32 I=pc*elems[e].ci+i,J=pc*elems[e].cj+j,K=pc*elems[e].ck+k; u64 key=qpKey(I,J,K);
@@ -1097,9 +1085,7 @@ void CutFemSolver::runQp(void) {
           std::vector<real> Kr((size_t)nd3c*nd3c);
           { std::vector<real> u(nd3c),y(nd3c); for(i32 cc=0;cc<nd3c;cc++){ for(i32 i=0;i<nd3c;i++)u[i]=(i==cc)?(real)1:(real)0; qpElemUncut(Bc,(real)mu,(real)lam,h,u.data(),y.data()); for(i32 r=0;r<nd3c;r++)Kr[(size_t)r*nd3c+cc]=y[r]; } }
           double Dl0c[QP_MAX+1][QN_MAX], Dl1c[QP_MAX+1][QN_MAX];
-          { double Dp[QN_MAX][QN_MAX]; for(i32 i=0;i<nc;i++)for(i32 a=0;a<nc;a++)Dp[i][a]=Bc.D[i][a];
-            for(i32 l=1;l<=pc;l++){ for(i32 a=0;a<nc;a++){Dl0c[l][a]=Dp[0][a];Dl1c[l][a]=Dp[nc-1][a];}
-              if(l<pc){ double Nw[QN_MAX][QN_MAX]; for(i32 i=0;i<nc;i++)for(i32 a=0;a<nc;a++){double s=0;for(i32 m=0;m<nc;m++)s+=Dp[i][m]*Bc.D[m][a];Nw[i][a]=s;} for(i32 i=0;i<nc;i++)for(i32 a=0;a<nc;a++)Dp[i][a]=Nw[i][a]; } } }
+          for(i32 l=1;l<=pc;l++)for(i32 a=0;a<nc;a++){ real v=Bc.dlFace(l,a); Dl0c[l][a]=(double)v; Dl1c[l][a]=(double)v; }
           auto ghostc=[&](i32 d,const double*uMP,double*yMP){ for(i32 i=0;i<mGc;i++)yMP[i]=0; i32 t1=(d+1)%3,t2=(d+2)%3; GaussRule g1=gaussLegendre(pc+1);
             for(i32 q1=0;q1<g1.n;q1++)for(i32 q2=0;q2<g1.n;q2++){ double w=g1.w[q1]*g1.w[q2]; real L1[QN_MAX],L2[QN_MAX]; Bc.basis1(g1.x[q1],L1); Bc.basis1(g1.x[q2],L2);
               double cP[QP_MAX+1][QN_MAX*QN_MAX*QN_MAX], cM[QP_MAX+1][QN_MAX*QN_MAX*QN_MAX];
@@ -1164,7 +1150,7 @@ void CutFemSolver::runQp(void) {
         d_tmpLev[0]=alR(nN); d_resLev[0]=alR(nN); d_dirLev[0]=alR(nN);
         for(void*pp:{(void*)d_diagN,(void*)d_tmpLev[0],(void*)d_resLev[0],(void*)d_dirLev[0]}) pmgFree.push_back(pp);
         for(i32 L=1; L<nLev; L++) buildLevel(p-L,L);
-        for(i32 L=0; L<nLev-1; L++){ i32 pf=p-L, ncf=pf+1, ndf=ncf*ncf*ncf, ndc=ndofLev[L+1]; QpBasis Bc=Blev[L+1]; i32 ncc=Bc.n;
+        for(i32 L=0; L<nLev-1; L++){ i32 pf=p-L, ncf=pf+1, ndf=ncf*ncf*ncf, ndc=ndofLev[L+1]; IgaBasis Bc=Blev[L+1]; i32 ncc=Bc.n;
           real tf[PNC]; gllNodes(pf,tf); wLev[L]=ndc;
           std::vector<i32> pcol((size_t)ndc*nNodeLev[L],0); std::vector<real> pw((size_t)ndc*nNodeLev[L],(real)0);
           for(i32 e=0;e<nE;e++){ const i32*nodF=&eNodeLev[L][(size_t)e*ndf]; const i32*nodC=&eNodeLev[L+1][(size_t)e*ndc];
@@ -1317,9 +1303,7 @@ void CutFemSolver::runQp(void) {
           i32 nGFc=(i32)gfM.size(); nGFLev[L]=nGFc;
           std::vector<double> Kg[3];
           { double Dl0c[QP_MAX+1][QN_MAX], Dl1c[QP_MAX+1][QN_MAX];
-            { double Dp[QN_MAX][QN_MAX]; for(i32 i=0;i<n;i++)for(i32 a=0;a<n;a++)Dp[i][a]=Bp.D[i][a];
-              for(i32 l=1;l<=p;l++){ for(i32 a=0;a<n;a++){Dl0c[l][a]=Dp[0][a];Dl1c[l][a]=Dp[n-1][a];}
-                if(l<p){ double Nw[QN_MAX][QN_MAX]; for(i32 i=0;i<n;i++)for(i32 a=0;a<n;a++){double s=0;for(i32 m2=0;m2<n;m2++)s+=Dp[i][m2]*Bp.D[m2][a];Nw[i][a]=s;} for(i32 i=0;i<n;i++)for(i32 a=0;a<n;a++)Dp[i][a]=Nw[i][a]; } } }
+            for(i32 l=1;l<=p;l++)for(i32 a=0;a<n;a++){ real v=Bp.dlFace(l,a); Dl0c[l][a]=(double)v; Dl1c[l][a]=(double)v; }
             for(i32 d=0;d<3;d++){ Kg[d].assign((size_t)mG*mG,0.0); i32 t1=(d+1)%3,t2=(d+2)%3;
               double hd=hSp[L][d]*h, ht1=hSp[L][t1]*h, ht2=hSp[L][t2]*h, gscale=ht1*ht2/hd;
               std::vector<double> ue(mG),ye(mG); GaussRule g1=gaussLegendre(p+1);
@@ -1936,7 +1920,7 @@ void CutFemSolver::runQp(void) {
       cudaMemcpy(d_r,d_b,(size_t)nR*sizeof(real),cudaMemcpyDeviceToDevice);   // u=0 -> r=b
       precond(d_z,d_r); cudaMemcpy(d_pd,d_z,(size_t)nR*sizeof(real),cudaMemcpyDeviceToDevice); cudaDeviceSynchronize();
       double bn=sqrt(dot(d_b,d_b)); if(bn==0)bn=1; double rz=dot(d_r,d_z); i32 it=0; double rn=0;
-      for(; !directOK && it<cgMaxIt; it++){ apply(d_pd,d_Ap); double pAp=dot(d_pd,d_Ap); if(!(pAp>0)){ printf("WARNING: Qp GPU-CG breakdown pAp=%.3e\n",pAp); break; }
+      for(; !directOK && it<cgMaxIt; it++){ apply(d_pd,d_Ap); double pAp=dot(d_pd,d_Ap); if(!(pAp>0)){ printf("WARNING: IGA GPU-CG breakdown pAp=%.3e\n",pAp); break; }
         double al=rz/pAp; cutAxpyK<<<GS,BS>>>(d_u,d_pd,(real)al,nR); cutAxpyK<<<GS,BS>>>(d_r,d_Ap,(real)-al,nR); cudaDeviceSynchronize();
         rn=sqrt(dot(d_r,d_r)); if(rn<=cgTol*bn){ it++; break; }
         cudaMemcpy(d_zold,d_z,(size_t)nR*sizeof(real),cudaMemcpyDeviceToDevice);
@@ -2136,7 +2120,7 @@ void CutFemSolver::runQp(void) {
       double pAp=0;
       #pragma omp parallel for reduction(+:pAp)
       for (i32 i=0;i<nDofQ;i++) pAp+=pd[i]*Ap[i];
-      if (!(pAp>0)){ printf("WARNING: Qp CG breakdown pAp=%.3e\n",pAp); break; }
+      if (!(pAp>0)){ printf("WARNING: IGA CG breakdown pAp=%.3e\n",pAp); break; }
       double al=rz/pAp;
       #pragma omp parallel for
       for (i32 i=0;i<nDofQ;i++){ uv[i]+=al*pd[i]; r[i]-=al*Ap[i]; }
@@ -2203,7 +2187,7 @@ void CutFemSolver::runQp(void) {
 
     // ---- report ----
     double ms=((tSolveEnd?tSolveEnd:qpNowUs())-t0)/1000.0; i32 nCutTrueQ=0; for (i32 e=0;e<nE;e++) if (elems[e].cut) nCutTrueQ++;
-    printf("active : %d Qp elements (%d cut), %d ghost faces\n", nE, nCutTrueQ, nGFQ);
+    printf("active : %d elements (%d cut), %d ghost faces\n", nE, nCutTrueQ, nGFQ);
     printf("dofs   : %d nodes -> %d unknowns   h = %.6g   p = %d\n", nNodeQ, nDofQ, (double)h, p);
     printf("geom   : |Omega_h| = %.8g", volOmega);
     if (volExact>0) printf("   exact %.8g   err %.3e (%.3f%%)", volExact, volOmega-volExact, 100.0*fabs(volOmega-volExact)/volExact);
@@ -2260,6 +2244,69 @@ void CutFemSolver::runQp(void) {
         if (phiN[nd]<0 && vmN[nd]>vmMax){ vmMax=vmN[nd]; ndMax=nd; } }
       if (ndMax>=0) printf("stress : peak von Mises %.6e at (%.4f, %.4f, %.4f)  [solid nodes only, phi<0]\n",
                            vmMax,nodeXQ[3*ndMax],nodeXQ[3*ndMax+1],nodeXQ[3*ndMax+2]);
+    }
+    // ---- constant-z SECTION sample (CUT_SLICEZ=<z>, CUT_SLICEN=<pts/elem/axis>) ----
+    // Samples u and von Mises on a plane by EVALUATING THE BASIS at reference
+    // points, not by reading nodal values.  That is the only basis-fair way to
+    // compare fem against iga: B-splines are NOT interpolatory, so a control-point
+    // coefficient is not the displacement there and the nodal arrays above (which
+    // average GLL-point values onto nodes) are meaningless for iga.
+    // Physical z equals grid z in both coord systems (the metric's third row is
+    // {0,0,h}), so the plane inverts exactly: xr2 = (z0-org2)/h - ck.
+    if (getenv("CUT_SLICEZ")) {
+      mkdir("output",0755);
+      // "<axis>,<coord>" in the COMPUTATIONAL frame (axis 0/1/2, coord in grid
+      // units).  For the cylindrical blade the span is RADIAL, so a constant-z
+      // world cut is oblique and exaggerates thickness -- axis 0 (constant r) is
+      // the true blade-to-blade section.  A bare number means axis 2 (legacy).
+      const char* sarg = getenv("CUT_SLICEZ");
+      i32 sax = 2; double z0 = 0;
+      { const char* cm = strchr(sarg,',');
+        if (cm) { sax = atoi(sarg); z0 = atof(cm+1); } else z0 = atof(sarg); }
+      const i32 t1=(sax+1)%3, t2=(sax+2)%3;
+      const i32 ms = getenv("CUT_SLICEN") ? atoi(getenv("CUT_SLICEN")) : 12;
+      std::string fn = "output/" + (outTag.empty()?std::string("dump"):outTag) + "_slice.csv";
+      std::ofstream os(fn.c_str());
+      os<<"s1,s2,x,y,z,phi,ux,uy,uz,umag,vm\n";
+      real gb[3*QN_MAX*QN_MAX*QN_MAX], vb[QN_MAX*QN_MAX*QN_MAX];
+      std::vector<double> uloc((size_t)3*ndof);
+      size_t nOut=0;
+      for (i32 e=0;e<nE;e++){
+        const i32 ec[3]={elems[e].ci,elems[e].cj,elems[e].ck};
+        double zr = (z0 - (double)ls.org[sax])/h - (double)ec[sax];
+        if (zr < 0.0 || zr > 1.0) continue;                 // plane misses this element
+        const i32*nod=&eNodeQ[(size_t)e*ndof];
+        for (i32 a=0;a<ndof;a++){ double u3[3]; gather3(uv,nod[a],u3);
+          uloc[3*a]=u3[0]; uloc[3*a+1]=u3[1]; uloc[3*a+2]=u3[2]; }
+        for (i32 jj=0;jj<ms;jj++) for (i32 ii=0;ii<ms;ii++){
+          real xr[3]; xr[sax]=(real)zr; xr[t1]=(real)((ii+0.5)/ms); xr[t2]=(real)((jj+0.5)/ms);
+          double s1=(ec[t1]+xr[t1])*h+(double)ls.org[t1], s2=(ec[t2]+xr[t2])*h+(double)ls.org[t2];
+          real X[3]; physOf(elems[e],xr,X);
+          double phi = (double)ls.phi((elems[e].ci+xr[0])*h,(elems[e].cj+xr[1])*h,(elems[e].ck+xr[2])*h);
+          double Jinv[3][3],detJ;
+          if (cyl) metric(elems[e],xr,Jinv,detJ);
+          else { for(i32 i2=0;i2<3;i2++)for(i32 j2=0;j2<3;j2++) Jinv[i2][j2]=0;
+                 Jinv[0][0]=Jinv[1][1]=Jinv[2][2]=1.0/h; detJ=h*h*h; }
+          Bp.allVal(xr,vb); Bp.allGradRef(xr,gb);
+          double uu[3]={0,0,0}, gU[3][3]={{0,0,0},{0,0,0},{0,0,0}};
+          for (i32 a=0;a<ndof;a++){ double gX[3];
+            for(i32 d=0;d<3;d++) gX[d]=Jinv[0][d]*gb[3*a+0]+Jinv[1][d]*gb[3*a+1]+Jinv[2][d]*gb[3*a+2];
+            for(i32 i2=0;i2<3;i2++){ double ua=uloc[3*a+i2]; uu[i2]+=ua*vb[a];
+              gU[i2][0]+=ua*gX[0]; gU[i2][1]+=ua*gX[1]; gU[i2][2]+=ua*gX[2]; } }
+          double eps[3][3];
+          for(i32 i2=0;i2<3;i2++)for(i32 j2=0;j2<3;j2++) eps[i2][j2]=0.5*(gU[i2][j2]+gU[j2][i2]);
+          double trc=eps[0][0]+eps[1][1]+eps[2][2], sg[3][3];
+          for(i32 i2=0;i2<3;i2++)for(i32 j2=0;j2<3;j2++) sg[i2][j2]=2*mu*eps[i2][j2]+(i2==j2?lam*trc:0);
+          double vm=sqrt(0.5*((sg[0][0]-sg[1][1])*(sg[0][0]-sg[1][1])
+                             +(sg[1][1]-sg[2][2])*(sg[1][1]-sg[2][2])
+                             +(sg[2][2]-sg[0][0])*(sg[2][2]-sg[0][0]))
+                         +3.0*(sg[0][1]*sg[0][1]+sg[1][2]*sg[1][2]+sg[2][0]*sg[2][0]));
+          double um=sqrt(uu[0]*uu[0]+uu[1]*uu[1]+uu[2]*uu[2]);
+          os<<s1<<","<<s2<<","<<X[0]<<","<<X[1]<<","<<X[2]<<","<<phi<<","
+            <<uu[0]<<","<<uu[1]<<","<<uu[2]<<","<<um<<","<<vm<<"\n";
+          nOut++;
+        } }
+      printf("slice  : axis %d at %.6f, %zu samples (%d^2/elem) -> %s\n", sax, z0, nOut, ms, fn.c_str());
     }
     // ---- VTU (p^3 sub-hexes) ----
     if (wantVtu && !outTag.empty()){ mkdir("output",0755);

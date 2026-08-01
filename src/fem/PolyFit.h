@@ -14,7 +14,7 @@
 
 #include "Poly.h"
 
-// GLL nodes on [0,1] for p = 1..4.  MUST match QpBasis::init exactly -- these are the
+// GLL nodes on [0,1] for p = 1..4.  MUST match IgaBasis::init exactly -- these are the
 // FEM solution points, and the cut-cell detector samples the level set at them.  A stale
 // `else` here silently returned the p=3 nodes (and left t[4] uninitialised) for p=4, so the
 // deg-4 fit was built on a degenerate node set and Saye returned an EMPTY rule.

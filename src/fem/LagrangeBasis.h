@@ -1,9 +1,16 @@
-#ifndef FEM_QPBASIS_H
-#define FEM_QPBASIS_H
+#ifndef FEM_LAGRANGEBASIS_H
+#define FEM_LAGRANGEBASIS_H
 
 //
-// Qp tensor-product Lagrange basis on the reference cell [0,1]^3, GLL nodes.
-// Foundation of the matrix-free higher-order operator (M1):
+// C^0 tensor-product LAGRANGE collocation basis on [0,1]^3, GLL nodes.
+//
+// This is no longer the CutFEM solver's solution basis -- that is IgaBasis.h
+// (uniform C^{p-1} B-splines).  What remains here is the COLLOCATION machinery
+// (GLL nodes, barycentric weights, the differentiation matrix D) that the
+// shifted-boundary paths and their tests genuinely need: SbmShift.h builds
+// Taylor shift operators from powers of D, which has no spline analogue.
+//
+// Provides:
 //
 //   * tensor GLL quadrature (nodes + weights)              -- uncut elements
 //   * 1-D differentiation matrix D[i][a] = l_a'(t_i)        -- sum factorization
@@ -18,37 +25,24 @@
 //
 
 #include "Util.cuh"
-#include "BsplineBasis.h"
 
 static constexpr i32 QP_MAX = 4;          // max supported order (p4: 5 nodes THROUGH THICKNESS in one
                                           // element -- p>=4 is where shear locking in thin structures
                                           // essentially vanishes, Szabo-Babuska p-version result)
 static constexpr i32 QN_MAX = QP_MAX + 1; // nodes per axis
 
-struct QpBasis {
+struct LagrangeBasis {
   i32  p, n;                 // order, nodes/axis (= p+1)
   real t[QN_MAX];            // GLL nodes on [0,1]
   real wq[QN_MAX];           // GLL quadrature weights on [0,1]
   real bw[QN_MAX];           // barycentric weights
   real D[QN_MAX][QN_MAX];    // D[i][a] = l_a'(t_i)
+  real qx[QN_MAX], qw[QN_MAX];  // volume quadrature = the GLL collocation rule
+                                // (== t/wq); named to match IgaBasis so the
+                                // templated element cores serve both.
 
-  // ---- IGA switch (--basis iga) ---------------------------------------------
-  // When iga==1 the SOLUTION basis is the uniform C^{p-1} B-spline, but the
-  // p+1-functions-per-axis interface is identical, so every operator/Nitsche/
-  // ghost call site below dispatches instead of forking.  Deliberately NOT
-  // switched: t[]/wq[]/bw[]/D[] stay GLL/Lagrange, because they also serve the
-  // level-set fit and the node coordinates -- those are GEOMETRY operations and
-  // are independent of the solution basis (see BsplineBasis.h).
-  i32  iga;                  // 0 = C^0 Lagrange (default), 1 = C^{p-1} B-spline
-  BsplineBasis bs;
-  real qx[QN_MAX], qw[QN_MAX];  // VOLUME quadrature on [0,1]: GLL if !iga (=t,wq,
-                                // i.e. collocation), Gauss if iga (splines have
-                                // no interpolation nodes, so no collocation)
-
-  __host__ __device__ void init(i32 order) { initBasis(order, 0); }
-
-  __host__ __device__ void initBasis(i32 order, i32 igaFlag) {
-    p = order; n = p+1; iga = igaFlag; bs.init(order);
+  __host__ __device__ void init(i32 order) {
+    p = order; n = p+1;
     // GLL nodes on [0,1]
     if (p == 1) { t[0]=0; t[1]=1; }
     else if (p == 2) { t[0]=0; t[1]=(real)0.5; t[2]=1; }
@@ -78,40 +72,11 @@ struct QpBasis {
       for (i32 a = 0; a < n; a++) if (a != i) s += D[i][a];
       D[i][i] = -s;                       // rows sum to zero
     }
-    // volume quadrature: GLL collocation for Lagrange (points == nodes, which is
-    // what makes the uncut interior cheap); n-point Gauss for splines, exact to
-    // degree 2n-1 = 2p+1 and so exact for the stiffness integrand.
-    if (!iga) { for (i32 i = 0; i < n; i++) { qx[i] = t[i]; qw[i] = wq[i]; } }
-    else if (n == 2) { qx[0]=(real)0.2113248654; qx[1]=(real)0.7886751346;
-                       qw[0]=(real)0.5;          qw[1]=(real)0.5; }
-    else if (n == 3) { qx[0]=(real)0.1127016654; qx[1]=(real)0.5; qx[2]=(real)0.8872983346;
-                       qw[0]=(real)(5.0/18);     qw[1]=(real)(4.0/9); qw[2]=(real)(5.0/18); }
-    else if (n == 4) { qx[0]=(real)0.0694318442; qx[1]=(real)0.3300094782;
-                       qx[2]=(real)0.6699905218; qx[3]=(real)0.9305681558;
-                       qw[0]=(real)0.1739274226; qw[1]=(real)0.3260725774;
-                       qw[2]=(real)0.3260725774; qw[3]=(real)0.1739274226; }
-    else            { qx[0]=(real)0.0469100770; qx[1]=(real)0.2307653449; qx[2]=(real)0.5;
-                      qx[3]=(real)0.7692346551; qx[4]=(real)0.9530899230;
-                      qw[0]=(real)0.1184634425; qw[1]=(real)0.2393143352; qw[2]=(real)(0.2844444444);
-                      qw[3]=(real)0.2393143352; qw[4]=(real)0.1184634425; }
-  }
-
-  // l-th derivative of the 1-D basis at a face, ord=0 => xi=0, ord=1 => xi=1.
-  // Lagrange: read off the l-th power of the collocation matrix D (caller does
-  // that today).  Spline: for l<p the trace is CONTINUOUS across the face so the
-  // ghost jump vanishes identically; for l==p the p-th derivative of a degree-p
-  // B-spline is the piecewise constant (-1)^(p-k) C(p,k) on the span, the same
-  // value at both faces.  Only l==p is ever requested for iga.
-  __host__ __device__ real dlFaceSpline(i32 l, i32 k) const {
-    if (l != p) return (real)0;
-    real c = 1;                                  // C(p,k)
-    for (i32 i = 0; i < k; i++) c = c*(real)(p-i)/(real)(i+1);
-    return ((p-k) & 1) ? -c : c;
+    for (i32 i = 0; i < n; i++) { qx[i] = t[i]; qw[i] = wq[i]; }
   }
 
   // 1-D Lagrange basis values L[a] = l_a(x) at an arbitrary x (barycentric)
   __host__ __device__ void basis1(real x, real L[QN_MAX]) const {
-    if (iga) { bs.val(x, L); return; }
     // exact-at-node guard
     for (i32 a = 0; a < n; a++) if (x == t[a]) {
       for (i32 b = 0; b < n; b++) L[b] = (b==a)?(real)1:(real)0;
@@ -124,7 +89,6 @@ struct QpBasis {
 
   // 1-D basis values AND derivatives at an arbitrary x
   __host__ __device__ void basis1d(real x, real L[QN_MAX], real dL[QN_MAX]) const {
-    if (iga) { bs.val(x, L); bs.der(x, dL); return; }
     bool onNode = false; i32 na = -1;
     for (i32 a = 0; a < n; a++) if (x == t[a]) { onNode = true; na = a; }
     if (onNode) {

@@ -106,7 +106,7 @@ WAVEDG_P2_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_p2/%.cu.o,$(WAVEDG_SRCS))
 # here).  wavefem_dp is the fp64 build: the convergence study needs errors well
 # below the ~1e-5 relative floor fp32 CG leaves.
 WAVEFEM_SRCS = $(COMMON_SRCS) \
-               fem/CutFemSolver fem/CutFemSolverKernels fem/CutFemQp fem/CutFemSbm fem/FemMain
+               fem/CutFemSolver fem/CutFemSolverKernels fem/CutFemIga fem/CutFemSbm fem/FemMain
 WAVEFEM_OBJS    = $(patsubst %,$(OBJ_DIR)/wavefem/%.cu.o,$(WAVEFEM_SRCS))
 WAVEFEM_DP_DEFS = $(WAVEFEM_DEFS) -DUSE_DOUBLE
 WAVEFEM_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wavefem_dp/%.cu.o,$(WAVEFEM_SRCS))
@@ -197,7 +197,7 @@ $(OBJ_DIR)/wavedg3d_p2/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) $(WAVEDG_P2_DEFS) $(WAVEDG_INC) -dc $< -o $@
 
-# -Xcompiler -fopenmp: the Qp path (CutFemQp.cu) parallelizes its host assembly /
+# -Xcompiler -fopenmp: the Qp path (CutFemIga.cu) parallelizes its host assembly /
 # CG over cores.  The p=1 sources have no OpenMP pragmas, so their generated code
 # is unchanged; only libgomp is linked in.
 $(OBJ_DIR)/wavefem/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)

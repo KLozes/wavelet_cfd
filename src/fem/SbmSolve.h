@@ -59,7 +59,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <vector>
-#include "QpElem.h"      // qpElemUncut (bulk), QpBasis
+#include "IgaElem.h"      // qpElemUncut (bulk), LagrangeBasis
 #include "SbmShift.h"    // sbmShiftAll (Taylor shift), sbmDerivMatrix
 
 static double MU=0.8, LAM=1.2, KK=M_PI;
@@ -172,7 +172,7 @@ struct SbmOut { double l2rel, l2abs; long nd3; int iters; int nBF; int nE; doubl
 // One SBM solve on a CUBIC box [lo3, lo3+L]^3 divided into N^3 cells.
 // Geometry comes from sdf() (see g_sdfFn).  Returns the MMS L2 error.
 inline SbmOut sbmSolveOne(int p, int N, const double lo3[3], double L){
-  QpBasis B; B.init(p); int n=B.n, ndof=n*n*n, ndof3=3*ndof;
+  LagrangeBasis B; B.init(p); int n=B.n, ndof=n*n*n, ndof3=3*ndof;
   real Vm[QN_MAX][QN_MAX]; sbmDerivMatrix(B, Vm);
   // GSBM (Colomes-Modderman-Scovazzi, CMAME 452 (2026) 118748), Eq. (35):
   //   beta_1 = chi (r+1)^2 (2mu+lam), chi = 20   (shifted-Nitsche penalty, /h)

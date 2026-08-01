@@ -2,7 +2,7 @@
 // Shifted-boundary (GSBM) path of the CutFEM solver -- CutFemSolver::runSbm().
 //
 // Production realization of the method verified standalone in SbmMms.cu /
-// SbmSolve.h, sitting ALONGSIDE the Saye cut-cell path (runQp): same octree +
+// SbmSolve.h, sitting ALONGSIDE the Saye cut-cell path (runIga): same octree +
 // oracle (buildMesh), same Qp node lattice and gather/scatter, but
 //
 //   * the domain is the SURROGATE Omega~ = cells whose CENTRE is inside
@@ -47,9 +47,9 @@
 #include <vector>
 
 #include "CutFemSolver.cuh"
-#include "QpBasis.h"
+#include "LagrangeBasis.h"
 #include "PolyFit.h"
-#include "QpElem.h"
+#include "IgaElem.h"
 #include "SbmShift.h"
 
 static inline u64 sbKey(i32 I, i32 J, i32 K) {
@@ -115,7 +115,7 @@ static void sbPolyVG(const PolyND &P, const double xr[3], double &val, double g[
 // across cells/applies on a Cartesian mesh).  Same math as qpElemCore but never
 // re-derives the gradients -- the density band-matrix assembly calls this 81x per
 // cell, so hoisting allGradRef out of the loop removes ~81x redundant work.
-static inline void qpElemCoreG(const QpBasis &B, real mu, real lam, real h,
+static inline void qpElemCoreG(const LagrangeBasis &B, real mu, real lam, real h,
                                const real *ggb, const real *w, i32 npts,
                                const real *u, real *y) {
   i32 ndof=B.n*B.n*B.n;
@@ -142,7 +142,7 @@ static inline void qpElemCoreG(const QpBasis &B, real mu, real lam, real h,
 //  Dirichlet shifted-Nitsche operator (Neumann/gap/cyl kernels are stage 2).
 // =====================================================================
 struct SbmDev {
-  QpBasis B;
+  LagrangeBasis B;
   i32 nE, nBF, nGFQ, nNode, ndof, ndof3, mG, NQF, gqn;
   real h, mu, lam, gammaD, cph, sph;
   const i32 *eNode, *nMap; const char *nRot;
@@ -345,7 +345,7 @@ __global__ void sbmBicgPK(real *p, const real *r, const real *v, real be, real o
 
 void CutFemSolver::runSbm(void) {
   const i32 p = femOrder;
-  QpBasis Bp; Bp.init(p);
+  LagrangeBasis Bp; Bp.init(p);
   const i32 n = p+1, ndof = n*n*n, ndof3 = 3*ndof, mG = 2*ndof3;
   const real h = cellSize();
   const double mu = prob.mu, lam = prob.lam;
@@ -780,7 +780,7 @@ void CutFemSolver::runSbm(void) {
           gbTab[(qp*3+d2)*ndof+a]=(real)(Jinv[0][d2]*gb[3*a]+Jinv[1][d2]*gb[3*a+1]+Jinv[2][d2]*gb[3*a+2]);
       } } }
 
-  // ghost matrices (one per axis, reference-invariant; same as runQp but kappa=0.5)
+  // ghost matrices (one per axis, reference-invariant; same as runIga but kappa=0.5)
   auto ghostLocal=[&](i32 d,const double*uMP,double*yMP){
     for (i32 i=0;i<mG;i++) yMP[i]=0.0;
     i32 t1=(d+1)%3,t2=(d+2)%3; GaussRule g1=gaussLegendre(p+1);
@@ -1637,7 +1637,7 @@ void CutFemSolver::runSbm(void) {
 // =====================================================================
 void CutFemSolver::runDensity(void) {
   const i32 p = femOrder<2?2:femOrder;
-  QpBasis Bp; Bp.init(p);
+  LagrangeBasis Bp; Bp.init(p);
   const i32 n=p+1, ndof=n*n*n, ndof3=3*ndof;
   const real h = cellSize();
   const double mu=prob.mu, lam=prob.lam;

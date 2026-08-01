@@ -1,5 +1,5 @@
-#ifndef FEM_QPELEM_H
-#define FEM_QPELEM_H
+#ifndef FEM_IGAELEM_H
+#define FEM_IGAELEM_H
 
 //
 // Qp element bulk elasticity operator (matrix-free), the M1 core.
@@ -19,12 +19,14 @@
 // Cartesian constant-Jacobian operator used to pass the M1 MMS gate.
 //
 
-#include "QpBasis.h"
+#include "IgaBasis.h"
+#include "LagrangeBasis.h"
 #include "SayeQuad.h"
 
 // action of the element bulk stiffness on nodal displacement u -> y, given an
 // explicit quadrature (points in [0,1]^3, weights).  u,y packed [3*a + i].
-__host__ __device__ inline void qpElemCore(const QpBasis &B, real mu, real lam,
+template <class B_t>
+__host__ __device__ inline void qpElemCore(const B_t &B, real mu, real lam,
                                            real h, const real (*pts)[3],
                                            const real *w, i32 npts,
                                            const real *u, real *y) {
@@ -58,9 +60,10 @@ __host__ __device__ inline void qpElemCore(const QpBasis &B, real mu, real lam,
   for (i32 a = 0; a < 3*ndof; a++) y[a] *= h;
 }
 
-// uncut element: tensor volume quadrature -- GLL collocation for Lagrange
-// (B.qx==B.t, B.qw==B.wq, so this is unchanged), n-pt Gauss for splines.
-__host__ __device__ inline void qpElemUncut(const QpBasis &B, real mu, real lam,
+// uncut element: tensor volume quadrature.  B.qx/B.qw is n-pt Gauss for the
+// spline basis; for the Lagrange collocation basis it is the GLL rule (== B.t/B.wq).
+template <class B_t>
+__host__ __device__ inline void qpElemUncut(const B_t &B, real mu, real lam,
                                             real h, const real *u, real *y) {
   i32 n = B.n, npts = n*n*n;
   real pts[QN_MAX*QN_MAX*QN_MAX][3], w[QN_MAX*QN_MAX*QN_MAX];
@@ -76,7 +79,8 @@ __host__ __device__ inline void qpElemUncut(const QpBasis &B, real mu, real lam,
 
 // action of the element bulk stiffness using a Saye node list directly
 // (points+weights carried in SayeNode.x / .w).  Same core, strided input.
-__host__ __device__ inline void qpElemCoreSaye(const QpBasis &B, real mu, real lam,
+template <class B_t>
+__host__ __device__ inline void qpElemCoreSaye(const B_t &B, real mu, real lam,
                                                real h, const SayeNode *nodes,
                                                i32 npts, const real *u, real *y) {
   i32 ndof = B.n*B.n*B.n;
@@ -109,7 +113,8 @@ __host__ __device__ inline void qpElemCoreSaye(const QpBasis &B, real mu, real l
 }
 
 // cut element: Saye volume rule for {phi<0}; phi = degree-p fit of nodal values
-__host__ __device__ inline void qpElemCut(const QpBasis &B, real mu, real lam,
+template <class B_t>
+__host__ __device__ inline void qpElemCut(const B_t &B, real mu, real lam,
                                           real h, const PolyND &phi,
                                           const real *u, real *y,
                                           SayeNode *arenaBuf, i32 arenaCap,

@@ -1,5 +1,5 @@
 //
-// Unit tests for the Qp reference-cell basis (QpBasis.h) -- the M1 foundation.
+// Unit tests for the Qp reference-cell basis (LagrangeBasis.h) -- the M1 foundation.
 // Decisive checks, each must pass to machine precision for p=1..3:
 //   (1) differentiation matrix reproduces d/dx of a degree-p polynomial at nodes
 //   (2) barycentric eval/grad reproduce a degree-p poly + gradient at ARBITRARY
@@ -11,7 +11,7 @@
 
 #include <cstdio>
 #include <cmath>
-#include "QpBasis.h"
+#include "LagrangeBasis.h"
 
 // a reference-cell test field: product of 1-D degree-p polynomials, so it is in
 // Q_p exactly.  f(x) = gx(x0) gy(x1) gz(x2)
@@ -36,7 +36,7 @@ int main() {
     coefX[0]=0.7; coefX[1]=-1.3; coefX[2]=0.9; coefX[3]=-0.4;
     coefY[0]=-0.2; coefY[1]=1.1; coefY[2]=-0.6; coefY[3]=0.8;
     coefZ[0]=1.0; coefZ[1]=0.5; coefZ[2]=-0.7; coefZ[3]=0.3;
-    QpBasis B; B.init(P);
+    LagrangeBasis B; B.init(P);
     int n = B.n;
     // nodal values
     static real u[QN_MAX*QN_MAX*QN_MAX];
