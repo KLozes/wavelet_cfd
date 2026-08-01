@@ -480,8 +480,7 @@ void CutFemSolver::runQp(void) {
   // -------------------------------------------------------------------------
   //  node numbering (p-finer lattice) + cyclic dof map (master + rotation)
   // -------------------------------------------------------------------------
-  std::unordered_map<u64,i32> nodeId;
-  nodeId.reserve((size_t)nE*ndof);
+  std::unordered_map<u64,i32> nodeId;           // fallback only (see latOK below)
   std::vector<i32> eNodeQ((size_t)nE*ndof);
   std::vector<i32> nI, nJ, nK;                 // per-node lattice coords
   // Lattice stride: C^0 Q_p shares only the p-th node with the next cell, so the
@@ -491,14 +490,42 @@ void CutFemSolver::runQp(void) {
   const i32 lstr = Bp.iga ? 1 : p;
   auto gcoord=[&](const QElem&E,i32 a,i32&I,i32&J,i32&K){ i32 i=a%n,j=(a/n)%n,k=a/(n*n);
     I=lstr*E.ci+i; J=lstr*E.cj+j; K=lstr*E.ck+k; };
+  // ---- GRID-NATIVE node numbering ----------------------------------------
+  // The node lattice is a regular integer grid, so identity is DIRECT-INDEXABLE:
+  // a dense (Imax-Imin+1)^3 table of node ids replaces the u64-key hash, turning
+  // every lookup into address arithmetic.  Ids are still handed out in first-
+  // encounter (e,a) order, so eNodeQ / nI / nJ / nK come out BIT-IDENTICAL to the
+  // hashed path -- this is a pure setup-cost change, not a numbering change.
+  // Falls back to the hash if the bounding box is pathologically larger than the
+  // narrowband (a very thin body in a very large domain at high p).
+  i32 lo[3]={INT32_MAX,INT32_MAX,INT32_MAX}, hi[3]={INT32_MIN,INT32_MIN,INT32_MIN};
+  for (i32 e=0;e<nE;e++){ const i32 c[3]={elems[e].ci,elems[e].cj,elems[e].ck};
+    for (i32 d=0;d<3;d++){ i32 v=lstr*c[d]; if(v<lo[d])lo[d]=v; if(v+p>hi[d])hi[d]=v+p; } }
+  const size_t lnx=(size_t)(hi[0]-lo[0]+1), lny=(size_t)(hi[1]-lo[1]+1), lnz=(size_t)(hi[2]-lo[2]+1);
+  const size_t latN=lnx*lny*lnz;
+  const bool latOK = latN <= (size_t)256e6 && !getenv("CUT_NODENSE");  // 1 GB ceiling on the i32 table
+  std::vector<i32> latId;
+  if (latOK) latId.assign(latN,-1); else nodeId.reserve((size_t)nE*ndof);
+  auto latAt=[&](i32 I,i32 J,i32 K)->size_t{
+    return (size_t)(I-lo[0]) + lnx*((size_t)(J-lo[1]) + lny*(size_t)(K-lo[2])); };
+  auto latFind=[&](i32 I,i32 J,i32 K)->i32{    // -1 if absent (both backends)
+    if (latOK){ if(I<lo[0]||I>hi[0]||J<lo[1]||J>hi[1]||K<lo[2]||K>hi[2]) return -1;
+                return latId[latAt(I,J,K)]; }
+    auto it=nodeId.find(qpKey(I,J,K)); return (it==nodeId.end())?-1:it->second; };
+  const bool tmr = getenv("CUT_TIMING")!=nullptr;
+  long tNum0 = qpNowUs();
   i32 nNodeQ=0;
   for (i32 e=0;e<nE;e++) for (i32 a=0;a<ndof;a++){
-    i32 I,J,K; gcoord(elems[e],a,I,J,K); u64 key=qpKey(I,J,K);
-    auto it=nodeId.find(key); i32 id;
-    if (it==nodeId.end()){ id=nNodeQ++; nodeId[key]=id; nI.push_back(I); nJ.push_back(J); nK.push_back(K); }
-    else id=it->second;
+    i32 I,J,K; gcoord(elems[e],a,I,J,K);
+    i32 id=latFind(I,J,K);
+    if (id<0){ id=nNodeQ++;
+      if (latOK) latId[latAt(I,J,K)]=id; else nodeId[qpKey(I,J,K)]=id;
+      nI.push_back(I); nJ.push_back(J); nK.push_back(K); }
     eNodeQ[(size_t)e*ndof+a]=id;
   }
+  if (tmr) printf("timing : node numbering %.1f ms (%s, %d nodes from %d elem-dofs, table %.1f MB)\n",
+                  (qpNowUs()-tNum0)*1e-3, latOK?"dense":"hash", nNodeQ, nE*ndof,
+                  latOK?latN*4.0/1048576.0:0.0);
   const i32 Jmax = lstr*nThetaCells;           // theta slave column (periodic)
   std::vector<i32> realIdx(nNodeQ,-1);
   std::vector<char> rotFlag(nNodeQ,0);
@@ -509,9 +536,9 @@ void CutFemSolver::runQp(void) {
   }
   for (i32 nd=0;nd<nNodeQ;nd++){
     if (realIdx[nd]>=0) continue;
-    auto it=nodeId.find(qpKey(nI[nd],0,nK[nd]));   // master at J=0
-    if (it==nodeId.end()){ realIdx[nd]=nDofNode++; nOrphan++; }   // no partner: own dof
-    else { realIdx[nd]=realIdx[it->second]; rotFlag[nd]=1; nTie++; }
+    i32 mst=latFind(nI[nd],0,nK[nd]);              // master at J=0
+    if (mst<0){ realIdx[nd]=nDofNode++; nOrphan++; }   // no partner: own dof
+    else { realIdx[nd]=realIdx[mst]; rotFlag[nd]=1; nTie++; }
   }
   const i32 nDofQ=3*nDofNode;
   if (per) printf("cyclic : %d Qp nodes tied across the pitch (%d unmatched kept free), %d -> %d dofs\n",
@@ -590,15 +617,39 @@ void CutFemSolver::runQp(void) {
   }
 
   // ghost faces (interior faces of cut elements; wrap the theta seam if periodic)
-  std::unordered_map<u64,i32> cellId; cellId.reserve((size_t)nE*2);
-  for (i32 e=0;e<nE;e++) cellId[qpCellKey(elems[e].ci,elems[e].cj,elems[e].ck)]=e;
+  // GRID-NATIVE: face pairing is a +1 step on a regular cell grid, so the partner
+  // is found by direct indexing into a dense cell->element table rather than by
+  // hashing a u64 cell key.  Same (e,d) visit order => identical face list.
+  // The theta-seam wrap is why the table spans cells, not blocks: nb[1] jumps to 0.
+  i32 clo[3]={INT32_MAX,INT32_MAX,INT32_MAX}, chi[3]={INT32_MIN,INT32_MIN,INT32_MIN};
+  for (i32 e=0;e<nE;e++){ const i32 c[3]={elems[e].ci,elems[e].cj,elems[e].ck};
+    for (i32 d=0;d<3;d++){ if(c[d]<clo[d])clo[d]=c[d]; if(c[d]>chi[d])chi[d]=c[d]; } }
+  if (per) { clo[1]=std::min(clo[1],0); chi[1]=std::max(chi[1],nThetaCells); }
+  const size_t cnx=(size_t)(chi[0]-clo[0]+1), cny=(size_t)(chi[1]-clo[1]+1), cnz=(size_t)(chi[2]-clo[2]+1);
+  const size_t cellN=cnx*cny*cnz;
+  const bool cellOK = cellN <= (size_t)256e6 && !getenv("CUT_NODENSE");
+  std::unordered_map<u64,i32> cellId;            // fallback only
+  std::vector<i32> cellTab;
+  if (cellOK) cellTab.assign(cellN,-1); else cellId.reserve((size_t)nE*2);
+  auto cellPut=[&](i32 i,i32 j,i32 k,i32 e){
+    if (cellOK) cellTab[(size_t)(i-clo[0])+cnx*((size_t)(j-clo[1])+cny*(size_t)(k-clo[2]))]=e;
+    else cellId[qpCellKey(i,j,k)]=e; };
+  auto cellGet=[&](i32 i,i32 j,i32 k)->i32{
+    if (cellOK){ if(i<clo[0]||i>chi[0]||j<clo[1]||j>chi[1]||k<clo[2]||k>chi[2]) return -1;
+                 return cellTab[(size_t)(i-clo[0])+cnx*((size_t)(j-clo[1])+cny*(size_t)(k-clo[2]))]; }
+    auto it=cellId.find(qpCellKey(i,j,k)); return (it==cellId.end())?-1:it->second; };
+  long tGf0 = qpNowUs();
+  for (i32 e=0;e<nE;e++) cellPut(elems[e].ci,elems[e].cj,elems[e].ck,e);
   struct GF{ i32 eM,eP,d; };
   std::vector<GF> gf;
   for (i32 e=0;e<nE;e++){ i32 cc[3]={elems[e].ci,elems[e].cj,elems[e].ck};
     for (i32 d=0;d<3;d++){ i32 nb[3]={cc[0],cc[1],cc[2]}; nb[d]++;
       if (per && d==1 && nb[1]==nThetaCells) nb[1]=0;      // theta seam wraps
-      auto it=cellId.find(qpCellKey(nb[0],nb[1],nb[2])); if (it==cellId.end()) continue;
-      i32 ep=it->second; if (elems[e].cut||elems[ep].cut) gf.push_back({e,ep,d}); } }
+      i32 ep=cellGet(nb[0],nb[1],nb[2]); if (ep<0) continue;
+      if (elems[e].cut||elems[ep].cut) gf.push_back({e,ep,d}); } }
+  if (tmr) printf("timing : ghost pairing %.1f ms (%s, %zu faces from %d cells, table %.1f MB)\n",
+                  (qpNowUs()-tGf0)*1e-3, cellOK?"dense":"hash", gf.size(), nE,
+                  cellOK?cellN*4.0/1048576.0:0.0);
   i32 nGFQ=(i32)gf.size();
 
   // ghost-penalty face traces: Dl0[l][a] / Dl1[l][a] = l-th reference derivative

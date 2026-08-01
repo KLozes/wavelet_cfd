@@ -181,8 +181,13 @@ public:
   double volExact = 0, areaExact = 0;     // from the STL itself (FemMain)
   double meshMs = 0, setupMs = 0, assembleMs = 0, solveMs = 0;
 
-  CutFemSolver(real *domainSize_, i32 *baseGridSize_) :
-    MultiLevelSparseGrid(domainSize_, baseGridSize_, 1, nFemFields, /*lean=*/true) {
+  // lean=true drops the facilities the p=1 / Qp paths never touch (nbrIdxList,
+  // prntIdxList, cFlagsList).  Pass lean=false to keep the 27-entry per-block
+  // neighbour table -- what the grid-native IGA layout gathers through.  It must
+  // be a CONSTRUCTOR argument because sortBlocks() decides whether to populate
+  // the table long before femBasis could be assigned to the object.
+  CutFemSolver(real *domainSize_, i32 *baseGridSize_, bool lean_ = true) :
+    MultiLevelSparseGrid(domainSize_, baseGridSize_, 1, nFemFields, lean_) {
     leafMode  = 1;         // leaf-only: no exterior ring, no parent blocks
     sortCurve = 1;         // space-filling-curve memory order
     gammaD    = 1000;      // p = 1

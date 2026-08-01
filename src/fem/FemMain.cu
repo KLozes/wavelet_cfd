@@ -619,7 +619,12 @@ int main(int argc, char *argv[]) {
   // -------------------------------------------------------------------------
   //  solver
   // -------------------------------------------------------------------------
-  CutFemSolver *S = new CutFemSolver(domainSize, baseGridSize);
+  // Stays LEAN.  The plan had IGA gather through the grid's 27-entry per-block
+  // neighbour table (lean=false allocates nbrIdxList), but runQp's node numbering
+  // and ghost pairing are HOST-side and now index a dense lattice table directly,
+  // which needs no neighbour list at all.  Allocating one nothing reads would be
+  // cargo cult; flip this to `femBasis == 0` if a device-side gather ever lands.
+  CutFemSolver *S = new CutFemSolver(domainSize, baseGridSize, /*lean=*/true);
   for (i32 d = 0; d < 3; d++) S->domainOrigin[d] = origin[d];
   S->ls = sdf;
 
