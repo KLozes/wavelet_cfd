@@ -72,13 +72,13 @@ inline bool srdSolveSPDLocal(std::vector<double> &A, std::vector<double> &b, i32
 struct CutBasis {
   i32 N, nb;
   double c[3], s;
-  static i32 count(i32 N) { return (N+1)*(N+2)*(N+3)/6; }
+  __host__ __device__ static i32 count(i32 N) { return (N+1)*(N+2)*(N+3)/6; }
 
-  void init(i32 N_, const double cc[3], double ss) {
+  __host__ __device__ void init(i32 N_, const double cc[3], double ss) {
     N=N_; nb=count(N); c[0]=cc[0]; c[1]=cc[1]; c[2]=cc[2]; s=(ss>0)?ss:1.0;
   }
   // exponent triple of basis function m, ordered by total degree
-  void expo(i32 m, i32 e[3]) const {
+  __host__ __device__ void expo(i32 m, i32 e[3]) const {
     i32 t=0;
     for (i32 d=0; d<=N; d++)
       for (i32 i=d;i>=0;i--) for (i32 j=d-i;j>=0;j--) {
@@ -87,17 +87,17 @@ struct CutBasis {
       }
     e[0]=e[1]=e[2]=0;
   }
-  void ref(const double X[3], double u[3]) const {
+  __host__ __device__ void ref(const double X[3], double u[3]) const {
     for (i32 d=0;d<3;d++) u[d]=(X[d]-c[d])/s;
   }
-  static double ipow(double x, i32 k){ double t=1; for(i32 a=0;a<k;a++) t*=x; return t; }
+  __host__ __device__ static double ipow(double x, i32 k){ double t=1; for(i32 a=0;a<k;a++) t*=x; return t; }
 
-  void eval(const double X[3], double *psi) const {
+  __host__ __device__ void eval(const double X[3], double *psi) const {
     double u[3]; ref(X,u); i32 e[3];
     for (i32 m=0;m<nb;m++){ expo(m,e); psi[m]=ipow(u[0],e[0])*ipow(u[1],e[1])*ipow(u[2],e[2]); }
   }
   // dpsi[3*m+d]
-  void grad(const double X[3], double *dpsi) const {
+  __host__ __device__ void grad(const double X[3], double *dpsi) const {
     double u[3]; ref(X,u); i32 e[3];
     for (i32 m=0;m<nb;m++){ expo(m,e);
       for (i32 d=0;d<3;d++){
@@ -110,7 +110,7 @@ struct CutBasis {
   // Primitive of psi_m along axis d: P with dP/dX_d == psi_m.  Exact, since a
   // monomial integrates to a monomial.  The additive constant is irrelevant --
   // a constant integrates to zero against a closed surface.
-  double prim(i32 m, i32 d, const double X[3]) const {
+  __host__ __device__ double prim(i32 m, i32 d, const double X[3]) const {
     double u[3]; ref(X,u); i32 e[3]; expo(m,e);
     double t = s/(double)(e[d]+1);
     for (i32 a=0;a<3;a++) t *= ipow(u[a], (a==d)? e[a]+1 : e[a]);

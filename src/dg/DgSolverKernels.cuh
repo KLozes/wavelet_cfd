@@ -8,6 +8,7 @@
 void dgUploadOperators(i32 gauss, i32 frType);
 bool dgOperatorSelfTest(i32 gauss, i32 frType);
 void dgGetHostOps(double *w, double *xi, i32 gauss);
+__global__ void dgRhsCutKernel(DgSolver &grid, real t);
 
 // RHS kernel launch geometry: EPB elements of blockSizeTot nodes per CUDA
 // block.  The in-kernel working set is sW[EPB][5][64] + the AV gradient banks

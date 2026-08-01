@@ -2,6 +2,7 @@
 #define DG_SOLVER_H
 
 #include "MultiLevelSparseGrid.cuh"
+#include "SayeQuad.h"   // SayeNode: the cut-cell rule pools below
 
 //
 // wavedg3d: multi-resolution adaptive DGSEM solver (3D compressible Euler).
@@ -78,6 +79,7 @@ enum IbClass { IB_FLUID = 0, IB_GHOST = 1, IB_DEAD = 2, IB_CUT = 3 };
 // managed diagnostic counters (ibCnt[])
 enum IbCnt { IB_CNT_NODONOR = 0, IB_CNT_RETRY1 = 1, IB_CNT_FALLBACK = 2, IB_CNT_N = 4 };
 static constexpr i32 nDgFields  = 17;
+static constexpr i32 CUT_NBMAX_H = 20;   // total-degree P^3 in 3-D (host mirror)
 
 class DgSolver : public MultiLevelSparseGrid {
 public:
@@ -238,6 +240,36 @@ public:
                        // 3 forced base collapse; 4 planar x-band two-level (vote overrides)
   real refineRadius;   // staticGrid 1/4: fine-region half-extent about the domain center
   real dmrShockPos;    // DMR: initial shock foot x-position on the bottom wall
+  // ---- CUT-CELL DG (--cutcell 1) -----------------------------------------
+  // A SECOND ELEMENT TYPE, not a modification of the Cartesian path.  Cartesian
+  // elements keep collocation, the diagonal GLL mass and tensor sum
+  // factorization; a cut element has none of those and carries dense operators
+  // built once by cutElemBuild() (src/common/CutElem.h).
+  //
+  // The cut element's STATE still lives in the ordinary nodal fieldData, so RK,
+  // positivity, MOOD, output and state redistribution all work on it unchanged.
+  // dgRhsCutKernel converts nodal -> modal, applies the operators, applies the
+  // dense M^-1, and writes a nodal RHS back.
+  //
+  // FACE COUPLING: a cut face's quadrature points are not the tensor face nodes,
+  // so the two sides must agree on a rule.  The CUT element owns it and computes
+  // BOTH sides of the flux, depositing the neighbour's share by atomicAdd; the
+  // Cartesian kernel simply SKIPS any face whose neighbour is cut.  That keeps
+  // the exchange conservative by construction and leaves dgRhsKernel almost
+  // untouched.
+  i32  cutOn = 0;          // 1 = cut-cell path active
+  i32  nCutElem = 0;       // number of cut elements
+  i32  cutNb = 0;          // modal basis size (total degree N)
+  i32  *blkCut = nullptr;  // [nBlocksMax] cut index of a block, or -1
+  i32  *cutBlk = nullptr;  // [nCutElem]   owning block of a cut element
+  real *cutCen = nullptr;  // [nCutElem*4] basis centroid (3) + scale (1)
+  real *cutMinv= nullptr;  // [nCutElem*cutNb*cutNb] DENSE inverse mass matrix
+  real *cutQual= nullptr;  // [nCutElem] bndIncons -- per-element geometry quality
+  // rule pools, reference coords, CSR-offset addressed
+  SayeNode *cutVolP = nullptr;  i32 *cutVolOff = nullptr;   // [nCutElem+1]
+  SayeNode *cutWalP = nullptr;  i32 *cutWalOff = nullptr;   // [nCutElem+1]
+  SayeNode *cutFacP = nullptr;  i32 *cutFacOff = nullptr;   // [6*nCutElem+1]
+
   i32  ibOn;           // 1 = ghost-element immersed boundary active (cylinder SDF)
   real ibX, ibY;       // cylinder center
   real ibR;            // cylinder radius
@@ -487,6 +519,8 @@ public:
   real step(real tStep);
 
   void adaptLeaves(void);       // the leaf-only vote/grade/spawn/fill/prune cascade
+  void buildCutElems(void);     // cut-cell preprocessing: classify, build the dense
+                                // operators once, upload.  Requires a STATIC wall band.
   void computeDeltaT(void);
   void setInitialConditions(void);
   void sortFieldData(void) override;     // gather the 5 evolved slabs through the Q0 bank

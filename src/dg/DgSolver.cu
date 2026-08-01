@@ -81,6 +81,11 @@ void DgSolver::buildInitialGrid(bool doPaint) {
       }
     }
   }
+  // Cut-cell operators are built ONCE, here, after the grid has finished its
+  // bootstrap climb: the wall band is then at its final (finest) level and is
+  // treated as STATIC.  NNLS moment fitting per element is far too costly to
+  // repeat per adaptation.
+  if (cutOn) buildCutElems();
 }
 
 void DgSolver::setInitialConditions(void) {
@@ -336,7 +341,10 @@ real DgSolver::step(real tStep) {
     #define DG_RHS(T) do { \
       if (dpSbp > (real)0.0) dgDpGammaKernel<<<cudaGridSize, cudaBlockSize>>>(*this); \
       if (gauss) dgRhsGaussKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (T)); \
-      else dgRhsKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (T)); } while (0)
+      else dgRhsKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (T)); \
+      if (cutOn) { \
+        size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H)*sizeof(real); \
+        dgRhsCutKernel<<<nCutElem, blockSizeTot, shm>>>(*this, (T)); } } while (0)
     for (i32 stage = 0; stage < 3; stage++) {
       // SSP-RK3 stage abscissae: t, t+dt, t+dt/2
       real stageT = simT + t + ((stage == 1) ? deltaT : ((stage == 2) ? (real)0.5*deltaT : (real)0.0));

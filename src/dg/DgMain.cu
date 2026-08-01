@@ -192,6 +192,7 @@ int main(int argc, char* argv[]) {
   solver->ibLimit     = argI("--iblimit", 1);
   solver->ibHO        = argI("--ibho", 1);   // 0 = first-order wall reconstruction
   solver->ibSbm       = argI("--ibsbm", 0);   // 1 = shifted boundary wall (no ghosts)
+  solver->cutOn       = argI("--cutcell", 0);   // cut-cell DG (replaces the IB family)
   solver->ibBrink     = argI("--ibbrink", 0);      // 1 = volume-penalization IB
   solver->ibBrinkEps  = argF("--ibbrinkeps", 1e-4);
   solver->ibBrinkDelta= argF("--ibbrinkdelta", 2.0);   // phi transition width in finest cells

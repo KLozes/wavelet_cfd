@@ -97,7 +97,7 @@ WAVEDG_DEFS    = -DNCELLS_MAX=32000000 -DDG_ORDER=3
 WAVEDG_DP_DEFS = -DNCELLS_MAX=8000000 -DDG_ORDER=3 -DUSE_DOUBLE
 WAVEDG_P2_DEFS = -DNCELLS_MAX=32000000 -DDG_ORDER=2 -DBLOCK_SIZE=3
 WAVEDG_SRCS = $(COMMON_SRCS) \
-              dg/DgSolver dg/DgSolverKernels dg/DgMain
+              dg/DgSolver dg/DgSolverKernels dg/DgCutBuild dg/DgMain
 WAVEDG_OBJS    = $(patsubst %,$(OBJ_DIR)/wavedg3d/%.cu.o,$(WAVEDG_SRCS))
 WAVEDG_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_dp/%.cu.o,$(WAVEDG_SRCS))
 WAVEDG_P2_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_p2/%.cu.o,$(WAVEDG_SRCS))
