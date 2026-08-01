@@ -249,6 +249,10 @@ dgcut_test: $(SRC_DIR)/dg/DgCutTest.cu $(HDRS)
 dgcutelem_test: $(SRC_DIR)/dg/DgCutElemTest.cu $(HDRS)
 	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
 
+# S2 gate (scheme): cut-element Euler RHS -- free stream + stagnant state
+dgcutrhs_test: $(SRC_DIR)/dg/DgCutRhsTest.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
+
 # state redistribution gate: conservation, polynomial exactness, contractivity
 dgsrd_test: $(SRC_DIR)/dg/DgSrdTest.cu $(HDRS)
 	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
