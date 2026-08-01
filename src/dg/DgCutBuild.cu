@@ -216,3 +216,133 @@ void DgSolver::probeCutRhs(void) {
   printf("[cutprobe] mask=%2d  max|RHS|  cut=%.3e (b%d)  nbr=%.3e (b%d)  far=%.3e\n",
          cutDbgMask, mCut, bCut, mNbr, bNbr, mFar);
 }
+
+// ===========================================================================
+//  STATE REDISTRIBUTION in the solver.
+//
+//  Built once, right after the cut operators: the SRD element set is every
+//  fluid block within two face-hops of a cut element (two hops because a small
+//  cut element's merge neighbourhood can need to grow past another cut
+//  element).  Applied on the HOST after every RK stage -- fieldData is managed
+//  memory, and at wall-band size (tens of elements) the cost is microseconds;
+//  port to a kernel only if a profile ever says so.
+//
+//  LIMITATION (by design, documented): block indices are captured at build
+//  time, so the wall band must be STATIC and unsorted -- the same constraint
+//  the cut operators already impose.
+// ===========================================================================
+
+#include "StateRedistribution.h"
+#include "LagrangeBasis.h"
+
+struct DgSrd {
+  SrdOperator            S;
+  std::vector<SrdElem>   elems;
+  std::vector<SayeNode>  qpool;
+  std::vector<i32>       blk;        // SRD element -> block index
+  LagrangeBasis          B;          // DG nodal basis on [0,1]
+  std::vector<double>    u, su;      // flat state scratch
+  i32 nMerged = 0;
+};
+
+void DgSolver::buildSrd(void) {
+  if (!cutOn || nCutElem == 0) return;
+  srd = new DgSrd();
+  srd->B.init(dgOrder);
+
+  // ---- collect the element set: cut blocks + two rings of fluid neighbours --
+  std::vector<i32> mark(nBlocksMax, 0);
+  for (i32 c = 0; c < nCutElem; c++) mark[cutBlk[c]] = 1;
+  for (i32 ring = 0; ring < 2; ring++) {
+    std::vector<i32> add;
+    for (i32 b = 0; b < hashTable.nKeys; b++) {
+      if (!mark[b]) continue;
+      for (i32 o = 0; o < 27; o++) {
+        i32 nn = nbrIdxList[27*b+o];
+        if (nn == bEmpty || nn < 0 || mark[nn]) continue;
+        if (ibClassList[nn] != IB_FLUID) continue;
+        add.push_back(nn);
+      }
+    }
+    for (i32 b : add) mark[b] = 1;
+  }
+
+  std::vector<i32> srdOf(nBlocksMax, -1);
+  double w[NNODE], xi[NNODE];
+  dgGetHostOps(w, xi, gauss);
+  for (i32 b = 0; b < hashTable.nKeys; b++) {
+    if (bLocList[b] == kEmpty || !mark[b]) continue;
+    i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
+    double h[3]; hostElemSizeLocal(*this, lvl, h);
+    SrdElem E{};
+    for (i32 f = 0; f < 6; f++) E.nbr[f] = -1;
+    E.x0[0] = ib*h[0]; E.x0[1] = jb*h[1]; E.x0[2] = kb*h[2];
+    E.h[0] = h[0]; E.h[1] = h[1]; E.h[2] = h[2];
+    E.qOff = (i32)srd->qpool.size();
+    i32 c = blkCut[b];
+    if (c >= 0) {                          // cut: the fitted positive rule
+      for (i32 q = cutVolOff[c]; q < cutVolOff[c+1]; q++) srd->qpool.push_back(cutVolP[q]);
+    } else {                               // uncut: tensor GLL collocation rule
+      for (i32 kk = 0; kk < NNODE; kk++)
+      for (i32 jj = 0; jj < NNODE; jj++)
+      for (i32 ii = 0; ii < NNODE; ii++) {
+        SayeNode s{};
+        s.x[0] = (real)(0.5*(xi[ii]+1.0)); s.x[1] = (real)(0.5*(xi[jj]+1.0));
+        s.x[2] = (real)(0.5*(xi[kk]+1.0));
+        s.w = (real)(0.125*w[ii]*w[jj]*w[kk]);
+        srd->qpool.push_back(s);
+      }
+    }
+    E.qN = (i32)srd->qpool.size() - E.qOff;
+    E.vol = 0;
+    for (i32 q = E.qOff; q < E.qOff+E.qN; q++) E.vol += (double)srd->qpool[q].w;
+    E.vol *= E.hv();
+    srdOf[b] = (i32)srd->elems.size();
+    srd->elems.push_back(E);
+    srd->blk.push_back(b);
+  }
+  // face neighbours within the set
+  const i32 faceOff[6][3] = {{-1,0,0},{1,0,0},{0,-1,0},{0,1,0},{0,0,-1},{0,0,1}};
+  for (size_t e = 0; e < srd->elems.size(); e++) {
+    i32 b = srd->blk[e];
+    for (i32 f = 0; f < 6; f++) {
+      i32 o[3] = {1+faceOff[f][0], 1+faceOff[f][1], 1+faceOff[f][2]};
+      i32 nn = nbrIdxList[27*b + o[0] + 3*o[1] + 9*o[2]];
+      if (nn != bEmpty && nn >= 0 && srdOf[nn] >= 0) srd->elems[e].nbr[f] = srdOf[nn];
+    }
+  }
+
+  srd->S.buildNeighborhoods(srd->elems);
+  srd->S.buildReverse();
+  srd->S.factor(srd->elems, srd->qpool.data(), dgOrder);
+  for (i32 k = 0; k < srd->S.nElem; k++) if (!srd->S.trivial[k]) srd->nMerged++;
+  const size_t nd = (size_t)srd->elems.size()*blockSizeTot*5;
+  srd->u.resize(nd); srd->su.resize(nd);
+  double vmin = 1e300;
+  for (const SrdElem &E : srd->elems) if (E.vol < vmin) vmin = E.vol;
+  printf("srd    : %zu elements (%d merged), smallest vol %.3e of full %.3e\n",
+         srd->elems.size(), srd->nMerged, vmin,
+         srd->elems.empty() ? 0.0 : srd->elems[0].hv());
+}
+
+void DgSolver::applySrd(void) {
+  if (!srd || srd->nMerged == 0) return;
+  cudaDeviceSynchronize();
+  const i32 nE = (i32)srd->elems.size();
+  for (i32 e = 0; e < nE; e++) {
+    i32 b = srd->blk[e];
+    for (i32 nd = 0; nd < blockSizeTot; nd++)
+      for (i32 q = 0; q < 5; q++)
+        srd->u[((size_t)e*blockSizeTot+nd)*5+q] =
+          (double)getField(D_RHO+q)[(size_t)b*blockSizeTot+nd];
+  }
+  srdApply(srd->S, srd->elems, srd->qpool.data(), srd->B,
+           srd->u.data(), srd->su.data(), 5);
+  for (i32 e = 0; e < nE; e++) {
+    i32 b = srd->blk[e];
+    for (i32 nd = 0; nd < blockSizeTot; nd++)
+      for (i32 q = 0; q < 5; q++)
+        getField(D_RHO+q)[(size_t)b*blockSizeTot+nd] =
+          (real)srd->su[((size_t)e*blockSizeTot+nd)*5+q];
+  }
+}

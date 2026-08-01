@@ -51,10 +51,11 @@
 // One element of the cut mesh, as SRD needs to see it.
 struct SrdElem {
   i32    nbr[6];      // face neighbours (element indices), -1 where absent
-  double vol;         // FLUID volume of this element
+  double vol;         // FLUID volume of this element (PHYSICAL)
   double x0[3];       // lower corner, physical
-  double h;           // background cell size
+  double h[3];        // background cell size PER AXIS (pseudo-2D: h_z >> h_x)
   i32    qOff, qN;    // slice of the shared quadrature pool (REFERENCE coords)
+  __host__ __device__ double hv() const { return h[0]*h[1]*h[2]; }
 };
 
 // Total-degree-N monomials in 3-D, scaled about a neighbourhood centroid.
@@ -119,7 +120,7 @@ struct SrdOperator {
   void buildNeighborhoods(const std::vector<SrdElem> &e) {
     nElem = (i32)e.size();
     M.assign(nElem, {}); trivial.assign(nElem, 1);
-    const double vFull = e.empty() ? 1.0 : e[0].h*e[0].h*e[0].h;
+    const double vFull = e.empty() ? 1.0 : e[0].hv();
     const double vTarget = volFrac * vFull;
     for (i32 k=0;k<nElem;k++) {
       M[k].push_back(k);
@@ -157,8 +158,8 @@ struct SrdOperator {
       // centroid + scale over the neighbourhood (conditioning, their Eq. 51-52)
       double cc[3]={0,0,0}; double wsum=0;
       for (i32 j : M[k]) for (i32 q=e[j].qOff; q<e[j].qOff+e[j].qN; q++) {
-        double w=(double)qx[q].w*e[j].h*e[j].h*e[j].h;
-        for (i32 d=0;d<3;d++) cc[d]+= w*(e[j].x0[d]+e[j].h*(double)qx[q].x[d]);
+        double w=(double)qx[q].w*e[j].hv();
+        for (i32 d=0;d<3;d++) cc[d]+= w*(e[j].x0[d]+e[j].h[d]*(double)qx[q].x[d]);
         wsum += w;
       }
       if (wsum<=0) { trivial[k]=1; continue; }
@@ -166,16 +167,16 @@ struct SrdOperator {
       double sc=0;
       for (i32 j : M[k]) for (i32 q=e[j].qOff; q<e[j].qOff+e[j].qN; q++) {
         double r2=0;
-        for (i32 d=0;d<3;d++){ double t=e[j].x0[d]+e[j].h*(double)qx[q].x[d]-cc[d]; r2+=t*t; }
+        for (i32 d=0;d<3;d++){ double t=e[j].x0[d]+e[j].h[d]*(double)qx[q].x[d]-cc[d]; r2+=t*t; }
         if (r2>sc) sc=r2;
       }
       basis[k].init(N, cc, sqrt(sc));
       std::vector<double> A((size_t)nb*nb, 0.0);
       for (i32 j : M[k]) {
-        double wj = 1.0/(double)Ccnt[j], hv = e[j].h*e[j].h*e[j].h;
+        double wj = 1.0/(double)Ccnt[j], hv = e[j].hv();
         for (i32 q=e[j].qOff; q<e[j].qOff+e[j].qN; q++) {
           double X[3];
-          for (i32 d=0;d<3;d++) X[d]=e[j].x0[d]+e[j].h*(double)qx[q].x[d];
+          for (i32 d=0;d<3;d++) X[d]=e[j].x0[d]+e[j].h[d]*(double)qx[q].x[d];
           basis[k].eval(X, psi.data());
           double w = wj * (double)qx[q].w * hv;
           for (i32 a=0;a<nb;a++) for (i32 b=a;b<nb;b++) A[(size_t)a*nb+b] += w*psi[a]*psi[b];
@@ -228,12 +229,12 @@ inline void srdApply(const SrdOperator &S, const std::vector<SrdElem> &e,
     if (S.trivial[k]) continue;
     std::fill(rhs.begin(), rhs.end(), 0.0);
     for (i32 j : S.M[k]) {
-      double wj = 1.0/(double)S.Ccnt[j], hv = e[j].h*e[j].h*e[j].h;
+      double wj = 1.0/(double)S.Ccnt[j], hv = e[j].hv();
       const double *uj = u + (size_t)j*ndof*nComp;
       for (i32 q=e[j].qOff; q<e[j].qOff+e[j].qN; q++) {
         real xr[3] = { qx[q].x[0], qx[q].x[1], qx[q].x[2] };
         double X[3];
-        for (i32 d=0;d<3;d++) X[d]=e[j].x0[d]+e[j].h*(double)xr[d];
+        for (i32 d=0;d<3;d++) X[d]=e[j].x0[d]+e[j].h[d]*(double)xr[d];
         B.allVal(xr, vb.data());
         S.basis[k].eval(X, psi.data());
         double w = wj * (double)qx[q].w * hv;
@@ -268,9 +269,9 @@ inline void srdApply(const SrdOperator &S, const std::vector<SrdElem> &e,
       }
       for (i32 a=0;a<ndof;a++) {
         i32 ii=a%n, jj=(a/n)%n, kk=a/(n*n);
-        double X[3] = { e[i].x0[0]+e[i].h*(double)B.t[ii],
-                        e[i].x0[1]+e[i].h*(double)B.t[jj],
-                        e[i].x0[2]+e[i].h*(double)B.t[kk] };
+        double X[3] = { e[i].x0[0]+e[i].h[0]*(double)B.t[ii],
+                        e[i].x0[1]+e[i].h[1]*(double)B.t[jj],
+                        e[i].x0[2]+e[i].h[2]*(double)B.t[kk] };
         S.basis[j].eval(X, psi.data());
         for (i32 c=0;c<nComp;c++) {
           double s=0;

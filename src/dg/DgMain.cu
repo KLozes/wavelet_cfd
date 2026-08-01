@@ -285,30 +285,6 @@ int main(int argc, char* argv[]) {
 
   if (hasFlag("--selftest")) {
     bool ok = solver->selfTest();
-  // Cut-cell uniform-preservation gate: with a uniform IC, the exact solution
-  // is u(t) == u(0) (transparent wall under --cutfsp, or any-Mach uniform flow
-  // in a wall-free domain).  Any drift is a scheme defect.
-  if (solver->cutOn && argI("--cutcheck", 0)) {
-    cudaDeviceSynchronize();
-    double W0[5] = {1.0, (double)solver->machInf, 0.0, 0.0, 1.0/(double)dgGam}, U0[5];
-    U0[0]=W0[0]; U0[1]=W0[0]*W0[1]; U0[2]=W0[0]*W0[2]; U0[3]=W0[0]*W0[3];
-    U0[4]=W0[4]/((double)dgGam-1.0)+0.5*W0[0]*(W0[1]*W0[1]+W0[2]*W0[2]+W0[3]*W0[3]);
-    double dev=0; i32 devB=-1, devQ=-1;
-    for (i32 b = 0; b < solver->hashTable.nKeys; b++) {
-      if (solver->bLocList[b] == kEmpty) continue;
-      if (solver->ibClassList[b] != IB_FLUID) continue;
-      for (i32 nd = 0; nd < blockSizeTot; nd++)
-        for (i32 q = 0; q < 5; q++) {
-          double d = fabs((double)solver->getField(D_RHO+q)[(size_t)b*blockSizeTot+nd]-U0[q])
-                     / fmax(fabs(U0[q]), 1.0);
-          if (d > dev) { dev=d; devB=b; devQ=q; }
-        }
-    }
-    i32 isCut = (devB>=0 && solver->blkCut) ? solver->blkCut[devB] : -1;
-    printf("[cutcheck] max relative drift from uniform IC = %.6e  (q=%d, %s element)\n",
-           dev, devQ, isCut>=0?"CUT":"cartesian");
-  }
-
     delete solver;
     cudaDeviceReset();
     return ok ? 0 : 1;
@@ -449,6 +425,30 @@ int main(int argc, char* argv[]) {
   solver->paintTroubled("output/dg_troubled_final.png");
 
   cudaDeviceSynchronize();
+  // Cut-cell uniform-preservation gate: with a uniform IC, the exact solution
+  // is u(t) == u(0) (transparent wall under --cutfsp, or any-Mach uniform flow
+  // in a wall-free domain).  Any drift is a scheme defect.
+  if (solver->cutOn && argI("--cutcheck", 0)) {
+    cudaDeviceSynchronize();
+    double W0[5] = {1.0, (double)solver->machInf, 0.0, 0.0, 1.0/(double)dgGam}, U0[5];
+    U0[0]=W0[0]; U0[1]=W0[0]*W0[1]; U0[2]=W0[0]*W0[2]; U0[3]=W0[0]*W0[3];
+    U0[4]=W0[4]/((double)dgGam-1.0)+0.5*W0[0]*(W0[1]*W0[1]+W0[2]*W0[2]+W0[3]*W0[3]);
+    double dev=0; i32 devB=-1, devQ=-1;
+    for (i32 b = 0; b < solver->hashTable.nKeys; b++) {
+      if (solver->bLocList[b] == kEmpty) continue;
+      if (solver->ibClassList[b] != IB_FLUID) continue;
+      for (i32 nd = 0; nd < blockSizeTot; nd++)
+        for (i32 q = 0; q < 5; q++) {
+          double d = fabs((double)solver->getField(D_RHO+q)[(size_t)b*blockSizeTot+nd]-U0[q])
+                     / fmax(fabs(U0[q]), 1.0);
+          if (d > dev) { dev=d; devB=b; devQ=q; }
+        }
+    }
+    i32 isCut = (devB>=0 && solver->blkCut) ? solver->blkCut[devB] : -1;
+    printf("[cutcheck] max relative drift from uniform IC = %.6e  (q=%d, %s element)\n",
+           dev, devQ, isCut>=0?"CUT":"cartesian");
+  }
+
   delete solver;
   cudaDeviceReset();
   return 0;

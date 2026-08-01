@@ -41,7 +41,7 @@ INC_COMMON    = -I./$(SRC_DIR)/common
 WAVE3D_INC    = $(INC_COMMON) -I./$(SRC_DIR)/fv
 WAVESDF_INC   = $(INC_COMMON) -I./$(SRC_DIR)/sdf
 WAVEWSDF_INC  = $(INC_COMMON) -I./$(SRC_DIR)/archive/waveletsdf
-WAVEDG_INC    = $(INC_COMMON) -I./$(SRC_DIR)/dg
+WAVEDG_INC    = $(INC_COMMON) -I./$(SRC_DIR)/dg -I./$(SRC_DIR)/fem
 WAVEFEM_INC   = $(INC_COMMON) -I./$(SRC_DIR)/fem
 
 # per-executable cell cap (blocks = NCELLS_MAX/blockSizeTot).  wave3d gets 64M

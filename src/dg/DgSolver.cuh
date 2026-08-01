@@ -526,9 +526,17 @@ public:
   real step(real tStep);
 
   void adaptLeaves(void);       // the leaf-only vote/grade/spawn/fill/prune cascade
-  void buildCutElems(void);
-  void probeCutRhs(void);       // one RHS apply + per-class |RHS| report (debug)     // cut-cell preprocessing: classify, build the dense
+  void buildCutElems(void);     // cut-cell preprocessing: classify, build the dense
                                 // operators once, upload.  Requires a STATIC wall band.
+  void probeCutRhs(void);       // one RHS apply + per-class |RHS| report (debug)
+  void buildSrd(void);          // build the SRD operator (once, after buildCutElems)
+  void applySrd(void);          // stage-wise state redistribution on the HOST via
+                                // managed memory -- microseconds at wall-band size;
+                                // port to a kernel only if a profile says so
+  struct DgSrd *srd = nullptr;  // opaque SRD state (DgCutBuild.cu); block indices
+                                // captured at build time, so the band must stay
+                                // STATIC and unsorted (same constraint as the cut
+                                // operators)
   void computeDeltaT(void);
   void setInitialConditions(void);
   void sortFieldData(void) override;     // gather the 5 evolved slabs through the Q0 bank

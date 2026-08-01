@@ -87,6 +87,7 @@ void DgSolver::buildInitialGrid(bool doPaint) {
   // repeat per adaptation.
   if (cutOn) {
     buildCutElems();
+    buildSrd();
     // The FRIB machinery ran during the build above (ibOn was still 1) and
     // FILLED ghost/dead blocks with wall-mirrored states -- including the
     // solid-side nodes of what are now cut elements.  The cut path reads those
@@ -370,6 +371,7 @@ real DgSolver::step(real tStep) {
         dgMoodDetectKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage, deltaT);
         DG_RHS(stageT);   // FV redo for flagged
         dgRk3StageKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage, deltaT);
+        if (cutOn) applySrd();   // stage-wise state redistribution (cut cells)
         dgPositivityKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // last-resort net
         if (ibOn && (ibFillEvery == 0 || stage == 2))
           dgIbFillKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
@@ -382,6 +384,7 @@ real DgSolver::step(real tStep) {
         // subcell-FV blend factor, and/or the bulk-viscosity gate (slot 1)
       DG_RHS(stageT);
       dgRk3StageKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage, deltaT);
+      if (cutOn) applySrd();     // stage-wise state redistribution (cut cells)
       dgPositivityKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
       if (esLim)   // ES limiter: bound the cell entropy by the RHS's slots 3/4
         dgEntropyLimitKernel<<<cudaGridSize, cudaBlockSize>>>(*this, deltaT);

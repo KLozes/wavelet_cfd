@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
     }
     if (!anyF) continue;                                   // fully solid
     SrdElem E{}; for (i32 f=0;f<6;f++) E.nbr[f]=-1;
-    E.x0[0]=x0[0]; E.x0[1]=x0[1]; E.x0[2]=x0[2]; E.h=h;
+    E.x0[0]=x0[0]; E.x0[1]=x0[1]; E.x0[2]=x0[2]; E.h[0]=E.h[1]=E.h[2]=h;
     E.qOff=(i32)qpool.size();
     if (!anyS) {                                           // uncut: tensor GLL
       for (i32 k=0;k<n;k++)for(i32 j=0;j<n;j++)for(i32 i=0;i<n;i++){
@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
       for (const SayeNode &s : cmp) qpool.push_back(s);
     }
     E.qN=(i32)qpool.size()-E.qOff;
-    E.vol=0; for (i32 q=E.qOff;q<E.qOff+E.qN;q++) E.vol += (double)qpool[q].w*h*h*h;
+    E.vol=0; for (i32 q=E.qOff;q<E.qOff+E.qN;q++) E.vol += (double)qpool[q].w*E.hv();
     gid[(size_t)(kz*NB+ky)*NB+kx]=(i32)elem.size();
     elem.push_back(E);
   }
@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
   const size_t NDOF=(size_t)nE*ndof;
   auto integral=[&](const double *u){                      // INT_Omega u
     double s=0; std::vector<real> vb(ndof);
-    for (i32 e=0;e<nE;e++){ double hv=elem[e].h*elem[e].h*elem[e].h;
+    for (i32 e=0;e<nE;e++){ double hv=elem[e].hv();
       for (i32 q=elem[e].qOff;q<elem[e].qOff+elem[e].qN;q++){
         real xr[3]={qpool[q].x[0],qpool[q].x[1],qpool[q].x[2]};
         B.allVal(xr,vb.data()); double uq=0;
@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
     return s; };
   auto l2sq=[&](const double *u){                          // ||u||^2_L2(Omega)
     double s=0; std::vector<real> vb(ndof);
-    for (i32 e=0;e<nE;e++){ double hv=elem[e].h*elem[e].h*elem[e].h;
+    for (i32 e=0;e<nE;e++){ double hv=elem[e].hv();
       for (i32 q=elem[e].qOff;q<elem[e].qOff+elem[e].qN;q++){
         real xr[3]={qpool[q].x[0],qpool[q].x[1],qpool[q].x[2]};
         B.allVal(xr,vb.data()); double uq=0;
@@ -143,9 +143,9 @@ int main(int argc, char **argv) {
     return s; };
   auto nodeX=[&](i32 e,i32 a,double X[3]){
     i32 i=a%n,j=(a/n)%n,k=a/(n*n);
-    X[0]=elem[e].x0[0]+elem[e].h*(double)B.t[i];
-    X[1]=elem[e].x0[1]+elem[e].h*(double)B.t[j];
-    X[2]=elem[e].x0[2]+elem[e].h*(double)B.t[k]; };
+    X[0]=elem[e].x0[0]+elem[e].h[0]*(double)B.t[i];
+    X[1]=elem[e].x0[1]+elem[e].h[1]*(double)B.t[j];
+    X[2]=elem[e].x0[2]+elem[e].h[2]*(double)B.t[k]; };
 
   std::vector<double> u(NDOF), su(NDOF);
 
@@ -184,7 +184,7 @@ int main(int argc, char **argv) {
     srdApply(S, elem, qpool.data(), B, v.data(), sv.data(), 1);
     auto ip=[&](const double *a,const double *b){
       double s=0; std::vector<real> vb(ndof);
-      for (i32 e=0;e<nE;e++){ double hv=elem[e].h*elem[e].h*elem[e].h;
+      for (i32 e=0;e<nE;e++){ double hv=elem[e].hv();
         for (i32 q=elem[e].qOff;q<elem[e].qOff+elem[e].qN;q++){
           real xr[3]={qpool[q].x[0],qpool[q].x[1],qpool[q].x[2]};
           B.allVal(xr,vb.data()); double aq=0,bq=0;
