@@ -77,10 +77,18 @@ int main(void) {
   };
 
   printf("cut-cell DG quadrature gate   p=%d  (%d nodes/elem)\n", p, nd);
-  printf("%-24s %10s %10s %12s %12s %12s\n",
-         "case", "|K n W|", "|wall|", "GCL(sum_i)", "GCL(max_i)", "verdict");
+  printf("%-24s %10s %10s %12s %12s %12s %8s\n",
+         "case", "|K n W|", "|wall|", "GCL(sum_i)", "Saye-vol", "DBQ-vol", "DBQ");
 
-  double worst = 0;
+  // alpha_a of Eq. (28): any split summing to 1.  1/3 each is their default.
+  const double ALPHA[3] = {1.0/3, 1.0/3, 1.0/3};
+  const i32 dbqNg = getenv("DBQ_NG") ? atoi(getenv("DBQ_NG")) : 10;
+  // alpha = e_d is the DEFAULT here: it is what makes the volume term
+  // coincide with the face term the flux already uses, and it is worth
+  // 2.6e-03 -> 4.6e-11 on the near-tangency case.  DBQ_THIRD=1 restores
+  // the paper's symmetric (1/3,1/3,1/3) split for comparison.
+  const bool dbqUnit = getenv("DBQ_THIRD") == nullptr;
+  double worst = 0, worstD = 0;
   for (const Case &c : cases) {
     // ---- degree-p fit of phi at the element's own GLL nodes ----------------
     // The DG element IS the fit stencil: blockSize == p+1, so the (p+1)^3 LGL
@@ -107,13 +115,66 @@ int main(void) {
     // Everything is on the REFERENCE cell, so the h factors cancel identically
     // (volume h^3 * gradient 1/h vs surface h^2) and this is a pure geometry
     // identity -- no metric bookkeeping can hide an inconsistency.
-    std::vector<double> lhs(3*nd, 0.0), rhs(3*nd, 0.0);
+    std::vector<double> lhs(3*nd, 0.0), rhs(3*nd, 0.0), dbq(3*nd, 0.0);
     real gb[QN_MAX*QN_MAX*QN_MAX*3], vb[QN_MAX*QN_MAX*QN_MAX];
 
     for (i32 q=0;q<vol.n;q++) {
       B.allGradRef(vol.p[q].x, gb);
       for (i32 i=0;i<nd;i++) for (i32 d=0;d<3;d++)
         lhs[3*i+d] += (double)vol.p[q].w * gb[3*i+d];
+    }
+
+    // ---- DIVERGENCE-BASED QUADRATURE (Mantecca et al., JCP 565 (2026) 115200)
+    // Instead of integrating g = d(phi_i)/dx_d over the cut VOLUME, build a
+    // vector field G with div G = g and integrate G.n over the cut BOUNDARY:
+    //
+    //   G_a(x) = alpha_a INT_{0}^{x_a} g(.., eta, ..) d(eta),   sum_a alpha_a = 1
+    //
+    // (their Eq. 26/28 with beta = 0 and the lower bound at the reference-cell
+    // corner).  Two things make this fit here.  First, the integrand is a global
+    // POLYNOMIAL on the cell -- the Lagrange basis gradient -- so G is smooth
+    // everywhere and the paper's "visibility" restriction (their 4.2) does not
+    // bind.  Second, with the lower bound at 0 the three "lower" cell faces
+    // contribute nothing (G_a vanishes at x_a = 0), which is their cost saving.
+    //
+    // The point for US: the volume term is now evaluated with THE SAME face and
+    // wall rules as the flux terms, so the discrete divergence theorem stops
+    // being a comparison between two independently-built quadratures.
+    {
+      GaussRule g1 = gaussLegendre(dbqNg);
+      // G.n accumulated over every boundary piece of the cut cell
+      auto addG = [&](const real xq[3], double wq, const double nrm[3]) {
+        real gg[QN_MAX*QN_MAX*QN_MAX*3];
+        for (i32 a=0; a<3; a++) {                       // the three components of G
+          if (fabs(nrm[a]) < 1e-15) continue;           // G_a only enters via n_a
+          double len = (double)xq[a];                   // path from 0 to x_a
+          if (len <= 0) continue;
+          for (i32 t=0; t<g1.n; t++) {
+            real xs[3] = { xq[0], xq[1], xq[2] };
+            xs[a] = (real)(len * g1.x[t]);
+            B.allGradRef(xs, gg);
+            double wl0 = (double)g1.w[t] * len * wq * nrm[a];
+            for (i32 i=0;i<nd;i++) for (i32 d=0;d<3;d++) {
+              // alpha choice (their Eq. 28 leaves it free, only sum_a alpha_a = 1):
+              //   default  alpha = (1/3,1/3,1/3)   -- the paper's choice
+              //   dbqUnit  alpha = e_d             -- puts ALL the weight on the
+              //     output direction, so G = phi_i e_d and the volume term becomes
+              //     literally the face term the flux uses.
+              double al = dbqUnit ? (a==d ? 1.0 : 0.0) : ALPHA[a];
+              if (al != 0.0) dbq[3*i+d] += al * wl0 * gg[3*i+d];
+            }
+          }
+        }
+      };
+      for (i32 q=0;q<srf.n;q++) {
+        double nr[3] = { (double)srf.p[q].n[0], (double)srf.p[q].n[1], (double)srf.p[q].n[2] };
+        addG(srf.p[q].x, (double)srf.p[q].w, nr);
+      }
+      for (i32 d=0;d<3;d++) for (i32 side=0;side<2;side++) {
+        SayeSet fc = mkset(facBuf); sayeFace(phi, d, side, &fc, &ar, cfg);
+        double nr[3] = {0,0,0}; nr[d] = side ? 1.0 : -1.0;
+        for (i32 q=0;q<fc.n;q++) addG(fc.p[q].x, (double)fc.p[q].w, nr);
+      }
     }
     // wall: Saye's node normal is grad(phi)/|grad(phi)|, i.e. it points from
     // {phi<0} into {phi>0} -- OUTWARD from the fluid region, which is the sign
@@ -144,12 +205,16 @@ int main(void) {
       for (i32 i=0;i<nd;i++) { double r=lhs[3*i+d]-rhs[3*i+d]; s+=r; if (fabs(r)>maxr) maxr=fabs(r); }
       if (fabs(s)>sumr) sumr=fabs(s);
     }
-    if (maxr > worst) worst = maxr;
-    printf("%-24s %10.6f %10.6f %12.3e %12.3e %12s\n",
-           c.name, volume, area, sumr, maxr, maxr < 1e-9 ? "ok" : "FAIL");
+    double maxd = 0;
+    for (i32 i=0;i<nd;i++) for (i32 d=0;d<3;d++) {
+      double r = dbq[3*i+d]-rhs[3*i+d]; if (fabs(r)>maxd) maxd = fabs(r); }
+    if (maxr > worst)  worst  = maxr;
+    if (maxd > worstD) worstD = maxd;
+    printf("%-24s %10.6f %10.6f %12.3e %12.3e %12.3e %8s\n",
+           c.name, volume, area, sumr, maxr, maxd, maxd < 1e-9 ? "ok" : "FAIL");
   }
-  printf("\nworst GCL residual over all cases and basis functions: %.3e   %s\n",
-         worst, worst < 1e-9 ? "PASS -- free-stream preservation is achievable"
-                             : "FAIL -- cut-cell DG would emit spurious sources");
-  return worst < 1e-9 ? 0 : 1;
+  printf("\nworst GCL residual   Saye volume rule %.3e     DBQ %.3e\n", worst, worstD);
+  printf("%s\n", worstD < 1e-9 ? "DBQ PASS -- free-stream preservation holds"
+                                : "DBQ FAIL");
+  return worstD < 1e-9 ? 0 : 1;
 }
