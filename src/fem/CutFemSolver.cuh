@@ -79,6 +79,12 @@ public:
   // reuses buildMesh() (the sparse octree + oracle) but does its own Qp dof
   // numbering, assembly and CG.  Cartesian only for now.
   i32         femOrder = 1;
+  i32         femBasis = 0;    // solution basis inside runQp():
+                               // 0 = C^0 Lagrange Q_p (--basis fem, the default
+                               //     and the only validated path),
+                               // 1 = C^{p-1} uniform B-spline (--basis iga):
+                               //     immersed isogeometric / finite-cell.  Same
+                               //     geometry (level set + Saye), ~p^3 fewer dofs.
   i32         femMethod = 0;   // 0 = cut-cell (Saye) -- the default;
                                // 1 = GSBM shifted boundary (runSbm, CutFemSbm.cu):
                                //     surrogate domain of FULL cells, shifted

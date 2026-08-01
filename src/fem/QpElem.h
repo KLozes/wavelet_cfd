@@ -58,7 +58,8 @@ __host__ __device__ inline void qpElemCore(const QpBasis &B, real mu, real lam,
   for (i32 a = 0; a < 3*ndof; a++) y[a] *= h;
 }
 
-// uncut element: tensor GLL quadrature (weights wq_i wq_j wq_k at nodes)
+// uncut element: tensor volume quadrature -- GLL collocation for Lagrange
+// (B.qx==B.t, B.qw==B.wq, so this is unchanged), n-pt Gauss for splines.
 __host__ __device__ inline void qpElemUncut(const QpBasis &B, real mu, real lam,
                                             real h, const real *u, real *y) {
   i32 n = B.n, npts = n*n*n;
@@ -67,8 +68,8 @@ __host__ __device__ inline void qpElemUncut(const QpBasis &B, real mu, real lam,
   for (i32 k = 0; k < n; k++)
   for (i32 j = 0; j < n; j++)
   for (i32 i = 0; i < n; i++) {
-    pts[q][0]=B.t[i]; pts[q][1]=B.t[j]; pts[q][2]=B.t[k];
-    w[q] = B.wq[i]*B.wq[j]*B.wq[k]; q++;
+    pts[q][0]=B.qx[i]; pts[q][1]=B.qx[j]; pts[q][2]=B.qx[k];
+    w[q] = B.qw[i]*B.qw[j]*B.qw[k]; q++;
   }
   qpElemCore(B, mu, lam, h, pts, w, npts, u, y);
 }

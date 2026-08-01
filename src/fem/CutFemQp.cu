@@ -412,7 +412,7 @@ __global__ void cutPRestrictWK(const i32*col,const real*W,i32 w,const real*fn,re
 
 void CutFemSolver::runQp(void) {
   const i32 p = femOrder;
-  QpBasis Bp; Bp.init(p);
+  QpBasis Bp; Bp.initBasis(p, femBasis);
   const i32 n = p+1, ndof = n*n*n, ndof3 = 3*ndof, mG = 2*ndof3;
   const real h = cellSize();
   const double mu = prob.mu, lam = prob.lam;
@@ -484,8 +484,13 @@ void CutFemSolver::runQp(void) {
   nodeId.reserve((size_t)nE*ndof);
   std::vector<i32> eNodeQ((size_t)nE*ndof);
   std::vector<i32> nI, nJ, nK;                 // per-node lattice coords
+  // Lattice stride: C^0 Q_p shares only the p-th node with the next cell, so the
+  // node lattice is p-times finer than the cell grid.  The p+1 B-splines nonzero
+  // on span ci are exactly ci..ci+p, so the control-point lattice has STRIDE 1 --
+  // nCells+p per axis instead of p*nCells+1, which is the whole dof-count win.
+  const i32 lstr = Bp.iga ? 1 : p;
   auto gcoord=[&](const QElem&E,i32 a,i32&I,i32&J,i32&K){ i32 i=a%n,j=(a/n)%n,k=a/(n*n);
-    I=p*E.ci+i; J=p*E.cj+j; K=p*E.ck+k; };
+    I=lstr*E.ci+i; J=lstr*E.cj+j; K=lstr*E.ck+k; };
   i32 nNodeQ=0;
   for (i32 e=0;e<nE;e++) for (i32 a=0;a<ndof;a++){
     i32 I,J,K; gcoord(elems[e],a,I,J,K); u64 key=qpKey(I,J,K);
@@ -494,7 +499,7 @@ void CutFemSolver::runQp(void) {
     else id=it->second;
     eNodeQ[(size_t)e*ndof+a]=id;
   }
-  const i32 Jmax = p*nThetaCells;              // theta slave column (periodic)
+  const i32 Jmax = lstr*nThetaCells;           // theta slave column (periodic)
   std::vector<i32> realIdx(nNodeQ,-1);
   std::vector<char> rotFlag(nNodeQ,0);
   i32 nDofNode=0, nTie=0, nOrphan=0;
@@ -596,8 +601,19 @@ void CutFemSolver::runQp(void) {
       i32 ep=it->second; if (elems[e].cut||elems[ep].cut) gf.push_back({e,ep,d}); } }
   i32 nGFQ=(i32)gf.size();
 
+  // ghost-penalty face traces: Dl0[l][a] / Dl1[l][a] = l-th reference derivative
+  // of 1-D basis function a at xi=0 / xi=1.
   double Dl0[QP_MAX+1][QN_MAX], Dl1[QP_MAX+1][QN_MAX];
-  { double Dp[QN_MAX][QN_MAX];
+  if (Bp.iga) {
+    // C^{p-1} splines: derivatives of order l<p are CONTINUOUS across the face,
+    // so their jump -- and hence the whole l<p penalty term -- vanishes
+    // identically.  Zero them rather than relying on numerical cancellation.
+    // Only l==p survives, and there the p-th derivative is the piecewise
+    // constant (-1)^(p-a) C(p,a), the same value at both faces.
+    for (i32 l=1;l<=p;l++) for (i32 a=0;a<n;a++){
+      real v=Bp.dlFaceSpline(l,a); Dl0[l][a]=(double)v; Dl1[l][a]=(double)v; }
+  } else {
+    double Dp[QN_MAX][QN_MAX];
     for (i32 i=0;i<n;i++) for (i32 a=0;a<n;a++) Dp[i][a]=Bp.D[i][a];
     for (i32 l=1;l<=p;l++){ for (i32 a=0;a<n;a++){ Dl0[l][a]=Dp[0][a]; Dl1[l][a]=Dp[n-1][a]; }
       if (l<p){ double Nw[QN_MAX][QN_MAX];
@@ -674,8 +690,8 @@ void CutFemSolver::runQp(void) {
     std::vector<SayeNode> tens; const SayeNode*vn; i32 nv;
     if (!elems[e].cut){ tens.resize(ndof); i32 qi=0;
       for (i32 k=0;k<n;k++)for(i32 j=0;j<n;j++)for(i32 i=0;i<n;i++){
-        tens[qi].x[0]=Bp.t[i];tens[qi].x[1]=Bp.t[j];tens[qi].x[2]=Bp.t[k];
-        tens[qi].w=Bp.wq[i]*Bp.wq[j]*Bp.wq[k]; qi++; } vn=tens.data(); nv=ndof;
+        tens[qi].x[0]=Bp.qx[i];tens[qi].x[1]=Bp.qx[j];tens[qi].x[2]=Bp.qx[k];
+        tens[qi].w=Bp.qw[i]*Bp.qw[j]*Bp.qw[k]; qi++; } vn=tens.data(); nv=ndof;
     } else { i32 c=cutIdx[e]; nv=volOff[c+1]-volOff[c]; vn=&volPool[volOff[c]]; }
     real gb[3*QN_MAX*QN_MAX*QN_MAX];
     for (i32 q=0;q<nv;q++){ real xr[3]={vn[q].x[0],vn[q].x[1],vn[q].x[2]};
@@ -832,8 +848,8 @@ void CutFemSolver::runQp(void) {
       // volume quadrature source
       std::vector<SayeNode> tens; const SayeNode*vn; i32 nv;
       if (!elems[e].cut){ tens.resize(ndof); i32 qi=0;
-        for (i32 k=0;k<n;k++)for(i32 j=0;j<n;j++)for(i32 i=0;i<n;i++){ tens[qi].x[0]=Bp.t[i];tens[qi].x[1]=Bp.t[j];tens[qi].x[2]=Bp.t[k];
-          tens[qi].w=Bp.wq[i]*Bp.wq[j]*Bp.wq[k]; qi++; } vn=tens.data(); nv=ndof;
+        for (i32 k=0;k<n;k++)for(i32 j=0;j<n;j++)for(i32 i=0;i<n;i++){ tens[qi].x[0]=Bp.qx[i];tens[qi].x[1]=Bp.qx[j];tens[qi].x[2]=Bp.qx[k];
+          tens[qi].w=Bp.qw[i]*Bp.qw[j]*Bp.qw[k]; qi++; } vn=tens.data(); nv=ndof;
       } else { i32 c=cutIdx[e]; nv=volOff[c+1]-volOff[c]; vn=&volPool[volOff[c]]; }
       for (i32 q=0;q<nv;q++){ real xr[3]={vn[q].x[0],vn[q].x[1],vn[q].x[2]};
         Bp.allGradRef(xr,gb); Bp.allVal(xr,vb); real X[3]; physOf(elems[e],xr,X);
@@ -1637,8 +1653,8 @@ void CutFemSolver::runQp(void) {
             std::vector<SayeNode> tens; const SayeNode*vn; i32 nv;
             if (!elems[e].cut){ tens.resize(ndof); i32 qi=0;
               for (i32 k2=0;k2<n;k2++)for(i32 j2=0;j2<n;j2++)for(i32 i2=0;i2<n;i2++){
-                tens[qi].x[0]=Bp.t[i2];tens[qi].x[1]=Bp.t[j2];tens[qi].x[2]=Bp.t[k2];
-                tens[qi].w=Bp.wq[i2]*Bp.wq[j2]*Bp.wq[k2]; qi++; } vn=tens.data(); nv=ndof;
+                tens[qi].x[0]=Bp.qx[i2];tens[qi].x[1]=Bp.qx[j2];tens[qi].x[2]=Bp.qx[k2];
+                tens[qi].w=Bp.qw[i2]*Bp.qw[j2]*Bp.qw[k2]; qi++; } vn=tens.data(); nv=ndof;
             } else { i32 c=cutIdx[e]; nv=volOff[c+1]-volOff[c]; vn=&volPool[volOff[c]]; }
             real vb[QN_MAX*QN_MAX*QN_MAX];
             for (i32 q=0;q<nv;q++){ real xr[3]={vn[q].x[0],vn[q].x[1],vn[q].x[2]};
@@ -2098,8 +2114,8 @@ void CutFemSolver::runQp(void) {
       for (i32 a=0;a<ndof;a++){ double u3[3]; gather3(uv,nod[a],u3); uloc[3*a]=u3[0];uloc[3*a+1]=u3[1];uloc[3*a+2]=u3[2]; }
       std::vector<SayeNode> tens; const SayeNode*vn; i32 nv;
       if (!elems[e].cut){ tens.resize(ndof); i32 qi=0;
-        for (i32 k=0;k<n;k++)for(i32 j=0;j<n;j++)for(i32 i=0;i<n;i++){ tens[qi].x[0]=Bp.t[i];tens[qi].x[1]=Bp.t[j];tens[qi].x[2]=Bp.t[k];
-          tens[qi].w=Bp.wq[i]*Bp.wq[j]*Bp.wq[k]; qi++; } vn=tens.data(); nv=ndof;
+        for (i32 k=0;k<n;k++)for(i32 j=0;j<n;j++)for(i32 i=0;i<n;i++){ tens[qi].x[0]=Bp.qx[i];tens[qi].x[1]=Bp.qx[j];tens[qi].x[2]=Bp.qx[k];
+          tens[qi].w=Bp.qw[i]*Bp.qw[j]*Bp.qw[k]; qi++; } vn=tens.data(); nv=ndof;
       } else { i32 c=cutIdx[e]; nv=volOff[c+1]-volOff[c]; vn=&volPool[volOff[c]]; }
       real gb[3*QN_MAX*QN_MAX*QN_MAX], vb[QN_MAX*QN_MAX*QN_MAX];
       for (i32 q=0;q<nv;q++){ real xr[3]={vn[q].x[0],vn[q].x[1],vn[q].x[2]};

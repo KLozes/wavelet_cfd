@@ -70,4 +70,32 @@ struct BsplineBasis {
   // Greville abscissa of local function k, measured from the span's left knot.
   // Needed for the linear-precision check and, later, for control-point BCs.
   __host__ __device__ real greville(i32 k) const { return (real)k - (real)(p - 1) * (real)0.5; }
+
+  // ---- tensor-product evaluators, signature-compatible with QpBasis ----
+  // Same local ordering a = i + n*(j + n*k) and same gb[3*a+d] gradient layout,
+  // so qpElemCoreSaye / cutCellK / cutCylK / the Nitsche loops need only a basis
+  // dispatch, not new math.  Gradients are w.r.t. the REFERENCE cell [0,1]^3;
+  // the physical metric is applied by the caller exactly as for Qp.
+  __host__ __device__ void allVal(const real x[3], real *vb) const {
+    real Nx[BS_NMAX], Ny[BS_NMAX], Nz[BS_NMAX];
+    val(x[0], Nx); val(x[1], Ny); val(x[2], Nz);
+    for (i32 k = 0; k < n; k++)
+    for (i32 j = 0; j < n; j++)
+    for (i32 i = 0; i < n; i++) vb[i + n*(j + n*k)] = Nx[i]*Ny[j]*Nz[k];
+  }
+
+  __host__ __device__ void allGradRef(const real x[3], real *gb) const {
+    real Nx[BS_NMAX], Ny[BS_NMAX], Nz[BS_NMAX];
+    real Dx[BS_NMAX], Dy[BS_NMAX], Dz[BS_NMAX];
+    val(x[0], Nx); val(x[1], Ny); val(x[2], Nz);
+    der(x[0], Dx); der(x[1], Dy); der(x[2], Dz);
+    for (i32 k = 0; k < n; k++)
+    for (i32 j = 0; j < n; j++)
+    for (i32 i = 0; i < n; i++) {
+      i32 a = i + n*(j + n*k);
+      gb[3*a  ] = Dx[i]*Ny[j]*Nz[k];
+      gb[3*a+1] = Nx[i]*Dy[j]*Nz[k];
+      gb[3*a+2] = Nx[i]*Ny[j]*Dz[k];
+    }
+  }
 };

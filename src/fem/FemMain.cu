@@ -39,6 +39,11 @@
 //     --res N          cells along the longest bounding-box axis  (default 64)
 //     --case mms|load  manufactured solution, or the load case    (default load
 //                      for bank input, mms for STL)
+//     --basis fem|iga  solution basis at --p >= 2: C^0 Lagrange Q_p (default),
+//                      or C^{p-1} uniform B-spline (immersed isogeometric).
+//                      Same geometry either way -- the level set and the Saye
+//                      rules are independent of the solution basis.  IGA needs
+//                      ~p^3 fewer dofs for the same h.
 //     --E v --nu v     Young's modulus / Poisson ratio        (default 1, 0.3)
 //     --rho v          density                                    (default 1)
 //     --rpm v          shaft speed -> centrifugal body load    (default 0)
@@ -104,7 +109,7 @@ int main(int argc, char *argv[]) {
   double fitSliceZ = -1e30; i32 fitNF = 700, fitDeg = 2;
   double sbmBox[4] = {0,0,0,-1};   // cx,cy,cz,half : solve a SUB-BOX instead of the whole model
   double sbmK = 0;                 // MMS wave number (0 => one wavelength across the box)
-  i32   femMethod = 0;
+  i32   femMethod = 0, femBasis = 0;
   i32   nCopies = 1, spdCheck = 0, isoN = 0, rangeTest = 0, femOrder = 1, reconP = 0, recon3dP = 0;
   real  E = 1, nu = (real)0.3, rhoMat = 1, margin = (real)0.05, refine = 1;
   real  gammaD = 1000, gammaA = -1, tol = (real)1e-10;
@@ -129,6 +134,7 @@ int main(int argc, char *argv[]) {
     else if (s == "--nosector")  noSector = 1;
     else if (s == "--res")       res = atoi(next());
     else if (s == "--p")         femOrder = atoi(next());
+    else if (s == "--basis")   { std::string v=next(); femBasis = (v=="iga"||v=="spline") ? 1 : 0; }
     else if (s == "--method")  { std::string v=next(); femMethod = (v=="sbm") ? 1 : (v=="density"||v=="dens") ? 2 : 0; }
     else if (s == "--case")      caseName = next();
     else if (s == "--E")         E = (real)atof(next());
@@ -637,6 +643,7 @@ int main(int argc, char *argv[]) {
   S->prob.tracX0 = domLo[0] + (real)0.85*ext[0];
 
   S->femOrder    = (femOrder < 1) ? 1 : femOrder;
+  S->femBasis    = femBasis;
   S->femMethod   = femMethod;
   S->outTag      = tag;
   S->wantVtu     = !novtu;
