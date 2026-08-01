@@ -1429,6 +1429,9 @@ __device__ void dgFaceLift(DgSolver &grid, const real (*sWe)[blockSizeTot],
   i32 nkb = kb + ((dir==2) ? (side ? 1 : -1) : 0);
 
   i32 nSame = grid.nbrIdxList[27*bIdx + faceSlot[dir][side]];
+  // A cut neighbour OWNS the shared face rule and deposits our share of the
+  // flux itself (dgRhsCutKernel); computing it here would double count.
+  if (grid.cutOn && nSame != bEmpty && grid.blkCut && grid.blkCut[nSame] >= 0) return;
 
   if (nSame == bEmpty && grid.isExteriorBlock(lvl, nib, njb, nkb)) {
     if (grid.bcType == 2) {
@@ -5758,7 +5761,6 @@ __device__ __forceinline__ void dgCutPsi(const real cen[4], const real xr[3],
 
 __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
   extern __shared__ real sh[];
-  const i32 nb = grid.cutNb;
   real *sU = sh;                       // [5][blockSizeTot] nodal state
   real *sR = sU + 5*blockSizeTot;      // [nb][5] modal residual
   real *sC = sR + 5*CUT_NBMAX;         // [nb][5] modal coefficients
@@ -5768,7 +5770,8 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     i32 lvl, ib, jb, kb; grid.decode(grid.bLocList[b], lvl, ib, jb, kb);
     real h[3]; dgElemSize(grid, lvl, h);
     const real *cen = grid.cutCen + 4*c;
-    const real *Minv = grid.cutMinv + (size_t)c*nb*nb;
+    const i32 nb = grid.cutNbOf[c];        // reduced on degenerate slivers
+    const real *Minv = grid.cutMinv + (size_t)c*CUT_NBMAX*CUT_NBMAX;
 
     for (i32 i = threadIdx.x; i < blockSizeTot; i += blockDim.x)
       for (i32 q = 0; q < 5; q++)
@@ -5791,7 +5794,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     __syncthreads();
     for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) {
       i32 m = i/5, q = i%5; real v = 0;
-      for (i32 n2 = 0; n2 < nb; n2++) v += Minv[(size_t)m*nb+n2]*sR[n2*5+q];
+      for (i32 n2 = 0; n2 < nb; n2++) v += Minv[(size_t)m*CUT_NBMAX+n2]*sR[n2*5+q];
       sC[i] = v;
     }
     __syncthreads();
@@ -5799,6 +5802,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     __syncthreads();
 
     // ---- volume:  + INT F_d(u) d(psi_m)/dx_d dV ----------------------------
+    if (grid.cutDbgMask & 1)
     for (i32 g = threadIdx.x; g < grid.cutVolOff[c+1]-grid.cutVolOff[c]; g += blockDim.x) {
       const SayeNode &s = grid.cutVolP[grid.cutVolOff[c] + g];
       real psi[CUT_NBMAX], dpsi[3*CUT_NBMAX];
@@ -5809,16 +5813,19 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
       dgSanitizeCons(U);
       real W[5]; W[0]=fmax(U[0],DG_EPSF);
       W[1]=U[1]/W[0]; W[2]=U[2]/W[0]; W[3]=U[3]/W[0]; W[4]=dgPressureFromCons(U);
-      // dV = hx hy hz dV_ref and d/dx_d = (1/h_d) d/dxi_d
-      const real hv = h[0]*h[1]*h[2];
+      // ALL of the modal RHS is kept in REFERENCE measure: the projection above
+      // used reference weights against the reference-mass M^-1, and dividing
+      // both R and M by hx*hy*hz cancels.  So the volume term carries only the
+      // 1/h_d of the physical gradient; wall and faces below follow suit.
       for (i32 d = 0; d < 3; d++) {
         real F[5]; dgEulerFluxAxis(W, d, F);
-        real jac = hv/h[d];
+        real jac = (real)1.0/h[d];
         for (i32 m = 0; m < nb; m++) for (i32 q = 0; q < 5; q++)
           atomicAdd(&sR[m*5+q], s.w*F[q]*dpsi[3*m+d]*jac);
       }
     }
     // ---- wall:  - INT (F_wall.n) psi_m dS ---------------------------------
+    if (grid.cutDbgMask & 4)
     for (i32 g = threadIdx.x; g < grid.cutWalOff[c+1]-grid.cutWalOff[c]; g += blockDim.x) {
       const SayeNode &s = grid.cutWalP[grid.cutWalOff[c] + g];
       real psi[CUT_NBMAX];
@@ -5833,14 +5840,19 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
       // a cube, and in pseudo-2D h_z differs from h_x by orders of magnitude.
       // For the diagonal metric J = diag(h),  n~ = (n_ref,d / h_d),
       // dS_phys = |n~| * hx hy hz * dS_ref,  n_phys = n~/|n~|.
-      const real hv = h[0]*h[1]*h[2];
       real nt[3] = { s.n[0]/h[0], s.n[1]/h[1], s.n[2]/h[2] };
       real nm = sqrt(nt[0]*nt[0] + nt[1]*nt[1] + nt[2]*nt[2]);
       if (nm <= (real)0) continue;
       real np[3] = { nt[0]/nm, nt[1]/nm, nt[2]/nm };
-      real dS = s.w*nm*hv;
-      // solid wall: pressure only, no mass or energy flux
-      real Fw[5] = { 0, W[4]*np[0], W[4]*np[1], W[4]*np[2], 0 };
+      real dS = s.w*nm;                     // reference measure (see volume term)
+      real Fw[5];
+      if (grid.cutFsp) {                    // TRANSPARENT wall (free-stream gate):
+        real Fx[5], Fy[5], Fz[5];           // the exact F.n of the trace state
+        dgEulerFluxAxis(W, 0, Fx); dgEulerFluxAxis(W, 1, Fy); dgEulerFluxAxis(W, 2, Fz);
+        for (i32 q = 0; q < 5; q++) Fw[q] = Fx[q]*np[0] + Fy[q]*np[1] + Fz[q]*np[2];
+      } else {                              // solid wall: pressure only
+        Fw[0] = 0; Fw[1] = W[4]*np[0]; Fw[2] = W[4]*np[1]; Fw[3] = W[4]*np[2]; Fw[4] = 0;
+      }
       for (i32 m = 0; m < nb; m++) for (i32 q = 0; q < 5; q++)
         atomicAdd(&sR[m*5+q], -dS*Fw[q]*psi[m]);
     }
@@ -5848,6 +5860,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     // The cut element OWNS the rule and computes both sides, depositing the
     // neighbour's share directly; dgRhsKernel skips faces whose neighbour is
     // cut, so nothing is double counted.
+    if (grid.cutDbgMask & 2)
     for (i32 f = 0; f < 6; f++) {
       const i32 d = f/2, side = f%2;
       const i32 f0 = grid.cutFacOff[6*c+f], fn = grid.cutFacOff[6*c+f+1]-f0;
@@ -5859,7 +5872,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
       i32 nbIdx = grid.nbrIdxList[27*b + o[0] + 3*o[1] + 9*o[2]];
       if (nbIdx == bEmpty) nbIdx = -1;
       const real sg = side ? (real)1.0 : (real)-1.0;
-      const real dSf = (h[0]*h[1]*h[2])/h[d];      // face measure hx hy hz / h_d
+      const real dSf = (real)1.0/h[d];             // reference measure (see volume term)
       for (i32 g = threadIdx.x; g < fn; g += blockDim.x) {
         const SayeNode &s = grid.cutFacP[f0 + g];
         real psi[CUT_NBMAX], phi[blockSizeTot];
@@ -5892,18 +5905,25 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         if (side) dgRusanovAxis(Wm, Wo, d, Fs); else dgRusanovAxis(Wo, Wm, d, Fs);
         for (i32 m = 0; m < nb; m++) for (i32 q = 0; q < 5; q++)
           atomicAdd(&sR[m*5+q], -s.w*sg*Fs[q]*psi[m]*dSf);
-        // the neighbour's share, lifted onto ITS nodal basis with its diagonal
-        // mass:  R_a += +sgn * w * F* * phi_a / (0.125 w_i w_j w_k h_nb^3) * dS
-        if (nbIdx >= 0 && grid.blkCut[nbIdx] < 0) {
+        // The neighbour's share.  The Cartesian solver is STRONG-form DGSEM: its
+        // face term is the CORRECTION sgn*jacDir*winv*(f* - f_own), its own flux
+        // divergence already being in its volume term.  Depositing f* alone
+        // blew the run up at 1e24 in one step -- the correction needs the
+        // neighbour's OWN flux at the same point subtracted, with the sign of
+        // ITS side of the face (its side flag is 1-side, so its sgn is +sg in
+        // the Cartesian convention sgn = side ? -1 : +1).
+        if ((grid.cutDbgMask & 8) && nbIdx >= 0 && grid.blkCut[nbIdx] < 0) {
+          real Fo[5]; dgEulerFluxAxis(Wo, d, Fo);
           real xn[3] = { s.x[0], s.x[1], s.x[2] }; xn[d] = (real)1.0 - xn[d];
           dgLag3(xn, phi);
           for (i32 a = 0; a < blockSizeTot; a++) {
             if (phi[a] == (real)0) continue;
             i32 ai = a % NNODE, aj = (a/NNODE) % NNODE, ak = a/(NNODE*NNODE);
             real mdiag = (real)0.125*c_w[ai]*c_w[aj]*c_w[ak]*(h[0]*h[1]*h[2]);
+            real dAp   = s.w*(h[0]*h[1]*h[2])/h[d];    // physical face area share
             for (i32 q = 0; q < 5; q++)
               atomicAdd(&grid.getField(D_RHS+q)[(size_t)nbIdx*blockSizeTot + a],
-                        sg*s.w*Fs[q]*phi[a]*dSf/mdiag);
+                        sg*dAp*(Fs[q]-Fo[q])*phi[a]/mdiag);
           }
         }
       }
@@ -5913,7 +5933,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     // ---- dc/dt = M^-1 R, then evaluate at the nodes ------------------------
     for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) {
       i32 m = i/5, q = i%5; real v = 0;
-      for (i32 n2 = 0; n2 < nb; n2++) v += Minv[(size_t)m*nb+n2]*sR[n2*5+q];
+      for (i32 n2 = 0; n2 < nb; n2++) v += Minv[(size_t)m*CUT_NBMAX+n2]*sR[n2*5+q];
       sC[i] = v;
     }
     __syncthreads();

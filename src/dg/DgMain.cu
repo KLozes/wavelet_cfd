@@ -193,6 +193,8 @@ int main(int argc, char* argv[]) {
   solver->ibHO        = argI("--ibho", 1);   // 0 = first-order wall reconstruction
   solver->ibSbm       = argI("--ibsbm", 0);   // 1 = shifted boundary wall (no ghosts)
   solver->cutOn       = argI("--cutcell", 0);   // cut-cell DG (replaces the IB family)
+  solver->cutFsp      = argI("--cutfsp", 0);    // transparent-wall free-stream gate
+  i32 cutProbe        = argI("--cutprobe", 0);  // isolate cut RHS terms and exit
   solver->ibBrink     = argI("--ibbrink", 0);      // 1 = volume-penalization IB
   solver->ibBrinkEps  = argF("--ibbrinkeps", 1e-4);
   solver->ibBrinkDelta= argF("--ibbrinkdelta", 2.0);   // phi transition width in finest cells
@@ -283,6 +285,30 @@ int main(int argc, char* argv[]) {
 
   if (hasFlag("--selftest")) {
     bool ok = solver->selfTest();
+  // Cut-cell uniform-preservation gate: with a uniform IC, the exact solution
+  // is u(t) == u(0) (transparent wall under --cutfsp, or any-Mach uniform flow
+  // in a wall-free domain).  Any drift is a scheme defect.
+  if (solver->cutOn && argI("--cutcheck", 0)) {
+    cudaDeviceSynchronize();
+    double W0[5] = {1.0, (double)solver->machInf, 0.0, 0.0, 1.0/(double)dgGam}, U0[5];
+    U0[0]=W0[0]; U0[1]=W0[0]*W0[1]; U0[2]=W0[0]*W0[2]; U0[3]=W0[0]*W0[3];
+    U0[4]=W0[4]/((double)dgGam-1.0)+0.5*W0[0]*(W0[1]*W0[1]+W0[2]*W0[2]+W0[3]*W0[3]);
+    double dev=0; i32 devB=-1, devQ=-1;
+    for (i32 b = 0; b < solver->hashTable.nKeys; b++) {
+      if (solver->bLocList[b] == kEmpty) continue;
+      if (solver->ibClassList[b] != IB_FLUID) continue;
+      for (i32 nd = 0; nd < blockSizeTot; nd++)
+        for (i32 q = 0; q < 5; q++) {
+          double d = fabs((double)solver->getField(D_RHO+q)[(size_t)b*blockSizeTot+nd]-U0[q])
+                     / fmax(fabs(U0[q]), 1.0);
+          if (d > dev) { dev=d; devB=b; devQ=q; }
+        }
+    }
+    i32 isCut = (devB>=0 && solver->blkCut) ? solver->blkCut[devB] : -1;
+    printf("[cutcheck] max relative drift from uniform IC = %.6e  (q=%d, %s element)\n",
+           dev, devQ, isCut>=0?"CUT":"cartesian");
+  }
+
     delete solver;
     cudaDeviceReset();
     return ok ? 0 : 1;
@@ -335,6 +361,11 @@ int main(int argc, char* argv[]) {
   double m0 = 0, px0 = 0, e0 = 0;
   solver->dgTotalConserved(m0, px0, e0);
   printf("[cons] initial mass=%.12e momx=%.12e energy=%.12e\n", m0, px0, e0);
+
+  if (argI("--cutprobe", 0) && solver->cutOn) {
+    for (i32 mask : {1, 2, 4, 3, 7, 15}) { solver->cutDbgMask = mask; solver->probeCutRhs(); }
+    return 0;
+  }
 
   real t = 0;
   auto wall0 = std::chrono::steady_clock::now();

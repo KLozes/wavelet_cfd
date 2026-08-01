@@ -127,6 +127,13 @@ struct CutElemOps {
   double volume=0, wallArea=0;
   double momResid=0;                // GCL residual BEFORE the correction
   i32    nNegW=0;                   // weights driven negative by the correction
+  i32    snap=0;                    // 0 = genuine cut element; 1 = SNAPPED TO FLUID
+                                    // (sub-resolution solid pocket dropped); 2 = SNAPPED
+                                    // TO SOLID.  A half-seen feature makes the rules
+                                    // mutually inconsistent, which is WORSE than not
+                                    // seeing it: snapping keeps the GCL exact and costs
+                                    // only the pocket volume, which is below resolution
+                                    // anyway.
   double bndIncons=0;               // SELF-INCONSISTENCY of the boundary rules:
                                     // max |CLOSED INT psi_m n_d - CLOSED INT psi_m' n_d'|
                                     // over pairs whose derivative functions COINCIDE.
@@ -148,7 +155,7 @@ struct CutElemOps {
 //  Build the operators for one cut element from its level-set fit.
 //  `phi < 0` is the ACTIVE region (negate at the caller if your fluid is phi>0).
 // ---------------------------------------------------------------------------
-inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
+inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
                          SayeArena &ar, const SayeCfg &cfg,
                          std::vector<SayeNode> &scratch) {
   E.ok=false;
@@ -171,21 +178,30 @@ inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
     cand.assign(v.p, v.p+v.n); }
   if (cand.empty()) return false;
 
-  // ---- basis, centred on the cut region ----------------------------------
-  double cc[3]={0,0,0}, wsum=0;
-  for (const SayeNode &s : cand){ for(i32 d=0;d<3;d++) cc[d]+=(double)s.w*(double)s.x[d]; wsum+=(double)s.w; }
+  // ---- basis, scaled over the WHOLE reference cell -------------------------
+  // NOT over the cut region.  A region-adapted centroid/scale looks better
+  // conditioned, but a DG cut element's polynomial must also be EVALUATED at
+  // the solution nodes outside the cut region -- and there u=(X-c)/s grows like
+  // (cell size)/(sliver size), so psi ~ u^N explodes.  In the solver that
+  // amplification fed back through the nodal->modal round trip and blew a
+  // uniform state to 1e24 in one RK step.  With the cell-wide scale psi = O(1)
+  // at every node; the sliver's mass-matrix conditioning is then worse, but
+  // that is the small-cell problem state redistribution exists to fix.
+  double cc[3]={0.5,0.5,0.5};
+  double wsum=0; for (const SayeNode &s : cand) wsum+=(double)s.w;
   if (wsum<=0) return false;
-  for (i32 d=0;d<3;d++) cc[d]/=wsum;
-  double sc=0;
-  for (const SayeNode &s : cand){ double r2=0;
-    for (i32 d=0;d<3;d++){ double t=(double)s.x[d]-cc[d]; r2+=t*t; } if(r2>sc) sc=r2; }
+  double sc=0.75;                          // (half-diagonal)^2 of the unit cell
   E.B.init(2*N, cc, sqrt(sc));            // moments to total degree 2N
   const i32 nm = E.B.nb;                  // number of moment constraints
 
-  // Solution basis (degree N) -- the GCL constraints live on it, not on the
-  // degree-2N moment basis.
+  // Solution basis.  Degree starts at N and DROPS if the element cannot carry
+  // it: a tiny sliver's quadrature cannot make a full-degree cell-scaled mass
+  // matrix positive definite (measured: fluid volume 3e-5 with 21 points fails
+  // to factor 20 modes).  Reducing the degree is the honest response -- the
+  // element represents what its fluid region can support, down to a piecewise
+  // constant -- and state redistribution merges exactly these cells anyway.
   CutBasis Bs; Bs.init(N, cc, sqrt(sc));
-  const i32 nb=Bs.nb, nG=3*nb;
+  i32 nb=Bs.nb, nG=3*nb;
 
   // ---- WHAT THE FIT MUST ACHIEVE ----------------------------------------
   // Two blocks of rows, and the priority between them is the whole design:
@@ -241,7 +257,12 @@ inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
     }
   }
 
-  // ---- step 2: LEAST-NORM CORRECTION so the GCL holds EXACTLY -------------
+  // ---- step 2+3, per candidate degree: GCL correction, then the mass -------
+  std::vector<SayeNode> volKeep(E.vol);      // pre-correction weights
+  for (i32 deg = N; deg >= 0; deg--) {
+  Bs.init(deg, cc, sqrt(sc)); nb = Bs.nb; nG = 3*nb;
+  E.vol = volKeep;                           // reset weights for this attempt
+  // ---- LEAST-NORM CORRECTION so the GCL holds EXACTLY ---------------------
   // The compressed rule is accurate but not boundary-CONSISTENT: G w - g is the
   // free-stream residual, and on a near-tangency cell it is ~1e-3.  Rather than
   // re-fitting (which lets the solver pick a support too sparse to make the mass
@@ -313,10 +334,43 @@ inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
       GG[(size_t)i*nG+j]=GG[(size_t)j*nG+i]=s; }
     double tr=0; for (i32 i=0;i<nG;i++) tr+=GG[(size_t)i*nG+i];
     for (i32 i=0;i<nG;i++) GG[(size_t)i*nG+i]+=1e-12*fmax(tr/nG,1.0);
-    if (srdSolveSPDLocal(GG, y, nG)) {
-      for (i32 q=0;q<np;q++){ double dw=0;
-        for (i32 i=0;i<nG;i++) dw+=G[(size_t)i*np+q]*y[i];
-        E.vol[q].w = (real)((double)E.vol[q].w + dw); }
+    {
+      // POSITIVITY-CONSTRAINED least-norm correction, active-set style.  An
+      // unconstrained dw can drive weights negative (measured: 84 of 128 on a
+      // corner-degenerate cell -> indefinite mass -> degree collapse), but a
+      // GLOBAL scale-back is wrong too: the padded points carry w0 = 0, so one
+      // negative component there zeroed the entire correction and the GCL was
+      // never enforced at all.  Instead: solve on the free set; PIN violators
+      // at exactly zero (their dw = -w0 moves into the right-hand side);
+      // re-solve on the rest.  Terminates in a few rounds; when the target is
+      // feasible over the positive cone this reproduces it exactly.
+      std::vector<double> dw(np, 0.0), rr(r);
+      std::vector<char> freeQ(np, 1);
+      for (i32 round = 0; round < 5; round++) {
+        std::vector<double> GGf((size_t)nG*nG, 0.0), yy(rr);
+        for (i32 i=0;i<nG;i++) for (i32 j=i;j<nG;j++){
+          double t=0;
+          for (i32 q=0;q<np;q++) if (freeQ[q]) t+=G[(size_t)i*np+q]*G[(size_t)j*np+q];
+          GGf[(size_t)i*nG+j]=GGf[(size_t)j*nG+i]=t; }
+        double tr2=0; for (i32 i=0;i<nG;i++) tr2+=GGf[(size_t)i*nG+i];
+        for (i32 i=0;i<nG;i++) GGf[(size_t)i*nG+i]+=1e-12*fmax(tr2/nG,1.0);
+        if (!srdSolveSPDLocal(GGf, yy, nG)) break;
+        bool viol=false;
+        for (i32 q=0;q<np;q++){
+          if (!freeQ[q]) continue;
+          double d=0; for (i32 i=0;i<nG;i++) d+=G[(size_t)i*np+q]*yy[i];
+          dw[q]=d;
+          if ((double)E.vol[q].w + d < 0) {
+            // pin at zero: dw = -w0 exactly, and its constraint contribution
+            // moves to the right-hand side for the next round
+            viol=true; freeQ[q]=0; dw[q]=-(double)E.vol[q].w;
+            for (i32 i=0;i<nG;i++) rr[i]-=G[(size_t)i*np+q]*dw[q];
+          }
+        }
+        if (!viol) break;
+      }
+      for (i32 q=0;q<np;q++)
+        E.vol[q].w = (real)fmax((double)E.vol[q].w + dw[q], 0.0);
     }
   }
   { i32 neg=0; for (const SayeNode &s : E.vol) if ((double)s.w<0) neg++;
@@ -324,7 +378,7 @@ inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
   if (E.vol.empty()) return false;
   E.volume=0; for (const SayeNode &s : E.vol) E.volume += (double)s.w;
 
-  // ---- dense mass matrix on the SOLUTION basis (degree N) ----------------
+  // ---- dense mass matrix on the SOLUTION basis ----------------------------
   std::vector<double> M((size_t)nb*nb, 0.0), ps(nb);
   for (const SayeNode &s : E.vol) {
     double X[3]={(double)s.x[0],(double)s.x[1],(double)s.x[2]};
@@ -334,19 +388,64 @@ inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
   }
   for (i32 a=0;a<nb;a++) for (i32 c2=0;c2<a;c2++) M[(size_t)a*nb+c2]=M[(size_t)c2*nb+a];
   // Cholesky in place
-  for (i32 j=0;j<nb;j++){
+  bool spd = true;
+  for (i32 j=0;j<nb && spd;j++){
     double d=M[(size_t)j*nb+j];
     for (i32 q=0;q<j;q++) d-=M[(size_t)j*nb+q]*M[(size_t)j*nb+q];
-    if (d<=1e-300) return false;
+    if (d<=1e-12*fmax(M[0],1e-300)) { spd=false; break; }
     d=sqrt(d); M[(size_t)j*nb+j]=d;
     for (i32 i=j+1;i<nb;i++){
       double t=M[(size_t)i*nb+j];
       for (i32 q=0;q<j;q++) t-=M[(size_t)i*nb+q]*M[(size_t)j*nb+q];
       M[(size_t)i*nb+j]=t/d;
     } }
+  if (!spd) continue;                      // this degree does not fit: try lower
   E.Mchol.swap(M);
-  E.B = Bs;                                // keep the SOLUTION basis
+  E.B = Bs;                                // keep the SOLUTION basis actually used
   E.ok = true;
+  return true;
+  }                                        // end of the degree loop
+  return false;
+}
+
+
+// ---------------------------------------------------------------------------
+//  Robust entry point: epsilon-escalation + snap.
+//
+//  A level set crossing a cell CORNER puts the Saye recursion on a degenerate
+//  branch: measured on a mirror pair, one side returned volume wrong by 2.6%
+//  and wall by 1.3% (bndIncons 7.8e-3) while its mirror was clean (8.5e-6) --
+//  and raising maxDepth made it WORSE (point spiral, silent truncation).
+//  Shifting phi by a tiny epsilon moves the crossing off the exact corner and
+//  fixed the pair bit-for-bit at a geometry cost of epsilon itself.
+//
+//  Ladder: build raw; if bndIncons > tol, retry with phi +/- eps for growing
+//  eps, keeping the best.  If still inconsistent AND the element is nearly
+//  uncut, SNAP: drop the sub-resolution feature entirely (status in E.snap)
+//  rather than keep rules that half-see it.
+// ---------------------------------------------------------------------------
+inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
+                         SayeArena &ar, const SayeCfg &cfg,
+                         std::vector<SayeNode> &scratch,
+                         double qualTol = 1e-6) {
+  if (!cutElemBuildRaw(phi, N, E, ar, cfg, scratch)) return false;
+  if (E.bndIncons > qualTol) {
+    const double epsL[6] = {1e-9,-1e-9,1e-7,-1e-7,1e-5,-1e-5};
+    CutElemOps best = E;
+    for (double eps : epsL) {
+      PolyND ps = phi; ps.at(0,0,0) = (real)((double)ps.at(0,0,0) + eps);
+      CutElemOps T;
+      if (!cutElemBuildRaw(ps, N, T, ar, cfg, scratch)) continue;
+      if (T.bndIncons < best.bndIncons) best = T;
+      if (best.bndIncons <= qualTol) break;
+    }
+    E = best;
+  }
+  if (E.bndIncons > qualTol) {
+    // still inconsistent: if the cut is marginal, drop the feature entirely
+    if (E.volume > 0.97 && E.wallArea < 0.2) { E.snap = 1; return true; }
+    if (E.volume < 0.03 && E.wallArea < 0.2) { E.snap = 2; return true; }
+  }
   return true;
 }
 

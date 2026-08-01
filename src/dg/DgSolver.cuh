@@ -258,10 +258,17 @@ public:
   // the exchange conservative by construction and leaves dgRhsKernel almost
   // untouched.
   i32  cutOn = 0;          // 1 = cut-cell path active
+  i32  cutDbgMask = 15;    // DEBUG term mask: 1 volume, 2 faces, 4 wall, 8 deposit
+  i32  cutFsp = 0;         // DEBUG: transparent wall (exact F.n of the trace)
+                           // for the in-solver free-stream gate; free stream is
+                           // NOT a solid-wall solution, so gating it against the
+                           // reflective wall would test the wrong thing
   i32  nCutElem = 0;       // number of cut elements
   i32  cutNb = 0;          // modal basis size (total degree N)
   i32  *blkCut = nullptr;  // [nBlocksMax] cut index of a block, or -1
   i32  *cutBlk = nullptr;  // [nCutElem]   owning block of a cut element
+  i32  *cutNbOf= nullptr;  // [nCutElem]   modes actually carried (degree may be
+                           //              REDUCED on degenerate slivers)
   real *cutCen = nullptr;  // [nCutElem*4] basis centroid (3) + scale (1)
   real *cutMinv= nullptr;  // [nCutElem*cutNb*cutNb] DENSE inverse mass matrix
   real *cutQual= nullptr;  // [nCutElem] bndIncons -- per-element geometry quality
@@ -519,7 +526,8 @@ public:
   real step(real tStep);
 
   void adaptLeaves(void);       // the leaf-only vote/grade/spawn/fill/prune cascade
-  void buildCutElems(void);     // cut-cell preprocessing: classify, build the dense
+  void buildCutElems(void);
+  void probeCutRhs(void);       // one RHS apply + per-class |RHS| report (debug)     // cut-cell preprocessing: classify, build the dense
                                 // operators once, upload.  Requires a STATIC wall band.
   void computeDeltaT(void);
   void setInitialConditions(void);

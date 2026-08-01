@@ -85,7 +85,18 @@ void DgSolver::buildInitialGrid(bool doPaint) {
   // bootstrap climb: the wall band is then at its final (finest) level and is
   // treated as STATIC.  NNLS moment fitting per element is far too costly to
   // repeat per adaptation.
-  if (cutOn) buildCutElems();
+  if (cutOn) {
+    buildCutElems();
+    // The FRIB machinery ran during the build above (ibOn was still 1) and
+    // FILLED ghost/dead blocks with wall-mirrored states -- including the
+    // solid-side nodes of what are now cut elements.  The cut path reads those
+    // nodes through the nodal->modal projection, so the fill is CONTAMINATION,
+    // not helpful data (probe measured |RHS| ~ 1e7 on a uniform IC from
+    // exactly this).  Reset every block to the analytic IC; ibOn is 0 now, so
+    // nothing re-fills.
+    setInitialConditions();
+    cudaDeviceSynchronize();
+  }
 }
 
 void DgSolver::setInitialConditions(void) {

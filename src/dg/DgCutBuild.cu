@@ -60,7 +60,7 @@ void DgSolver::buildCutElems(void) {
 
   std::vector<i32>       blkOf;
   std::vector<CutElemOps> ops;
-  i32 nSolid = 0, nGeomBad = 0;
+  i32 nSolid = 0, nGeomBad = 0, nSnapF = 0, nSnapS = 0;
 
   for (i32 b = 0; b < hashTable.nKeys; b++) {
     u64 loc = bLocList[b];
@@ -82,13 +82,22 @@ void DgSolver::buildCutElems(void) {
       v[i + NNODE*(j + NNODE*k)] = (real)f;
       if (f < 0) anyF = true; else anyS = true;
     }
-    if (!anyS) continue;                 // wholly fluid: ordinary Cartesian element
-    if (!anyF) { nSolid++; continue; }   // wholly solid: not evolved
+    if (!anyS) { ibClassList[b] = IB_FLUID; continue; }   // ordinary Cartesian element
+    if (!anyF) { ibClassList[b] = IB_DEAD; nSolid++; continue; }  // not evolved
 
     PolyND phi = fitPoly3(dgOrder, v.data());
     CutElemOps E;
     if (!cutElemBuild(phi, N, E, ar, cfg, scratch)) continue;
+    // SNAPPED elements: the cut machinery half-saw a sub-resolution feature and
+    // its rules were irreparably inconsistent.  Dropping the feature keeps the
+    // GCL exact; the cost is the pocket volume, which is below resolution.
+    if (E.snap == 1) { ibClassList[b] = IB_FLUID; nSnapF++; continue; }
+    if (E.snap == 2) { ibClassList[b] = IB_DEAD;  nSnapS++; nSolid++; continue; }
     if (E.bndIncons > 1e-6) nGeomBad++;
+    if (getenv("CUT_DUMPQ"))
+      printf("  cut elem (%2d,%2d) h=(%.4f,%.4f,%.4f)  vol %.4f  wall %.4f  "
+             "bndIncons %.2e  deg %d\n", ib, jb, h[0], h[1], h[2],
+             E.volume, E.wallArea, E.bndIncons, E.B.N);
     blkOf.push_back(b);
     ops.push_back(std::move(E));
   }
@@ -119,9 +128,11 @@ void DgSolver::buildCutElems(void) {
   devS(walOff[nCutElem], &cutWalP);
   devS(facOff[6*nCutElem], &cutFacP);
   cudaMallocManaged(&cutBlk,  nCutElem*sizeof(i32));
+  cudaMallocManaged(&cutNbOf, nCutElem*sizeof(i32));
   cudaMallocManaged(&cutCen,  (size_t)nCutElem*4*sizeof(real));
   cudaMallocManaged(&cutQual, (size_t)nCutElem*sizeof(real));
-  cudaMallocManaged(&cutMinv, (size_t)nCutElem*nb*nb*sizeof(real));
+  cudaMallocManaged(&cutMinv, (size_t)nCutElem*CUT_NBMAX_H*CUT_NBMAX_H*sizeof(real));
+  memset(cutMinv, 0, (size_t)nCutElem*CUT_NBMAX_H*CUT_NBMAX_H*sizeof(real));
   cudaMallocManaged(&blkCut,  nBlocksMax*sizeof(i32));
   for (i32 b = 0; b < nBlocksMax; b++) blkCut[b] = -1;
 
@@ -129,6 +140,7 @@ void DgSolver::buildCutElems(void) {
   for (i32 c = 0; c < nCutElem; c++) {
     const CutElemOps &E = ops[c];
     cutBlk[c] = blkOf[c];  blkCut[blkOf[c]] = c;
+    cutNbOf[c] = E.B.nb;
     cutQual[c] = (real)E.bndIncons;
     cutCen[4*c+0]=(real)E.B.c[0]; cutCen[4*c+1]=(real)E.B.c[1];
     cutCen[4*c+2]=(real)E.B.c[2]; cutCen[4*c+3]=(real)E.B.s;
@@ -137,21 +149,35 @@ void DgSolver::buildCutElems(void) {
     for (i32 f = 0; f < 6; f++) for (const SayeNode &s : E.face[f]) cutFacP[nFacT++] = s;
     // DENSE inverse mass: the kernel applies M^-1 as a matvec rather than
     // carrying a triangular solve, which is the wrong shape for a GPU thread.
-    std::vector<double> col(nb);
-    for (i32 j = 0; j < nb; j++) {
-      for (i32 i = 0; i < nb; i++) col[i] = (i==j) ? 1.0 : 0.0;
+    const i32 nbE = E.B.nb;               // may be < nb on a degenerate sliver
+    std::vector<double> col(nbE);
+    for (i32 j = 0; j < nbE; j++) {
+      for (i32 i = 0; i < nbE; i++) col[i] = (i==j) ? 1.0 : 0.0;
       E.massSolve(col.data());
-      for (i32 i = 0; i < nb; i++) cutMinv[(size_t)c*nb*nb + (size_t)i*nb + j] = (real)col[i];
+      for (i32 i = 0; i < nbE; i++)
+        cutMinv[(size_t)c*CUT_NBMAX_H*CUT_NBMAX_H + (size_t)i*CUT_NBMAX_H + j] = (real)col[i];
     }
   }
+
+  // ---- the cut path REPLACES the IB machinery ----------------------------
+  // Cut elements integrate as ordinary fluid (the wall lives in their flux
+  // terms), solid blocks are dead, and the FRIB/ghost/donor machinery must not
+  // run at all -- it would re-classify these blocks as IB_GHOST and the RK
+  // stage would skip them.
+  for (i32 c = 0; c < nCutElem; c++) ibClassList[cutBlk[c]] = IB_FLUID;
+  if (ibOn) { printf("cut    : disabling the FRIB/ghost IB machinery (ibOn 1 -> 0)\n"); ibOn = 0; }
 
   double vmin = 1e300, vmax = 0, qmax = 0;
   for (const CutElemOps &E : ops) {
     vmin = fmin(vmin, E.volume); vmax = fmax(vmax, E.volume);
     qmax = fmax(qmax, E.bndIncons);
   }
-  printf("cut    : %d cut elements (%d solid blocks skipped), %d modes/elem\n",
-         nCutElem, nSolid, nb);
+  i32 nRed = 0; for (i32 c = 0; c < nCutElem; c++) if (cutNbOf[c] < nb) nRed++;
+  printf("cut    : %d cut elements (%d solid blocks skipped), %d modes/elem (%d degree-reduced)\n",
+         nCutElem, nSolid, nb, nRed);
+  if (nSnapF || nSnapS)
+    printf("       : %d snapped to FLUID, %d snapped to SOLID (sub-resolution features dropped)\n",
+           nSnapF, nSnapS);
   printf("       : rule pools  vol %zu  wall %zu  face %zu pts   M^-1 %.1f MB\n",
          nVolT, nWalT, nFacT, (double)nCutElem*nb*nb*sizeof(real)/1048576.0);
   printf("       : cut volume fraction %.3e .. %.3e   worst bndIncons %.2e (%d > 1e-6)\n",
@@ -160,4 +186,33 @@ void DgSolver::buildCutElems(void) {
     printf("       : WARNING %d element(s) geometry-limited -- free stream is only\n"
            "         preserved to their bndIncons; refine the wall band\n", nGeomBad);
   cudaDeviceSynchronize();
+}
+
+// one RHS apply with the current mask, then per-class max |RHS| -- the debug
+// probe that localises which term of the cut RHS misbehaves.
+void DgSolver::probeCutRhs(void) {
+  cudaDeviceSynchronize();
+  for (i32 q = 0; q < 5; q++)
+    cudaMemset(getField(D_RHS+q), 0, (size_t)nBlocksMax*blockSizeTot*sizeof(real));
+  dgRhsKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (real)0);
+  size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H)*sizeof(real);
+  dgRhsCutKernel<<<nCutElem, blockSizeTot, shm>>>(*this, (real)0);
+  cudaDeviceSynchronize();
+  double mCut=0, mNbr=0, mFar=0; i32 bCut=-1,bNbr=-1;
+  for (i32 b = 0; b < hashTable.nKeys; b++) {
+    if (bLocList[b] == kEmpty || ibClassList[b] != IB_FLUID) continue;
+    bool isCut = blkCut[b] >= 0, isNbr = false;
+    if (!isCut) for (i32 o = 0; o < 27 && !isNbr; o++) {
+      i32 nn = nbrIdxList[27*b+o];
+      if (nn != bEmpty && nn >= 0 && blkCut[nn] >= 0) isNbr = true;
+    }
+    for (i32 nd = 0; nd < blockSizeTot; nd++) for (i32 q = 0; q < 5; q++) {
+      double v = fabs((double)getField(D_RHS+q)[(size_t)b*blockSizeTot+nd]);
+      if (isCut)      { if (v>mCut){mCut=v;bCut=b;} }
+      else if (isNbr) { if (v>mNbr){mNbr=v;bNbr=b;} }
+      else            { if (v>mFar) mFar=v; }
+    }
+  }
+  printf("[cutprobe] mask=%2d  max|RHS|  cut=%.3e (b%d)  nbr=%.3e (b%d)  far=%.3e\n",
+         cutDbgMask, mCut, bCut, mNbr, bNbr, mFar);
 }
