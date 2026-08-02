@@ -224,7 +224,13 @@ struct Solver2d {
   std::vector<i32> cutIdx;                     // cell -> cut record (-1)
   std::vector<CutCellQ> cq;
   std::vector<char> act;                       // control point active flag
-  // ELL mass (2p+1)^2 stencil over control lattice + Kronecker preconditioner
+  // ELL mass (2*mw+1)^2 stencil over control lattice + Kronecker preconditioner.
+  // mw = p for the plain mass (two dofs couple only if they share a span), but
+  // the ghost penalty couples the two spans ACROSS a knot line, whose dof sets
+  // are {g-1..g-1+p} and {g..g+p}: index distance up to p+1.  Widen by one ring
+  // when the GP is on, or the corner couplings are silently dropped (which
+  // breaks symmetry AND the constant-annihilation property the GP relies on).
+  i32 mw = 1;
   std::vector<double> Mell;
   BandChol Mx1, My1;
   std::vector<double> sdiag;      // sqrt(Kronecker_ii / M_ii): rescales the
@@ -233,8 +239,11 @@ struct Solver2d {
                                   // unpreconditioned tail, CG hit 200 iters)
   GaussRule gv;                                // volume rule (full cells)
   double Uinf[NF];
-  // EV state
-  std::vector<double> nuCell, nuS;
+  // EV state.  nuRaw / nuCap are diagnostics only: the UNCAPPED sensor value
+  // C_DC h^2 res/evNorm and the first-order cap C_MAX h lam, kept per cell so
+  // the "why does the sensor fire on cut cells" question can be answered by
+  // measurement (is the band viscosity residual-driven or cap-limited?).
+  std::vector<double> nuCell, nuS, nuRaw, nuCap;
   double evNorm = 1.0, evDelta = 0.05;
   std::vector<double> Udot;
   // knobs
@@ -248,7 +257,7 @@ struct Solver2d {
 
   void init(i32 p_, i32 Nx_, i32 Ny_, double x0_, double y0_, double h_) {
     p=p_; Nx=Nx_; Ny=Ny_; nx=Nx+p; ny=Ny+p; n=nx*ny;
-    x0d=x0_; y0d=y0_; h=h_;
+    x0d=x0_; y0d=y0_; h=h_; mw=p;
     Sx.init(p,Nx); Sy.init(p,Ny);
     // full-cell volume rule: (p+1) Gauss = standard full integration for
     // degree-p elements (exact through 2p+1); p+2 adds one point of
@@ -259,6 +268,7 @@ struct Solver2d {
     cls.assign((size_t)Nx*Ny, 0); cutIdx.assign((size_t)Nx*Ny, -1);
     act.assign(n, 1);
     nuCell.assign((size_t)Nx*Ny, 0.0); nuS.assign((size_t)Nx*Ny, 0.0);
+    nuRaw.assign((size_t)Nx*Ny, 0.0);  nuCap.assign((size_t)Nx*Ny, 0.0);
     Udot.assign((size_t)NF*n, 0.0);
   }
 
@@ -291,8 +301,22 @@ struct Solver2d {
     }
   }
 
+  // Jump of the p-th PARAMETRIC derivative of the global function (g+m) across
+  // knot line g, m = -1..p.  The p-th derivative of a degree-p B-spline is
+  // piecewise constant with the SAME trace at both ends of a span (dlFace), so
+  // the jump is (trace from the right span) - (trace from the left span): on
+  // span g the function's local index is m, on span g-1 it is m+1.  The result
+  // is (-1)^(p-m) C(p+1,m+1) -- the alternating binomial row, e.g. {-1,3,-3,1}
+  // at p=2 and {1,-4,6,-4,1} at p=3.
+  double gpJump(i32 m) const {
+    double a = (m>=0   && m<=p) ? (double)Sx.B.dlFace(p,m)   : 0.0;
+    double b = (m+1>=0 && m+1<=p) ? (double)Sx.B.dlFace(p,m+1) : 0.0;
+    return a-b;
+  }
+
   void buildMass() {
-    const i32 W=2*p+1, WW=W*W;
+    mw = p + ((gpM>0)?1:0);
+    const i32 W=2*mw+1, WW=W*W;
     Mell.assign((size_t)n*WW, 0.0);
     real Nvx[BS_NMAX], Nvy[BS_NMAX];
     // GHOST-PENALTY mass (the elasticity stack's stabilizer, ported): for
@@ -302,44 +326,51 @@ struct Solver2d {
     // (ties small-support rows to their neighbours THROUGH the solid) and --
     // unlike the eps-mass -- row sums against constants are ZERO (the jump of
     // d^p(sum psi)=0), so conservation is untouched and no solid inertia is
-    // added.  p=2 only here (analytic B'' knot jumps {+1,-3,+3,-1}).
-    if (gpM > 0 && p==2) {
-      const double J[4]={1.0,-3.0,3.0,-1.0};
+    // added.  Any p: the jump traces come from IgaBasis::dlFace (gate "gp"
+    // validates the traces, the annihilation and the assembly).
+    if (gpM > 0) {
+      const i32 P1=p+1;
       // 1-D span mass of the tangential direction (unit span, scaled by h)
-      double Mt[3][3]={{0}};
+      std::vector<double> Mt((size_t)P1*P1, 0.0);
       { GaussRule g1=gaussLegendre(p+1); real Nv[BS_NMAX];
         for (i32 q=0;q<g1.n;q++){ Sx.val(g1.x[q],Nv);
           for (i32 a2=0;a2<=p;a2++) for (i32 b2=0;b2<=p;b2++)
-            Mt[a2][b2]+=(double)g1.w[q]*h*(double)Nv[a2]*(double)Nv[b2]; } }
-      const double gam = gpM*pow(h,2*p+1)/(h*h*h*h);  // h^{2p+1} * (1/h^2)^2
+            Mt[(size_t)a2*P1+b2]+=(double)g1.w[q]*h*(double)Nv[a2]*(double)Nv[b2]; } }
+      // gamma h^{2p+1} against the PHYSICAL normal derivative (1/h^p)^2, with
+      // the face measure already carried in Mt: h^{2p+1} * h^{-2p} = h for
+      // EVERY p.  (The old hardcoded h^{2p+1}/h^4 was the p=2 instance of the
+      // same thing and would be h^2 too small at p=3.)
+      const double gam = gpM*h;
+      // The two spans meeting at knot line g own dofs {g-1..g-1+p} and
+      // {g..g+p}, so the jump stencil is m = -1..p about g -- p+2 functions,
+      // width p+1.  (A previous version looped ia = g-p..g, which is the
+      // stencil REFLECTED about g with one term dropped: it penalised the
+      // jumps of functions that do not even touch the face, and its weights
+      // summed to 1 instead of 0, so it did NOT annihilate constants.)
       auto addFaceX=[&](i32 gx, i32 cy){        // vertical knot line x-index gx,
-        for (i32 ia=gx-p; ia<=gx; ia++) {       // tangential span cy
-          if (ia<0||ia>=nx) continue;
-          double Ja=J[gx-ia];
-          for (i32 ib=gx-p; ib<=gx; ib++) {
-            if (ib<0||ib>=nx) continue;
-            double Jb=J[gx-ib];
+        for (i32 ma=-1; ma<=p; ma++) {          // tangential span cy
+          i32 ia=gx+ma; if (ia<0||ia>=nx) continue;
+          double Ja=gpJump(ma);
+          for (i32 mb=-1; mb<=p; mb++) {
+            i32 ib=gx+mb; if (ib<0||ib>=nx) continue;
+            double Jb=gpJump(mb);
             for (i32 ja=0;ja<=p;ja++) for (i32 jb=0;jb<=p;jb++) {
               i32 arow=aidx(ia,cy+ja);
-              i32 di=ib-ia+p, dj=(cy+jb)-(cy+ja)+p;
-              if (di<0||di>2*p||dj<0||dj>2*p) continue;
-              Mell[(size_t)arow*(2*p+1)*(2*p+1) + dj*(2*p+1)+di]
-                += gam*Ja*Jb*Mt[ja][jb];
+              i32 di=ib-ia+mw, dj=(cy+jb)-(cy+ja)+mw;
+              Mell[(size_t)arow*WW + dj*W+di] += gam*Ja*Jb*Mt[(size_t)ja*P1+jb];
             } }
         } };
       auto addFaceY=[&](i32 gy, i32 cx){
-        for (i32 ja=gy-p; ja<=gy; ja++) {
-          if (ja<0||ja>=ny) continue;
-          double Ja=J[gy-ja];
-          for (i32 jb=gy-p; jb<=gy; jb++) {
-            if (jb<0||jb>=ny) continue;
-            double Jb=J[gy-jb];
+        for (i32 ma=-1; ma<=p; ma++) {
+          i32 ja=gy+ma; if (ja<0||ja>=ny) continue;
+          double Ja=gpJump(ma);
+          for (i32 mb=-1; mb<=p; mb++) {
+            i32 jb=gy+mb; if (jb<0||jb>=ny) continue;
+            double Jb=gpJump(mb);
             for (i32 ia=0;ia<=p;ia++) for (i32 ib=0;ib<=p;ib++) {
               i32 arow=aidx(cx+ia,ja);
-              i32 di=(cx+ib)-(cx+ia)+p, dj=jb-ja+p;
-              if (di<0||di>2*p||dj<0||dj>2*p) continue;
-              Mell[(size_t)arow*(2*p+1)*(2*p+1) + dj*(2*p+1)+di]
-                += gam*Ja*Jb*Mt[ia][ib];
+              i32 di=(cx+ib)-(cx+ia)+mw, dj=jb-ja+mw;
+              Mell[(size_t)arow*WW + dj*W+di] += gam*Ja*Jb*Mt[(size_t)ia*P1+ib];
             } }
         } };
       std::vector<char> fx((size_t)(Nx+1)*Ny,0), fy((size_t)Nx*(Ny+1),0);
@@ -383,7 +414,7 @@ struct Solver2d {
             i32 ia=cx+a, ja=cy+b;
             for (i32 a2=0;a2<=p;a2++) for (i32 b2=0;b2<=p;b2++) {
               double Pb=(double)Nvx[a2]*(double)Nvy[b2];
-              i32 di=(cx+a2)-ia+p, dj=(cy+b2)-ja+p;
+              i32 di=(cx+a2)-ia+mw, dj=(cy+b2)-ja+mw;
               Mell[(size_t)aidx(ia,ja)*WW + dj*W+di] += w*Pa*Pb;
             } }
         }
@@ -409,7 +440,7 @@ struct Solver2d {
             i32 ia=cx+a, ja=cy+b;
             for (i32 a2=0;a2<=p;a2++) for (i32 b2=0;b2<=p;b2++) {
               double Pb=(double)Nvx[a2]*(double)Nvy[b2];
-              i32 di=(cx+a2)-ia+p, dj=(cy+b2)-ja+p;
+              i32 di=(cx+a2)-ia+mw, dj=(cy+b2)-ja+mw;
               Mell[(size_t)aidx(ia,ja)*WW + dj*W+di] += w*Pa*Pb;
             } }
         }
@@ -423,13 +454,13 @@ struct Solver2d {
             i32 ia=cx+a, ja=cy+b;
             for (i32 a2=0;a2<=p;a2++) for (i32 b2=0;b2<=p;b2++) {
               double Pb=(double)Nvx[a2]*(double)Nvy[b2];
-              i32 di=(cx+a2)-ia+p, dj=(cy+b2)-ja+p;
+              i32 di=(cx+a2)-ia+mw, dj=(cy+b2)-ja+mw;
               Mell[(size_t)aidx(ia,ja)*WW + dj*W+di] += Q.vw[q]*Pa*Pb;
             } }
         }
       }
     }
-    for (i32 a=0;a<n;a++) if (!act[a]) Mell[(size_t)a*(2*p+1)*(2*p+1)+((2*p+1)*(2*p+1))/2]=1.0;
+    for (i32 a=0;a<n;a++) if (!act[a]) Mell[(size_t)a*WW+WW/2]=1.0;
     // 1-D Kronecker factors of the FULL uniform grid (preconditioner)
     auto oneD=[&](Spline1d &S, i32 N, BandChol &M){
       M.n=S.n; M.b=p;
@@ -451,7 +482,7 @@ struct Solver2d {
         for (i32 a=0;a<=p;a++) dx[s2+a]+=(double)g1.w[q]*h*(double)Nv[a]*(double)Nv[a]; }
       for (i32 s2=0;s2<Ny;s2++) for (i32 q=0;q<g1.n;q++){ Sy.val(g1.x[q],Nv);
         for (i32 a=0;a<=p;a++) dy[s2+a]+=(double)g1.w[q]*h*(double)Nv[a]*(double)Nv[a]; }
-      const i32 WW=(2*p+1)*(2*p+1);
+      const i32 WW=(2*mw+1)*(2*mw+1);
       sdiag.assign(n,1.0);
       for (i32 a=0;a<n;a++){
         if (!act[a]) continue;
@@ -461,7 +492,7 @@ struct Solver2d {
   }
 
   void massApply(const double *v, double *out) const {
-    const i32 W=2*p+1, WW=W*W;
+    const i32 W=2*mw+1, WW=W*W;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -469,11 +500,11 @@ struct Solver2d {
       i32 i=a%nx, j=a/nx;
       double s[NF]={0,0,0,0};
       const double *row=&Mell[(size_t)a*WW];
-      for (i32 dj=-p;dj<=p;dj++) {
+      for (i32 dj=-mw;dj<=mw;dj++) {
         i32 jj=j+dj; if (jj<0||jj>=ny) continue;
-        for (i32 di=-p;di<=p;di++) {
+        for (i32 di=-mw;di<=mw;di++) {
           i32 ii=i+di; if (ii<0||ii>=nx) continue;
-          double m=row[(dj+p)*W+(di+p)]; if (m==0.0) continue;
+          double m=row[(dj+mw)*W+(di+mw)]; if (m==0.0) continue;
           const double *vv=&v[(size_t)NF*(ii+nx*jj)];
           for (i32 k=0;k<NF;k++) s[k]+=m*vv[k];
         } }
@@ -571,7 +602,7 @@ struct Solver2d {
 #endif
     for (i32 cc=0;cc<Nx*Ny;cc++) {
       i32 cx=cc%Nx, cy=cc/Nx;
-      i32 c=cls[cc]; if (c==2){ nuS[cc]=0; continue; }
+      i32 c=cls[cc]; if (c==2){ nuS[cc]=0; nuRaw[cc]=0; nuCap[cc]=0; continue; }
       double nmax=0, lamM=0;
       double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
       if (c==0) {
@@ -600,6 +631,7 @@ struct Solver2d {
           nmax=fmax(nmax, C_DC*h*h*res/evNorm);
         }
       }
+      nuRaw[cc]=nmax; nuCap[cc]=C_MAX*h*lamM;
       nuS[cc]=fmin(nmax, C_MAX*h*lamM);
     }
     // Guermond normalization ||eta - eta_bar||_inf with a PHYSICAL floor.
@@ -946,18 +978,18 @@ __global__ static void kFar(DevPar P) {
     for (i32 k=0;k<NF;k++) atomicAdd(&out[k], -w*Pv*Fh[k]);
   }
 }
-__global__ static void kMassEll(i32 n, i32 nx, i32 ny, i32 p,
+__global__ static void kMassEll(i32 n, i32 nx, i32 ny, i32 mw,
                                 const double *Mell, const char *act,
                                 const double *v, double *out) {
   i32 a=blockIdx.x*blockDim.x+threadIdx.x;
   if (a>=n) return;
-  const i32 W=2*p+1, WW=W*W;
+  const i32 W=2*mw+1, WW=W*W;
   i32 i=a%nx, j=a/nx;
   double s[NF]={0,0,0,0};
   const double *row=&Mell[(size_t)a*WW];
-  for (i32 dj=-p;dj<=p;dj++){ i32 jj=j+dj; if(jj<0||jj>=ny) continue;
-    for (i32 di=-p;di<=p;di++){ i32 ii=i+di; if(ii<0||ii>=nx) continue;
-      double m=row[(dj+p)*W+(di+p)]; if(m==0.0) continue;
+  for (i32 dj=-mw;dj<=mw;dj++){ i32 jj=j+dj; if(jj<0||jj>=ny) continue;
+    for (i32 di=-mw;di<=mw;di++){ i32 ii=i+di; if(ii<0||ii>=nx) continue;
+      double m=row[(dj+mw)*W+(di+mw)]; if(m==0.0) continue;
       const double *vv=&v[(size_t)NF*(ii+nx*jj)];
       for (i32 k=0;k<NF;k++) s[k]+=m*vv[k]; } }
   for (i32 k=0;k<NF;k++) out[(size_t)NF*a+k]=s[k];
@@ -1259,7 +1291,7 @@ static i32 gmresGpu(Dev &D, Solver2d &S, const std::vector<double> &Uhost,
       double eps=sqrt(1e-13)*sqrt(1.0+normU)/fmax(nv,1e-300);
       kAddScaled<<<gb,B>>>(m, D.U, eps, D.pz, D.scr);
       D.rhs(D.scr, D.R2);
-      kMassEll<<<(D.n+255)/256,256>>>(D.n,S.nx,S.ny,S.p,D.Mell,D.act,D.pz,D.Mv);
+      kMassEll<<<(D.n+255)/256,256>>>(D.n,S.nx,S.ny,S.mw,D.Mell,D.act,D.pz,D.Mv);
       kFormA<<<gb,B>>>(m,D.act,D.Mv,dtau,D.R2,D.R1,eps,D.x,D.w);
       kScalCopy<<<gb,B>>>(m,1.0,D.R1,D.scr);
       kAxpy<<<gb,B>>>(m,-1.0,D.w,D.scr);
@@ -1276,7 +1308,7 @@ static i32 gmresGpu(Dev &D, Solver2d &S, const std::vector<double> &Uhost,
       double eps=sqrt(1e-13)*sqrt(1.0+normU)/fmax(nv,1e-300);
       kAddScaled<<<gb,B>>>(m, D.U, eps, D.pz, D.scr);
       D.rhs(D.scr, D.R2);
-      kMassEll<<<(D.n+255)/256,256>>>(D.n,S.nx,S.ny,S.p,D.Mell,D.act,D.pz,D.Mv);
+      kMassEll<<<(D.n+255)/256,256>>>(D.n,S.nx,S.ny,S.mw,D.Mell,D.act,D.pz,D.Mv);
       kFormA<<<gb,B>>>(m,D.act,D.Mv,dtau,D.R2,D.R1,eps,Vk,D.w);
       for (i32 j=0;j<=k;j++) {
         double hjk=D.dot(D.w, D.V+(size_t)j*m);
@@ -1585,6 +1617,32 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
     printf("  L2 entropy deviation (annulus r<1.5): %.6e  off-band [1,1.5]: %.6e\n",
            sqrt(s2i/ar), sqrt(s2o/fmax(aro,1e-300)));
   }
+  // ---- where does the entropy-viscosity sensor fire, and is it capped? -----
+  // "band" = the cells the 3x3 neighbour-max smoothing reaches from a cut cell,
+  // i.e. exactly the cells whose nu is set by the wall.  nuRaw is the uncapped
+  // sensor C_DC h^2 res/evNorm, nuCap the first-order cap C_MAX h lam: nuRaw >
+  // nuCap means the cell runs at FIRST-ORDER viscosity, which would cap the
+  // global order however much the geometry is refined.
+  { double bMax=0, oMax=0, bRawMax=0, oRawMax=0;
+    i32 nb=0, no=0, bCap=0, oCap=0;
+    for (i32 cy=0;cy<N;cy++) for (i32 cx=0;cx<N;cx++) {
+      i32 cc=cx+N*cy; if (S.cls[cc]==2) continue;
+      bool band=false;
+      for (i32 dj=-1;dj<=1&&!band;dj++) for (i32 di=-1;di<=1;di++) {
+        i32 ii=cx+di, jj=cy+dj;
+        if (ii<0||ii>=N||jj<0||jj>=N) continue;
+        if (S.cls[(size_t)ii+N*jj]==1) { band=true; break; }
+      }
+      bool capped = S.nuRaw[cc] > S.nuCap[cc];
+      if (band){ nb++; bMax=fmax(bMax,S.nuCell[cc]); bRawMax=fmax(bRawMax,S.nuRaw[cc]); bCap+=capped; }
+      else     { no++; oMax=fmax(oMax,S.nuCell[cc]); oRawMax=fmax(oRawMax,S.nuRaw[cc]); oCap+=capped; }
+    }
+    printf("  EV band (%d cells): nu_max %.3e  raw %.3e  cap-limited %d (%.1f%%)\n",
+           nb, bMax, bRawMax, bCap, 100.0*bCap/fmax(nb,1));
+    printf("     off  (%d cells): nu_max %.3e  raw %.3e  cap-limited %d (%.1f%%)\n",
+           no, oMax, oRawMax, oCap, 100.0*oCap/fmax(no,1));
+    printf("     band/off nu_max ratio %.1f\n", bMax/fmax(oMax,1e-300));
+  }
   if (getenv("IGA2_FDUMP")) {
     // regular-grid sample of the spline solution for field plots
     FILE *fp=fopen(getenv("IGA2_FDUMP"),"w");
@@ -1784,6 +1842,147 @@ static void gateCyl(i32 p, double CFL, double CDC, double CMAX) {
   }
 }
 
+// ---------------------------------------------------------------------------
+//  ghost-penalty validation gate.  Three independent checks, none of which
+//  shares code with the assembly it is testing:
+//    (1) the p-th derivative traces dlFace vs a p-th finite difference of the
+//        basis (a p-th difference is EXACT for a degree-p polynomial);
+//    (2) G . 1 == 0 -- the constant-annihilation invariant the GP mass is
+//        chosen for (this is what conservation and "no solid inertia" rest on);
+//    (3) c^T G c for a random c vs sum_F gamma h^{2p+1} int_F [d^p_n u_c]^2 ds
+//        with the jump obtained by finite-differencing the actual field on
+//        either side of the knot line -- an end-to-end check of the stencil,
+//        the weights and the h-scaling at once.
+// ---------------------------------------------------------------------------
+static i32 gateGp(i32 p) {
+  printf("\n[gp] ghost-penalty mass (p=%d): traces, constant annihilation, "
+         "assembly\n", p);
+  i32 ok=1;
+  // ---- (1) jump traces ------------------------------------------------------
+  { IgaBasis B; B.init(p);
+    const double d=1.0/(2*(p+1));
+    double emax=0;
+    for (i32 a=0;a<=p;a++) {
+      double s=0;
+      for (i32 k=0;k<=p;k++) {
+        double cb=1; for (i32 i=0;i<k;i++) cb=cb*(double)(p-i)/(double)(i+1);
+        real Nv[BS_NMAX]; B.val((real)(0.2+k*d), Nv);
+        s += (((p-k)&1)? -cb : cb)*(double)Nv[a];
+      }
+      emax=fmax(emax, fabs(s/pow(d,p) - (double)B.dlFace(p,a)));
+    }
+    printf("  (1) dlFace vs p-th finite difference     max|err| = %.3e\n", emax);
+    if (!(emax<1e-8)) ok=0;
+  }
+  // the jump row itself, for the record
+  { Solver2d T; T.init(p,4,4,0.0,0.0,1.0);
+    printf("      jump row  m=-1..p :");
+    for (i32 m=-1;m<=p;m++) printf(" %+.0f", T.gpJump(m));
+    double s=0; for (i32 m=-1;m<=p;m++) s+=T.gpJump(m);
+    printf("   sum = %+.0f\n", s);
+    if (fabs(s)>1e-12) ok=0;
+  }
+  // ---- build the GP operator in isolation: G = M(gpM=1) - M(gpM=0) ---------
+  const i32 N=24;
+  const double h=1.0/N;
+  Circle G{0.5,0.5,0.25};              // body well inside: every GP face is
+  Solver2d S0, S1;                     // interior, so nothing is clipped
+  S0.init(p,N,N,0.0,0.0,h); S0.gpM=0.0; S0.epsM=0.0; S0.classify(G); S0.buildMass();
+  S1.init(p,N,N,0.0,0.0,h); S1.gpM=1.0; S1.epsM=0.0; S1.classify(G); S1.buildMass();
+  const i32 nx=S1.nx, ny=S1.ny, mw=S1.mw, W1=2*S1.mw+1, W0=2*S0.mw+1;
+  auto Gent=[&](i32 a, i32 di, i32 dj)->double{
+    double v=S1.Mell[(size_t)a*W1*W1+(dj+S1.mw)*W1+(di+S1.mw)];
+    if (abs(di)<=S0.mw && abs(dj)<=S0.mw)
+      v-=S0.Mell[(size_t)a*W0*W0+(dj+S0.mw)*W0+(di+S0.mw)];
+    return v; };
+  // Rows of INACTIVE dofs have their diagonal overwritten by the 1.0 identity
+  // fill (buildMass), which is deliberate -- the GP reaches through the solid
+  // into dofs the fluid-support active set excludes, and those rows are not in
+  // the solve.  The operator identities below are therefore checked on the
+  // active block, which is exactly the operator the solver applies.
+  // ---- (2) constants in the kernel -----------------------------------------
+  { double worst=0, scale=0;
+    for (i32 a=0;a<S1.n;a++) {
+      if (!S1.act[a]) continue;
+      double s=0, m=0;
+      for (i32 dj=-mw;dj<=mw;dj++) for (i32 di=-mw;di<=mw;di++) {
+        i32 ii=a%nx+di, jj=a/nx+dj;
+        if (ii<0||ii>=nx||jj<0||jj>=ny) continue;
+        double g=Gent(a,di,dj); s+=g; m+=fabs(g);
+      }
+      worst=fmax(worst,fabs(s)); scale=fmax(scale,m);
+    }
+    printf("  (2) |G.1|_inf / |G|_inf                          = %.3e\n",
+           worst/fmax(scale,1e-300));
+    if (!(worst/fmax(scale,1e-300) < 1e-12)) ok=0;
+  }
+  // ---- (3) assembled form vs finite-differenced face integral ---------------
+  { std::vector<double> c((size_t)S1.n);
+    unsigned s32=12345u;
+    for (i32 a=0;a<S1.n;a++){ s32=s32*1664525u+1013904223u;
+      c[a]=S1.act[a] ? (double)(s32>>8)/(double)(1u<<24)-0.5 : 0.0; }
+    double qAsm=0;
+    for (i32 a=0;a<S1.n;a++)
+      for (i32 dj=-mw;dj<=mw;dj++) for (i32 di=-mw;di<=mw;di++) {
+        i32 ii=a%nx+di, jj=a/nx+dj;
+        if (ii<0||ii>=nx||jj<0||jj>=ny) continue;
+        qAsm += c[a]*Gent(a,di,dj)*c[ii+nx*jj];
+      }
+    auto uAt=[&](i32 cx,i32 cy,double xi,double yi)->double{
+      real Nvx[BS_NMAX],Nvy[BS_NMAX];
+      S1.Sx.val((real)xi,Nvx); S1.Sy.val((real)yi,Nvy);
+      double s=0;
+      for (i32 a=0;a<=p;a++) for (i32 b=0;b<=p;b++)
+        s+=c[S1.aidx(cx+a,cy+b)]*(double)Nvx[a]*(double)Nvy[b];
+      return s; };
+    const double dd=1.0/(2*(p+1));
+    // p-th PHYSICAL derivative across span (cx,cy), along x (dir=0) or y (=1)
+    auto dp=[&](i32 dir,i32 cx,i32 cy,double t)->double{
+      double s=0;
+      for (i32 k=0;k<=p;k++) {
+        double cb=1; for (i32 i=0;i<k;i++) cb=cb*(double)(p-i)/(double)(i+1);
+        double z=0.2+k*dd;
+        s += (((p-k)&1)? -cb : cb)*(dir? uAt(cx,cy,t,z) : uAt(cx,cy,z,t));
+      }
+      return s/pow(h*dd,p); };
+    GaussRule g1=gaussLegendre(p+1);
+    const double gam = pow(h,2*p+1);
+    double qRef=0; i32 nface=0;
+    std::vector<char> fx((size_t)(N+1)*N,0), fy((size_t)N*(N+1),0);
+    for (i32 cy=0;cy<N;cy++) for (i32 cx=0;cx<N;cx++) {
+      if (S1.cls[(size_t)cx+N*cy]!=1) continue;
+      fx[(size_t)cx+(N+1)*cy]=1; fx[(size_t)cx+1+(N+1)*cy]=1;
+      fy[(size_t)cx+N*cy]=1;     fy[(size_t)cx+N*(cy+1)]=1;
+    }
+    for (i32 cy=0;cy<N;cy++) for (i32 g=0;g<=N;g++) {
+      if (!fx[(size_t)g+(N+1)*cy]) continue;
+      if (g<1||g>N-1) { printf("  GP face on the domain edge -- test setup\n"); ok=0; continue; }
+      nface++;
+      for (i32 q=0;q<g1.n;q++) {
+        double t=(double)g1.x[q];
+        double jmp=dp(0,g,cy,t)-dp(0,g-1,cy,t);
+        qRef += gam*(double)g1.w[q]*h*jmp*jmp;
+      }
+    }
+    for (i32 cx=0;cx<N;cx++) for (i32 g=0;g<=N;g++) {
+      if (!fy[(size_t)cx+N*g]) continue;
+      if (g<1||g>N-1) { ok=0; continue; }
+      nface++;
+      for (i32 q=0;q<g1.n;q++) {
+        double t=(double)g1.x[q];
+        double jmp=dp(1,cx,g,t)-dp(1,cx,g-1,t);
+        qRef += gam*(double)g1.w[q]*h*jmp*jmp;
+      }
+    }
+    printf("  (3) c'Gc assembled %.10e   reference %.10e\n", qAsm, qRef);
+    printf("      %d faces, relative difference                 = %.3e\n",
+           nface, fabs(qAsm-qRef)/fmax(fabs(qRef),1e-300));
+    if (!(fabs(qAsm-qRef) < 1e-9*fabs(qRef))) ok=0;
+  }
+  printf("[gp] %s\n", ok? "PASS":"FAIL");
+  return ok;
+}
+
 int main(int argc, char **argv) {
   const char *mode = (argc>1)? argv[1] : "all";
   const i32 p = (argc>2)? atoi(argv[2]) : 2;
@@ -1796,6 +1995,7 @@ int main(int argc, char **argv) {
          "(C=%.2f cap=%.2f), cut-cell cylinder\n", p-1, p, CDC, CMAX);
   i32 ok=1;
   g_csupg=CSUP;
+  if (!strcmp(mode,"gp")    ||!strcmp(mode,"all")) ok &= gateGp(p);
   if (!strcmp(mode,"vortex")||!strcmp(mode,"all")) ok &= gateVortex(p,CFL,CDC,CMAX);
   if (!strcmp(mode,"fsp")   ||!strcmp(mode,"all")) ok &= gateFsp(p);
   if (!strcmp(mode,"cyl")) gateCyl(p,CFL,CDC,CMAX);
