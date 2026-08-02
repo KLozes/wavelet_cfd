@@ -238,7 +238,7 @@ struct Solver2d {
   double evNorm = 1.0, evDelta = 0.05;
   std::vector<double> Udot;
   // knobs
-  double C_DC=1.0, C_MAX=0.5, C_SUPG=1.0, epsM=0.0; i32 fsp=0;
+  double C_DC=1.0, C_MAX=0.5, C_SUPG=1.0, epsM=0.0, wallBeta=1.0; i32 fsp=0;
 
   i32 aidx(i32 i, i32 j) const { return i + nx*j; }
 
@@ -630,6 +630,15 @@ struct Solver2d {
               double Um[NF]; double un=(Uq[1]*nxq+Uq[2]*nyq);
               Um[0]=Uq[0]; Um[1]=Uq[1]-2*un*nxq; Um[2]=Uq[2]-2*un*nyq; Um[3]=Uq[3];
               rusanov(Uq,Um,nxq,nyq,Fh);
+              // wallBeta scales ONLY the u.n penalty (the Rusanov dissipation
+              // term; central part untouched): the mirror jump is purely the
+              // normal momentum, so the extra term is beta-1 times it
+              if (wallBeta != 1.0) {
+                double u2,v2,cs2,r2,pr2; primEval(Uq,r2,u2,v2,pr2,cs2);
+                double lam=fabs(u2*nxq+v2*nyq)+cs2;
+                double ex=(wallBeta-1.0)*0.5*lam*2.0*un;   // -0.5*lam*(Um-Uq) extra
+                Fh[1]+=ex*nxq; Fh[2]+=ex*nyq;
+              }
             }
             Sx.val(xi,Nvx); Sy.val(yi,Nvy);
             for (i32 a=0;a<=p;a++) for (i32 b=0;b<=p;b++) {
@@ -887,6 +896,7 @@ static void gateCyl(i32 p, double CFL, double CDC, double CMAX) {
          M, N, 0.1*N*1.0/1.6, T);
   Solver2d S; S.init(p,N,N,-8.0,-8.0,16.0/N);
   S.C_DC=CDC; S.C_MAX=CMAX; S.C_SUPG=g_csupg; S.epsM=g_epsm;
+  S.wallBeta = getenv("IGA2_WBETA")? atof(getenv("IGA2_WBETA")) : 1.0;
   double r=1.0, c=1.0, pr=r*c*c/GAM, u=M*c;
   S.Uinf[0]=r; S.Uinf[1]=r*u; S.Uinf[2]=0; S.Uinf[3]=pr/(GAM-1)+0.5*r*u*u;
   Circle G{0.0,0.0,0.5};
