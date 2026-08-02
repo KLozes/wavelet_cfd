@@ -133,6 +133,18 @@ struct BandChol {
   }
 };
 
+// mathematical entropy pair: eta = -rho*s/(gam-1), s = ln p - gam ln rho; q = u*eta
+static double entEta(const double U[3]) {
+  double r=fmax(U[0],1e-12), u=U[1]/r;
+  double p=fmax((GAM-1.0)*(U[2]-0.5*r*u*u),1e-12);
+  double sp=log(p)-GAM*log(r);
+  return -r*sp/(GAM-1.0);
+}
+static double entQ(const double U[3]) {
+  double r=fmax(U[0],1e-12), u=U[1]/r;
+  return u*entEta(U);
+}
+
 static void eulerFlux(const double U[3], double F[3], double &u, double &c) {
   double r=fmax(U[0],1e-12); u=U[1]/r;
   double p=(GAM-1.0)*(U[2]-0.5*r*u*u); p=fmax(p,1e-12);
@@ -150,12 +162,19 @@ int main(int argc, char **argv) {
   // stable but adds diffusion and breaks exact conservation.  DC alone passes
   // the gate, so SUPG is OPT-IN (IGA_SUPG=1, steady-residual form).
   const i32 supg     = getenv("IGA_SUPG")? 1 : 0;
+  // IGA_EV=1: Guermond-Popov ENTROPY VISCOSITY instead of the U-residual DC.
+  // The entropy residual eta_t + q_x is O(1) at shocks (entropy production is
+  // a Dirac there), EXACTLY zero across contacts, truncation-small in smooth
+  // flow -- a shock-only sensor with convergence theory behind it.
+  const i32 useEV    = getenv("IGA_UDC")? 0 : 1;   // entropy viscosity DEFAULT;
+                                                    // IGA_UDC=1 for the U-residual
   const double TEND = 0.2;
 
-  printf("IGA 1-D Euler, C^%d B-splines (p=%d), SUPG=%d + DC viscosity "
-         "(Cdc=%.2f cap=%.2f), Sod gate\n", p-1, p, supg, C_DC, C_MAX);
-  printf("%6s %10s %12s %10s %10s %10s %9s\n",
-         "N", "dofs", "L1(rho)", "order", "min rho", "overshoot", "dM/M0");
+  printf("IGA 1-D Euler, C^%d B-splines (p=%d), SUPG=%d, sensor=%s "
+         "(C=%.2f cap=%.2f), Sod gate\n", p-1, p, supg,
+         useEV?"ENTROPY-VISC":"U-residual DC", C_DC, C_MAX);
+  printf("%6s %10s %12s %10s %10s %10s %9s %7s\n",
+         "N", "dofs", "L1(rho)", "order", "min rho", "overshoot", "dM/M0", "cw/h");
 
   double prevErr = 0; bool pass = true;
   for (i32 N : {100, 200, 400, 800}) {
@@ -190,9 +209,11 @@ int main(int argc, char **argv) {
     // then M^-1
     GaussRule g = gaussLegendre(p+2);
     std::vector<double> nuSpan(N), nuS(N);
+    double evNorm = 1.0;                 // lagged ||eta - eta_bar||_inf (Guermond)
     auto rhs=[&](const std::vector<double> &Uc, std::vector<double> &Rout){
       std::fill(Rout.begin(), Rout.end(), 0.0);
       real Nv[BS_NMAX], Dv[BS_NMAX];
+      double eAcc=0, eMax=0;
       // ---- pass 1: span-wise DC viscosity ---------------------------------
       // A per-POINT sensor switches off too sharply as the shock thins: the
       // measured post-shock overshoot GREW under refinement (2.5% -> 12%).
@@ -218,17 +239,50 @@ int main(int argc, char **argv) {
             eulerFlux(Up,Fm,uu,cc);
             for (i32 k=0;k<3;k++) Fx[k]=(Fp[k]-Fm[k])/(2*du);
           }
-          double gradU=fabs(Ux[0])+fabs(Ux[1])+fabs(Ux[2]);
-          double res =fabs(Ut[0]+Fx[0])+fabs(Ut[1]+Fx[1])+fabs(Ut[2]+Fx[2]);
-          double nu = C_DC*h*h*res/(gradU*h+1e-10);
+          double nu;
+          if (useEV) {
+            // entropy residual eta_t + q_x, both via the same directional-FD
+            // trick as Fx (chain rule along Ut / Ux)
+            double du=1e-7, Up[3];
+            for (i32 k=0;k<3;k++) Up[k]=Uq[k]+du*Ut[k];
+            double etp=entEta(Up);
+            for (i32 k=0;k<3;k++) Up[k]=Uq[k]-du*Ut[k];
+            double etm=entEta(Up);
+            double eta_t=(etp-etm)/(2*du);
+            for (i32 k=0;k<3;k++) Up[k]=Uq[k]+du*Ux[k];
+            double qp=entQ(Up);
+            for (i32 k=0;k<3;k++) Up[k]=Uq[k]-du*Ux[k];
+            double qm=entQ(Up);
+            double q_x=(qp-qm)/(2*du);
+            nu = C_DC*h*h*fabs(eta_t+q_x)/evNorm;
+            eAcc += (double)g.w[q]*h*entEta(Uq);      // eta mean accumulation
+            eMax = fmax(eMax, fabs(entEta(Uq)));
+          } else {
+            double gradU=fabs(Ux[0])+fabs(Ux[1])+fabs(Ux[2]);
+            double res =fabs(Ut[0]+Fx[0])+fabs(Ut[1]+Fx[1])+fabs(Ut[2]+Fx[2]);
+            nu = C_DC*h*h*res/(gradU*h+1e-10);
+          }
           nmax=fmax(nmax, fmin(nu, C_MAX*h*lam));
         }
         nuS[s2]=nmax;
+      }
+      if (useEV) {
+        // lagged Guermond normalization: ||eta - eta_bar||_inf from THIS pass,
+        // used by the NEXT (one-evaluation lag, standard practice)
+        double ebar = eAcc;                         // domain length is 1
+        double dev = fabs(eMax - fabs(ebar));
+        evNorm = fmax(dev, 1e-8);
       }
       for (i32 s2=0;s2<N;s2++){
         double v=nuS[s2];
         if (s2>0)   v=fmax(v,nuS[s2-1]);
         if (s2<N-1) v=fmax(v,nuS[s2+1]);
+        // frozen-end guard: the boundary control points hold the IC, so a
+        // nonzero nu there leaks mass through the frozen rows -- measured as
+        // an O(h) drift (1e-6, halving with h) under the entropy sensor,
+        // whose normalized residual never vanishes EXACTLY.  Waves stay far
+        // from the ends in this test by construction.
+        if (s2 < 2*p || s2 >= N-2*p) v = 0;
         nuSpan[s2]=v;
       }
       // ---- pass 2: assembly ------------------------------------------------
@@ -320,9 +374,20 @@ int main(int argc, char **argv) {
         if (x > xc + 5*h && x < xs2 - 2*h && rq > rPost) over=fmax(over, rq-rPost);
         if (x > xs2 + 5*h && rq > 0.125) over=fmax(over, rq-0.125); }
     }
+    // contact width: x-extent of the transition band between the contact's two
+    // exact states (0.426 -> 0.266): rho in (0.29, 0.40) near the contact
+    double cw=0;
+    { double xc=0.5+ex.us*TEND, xlo=1e300, xhi=-1e300;
+      for (i32 s2=0;s2<N;s2++) for(i32 q=0;q<gm.n;q++){
+        double x=(s2+(double)gm.x[q])*h;
+        if (fabs(x-xc)>0.1) continue;
+        real Nv3[BS_NMAX]; S.val(gm.x[q],Nv3);
+        double rq=0; for(i32 a=0;a<=p;a++) rq+=(double)Nv3[a]*U[3*(s2+a)];
+        if (rq>0.29 && rq<0.40){ xlo=fmin(xlo,x); xhi=fmax(xhi,x); } }
+      cw = (xhi>xlo)? (xhi-xlo)/h : 0; }
     double order = prevErr>0 ? log2(prevErr/e1) : 0;
-    printf("%6d %10d %12.4e %10.2f %10.4f %10.4f %9.1e\n",
-           N, 3*n, e1, order, rmin, over/rPost, fabs(M1-M0)/M0);
+    printf("%6d %10d %12.4e %10.2f %10.4f %10.4f %9.1e %7.1f\n",
+           N, 3*n, e1, order, rmin, over/rPost, fabs(M1-M0)/M0, cw);
     prevErr = e1;
     if (rmin <= 0 || over/rPost > 0.15) pass=false;
     if (getenv("IGA_DUMP") && N==400) {
