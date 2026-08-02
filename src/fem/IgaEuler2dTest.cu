@@ -250,7 +250,12 @@ struct Solver2d {
     p=p_; Nx=Nx_; Ny=Ny_; nx=Nx+p; ny=Ny+p; n=nx*ny;
     x0d=x0_; y0d=y0_; h=h_;
     Sx.init(p,Nx); Sy.init(p,Ny);
-    gv = gaussLegendre(p+2);
+    // full-cell volume rule: (p+1) Gauss = standard full integration for
+    // degree-p elements (exact through 2p+1); p+2 adds one point of
+    // dealiasing for the rational Euler fluxes -- measured equivalent on
+    // the vortex orders and the cylinder record, so p+1 is the default
+    i32 ngv = getenv("IGA2_NGV")? atoi(getenv("IGA2_NGV")) : p+1;
+    gv = gaussLegendre(ngv);
     cls.assign((size_t)Nx*Ny, 0); cutIdx.assign((size_t)Nx*Ny, -1);
     act.assign(n, 1);
     nuCell.assign((size_t)Nx*Ny, 0.0); nuS.assign((size_t)Nx*Ny, 0.0);
