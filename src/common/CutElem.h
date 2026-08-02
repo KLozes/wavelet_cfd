@@ -165,7 +165,8 @@ struct CutElemOps {
 // ---------------------------------------------------------------------------
 inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
                          SayeArena &ar, const SayeCfg &cfg,
-                         std::vector<SayeNode> &scratch) {
+                         std::vector<SayeNode> &scratch,
+                         const std::vector<SayeNode> * const *faceOverride = nullptr) {
   E.ok=false;
   auto mkset=[&](std::vector<SayeNode> &b){
     SayeSet s; s.p=b.data(); s.n=0; s.cap=(i32)b.size(); s.ovf=false; return s; };
@@ -270,6 +271,27 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
   i32 degTop = N;
   { const char *de = getenv("CUT_DEGMAX");
     if (de) { i32 v = atoi(de); if (v >= 0 && v < degTop) degTop = v; } }
+  // THIN-CELL DEGREE RULE.  Mean thickness = fluid volume / wall area.  A
+  // tangency WEDGE (wall grazing a cell face) has thickness ~0.08 cells; its
+  // P^N trace on the far face is extrapolation garbage that no face-coupling
+  // structure can repair -- measured as the persistent supersonic blowup at
+  // exactly the four tangency cells after the mortar fixed everything else.
+  // A cell thinner than CUT_THINTOL (default 0.25) of a cell carries P0 only:
+  // the geometric form of the sub-half-cell resolution limit, applied to the
+  // DEGREE instead of to existence.
+  {
+    // NOTE: E.volume is not assigned yet at this point -- an earlier version
+    // read it here and silently collapsed EVERY element to degree 0 (the
+    // "P2 all-Mach pass" it produced was P0 in disguise).  The raw Saye
+    // candidate volume wsum is what exists now, and is the right measure.
+    double aw = E.wallArea;
+    if (aw > 1e-12) {
+      double thick = wsum / aw;
+      const char *tt = getenv("CUT_THINTOL");
+      double tol = tt ? atof(tt) : 0.25;
+      if (thick < tol) degTop = 0;
+    }
+  }
   for (i32 deg = degTop; deg >= 0; deg--) {
   Bs.init(deg, cc, sqrt(sc)); nb = Bs.nb; nG = 3*nb;
   E.vol = volKeep;                           // reset weights for this attempt
@@ -454,20 +476,29 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
 inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
                          SayeArena &ar, const SayeCfg &cfg,
                          std::vector<SayeNode> &scratch,
-                         double qualTol = 1e-6) {
-  if (!cutElemBuildRaw(phi, N, E, ar, cfg, scratch)) return false;
+                         double qualTol = 1e-6,
+                         const std::vector<SayeNode> * const *faceOverride = nullptr) {
+  if (!cutElemBuildRaw(phi, N, E, ar, cfg, scratch, faceOverride)) return false;
   if (E.bndIncons > qualTol) {
     const double epsL[6] = {1e-9,-1e-9,1e-7,-1e-7,1e-5,-1e-5};
     CutElemOps best = E;
     for (double eps : epsL) {
       PolyND ps = phi; ps.at(0,0,0) = (real)((double)ps.at(0,0,0) + eps);
       CutElemOps T;
-      if (!cutElemBuildRaw(ps, N, T, ar, cfg, scratch)) continue;
+      if (!cutElemBuildRaw(ps, N, T, ar, cfg, scratch, faceOverride)) continue;
       if (T.bndIncons < best.bndIncons) best = T;
       if (best.bndIncons <= qualTol) break;
     }
     E = best;
   }
+  // GEOMETRIC snap, unconditional: a nearly-full cell with a pin-prick of wall
+  // (the tangency GRAZE: the arc clips a corner) is not a meaningful cut cell.
+  // This must NOT be gated on bndIncons -- the shared-face canonicalization
+  // makes bndIncons exactly 0 on such cells, which silently un-snapped them and
+  // left live P2 cells with needle walls paired against P0 wedges across the
+  // tangency face (the surviving supersonic blowup pair).
+  if (E.volume > 0.97 && E.wallArea < 0.05) { E.snap = 1; return true; }
+  if (E.volume < 0.03 && E.wallArea < 0.05) { E.snap = 2; return true; }
   if (E.bndIncons > qualTol) {
     // still inconsistent: if the cut is marginal, drop the feature entirely
     if (E.volume > 0.97 && E.wallArea < 0.2) { E.snap = 1; return true; }

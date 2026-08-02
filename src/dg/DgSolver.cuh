@@ -279,6 +279,8 @@ public:
   SayeNode *cutVolP = nullptr;  i32 *cutVolOff = nullptr;   // [nCutElem+1]
   SayeNode *cutWalP = nullptr;  i32 *cutWalOff = nullptr;   // [nCutElem+1]
   SayeNode *cutFacP = nullptr;  i32 *cutFacOff = nullptr;   // [6*nCutElem+1]
+  real *cutFacA = nullptr;      // [6*nCutElem] fluid area of each cut face --
+                                // ~1 selects the conforming GLL mortar path
 
   i32  ibOn;           // 1 = ghost-element immersed boundary active (cylinder SDF)
   real ibX, ibY;       // cylinder center

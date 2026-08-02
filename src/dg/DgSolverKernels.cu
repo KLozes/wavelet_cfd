@@ -5738,6 +5738,23 @@ __device__ __forceinline__ void dgLag3(const real xr[3], real *phi) {
 
 static constexpr i32 CUT_NBMAX = 20;    // total-degree P^3 in 3-D
 
+// Zhang-Shu-limit a cut element's trace state toward its fluid mean (sC[0] IS
+// the mean: psi_0 = 1).  A modal trace can overshoot near under-resolved
+// features; every consumer of a trace (faces, wall, mortar) limits first --
+// the same protection the FRIB wall path gives its traces.
+__device__ __forceinline__ void dgCutLimitTrace(const real *sC, real U[5]) {
+  real Ub[5];
+  for (i32 q = 0; q < 5; q++) Ub[q] = sC[q];      // mode-0 row: sC[0*5+q]
+  real rb = fmax(Ub[0], DG_EPSF), pb = dgPressureFromCons(Ub);
+  real th = (real)1.0, rf = (real)0.2*rb, pf = (real)0.2*fmax(pb, DG_EPSF);
+  real rhoM = fmax(U[0], DG_EPSF), pM = dgPressureFromCons(U);
+  if (rhoM < rf) th = fmin(th, (rb-rf)/fmax(rb-rhoM, DG_EPSF));
+  if (pM   < pf) th = fmin(th, (pb-pf)/fmax(pb-pM,   DG_EPSF));
+  th = fmax(th, (real)0.0);
+  for (i32 q = 0; q < 5; q++) U[q] = Ub[q] + th*(U[q]-Ub[q]);
+  dgSanitizeCons(U);
+}
+
 // modal basis value / gradient at a reference point, from the stored centroid
 // and scale.  Mirrors CutBasis so the device and the host builder agree.
 __device__ __forceinline__ void dgCutPsi(const real cen[4], const real xr[3],
@@ -5935,7 +5952,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
       real U[5];
       for (i32 q = 0; q < 5; q++) { real v = 0;
         for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*psi[m]; U[q] = v; }
-      dgSanitizeCons(U);
+      dgCutLimitTrace(sC, U);
       real W[5]; W[0]=fmax(U[0],DG_EPSF);
       W[1]=U[1]/W[0]; W[2]=U[2]/W[0]; W[3]=U[3]/W[0]; W[4]=dgPressureFromCons(U);
       // NANSON: the reference normal is not the physical one unless the cell is
@@ -5964,6 +5981,74 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     // cut, so nothing is double counted.
     if (grid.cutDbgMask & 2)
     for (i32 f = 0; f < 6; f++) {
+      // ---- CONFORMING GLL MORTAR (cut <-> Cartesian, full fluid face) ------
+      // ONE flux per shared GLL face node, used by BOTH sides: my modal weak
+      // integral over the tensor GLL face rule, and their native pointwise
+      // sgn*jacDir*winv lift.  That is exactly the conforming-DG coupling, so
+      // the neighbour keeps its SBP stability structure and the interface flux
+      // is single-valued (conservative in the native discrete sense).  The
+      // quadrature-lifted deposit that predated this broke that structure and
+      // was the proven supersonic instability vector (mask-7 bisection).
+      {
+        const i32 dM = f/2, sideM = f%2;
+        i32 oM[3] = {1,1,1}; oM[dM] = sideM ? 2 : 0;
+        i32 nbM = grid.nbrIdxList[27*b + oM[0] + 3*oM[1] + 9*oM[2]];
+        if (nbM == bEmpty) nbM = -1;
+        const bool fullFace = fabs(grid.cutFacA[6*c+f] - (real)1.0) < (real)1e-6;
+        if ((grid.cutDbgMask & 8) && fullFace && nbM >= 0 && grid.blkCut[nbM] < 0) {
+          const real sgM  = sideM ? (real)1.0 : (real)-1.0;
+          const real jacD = (real)2.0/h[dM];
+          const i32  nrmN = sideM ? 0 : (NNODE-1);
+          const real sgnN = sideM ? (real)1.0 : (real)-1.0;
+          const i32  t1ax = (dM==0) ? 1 : 0, t2ax = (dM==2) ? 1 : 2;
+          for (i32 fn = threadIdx.x; fn < NNODE*NNODE; fn += blockDim.x) {
+            const i32 fa = fn % NNODE, fb = fn / NNODE;
+            real xr[3]; xr[dM] = sideM ? (real)1.0 : (real)0.0;
+            xr[t1ax] = (real)0.5*(c_xi[fa]+(real)1.0);
+            xr[t2ax] = (real)0.5*(c_xi[fb]+(real)1.0);
+            real psi[CUT_NBMAX];
+            dgCutPsi(cen, xr, nb, psi, nullptr);
+            real Um[5];
+            for (i32 q = 0; q < 5; q++) { real v = 0;
+              for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*psi[m]; Um[q] = v; }
+            dgCutLimitTrace(sC, Um);
+            real Wm[5]; Wm[0]=fmax(Um[0],DG_EPSF);
+            Wm[1]=Um[1]/Wm[0]; Wm[2]=Um[2]/Wm[0]; Wm[3]=Um[3]/Wm[0];
+            Wm[4]=dgPressureFromCons(Um);
+            i32 nodeIdx;
+            { i32 ci3[3]; ci3[dM] = nrmN; ci3[t1ax] = fa; ci3[t2ax] = fb;
+              nodeIdx = ci3[0] + NNODE*(ci3[1] + NNODE*ci3[2]); }
+            real Uo[5], Wo[5];
+            for (i32 q = 0; q < 5; q++)
+              Uo[q] = grid.getField(D_RHO+q)[(size_t)nbM*blockSizeTot + nodeIdx];
+            dgSanitizeCons(Uo);
+            Wo[0]=fmax(Uo[0],DG_EPSF);
+            Wo[1]=Uo[1]/Wo[0]; Wo[2]=Uo[2]/Wo[0]; Wo[3]=Uo[3]/Wo[0];
+            Wo[4]=dgPressureFromCons(Uo);
+            real fs[5];
+            if (sideM) dgRusanovAxis(Wm, Wo, dM, fs); else dgRusanovAxis(Wo, Wm, dM, fs);
+            if (grid.avOn) {
+              real nuMe = grid.getField(D_SCRATCH)[(u64)b*blockSizeTot];
+              real nuNb = grid.getField(D_SCRATCH)[(u64)nbM*blockSizeTot];
+              real sig = sideM ? dgPenaltySigma(grid, nuMe, nuNb, Wm, Wo)
+                               : dgPenaltySigma(grid, nuNb, nuMe, Wo, Wm);
+              real Umc[5], Uoc[5]; dgP2C(Wm, Umc); dgP2C(Wo, Uoc);
+              if (sideM) for (i32 q=0;q<5;q++) fs[q] -= sig*(Uoc[q]-Umc[q]);
+              else       for (i32 q=0;q<5;q++) fs[q] -= sig*(Umc[q]-Uoc[q]);
+            }
+            // my side: weak face term over the GLL face rule (reference measure)
+            const real w2d = (real)0.25*c_w[fa]*c_w[fb]/h[dM];
+            for (i32 m = 0; m < nb; m++) for (i32 q = 0; q < 5; q++)
+              atomicAdd(&sR[m*5+q], -sgM*w2d*fs[q]*psi[m]);
+            // their side: the native pointwise lift of the SAME flux
+            real fOwn[5]; dgEulerFluxAxis(Wo, dM, fOwn);
+            for (i32 q = 0; q < 5; q++)
+              atomicAdd(&grid.getField(D_RHS+q)[(size_t)nbM*blockSizeTot + nodeIdx],
+                        sgnN*jacD*c_winv[nrmN]*(fs[q] - fOwn[q]));
+          }
+          continue;                        // this face is fully handled
+        }
+      }
       const i32 d = f/2, side = f%2;
       const i32 f0 = grid.cutFacOff[6*c+f], fn = grid.cutFacOff[6*c+f+1]-f0;
       if (fn == 0) continue;
@@ -5982,7 +6067,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         real Um[5];
         for (i32 q = 0; q < 5; q++) { real v = 0;
           for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*psi[m]; Um[q] = v; }
-        dgSanitizeCons(Um);
+        dgCutLimitTrace(sC, Um);
         real Wm[5]; Wm[0]=fmax(Um[0],DG_EPSF);
         Wm[1]=Um[1]/Wm[0]; Wm[2]=Um[2]/Wm[0]; Wm[3]=Um[3]/Wm[0]; Wm[4]=dgPressureFromCons(Um);
         // neighbour trace at the SAME physical point: its reference coordinate
@@ -6003,26 +6088,6 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         } else {
           for (i32 q = 0; q < 5; q++) Wo[q] = Wm[q];      // outflow / copy
         }
-        // Zhang-Shu-limit MY trace toward the element's fluid mean (mode 0 --
-        // psi_0 = 1, so sC[0] IS the fluid-region mean): a P2 modal trace can
-        // overshoot near a wall-tangent face, and the deposit otherwise feeds
-        // that overshoot straight to the neighbour.  Mirrors the FRIB wall
-        // path's trace limiting.
-        {
-          real Ub[5];
-          for (i32 q = 0; q < 5; q++) Ub[q] = sC[0*5+q];
-          real rb = fmax(Ub[0], DG_EPSF), pb = dgPressureFromCons(Ub);
-          real th = (real)1.0;
-          real rf = (real)0.2*rb, pf = (real)0.2*fmax(pb, DG_EPSF);
-          real rhoM = fmax(Um[0], DG_EPSF), pM = dgPressureFromCons(Um);
-          if (rhoM < rf) th = fmin(th, (rb-rf)/fmax(rb-rhoM, DG_EPSF));
-          if (pM   < pf) th = fmin(th, (pb-pf)/fmax(pb-pM,   DG_EPSF));
-          th = fmax(th, (real)0.0);
-          for (i32 q = 0; q < 5; q++) Um[q] = Ub[q] + th*(Um[q]-Ub[q]);
-          dgSanitizeCons(Um);
-          Wm[0]=fmax(Um[0],DG_EPSF);
-          Wm[1]=Um[1]/Wm[0]; Wm[2]=Um[2]/Wm[0]; Wm[3]=Um[3]/Wm[0]; Wm[4]=dgPressureFromCons(Um);
-        }
         real Fs[5];
         if (side) dgRusanovAxis(Wm, Wo, d, Fs); else dgRusanovAxis(Wo, Wm, d, Fs);
         // AV jump penalty, exactly as the Cartesian face path applies it: the
@@ -6040,78 +6105,6 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         for (i32 m = 0; m < nb; m++) for (i32 q = 0; q < 5; q++)
           atomicAdd(&sR[m*5+q], -s.w*sg*Fs[q]*psi[m]*dSf);
         // (neighbour share handled node-pointwise below, outside this loop)
-      }
-      // ---- NEIGHBOUR DEPOSIT, node-pointwise ------------------------------
-      // The first deposit L2-lifted quadrature-point fluxes through phi/mdiag.
-      // That is NOT the native coupling: the Cartesian scheme's stability
-      // rests on the SBP pairing of a POINTWISE face flux at ITS OWN nodes
-      // with the diagonal-mass lift, and the mismatch pumped energy at
-      // supersonic conditions (mask-7 bisection: removing the deposit made
-      // Mach 1.5 run clean).  So compute the correction exactly the way the
-      // neighbour's own kernel would: MY modal trace evaluated AT ITS 16 face
-      // nodes, ITS nodal value there, Rusanov + AV penalty, and the native
-      // sgn*jacDir*winv lift.  (Exact cross-face conservation is now O(h^p)
-      // instead of exact -- the mortar-style matched-quadrature fix is noted
-      // follow-up; the native coarse/fine faces accept the same trade.)
-      if ((grid.cutDbgMask & 8) && nbIdx >= 0 && grid.blkCut[nbIdx] < 0) {
-        const real jacD = (real)2.0/h[d];
-        const i32 nrmN  = side ? 0 : (NNODE-1);       // their face-normal node index
-        const real sgnN = side ? (real)1.0 : (real)-1.0;  // their sgn (their side = 1-side)
-        for (i32 fn = threadIdx.x; fn < NNODE*NNODE; fn += blockDim.x) {
-          const i32 fa = fn % NNODE, fb = fn / NNODE;
-          // their face node in the shared-face plane, in MY reference coords
-          const i32 t1ax = (d==0) ? 1 : 0, t2ax = (d==2) ? 1 : 2;
-          real xr[3]; xr[d] = side ? (real)1.0 : (real)0.0;
-          xr[t1ax] = (real)0.5*(c_xi[fa]+(real)1.0);
-          xr[t2ax] = (real)0.5*(c_xi[fb]+(real)1.0);
-          real psi[CUT_NBMAX];
-          dgCutPsi(cen, xr, nb, psi, nullptr);
-          real Um[5];
-          for (i32 q = 0; q < 5; q++) { real v = 0;
-            for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*psi[m]; Um[q] = v; }
-          dgSanitizeCons(Um);
-          // Zhang-Shu the trace toward the fluid mean (as the wall path does)
-          {
-            real Ub[5]; for (i32 q = 0; q < 5; q++) Ub[q] = sC[0*5+q];
-            real rb = fmax(Ub[0], DG_EPSF), pb = dgPressureFromCons(Ub);
-            real th = (real)1.0, rf = (real)0.2*rb, pf = (real)0.2*fmax(pb, DG_EPSF);
-            real rhoM = fmax(Um[0], DG_EPSF), pM = dgPressureFromCons(Um);
-            if (rhoM < rf) th = fmin(th, (rb-rf)/fmax(rb-rhoM, DG_EPSF));
-            if (pM   < pf) th = fmin(th, (pb-pf)/fmax(pb-pM,   DG_EPSF));
-            th = fmax(th, (real)0.0);
-            for (i32 q = 0; q < 5; q++) Um[q] = Ub[q] + th*(Um[q]-Ub[q]);
-            dgSanitizeCons(Um);
-          }
-          real Wm2[5]; Wm2[0]=fmax(Um[0],DG_EPSF);
-          Wm2[1]=Um[1]/Wm2[0]; Wm2[2]=Um[2]/Wm2[0]; Wm2[3]=Um[3]/Wm2[0];
-          Wm2[4]=dgPressureFromCons(Um);
-          // their nodal state AT this face node (no interpolation)
-          i32 nodeIdx;
-          { i32 ci3[3]; ci3[d] = nrmN; ci3[t1ax] = fa; ci3[t2ax] = fb;
-            nodeIdx = ci3[0] + NNODE*(ci3[1] + NNODE*ci3[2]); }
-          real Uo[5], Wo2[5];
-          for (i32 q = 0; q < 5; q++)
-            Uo[q] = grid.getField(D_RHO+q)[(size_t)nbIdx*blockSizeTot + nodeIdx];
-          dgSanitizeCons(Uo);
-          Wo2[0]=fmax(Uo[0],DG_EPSF);
-          Wo2[1]=Uo[1]/Wo2[0]; Wo2[2]=Uo[2]/Wo2[0]; Wo2[3]=Uo[3]/Wo2[0];
-          Wo2[4]=dgPressureFromCons(Uo);
-          real fs2[5];
-          if (side) dgRusanovAxis(Wm2, Wo2, d, fs2); else dgRusanovAxis(Wo2, Wm2, d, fs2);
-          if (grid.avOn) {
-            real nuMe = grid.getField(D_SCRATCH)[(u64)b*blockSizeTot];
-            real nuNb = grid.getField(D_SCRATCH)[(u64)nbIdx*blockSizeTot];
-            real sig = side ? dgPenaltySigma(grid, nuMe, nuNb, Wm2, Wo2)
-                            : dgPenaltySigma(grid, nuNb, nuMe, Wo2, Wm2);
-            real Umc[5], Uoc[5]; dgP2C(Wm2, Umc); dgP2C(Wo2, Uoc);
-            if (side) for (i32 q=0;q<5;q++) fs2[q] -= sig*(Uoc[q]-Umc[q]);
-            else      for (i32 q=0;q<5;q++) fs2[q] -= sig*(Umc[q]-Uoc[q]);
-          }
-          real fOwn2[5]; dgEulerFluxAxis(Wo2, d, fOwn2);
-          for (i32 q = 0; q < 5; q++)
-            atomicAdd(&grid.getField(D_RHS+q)[(size_t)nbIdx*blockSizeTot + nodeIdx],
-                      sgnN*jacD*c_winv[nrmN]*(fs2[q] - fOwn2[q]));
-        }
       }
     }
     __syncthreads();

@@ -86,8 +86,35 @@ void DgSolver::buildCutElems(void) {
     if (!anyF) { ibClassList[b] = IB_DEAD; nSolid++; continue; }  // not evolved
 
     PolyND phi = fitPoly3(dgOrder, v.data());
+    // SHARED-FACE CANONICALIZATION.  The two fits RESTRICT IDENTICALLY to a
+    // shared face in exact arithmetic (fitPoly3 interpolates; the face's
+    // (p+1)^2 Lobatto samples are the same physical nodes; a tensor degree-p
+    // restriction is unique in those values) -- but in floating point each side
+    // evaluates from different 3-D coefficients, and at a TANGENCY the ulp
+    // differences flip Saye branches: the measured mirror-pair asymmetry
+    // (bndIncons 8.5e-6 vs 7.8e-3 on identical geometry) was exactly that.
+    // The block loop ascends, so an already-built cut neighbour OWNS the shared
+    // face: flip its rule into our frame and pass it as an override.
+    std::vector<SayeNode> ovStore[6];
+    const std::vector<SayeNode> *ovPtr[6] = {nullptr,nullptr,nullptr,nullptr,nullptr,nullptr};
+    {
+      const i32 faceOff2[6][3] = {{-1,0,0},{1,0,0},{0,-1,0},{0,1,0},{0,0,-1},{0,0,1}};
+      for (i32 fc = 0; fc < 6; fc++) {
+        i32 o[3] = {1+faceOff2[fc][0], 1+faceOff2[fc][1], 1+faceOff2[fc][2]};
+        i32 nn = nbrIdxList[27*b + o[0] + 3*o[1] + 9*o[2]];
+        if (nn == bEmpty || nn < 0) continue;
+        // already-built cut neighbour?
+        i32 cnb = -1;
+        for (size_t cc = 0; cc < blkOf.size(); cc++) if (blkOf[cc] == nn) { cnb = (i32)cc; break; }
+        if (cnb < 0) continue;
+        const i32 d2 = fc/2, myS = fc%2, nbF = 2*d2 + (1-myS);   // their matching face
+        ovStore[fc] = ops[cnb].face[nbF];
+        for (SayeNode &sn : ovStore[fc]) sn.x[d2] = (real)1.0 - sn.x[d2];
+        ovPtr[fc] = &ovStore[fc];
+      }
+    }
     CutElemOps E;
-    if (!cutElemBuild(phi, N, E, ar, cfg, scratch)) continue;
+    if (!cutElemBuild(phi, N, E, ar, cfg, scratch, 1e-6, ovPtr)) continue;
     // SNAPPED elements: the cut machinery half-saw a sub-resolution feature and
     // its rules were irreparably inconsistent.  Dropping the feature keeps the
     // GCL exact; the cost is the pocket volume, which is below resolution.
@@ -127,6 +154,7 @@ void DgSolver::buildCutElems(void) {
   devS(volOff[nCutElem], &cutVolP);
   devS(walOff[nCutElem], &cutWalP);
   devS(facOff[6*nCutElem], &cutFacP);
+  cudaMallocManaged(&cutFacA, (size_t)6*nCutElem*sizeof(real));
   cudaMallocManaged(&cutBlk,  nCutElem*sizeof(i32));
   cudaMallocManaged(&cutNbOf, nCutElem*sizeof(i32));
   cudaMallocManaged(&cutNbLo, nCutElem*sizeof(i32));
@@ -153,7 +181,11 @@ void DgSolver::buildCutElems(void) {
     cutCen[4*c+2]=(real)E.B.c[2]; cutCen[4*c+3]=(real)E.B.s;
     for (const SayeNode &s : E.vol)  cutVolP[nVolT++] = s;
     for (const SayeNode &s : E.wall) cutWalP[nWalT++] = s;
-    for (i32 f = 0; f < 6; f++) for (const SayeNode &s : E.face[f]) cutFacP[nFacT++] = s;
+    for (i32 f = 0; f < 6; f++) {
+      double a = 0;
+      for (const SayeNode &s : E.face[f]) { cutFacP[nFacT++] = s; a += (double)s.w; }
+      cutFacA[6*c+f] = (real)a;
+    }
     // DENSE inverse mass: the kernel applies M^-1 as a matvec rather than
     // carrying a triangular solve, which is the wrong shape for a GPU thread.
     const i32 nbE = E.B.nb;               // may be < nb on a degenerate sliver
