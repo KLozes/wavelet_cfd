@@ -355,7 +355,7 @@ real DgSolver::step(real tStep) {
       if (gauss) dgRhsGaussKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (T)); \
       else dgRhsKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (T)); \
       if (cutOn) { \
-        size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 1)*sizeof(real); \
+        size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 2)*sizeof(real); \
         dgRhsCutKernel<<<nCutElem, blockSizeTot, shm>>>(*this, (T)); } } while (0)
     for (i32 stage = 0; stage < 3; stage++) {
       // SSP-RK3 stage abscissae: t, t+dt, t+dt/2

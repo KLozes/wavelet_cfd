@@ -196,6 +196,7 @@ int main(int argc, char* argv[]) {
   solver->cutOn       = argI("--cutcell", 0);   // cut-cell DG (replaces the IB family)
   solver->cutFsp      = argI("--cutfsp", 0);    // transparent-wall free-stream gate
   solver->cutDbgMask  = argI("--cutmask", 15);  // term mask (debug bisection)
+  solver->cutEta      = argF("--cuteta", 0.05); // modal-decay trouble threshold
   i32 cutProbe        = argI("--cutprobe", 0);  // isolate cut RHS terms and exit
   solver->ibBrink     = argI("--ibbrink", 0);      // 1 = volume-penalization IB
   solver->ibBrinkEps  = argF("--ibbrinkeps", 1e-4);

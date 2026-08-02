@@ -125,6 +125,13 @@ struct CutElemOps {
   std::vector<SayeNode> face[6];    // cut-face rules (normal = +/- e_d)
   std::vector<SayeNode> wall;       // wall rule, .n carries the outward normal
   std::vector<double>   Mchol;      // Cholesky factor of M = V^T W V
+  std::vector<double>   M11inv;     // inverse of the degree<=(N-1) sub-mass --
+                                    // the monomial ordering is DEGREE-MAJOR, so
+                                    // this is the leading block of M.  Feeds the
+                                    // modal-decay trouble sensor: with r = M c in
+                                    // hand, eta = 1 - (z^T b)/(c^T r), z = M11^-1 b,
+                                    // b = r[0..k) -- no extra mass matvec needed.
+  i32                   nbLo=0;     // its size = count(deg-1); 0 => no sensor
   double volume=0, wallArea=0;
   double momResid=0;                // GCL residual BEFORE the correction
   i32    nNegW=0;                   // weights driven negative by the correction

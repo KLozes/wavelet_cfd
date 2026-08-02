@@ -129,6 +129,9 @@ void DgSolver::buildCutElems(void) {
   devS(facOff[6*nCutElem], &cutFacP);
   cudaMallocManaged(&cutBlk,  nCutElem*sizeof(i32));
   cudaMallocManaged(&cutNbOf, nCutElem*sizeof(i32));
+  cudaMallocManaged(&cutNbLo, nCutElem*sizeof(i32));
+  cudaMallocManaged(&cutM11,  (size_t)nCutElem*CUT_NBMAX_H*CUT_NBMAX_H*sizeof(real));
+  memset(cutM11, 0, (size_t)nCutElem*CUT_NBMAX_H*CUT_NBMAX_H*sizeof(real));
   cudaMallocManaged(&cutCen,  (size_t)nCutElem*4*sizeof(real));
   cudaMallocManaged(&cutQual, (size_t)nCutElem*sizeof(real));
   cudaMallocManaged(&cutMinv, (size_t)nCutElem*CUT_NBMAX_H*CUT_NBMAX_H*sizeof(real));
@@ -141,6 +144,10 @@ void DgSolver::buildCutElems(void) {
     const CutElemOps &E = ops[c];
     cutBlk[c] = blkOf[c];  blkCut[blkOf[c]] = c;
     cutNbOf[c] = E.B.nb;
+    cutNbLo[c] = E.nbLo;
+    for (i32 i = 0; i < E.nbLo; i++) for (i32 j = 0; j < E.nbLo; j++)
+      cutM11[(size_t)c*CUT_NBMAX_H*CUT_NBMAX_H + (size_t)i*CUT_NBMAX_H + j] =
+        (real)E.M11inv[(size_t)i*E.nbLo + j];
     cutQual[c] = (real)E.bndIncons;
     cutCen[4*c+0]=(real)E.B.c[0]; cutCen[4*c+1]=(real)E.B.c[1];
     cutCen[4*c+2]=(real)E.B.c[2]; cutCen[4*c+3]=(real)E.B.s;
@@ -195,7 +202,7 @@ void DgSolver::probeCutRhs(void) {
   for (i32 q = 0; q < 5; q++)
     cudaMemset(getField(D_RHS+q), 0, (size_t)nBlocksMax*blockSizeTot*sizeof(real));
   dgRhsKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (real)0);
-  size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 1)*sizeof(real);
+  size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 2)*sizeof(real);
   dgRhsCutKernel<<<nCutElem, blockSizeTot, shm>>>(*this, (real)0);
   cudaDeviceSynchronize();
   double mCut=0, mNbr=0, mFar=0; i32 bCut=-1,bNbr=-1;

@@ -269,6 +269,9 @@ public:
   i32  *cutBlk = nullptr;  // [nCutElem]   owning block of a cut element
   i32  *cutNbOf= nullptr;  // [nCutElem]   modes actually carried (degree may be
                            //              REDUCED on degenerate slivers)
+  i32  *cutNbLo= nullptr;  // [nCutElem]   low-degree mode count for the decay sensor
+  real *cutM11 = nullptr;  // [nCutElem*CUT_NBMAX^2] low-degree sub-mass inverse
+  real  cutEta = (real)0.05;  // modal-decay trouble threshold (--cuteta)
   real *cutCen = nullptr;  // [nCutElem*4] basis centroid (3) + scale (1)
   real *cutMinv= nullptr;  // [nCutElem*cutNb*cutNb] DENSE inverse mass matrix
   real *cutQual= nullptr;  // [nCutElem] bndIncons -- per-element geometry quality
