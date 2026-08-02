@@ -261,6 +261,10 @@ dgsrd_test: $(SRC_DIR)/dg/DgSrdTest.cu $(HDRS)
 iga_euler1d: $(SRC_DIR)/fem/IgaEuler1dTest.cu $(HDRS)
 	$(NVCC) $(FEMTEST_FLAGS) $< -o $@
 
+# IGA compressible flow, step 2: 2-D Euler + cut-cell cylinder (vortex/fsp/cyl gates)
+iga_euler2d: $(SRC_DIR)/fem/IgaEuler2dTest.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) -Xcompiler -fopenmp $< -o $@
+
 femtests: saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
 clean:
