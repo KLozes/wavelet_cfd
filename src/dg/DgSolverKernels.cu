@@ -5770,13 +5770,24 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
   real *sU = sh;                       // [5][blockSizeTot] nodal state
   real *sR = sU + 5*blockSizeTot;      // [nb][5] modal residual
   real *sC = sR + 5*CUT_NBMAX;         // [nb][5] modal coefficients
+  real *sLam = sC + 5*CUT_NBMAX;       // [1] element wave-speed reduce (AV)
 
   for (i32 c = blockIdx.x; c < grid.nCutElem; c += gridDim.x) {
     const i32 b = grid.cutBlk[c];
     i32 lvl, ib, jb, kb; grid.decode(grid.bLocList[b], lvl, ib, jb, kb);
     real h[3]; dgElemSize(grid, lvl, h);
     const real *cen = grid.cutCen + 4*c;
-    const i32 nb = grid.cutNbOf[c];        // reduced on degenerate slivers
+    i32 nb = grid.cutNbOf[c];              // reduced on degenerate slivers
+    // CUT-MOOD: when the element's own shock sensor fires, evaluate THIS RHS
+    // at P0 -- the flux terms and traces of a troubled cut element go first
+    // order for the step, exactly the FV fallback MOOD gives Cartesian
+    // elements, and recover to P^N when the sensor clears.  The projection
+    // below still uses the full basis, so the STATE keeps its modes; only the
+    // dynamics drop order.  Wall-tangent cells host sub-cell wedges no P^N
+    // basis can resolve at supersonic speeds; this is their escape.
+    real thMe = grid.getField(D_SCRATCH)[(u64)b*blockSizeTot + 1];
+    const i32 nbFull = nb;
+    if (grid.avOn && thMe > (real)0.35) nb = 1;
     const real *Minv = grid.cutMinv + (size_t)c*CUT_NBMAX*CUT_NBMAX;
 
     for (i32 i = threadIdx.x; i < blockSizeTot; i += blockDim.x)
@@ -5786,26 +5797,59 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     __syncthreads();
 
     // ---- nodal -> modal:  c = M^-1 SUM_q w_q psi(x_q) u(x_q) ---------------
+    // FULL basis: the state keeps its modes even when the flux evaluation
+    // below is order-dropped.
     for (i32 g = threadIdx.x; g < grid.cutVolOff[c+1]-grid.cutVolOff[c]; g += blockDim.x) {
       const SayeNode &s = grid.cutVolP[grid.cutVolOff[c] + g];
       real psi[CUT_NBMAX], phi[blockSizeTot];
-      dgCutPsi(cen, s.x, nb, psi, nullptr);
+      dgCutPsi(cen, s.x, nbFull, psi, nullptr);
       dgLag3(s.x, phi);
       for (i32 q = 0; q < 5; q++) {
         real uq = 0;
         for (i32 a = 0; a < blockSizeTot; a++) uq += sU[q*blockSizeTot+a]*phi[a];
-        for (i32 m = 0; m < nb; m++) atomicAdd(&sR[m*5+q], s.w*psi[m]*uq);
+        for (i32 m = 0; m < nbFull; m++) atomicAdd(&sR[m*5+q], s.w*psi[m]*uq);
       }
     }
     __syncthreads();
-    for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) {
+    for (i32 i = threadIdx.x; i < nbFull*5; i += blockDim.x) {
       i32 m = i/5, q = i%5; real v = 0;
-      for (i32 n2 = 0; n2 < nb; n2++) v += Minv[(size_t)m*CUT_NBMAX+n2]*sR[n2*5+q];
+      for (i32 n2 = 0; n2 < nbFull; n2++) v += Minv[(size_t)m*CUT_NBMAX+n2]*sR[n2*5+q];
       sC[i] = v;
     }
     __syncthreads();
     for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) sR[i] = 0;
+    if (threadIdx.x == 0) sLam[0] = 0;
     __syncthreads();
+
+    // ---- ARTIFICIAL VISCOSITY, element-local LDG (mirrors the Cartesian
+    //      two-pass BR1 term at DgSolverKernels:2076): nu_e = avCav * theta *
+    //      (h/(2p+1)) * lambda_e, with theta from the SAME Ducros/Persson
+    //      sensor slot the Cartesian elements publish (dgAvNuKernel runs on
+    //      every active block, cut ones included -- their nodal values are the
+    //      modal extension, which is exactly what the sensor should look at).
+    //      The modal gradient is ANALYTIC, so the viscous volume term is one
+    //      extra dot product per quadrature point; face dissipation is already
+    //      present via the Rusanov jump term.
+    real nuE = 0;
+    if (grid.avOn) {
+      for (i32 g = threadIdx.x; g < grid.cutVolOff[c+1]-grid.cutVolOff[c]; g += blockDim.x) {
+        const SayeNode &s = grid.cutVolP[grid.cutVolOff[c] + g];
+        real psi[CUT_NBMAX];
+        dgCutPsi(cen, s.x, nb, psi, nullptr);
+        real U[5];
+        for (i32 q = 0; q < 5; q++) { real v = 0;
+          for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*psi[m]; U[q] = v; }
+        dgSanitizeCons(U);
+        real rho = fmax(U[0], DG_EPSF);
+        real p = dgPressureFromCons(U);
+        real lam = (fabs(U[1])+fabs(U[2])+fabs(U[3]))/rho + dgSoundSpeed(p, rho);
+        atomicMax((unsigned long long*)sLam, (unsigned long long)__double_as_longlong(lam));
+      }
+      __syncthreads();
+      real theta = grid.getField(D_SCRATCH)[(u64)b*blockSizeTot + 1];
+      real lenp  = h[0]/(real)(2*dgOrder+1);
+      nuE = grid.avCav * theta * lenp * __longlong_as_double(*(long long*)sLam);
+    }
 
     // ---- volume:  + INT F_d(u) d(psi_m)/dx_d dV ----------------------------
     if (grid.cutDbgMask & 1)
@@ -5828,6 +5872,22 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         real jac = (real)1.0/h[d];
         for (i32 m = 0; m < nb; m++) for (i32 q = 0; q < 5; q++)
           atomicAdd(&sR[m*5+q], s.w*F[q]*dpsi[3*m+d]*jac);
+      }
+      // AV:  R_m -= INT nu grad(U) . grad(psi_m) dV   (reference measure; the
+      // physical gradients carry 1/h_d each).  Conservative-variable Laplacian,
+      // like the Cartesian term.
+      if (nuE > (real)0.0) {
+        real gU[5][3];
+        for (i32 q = 0; q < 5; q++) for (i32 d = 0; d < 3; d++) {
+          real v = 0;
+          for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*dpsi[3*m+d];
+          gU[q][d] = v/h[d];
+        }
+        for (i32 m = 0; m < nb; m++) for (i32 q = 0; q < 5; q++) {
+          real acc = 0;
+          for (i32 d = 0; d < 3; d++) acc += gU[q][d]*dpsi[3*m+d]/h[d];
+          atomicAdd(&sR[m*5+q], -s.w*nuE*acc);
+        }
       }
     }
     // ---- wall:  - INT (F_wall.n) psi_m dS ---------------------------------
@@ -5907,8 +5967,40 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         } else {
           for (i32 q = 0; q < 5; q++) Wo[q] = Wm[q];      // outflow / copy
         }
+        // Zhang-Shu-limit MY trace toward the element's fluid mean (mode 0 --
+        // psi_0 = 1, so sC[0] IS the fluid-region mean): a P2 modal trace can
+        // overshoot near a wall-tangent face, and the deposit otherwise feeds
+        // that overshoot straight to the neighbour.  Mirrors the FRIB wall
+        // path's trace limiting.
+        {
+          real Ub[5];
+          for (i32 q = 0; q < 5; q++) Ub[q] = sC[0*5+q];
+          real rb = fmax(Ub[0], DG_EPSF), pb = dgPressureFromCons(Ub);
+          real th = (real)1.0;
+          real rf = (real)0.2*rb, pf = (real)0.2*fmax(pb, DG_EPSF);
+          real rhoM = fmax(Um[0], DG_EPSF), pM = dgPressureFromCons(Um);
+          if (rhoM < rf) th = fmin(th, (rb-rf)/fmax(rb-rhoM, DG_EPSF));
+          if (pM   < pf) th = fmin(th, (pb-pf)/fmax(pb-pM,   DG_EPSF));
+          th = fmax(th, (real)0.0);
+          for (i32 q = 0; q < 5; q++) Um[q] = Ub[q] + th*(Um[q]-Ub[q]);
+          dgSanitizeCons(Um);
+          Wm[0]=fmax(Um[0],DG_EPSF);
+          Wm[1]=Um[1]/Wm[0]; Wm[2]=Um[2]/Wm[0]; Wm[3]=Um[3]/Wm[0]; Wm[4]=dgPressureFromCons(Um);
+        }
         real Fs[5];
         if (side) dgRusanovAxis(Wm, Wo, d, Fs); else dgRusanovAxis(Wo, Wm, d, Fs);
+        // AV jump penalty, exactly as the Cartesian face path applies it: the
+        // deposit is the only face flux these two elements exchange, so it must
+        // carry the same dissipation the native path would.
+        if (grid.avOn) {
+          real nuMe = grid.getField(D_SCRATCH)[(u64)b*blockSizeTot];
+          real nuNb = (nbIdx >= 0) ? grid.getField(D_SCRATCH)[(u64)nbIdx*blockSizeTot] : nuMe;
+          real sig = side ? dgPenaltySigma(grid, nuMe, nuNb, Wm, Wo)
+                          : dgPenaltySigma(grid, nuNb, nuMe, Wo, Wm);
+          real Umc[5], Uoc[5]; dgP2C(Wm, Umc); dgP2C(Wo, Uoc);
+          if (side) for (i32 q=0;q<5;q++) Fs[q] -= sig*(Uoc[q]-Umc[q]);
+          else      for (i32 q=0;q<5;q++) Fs[q] -= sig*(Umc[q]-Uoc[q]);
+        }
         for (i32 m = 0; m < nb; m++) for (i32 q = 0; q < 5; q++)
           atomicAdd(&sR[m*5+q], -s.w*sg*Fs[q]*psi[m]*dSf);
         // The neighbour's share.  The Cartesian solver is STRONG-form DGSEM: its

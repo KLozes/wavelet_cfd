@@ -260,7 +260,10 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
 
   // ---- step 2+3, per candidate degree: GCL correction, then the mass -------
   std::vector<SayeNode> volKeep(E.vol);      // pre-correction weights
-  for (i32 deg = N; deg >= 0; deg--) {
+  i32 degTop = N;
+  { const char *de = getenv("CUT_DEGMAX");
+    if (de) { i32 v = atoi(de); if (v >= 0 && v < degTop) degTop = v; } }
+  for (i32 deg = degTop; deg >= 0; deg--) {
   Bs.init(deg, cc, sqrt(sc)); nb = Bs.nb; nG = 3*nb;
   E.vol = volKeep;                           // reset weights for this attempt
   // ---- LEAST-NORM CORRECTION so the GCL holds EXACTLY ---------------------
@@ -463,6 +466,12 @@ inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
     if (E.volume > 0.97 && E.wallArea < 0.2) { E.snap = 1; return true; }
     if (E.volume < 0.03 && E.wallArea < 0.2) { E.snap = 2; return true; }
   }
+  // A cell with NO wall rule is not a cut cell, whatever its quality number:
+  // the graze case (solid pocket below the detection limit) leaves wall == 0
+  // with vol slightly under 1, and evolving it as cut lets flow through the
+  // physical wall gap -- measured as a CFL-insensitive neighbour blowup at P2.
+  if (E.wallArea <= 1e-12 && E.volume > 0.9) { E.snap = 1; return true; }
+  if (E.wallArea <= 1e-12 && E.volume < 0.1) { E.snap = 2; return true; }
   return true;
 }
 

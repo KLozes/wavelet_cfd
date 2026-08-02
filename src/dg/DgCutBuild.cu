@@ -195,7 +195,7 @@ void DgSolver::probeCutRhs(void) {
   for (i32 q = 0; q < 5; q++)
     cudaMemset(getField(D_RHS+q), 0, (size_t)nBlocksMax*blockSizeTot*sizeof(real));
   dgRhsKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (real)0);
-  size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H)*sizeof(real);
+  size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 1)*sizeof(real);
   dgRhsCutKernel<<<nCutElem, blockSizeTot, shm>>>(*this, (real)0);
   cudaDeviceSynchronize();
   double mCut=0, mNbr=0, mFar=0; i32 bCut=-1,bNbr=-1;
