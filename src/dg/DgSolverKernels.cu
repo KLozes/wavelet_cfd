@@ -5738,13 +5738,15 @@ __device__ __forceinline__ void dgLag3(const real xr[3], real *phi) {
 
 static constexpr i32 CUT_NBMAX = 20;    // total-degree P^3 in 3-D
 
+
 // Zhang-Shu-limit a cut element's trace state toward its fluid mean (sC[0] IS
 // the mean: psi_0 = 1).  A modal trace can overshoot near under-resolved
 // features; every consumer of a trace (faces, wall, mortar) limits first --
 // the same protection the FRIB wall path gives its traces.
-__device__ __forceinline__ void dgCutLimitTrace(const real *sC, real U[5]) {
+__device__ __forceinline__ void dgCutLimitTrace(const real *sC, real U[5],
+                                                real psi0t) {
   real Ub[5];
-  for (i32 q = 0; q < 5; q++) Ub[q] = sC[q];      // mode-0 row: sC[0*5+q]
+  for (i32 q = 0; q < 5; q++) Ub[q] = sC[q]*psi0t;  // mean = c~_0 psi~_0, psi~_0 = 1/L00
   real rb = fmax(Ub[0], DG_EPSF), pb = dgPressureFromCons(Ub);
   real th = (real)1.0, rf = (real)0.2*rb, pf = (real)0.2*fmax(pb, DG_EPSF);
   real rhoM = fmax(U[0], DG_EPSF), pM = dgPressureFromCons(U);
@@ -5782,6 +5784,34 @@ __device__ __forceinline__ void dgCutPsi(const real cen[4], const real xr[3],
   }
 }
 
+// ORTHONORMAL basis evaluation: monomials psi, then the forward solve
+// L psi~ = psi (and per gradient component).  In this frame the element mass
+// is exactly I -- no dense inverse anywhere, and the round trip
+// nodal -> modal -> nodal is an orthogonal projection.  The sliver conditioning
+// still exists, but it enters through ONE backward-stable triangular solve
+// instead of a stored explicit inverse.
+__device__ __forceinline__ void dgCutSolveL(const real *Lc, i32 nb, real *v) {
+  for (i32 i = 0; i < nb; i++) {
+    real t = v[i];
+    for (i32 j = 0; j < i; j++) t -= Lc[(size_t)i*CUT_NBMAX+j]*v[j];
+    v[i] = t/Lc[(size_t)i*CUT_NBMAX+i];
+  }
+}
+__device__ __forceinline__ void dgCutPsiO(const real cen[4], const real xr[3],
+                                          i32 nb, const real *Lc,
+                                          real *psi, real *dpsi) {
+  dgCutPsi(cen, xr, nb, psi, dpsi);
+  if (psi) dgCutSolveL(Lc, nb, psi);
+  if (dpsi) {
+    real col[CUT_NBMAX];
+    for (i32 d = 0; d < 3; d++) {
+      for (i32 m = 0; m < nb; m++) col[m] = dpsi[3*m+d];
+      dgCutSolveL(Lc, nb, col);
+      for (i32 m = 0; m < nb; m++) dpsi[3*m+d] = col[m];
+    }
+  }
+}
+
 __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
   extern __shared__ real sh[];
   real *sU = sh;                       // [5][blockSizeTot] nodal state
@@ -5794,6 +5824,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     i32 lvl, ib, jb, kb; grid.decode(grid.bLocList[b], lvl, ib, jb, kb);
     real h[3]; dgElemSize(grid, lvl, h);
     const real *cen = grid.cutCen + 4*c;
+    const real *Lc = grid.cutLc + (size_t)c*CUT_NBMAX*CUT_NBMAX;
     i32 nb = grid.cutNbOf[c];              // reduced on degenerate slivers
     // CUT-MOOD: a troubled cut element evaluates THIS RHS at P0 -- first order
     // through the trouble, P^N when clear; the state keeps its modes.  The
@@ -5801,53 +5832,42 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     // below (the tensor-node Ducros/Persson sensors measured theta 0.001..0.02
     // at every supersonic blowup -- they cannot see sub-cell wedge trouble).
     const i32 nbFull = nb;
-    const real *Minv = grid.cutMinv + (size_t)c*CUT_NBMAX*CUT_NBMAX;
 
     for (i32 i = threadIdx.x; i < blockSizeTot; i += blockDim.x)
       for (i32 q = 0; q < 5; q++)
         sU[q*blockSizeTot + i] = grid.getField(D_RHO+q)[(size_t)b*blockSizeTot + i];
-    for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) { sR[i] = 0; sC[i] = 0; }
+    for (i32 i = threadIdx.x; i < nbFull*5; i += blockDim.x) { sR[i] = 0; sC[i] = 0; }
     __syncthreads();
 
-    // ---- nodal -> modal:  c = M^-1 SUM_q w_q psi(x_q) u(x_q) ---------------
-    // FULL basis: the state keeps its modes even when the flux evaluation
-    // below is order-dropped.
+    // ---- nodal -> modal, ORTHONORMAL: c~ = SUM_q w_q psi~(x_q) u(x_q) ------
+    // The mass is exactly I in this frame, so the projection IS the weighted
+    // sum -- no solve, no stored inverse, and the round trip is an orthogonal
+    // projection.  FULL basis: the state keeps its modes even when the flux
+    // evaluation below is order-dropped.
     for (i32 g = threadIdx.x; g < grid.cutVolOff[c+1]-grid.cutVolOff[c]; g += blockDim.x) {
       const SayeNode &s = grid.cutVolP[grid.cutVolOff[c] + g];
       real psi[CUT_NBMAX], phi[blockSizeTot];
-      dgCutPsi(cen, s.x, nbFull, psi, nullptr);
+      dgCutPsiO(cen, s.x, nbFull, Lc, psi, nullptr);
       dgLag3(s.x, phi);
       for (i32 q = 0; q < 5; q++) {
         real uq = 0;
         for (i32 a = 0; a < blockSizeTot; a++) uq += sU[q*blockSizeTot+a]*phi[a];
-        for (i32 m = 0; m < nbFull; m++) atomicAdd(&sR[m*5+q], s.w*psi[m]*uq);
+        for (i32 m = 0; m < nbFull; m++) atomicAdd(&sC[m*5+q], s.w*psi[m]*uq);
       }
     }
     __syncthreads();
-    for (i32 i = threadIdx.x; i < nbFull*5; i += blockDim.x) {
-      i32 m = i/5, q = i%5; real v = 0;
-      for (i32 n2 = 0; n2 < nbFull; n2++) v += Minv[(size_t)m*CUT_NBMAX+n2]*sR[n2*5+q];
-      sC[i] = v;
-    }
-    __syncthreads();
     // ---- CUT-AWARE TROUBLE SENSOR 1: MODAL DECAY over the fluid region -----
-    // sR still holds r = M c and sC holds c, so the energies come free:
-    //   ||u||^2_M = c^T r;   low part: b = r[0..k), z = M11^-1 b, ||u_lo||^2 = z^T b
-    //   eta = 1 - z^T b / c^T r   (top-degree energy fraction, M-inner product)
-    // Sensed on DENSITY (Persson's choice).  Computed by thread 0 -- k,nb <= 20.
+    // Orthonormal frame: energies are PLAIN COEFFICIENT SUMS, and the
+    // degree-major Cholesky NESTS, so the first k coefficients span the
+    // low-degree space exactly.  eta = 1 - sum_{m<k} c~^2 / sum c~^2.
+    // Sensed on DENSITY (Persson's choice).
     if (threadIdx.x == 0) {
       real trouble = 0;
       const i32 k = grid.cutNbLo[c];
       if (nbFull > 1 && k > 0) {
-        const real *M11 = grid.cutM11 + (size_t)c*CUT_NBMAX*CUT_NBMAX;
-        real num = 0;
-        for (i32 m = 0; m < nbFull; m++) num += sC[m*5+0]*sR[m*5+0];
-        real low = 0;
-        for (i32 i2 = 0; i2 < k; i2++) {
-          real z = 0;
-          for (i32 j2 = 0; j2 < k; j2++) z += M11[(size_t)i2*CUT_NBMAX+j2]*sR[j2*5+0];
-          low += z*sR[i2*5+0];
-        }
+        real num = 0, low = 0;
+        for (i32 m = 0; m < nbFull; m++) { real cm = sC[m*5+0]; num += cm*cm;
+          if (m < k) low += cm*cm; }
         if (num > (real)1e-30) {
           real eta = (real)1.0 - low/num;
           if (eta > grid.cutEta) trouble = 1;
@@ -5878,7 +5898,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
       for (i32 g = threadIdx.x; g < grid.cutVolOff[c+1]-grid.cutVolOff[c]; g += blockDim.x) {
         const SayeNode &s = grid.cutVolP[grid.cutVolOff[c] + g];
         real psi[CUT_NBMAX];
-        dgCutPsi(cen, s.x, nb, psi, nullptr);
+        dgCutPsiO(cen, s.x, nb, Lc, psi, nullptr);
         real U[5];
         for (i32 q = 0; q < 5; q++) { real v = 0;
           for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*psi[m]; U[q] = v; }
@@ -5897,7 +5917,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
       // the tensor-node theta) can miss imminent vacuum in the wedge; if the
       // modal solution's density anywhere in the FLUID region is below 10% of
       // the mean, run this evaluation with the sensor forced full on.
-      real c0rho = fmax(sC[0], DG_EPSF);
+      real c0rho = fmax(sC[0]/Lc[0], DG_EPSF);   // mean rho = c~_0 psi~_0
       if (__longlong_as_double(*(long long*)&sLam[1]) < (real)0.1*c0rho)
         theta = (real)1.0;
       real lenp  = h[0]/(real)(2*dgOrder+1);
@@ -5909,7 +5929,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     for (i32 g = threadIdx.x; g < grid.cutVolOff[c+1]-grid.cutVolOff[c]; g += blockDim.x) {
       const SayeNode &s = grid.cutVolP[grid.cutVolOff[c] + g];
       real psi[CUT_NBMAX], dpsi[3*CUT_NBMAX];
-      dgCutPsi(cen, s.x, nb, psi, dpsi);
+      dgCutPsiO(cen, s.x, nb, Lc, psi, dpsi);
       real U[5];
       for (i32 q = 0; q < 5; q++) { real v = 0;
         for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*psi[m]; U[q] = v; }
@@ -5948,11 +5968,11 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     for (i32 g = threadIdx.x; g < grid.cutWalOff[c+1]-grid.cutWalOff[c]; g += blockDim.x) {
       const SayeNode &s = grid.cutWalP[grid.cutWalOff[c] + g];
       real psi[CUT_NBMAX];
-      dgCutPsi(cen, s.x, nb, psi, nullptr);
+      dgCutPsiO(cen, s.x, nb, Lc, psi, nullptr);
       real U[5];
       for (i32 q = 0; q < 5; q++) { real v = 0;
         for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*psi[m]; U[q] = v; }
-      dgCutLimitTrace(sC, U);
+      dgCutLimitTrace(sC, U, (real)1.0/Lc[0]);
       real W[5]; W[0]=fmax(U[0],DG_EPSF);
       W[1]=U[1]/W[0]; W[2]=U[2]/W[0]; W[3]=U[3]/W[0]; W[4]=dgPressureFromCons(U);
       // NANSON: the reference normal is not the physical one unless the cell is
@@ -6007,11 +6027,11 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
             xr[t1ax] = (real)0.5*(c_xi[fa]+(real)1.0);
             xr[t2ax] = (real)0.5*(c_xi[fb]+(real)1.0);
             real psi[CUT_NBMAX];
-            dgCutPsi(cen, xr, nb, psi, nullptr);
+            dgCutPsiO(cen, xr, nb, Lc, psi, nullptr);
             real Um[5];
             for (i32 q = 0; q < 5; q++) { real v = 0;
               for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*psi[m]; Um[q] = v; }
-            dgCutLimitTrace(sC, Um);
+            dgCutLimitTrace(sC, Um, (real)1.0/Lc[0]);
             real Wm[5]; Wm[0]=fmax(Um[0],DG_EPSF);
             Wm[1]=Um[1]/Wm[0]; Wm[2]=Um[2]/Wm[0]; Wm[3]=Um[3]/Wm[0];
             Wm[4]=dgPressureFromCons(Um);
@@ -6063,11 +6083,11 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
       for (i32 g = threadIdx.x; g < fn; g += blockDim.x) {
         const SayeNode &s = grid.cutFacP[f0 + g];
         real psi[CUT_NBMAX], phi[blockSizeTot];
-        dgCutPsi(cen, s.x, nb, psi, nullptr);
+        dgCutPsiO(cen, s.x, nb, Lc, psi, nullptr);
         real Um[5];
         for (i32 q = 0; q < 5; q++) { real v = 0;
           for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*psi[m]; Um[q] = v; }
-        dgCutLimitTrace(sC, Um);
+        dgCutLimitTrace(sC, Um, (real)1.0/Lc[0]);
         real Wm[5]; Wm[0]=fmax(Um[0],DG_EPSF);
         Wm[1]=Um[1]/Wm[0]; Wm[2]=Um[2]/Wm[0]; Wm[3]=Um[3]/Wm[0]; Wm[4]=dgPressureFromCons(Um);
         // neighbour trace at the SAME physical point: its reference coordinate
@@ -6109,12 +6129,8 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     }
     __syncthreads();
 
-    // ---- dc/dt = M^-1 R, then evaluate at the nodes ------------------------
-    for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) {
-      i32 m = i/5, q = i%5; real v = 0;
-      for (i32 n2 = 0; n2 < nb; n2++) v += Minv[(size_t)m*CUT_NBMAX+n2]*sR[n2*5+q];
-      sC[i] = v;
-    }
+    // ---- dc~/dt = R~ (identity mass!), then evaluate at the nodes ----------
+    for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) sC[i] = sR[i];
     __syncthreads();
     for (i32 i = threadIdx.x; i < blockSizeTot; i += blockDim.x) {
       i32 ii = i % NNODE, jj = (i/NNODE) % NNODE, kk = i/(NNODE*NNODE);
@@ -6122,7 +6138,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
                      (real)0.5*(c_xi[jj]+(real)1.0),
                      (real)0.5*(c_xi[kk]+(real)1.0) };
       real psi[CUT_NBMAX];
-      dgCutPsi(cen, xr, nb, psi, nullptr);
+      dgCutPsiO(cen, xr, nb, Lc, psi, nullptr);
       for (i32 q = 0; q < 5; q++) { real v = 0;
         for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*psi[m];
         grid.getField(D_RHS+q)[(size_t)b*blockSizeTot + i] = v; }

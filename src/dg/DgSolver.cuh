@@ -273,7 +273,13 @@ public:
   real *cutM11 = nullptr;  // [nCutElem*CUT_NBMAX^2] low-degree sub-mass inverse
   real  cutEta = (real)0.05;  // modal-decay trouble threshold (--cuteta)
   real *cutCen = nullptr;  // [nCutElem*4] basis centroid (3) + scale (1)
-  real *cutMinv= nullptr;  // [nCutElem*cutNb*cutNb] DENSE inverse mass matrix
+  real *cutLc  = nullptr;  // [nCutElem*CUT_NBMAX^2] Cholesky factor L of the
+                           // monomial mass.  The kernel works in the ORTHONORMAL
+                           // basis psi~ = L^-1 psi, where the mass is exactly I:
+                           // projection is a direct weighted sum, the RHS needs
+                           // no solve, and the decay sensor is exact -- the
+                           // degree-major Cholesky NESTS, so the first k rows
+                           // span the low-degree space
   real *cutQual= nullptr;  // [nCutElem] bndIncons -- per-element geometry quality
   real *cutWallN= nullptr; // [nCutElem*2] mean wall normal (x,y) -- the
                            // characteristic limiter's eigendirection is the

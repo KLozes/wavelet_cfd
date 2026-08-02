@@ -163,8 +163,8 @@ void DgSolver::buildCutElems(void) {
   cudaMallocManaged(&cutCen,  (size_t)nCutElem*4*sizeof(real));
   cudaMallocManaged(&cutQual, (size_t)nCutElem*sizeof(real));
   cudaMallocManaged(&cutWallN, (size_t)nCutElem*2*sizeof(real));
-  cudaMallocManaged(&cutMinv, (size_t)nCutElem*CUT_NBMAX_H*CUT_NBMAX_H*sizeof(real));
-  memset(cutMinv, 0, (size_t)nCutElem*CUT_NBMAX_H*CUT_NBMAX_H*sizeof(real));
+  cudaMallocManaged(&cutLc, (size_t)nCutElem*CUT_NBMAX_H*CUT_NBMAX_H*sizeof(real));
+  memset(cutLc, 0, (size_t)nCutElem*CUT_NBMAX_H*CUT_NBMAX_H*sizeof(real));
   cudaMallocManaged(&blkCut,  nBlocksMax*sizeof(i32));
   for (i32 b = 0; b < nBlocksMax; b++) blkCut[b] = -1;
 
@@ -173,10 +173,8 @@ void DgSolver::buildCutElems(void) {
     const CutElemOps &E = ops[c];
     cutBlk[c] = blkOf[c];  blkCut[blkOf[c]] = c;
     cutNbOf[c] = E.B.nb;
-    cutNbLo[c] = E.nbLo;
-    for (i32 i = 0; i < E.nbLo; i++) for (i32 j = 0; j < E.nbLo; j++)
-      cutM11[(size_t)c*CUT_NBMAX_H*CUT_NBMAX_H + (size_t)i*CUT_NBMAX_H + j] =
-        (real)E.M11inv[(size_t)i*E.nbLo + j];
+    cutNbLo[c] = E.nbLo;   // sensor threshold index; M11inv no longer needed
+                           // (orthonormal energies are plain coefficient sums)
     cutQual[c] = (real)E.bndIncons;
     { double nx=0, ny=0;
       for (const SayeNode &sn : E.wall) { nx += (double)sn.w*(double)sn.n[0];
@@ -193,16 +191,13 @@ void DgSolver::buildCutElems(void) {
       for (const SayeNode &s : E.face[f]) { cutFacP[nFacT++] = s; a += (double)s.w; }
       cutFacA[6*c+f] = (real)a;
     }
-    // DENSE inverse mass: the kernel applies M^-1 as a matvec rather than
-    // carrying a triangular solve, which is the wrong shape for a GPU thread.
+    // Cholesky factor L (lower triangle of Mchol): the kernel orthonormalizes
+    // per point via a forward solve, and the mass becomes exactly I.
     const i32 nbE = E.B.nb;               // may be < nb on a degenerate sliver
-    std::vector<double> col(nbE);
-    for (i32 j = 0; j < nbE; j++) {
-      for (i32 i = 0; i < nbE; i++) col[i] = (i==j) ? 1.0 : 0.0;
-      E.massSolve(col.data());
-      for (i32 i = 0; i < nbE; i++)
-        cutMinv[(size_t)c*CUT_NBMAX_H*CUT_NBMAX_H + (size_t)i*CUT_NBMAX_H + j] = (real)col[i];
-    }
+    for (i32 i = 0; i < nbE; i++)
+      for (i32 j = 0; j <= i; j++)
+        cutLc[(size_t)c*CUT_NBMAX_H*CUT_NBMAX_H + (size_t)i*CUT_NBMAX_H + j] =
+          (real)E.Mchol[(size_t)i*nbE + j];
   }
 
   // ---- the cut path REPLACES the IB machinery ----------------------------
