@@ -314,7 +314,14 @@ void DgSolver::printPerf(void) {
 real DgSolver::step(real tStep) {
   real t = 0;
   while (t < tStep) {
-    if (iter % adaptEvery == 0 && nLvls > 1) adaptLeaves();
+    // CUT-CELL RUNS: the grid is FROZEN after buildInitialGrid.  The wall band
+    // was forced to the finest level by the bootstrap climb (dgIbBandVoteKernel
+    // ran while ibOn was still 1), the cut operators and SRD/FRD maps captured
+    // block indices on that grid, and adaptation would both move the band and
+    // RESORT the blocks -- either invalidates every captured index.  AMR away
+    // from the wall is given up for cut runs; re-mapping by location code after
+    // each adapt is the documented upgrade path if it is ever needed.
+    if (iter % adaptEvery == 0 && nLvls > 1 && !cutOn) adaptLeaves();
 
     computeDeltaT();
     // blow-up guard: a NaN/vacuum state caps velocities at the sanitizer bound
