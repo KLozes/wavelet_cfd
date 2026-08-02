@@ -239,6 +239,9 @@ struct Solver2d {
   std::vector<double> Udot;
   // knobs
   double C_DC=1.0, C_MAX=0.5, C_SUPG=1.0, epsM=0.0, wallBeta=1.0; i32 fsp=0;
+  i32 nuFrozen=0;   // JFNK: freeze nuCell/evNorm during J*v differencing
+                    // (max/abs in the sensor are non-differentiable; lagged
+                    // viscosity is the standard Newton treatment)
 
   i32 aidx(i32 i, i32 j) const { return i + nx*j; }
 
@@ -486,6 +489,10 @@ struct Solver2d {
 
   void rhs(const std::vector<double> &U, std::vector<double> &R) {
     R.assign((size_t)NF*n, 0.0);
+    if (!nuFrozen) rhsPass1(U);
+    rhsPass2(U, R);
+  }
+  void rhsPass1(const std::vector<double> &U) {
     // ---- pass 1: cell-wise entropy viscosity -------------------------------
     double eMax=-1e300, eMin=1e300, eInt=0, fluidArea=0, rhoMax=0;
 #ifdef _OPENMP
@@ -544,6 +551,8 @@ struct Solver2d {
       }
       nuCell[(size_t)cx+Nx*cy]=v;
     }
+  }
+  void rhsPass2(const std::vector<double> &U, std::vector<double> &R) {
     // ---- pass 2: assembly ---------------------------------------------------
 #ifdef _OPENMP
     i32 nth=omp_get_max_threads();
@@ -740,6 +749,88 @@ struct Stepper {
 };
 
 // ---------------------------------------------------------------------------
+//  PTC-JFNK: backward-Euler pseudo-transient continuation, Jacobian-free
+//  GMRES on (M/dtau - J) delta = R(U), right-preconditioned by the Kronecker
+//  mass (P^-1 = dtau * Ktilde^-1).  SER timestep growth, positivity-guarded.
+// ---------------------------------------------------------------------------
+struct Ptc {
+  Solver2d &S;
+  std::vector<double> Rbase;
+  double normv(const std::vector<double> &v){ double s2=0;
+    for (size_t i=0;i<v.size();i++) s2+=v[i]*v[i]; return sqrt(s2); }
+  Ptc(Solver2d &s):S(s){}
+  // A*v = M v/dtau - (R(U+eps v)-R(U))/eps   (nu frozen by caller)
+  void applyA(const std::vector<double> &U, const std::vector<double> &v,
+              double dtau, double normU, std::vector<double> &out,
+              std::vector<double> &scr1, std::vector<double> &scr2) {
+    double nv=normv(v);
+    double eps = sqrt(1e-13)*sqrt(1.0+normU)/fmax(nv,1e-300);
+    scr1.resize(v.size());
+    for (size_t i=0;i<v.size();i++) scr1[i]=U[i]+eps*v[i];
+    S.rhs(scr1, scr2);                       // nuFrozen=1 during solves
+    S.massApply(v.data(), scr1.data());      // reuse scr1 for M v
+    out.resize(v.size());
+    for (size_t i=0;i<v.size();i++)
+      out[i]= scr1[i]/dtau - (scr2[i]-Rbase[i])/eps;
+    for (size_t i=0;i<v.size();i++) if (!S.act[i/NF]) out[i]=v[i];
+  }
+  // right-preconditioned GMRES(m): solve A x = b, returns iterations (<0 fail)
+  i32 gmres(const std::vector<double> &U, const std::vector<double> &b,
+            double dtau, std::vector<double> &x, i32 m, double rtol) {
+    size_t Nd=b.size();
+    double normU=normv(U);
+    x.assign(Nd,0.0);
+    std::vector<std::vector<double>> V; std::vector<double> H((size_t)(m+1)*m,0.0);
+    std::vector<double> cs(m), sn(m), g(m+1), scr1, scr2, w(Nd), pz(Nd), scr3;
+    double b2=normv(b); if (b2==0) return 0;
+    i32 total=0;
+    for (i32 restart=0; restart<3; restart++) {
+      // r = b - A x  (x=0 first pass)
+      std::vector<double> r=b;
+      if (total>0) { applyA(U,xPrec(x,dtau,pz,scr3),dtau,normU,w,scr1,scr2);
+        for (size_t i=0;i<Nd;i++) r[i]=b[i]-w[i]; }
+      double beta=normv(r); if (beta/b2<rtol) return total;
+      V.assign(1,r); for (size_t i=0;i<Nd;i++) V[0][i]/=beta;
+      std::fill(g.begin(),g.end(),0.0); g[0]=beta;
+      i32 k=0;
+      for (; k<m; k++) {
+        applyA(U,xPrec(V[k],dtau,pz,scr3),dtau,normU,w,scr1,scr2);
+        for (i32 j=0;j<=k;j++){ double hjk=0;
+          for (size_t i=0;i<Nd;i++) hjk+=w[i]*V[j][i];
+          H[(size_t)j*m+k]=hjk;
+          for (size_t i=0;i<Nd;i++) w[i]-=hjk*V[j][i]; }
+        double hk1=normv(w); H[(size_t)(k+1)*m+k]=hk1;
+        if (hk1>1e-30){ V.push_back(w); for (size_t i=0;i<Nd;i++) V[k+1][i]/=hk1; }
+        for (i32 j=0;j<k;j++){ double t=cs[j]*H[(size_t)j*m+k]+sn[j]*H[(size_t)(j+1)*m+k];
+          H[(size_t)(j+1)*m+k]=-sn[j]*H[(size_t)j*m+k]+cs[j]*H[(size_t)(j+1)*m+k];
+          H[(size_t)j*m+k]=t; }
+        double d=sqrt(H[(size_t)k*m+k]*H[(size_t)k*m+k]+hk1*hk1);
+        cs[k]=H[(size_t)k*m+k]/d; sn[k]=hk1/d;
+        H[(size_t)k*m+k]=d; g[k+1]=-sn[k]*g[k]; g[k]=cs[k]*g[k];
+        total++;
+        if (fabs(g[k+1])/b2 < rtol || hk1<=1e-30) { k++; break; }
+      }
+      // back substitution, x += V y
+      std::vector<double> y(k);
+      for (i32 i=k-1;i>=0;i--){ double t=g[i];
+        for (i32 j=i+1;j<k;j++) t-=H[(size_t)i*m+j]*y[j];
+        y[i]=t/H[(size_t)i*m+i]; }
+      for (i32 j=0;j<k;j++) for (size_t i=0;i<Nd;i++) x[i]+=y[j]*V[j][i];
+      if (fabs(g[k>0?k:0])/b2 < rtol || (k<m)) break;
+    }
+    return total;
+  }
+  // helper: z = P^-1 v = dtau * Ktilde^-1 v (masked)
+  const std::vector<double>& xPrec(const std::vector<double> &v, double dtau,
+                                   std::vector<double> &pz, std::vector<double> &scr) {
+    pz.resize(v.size());
+    S.precApply(v.data(), pz.data(), scr);
+    for (size_t i=0;i<pz.size();i++) pz[i]*=dtau;
+    return pz;
+  }
+};
+
+// ---------------------------------------------------------------------------
 //  gates
 // ---------------------------------------------------------------------------
 static void vortexExact(double x, double y, double t, double beta,
@@ -888,6 +979,110 @@ static i32 gateFsp(i32 p) {
   return ok;
 }
 
+static void gateSteady(i32 p, double CDC, double CMAX) {
+  const double M = getenv("IGA2_MACH")? atof(getenv("IGA2_MACH")) : 0.3;
+  const i32 N = getenv("IGA2_N")? atoi(getenv("IGA2_N")) : 160;
+  const i32 maxIt = getenv("IGA2_PITS")? atoi(getenv("IGA2_PITS")) : 120;
+  printf("\n[steady] PTC-JFNK, M=%.2f cylinder D=1, N=%d, wallBeta=%.0f, epsM=%.2f\n",
+         M, N, getenv("IGA2_WBETA")? atof(getenv("IGA2_WBETA")):16.0,
+         g_epsm>0? g_epsm:0.1);
+  Solver2d S; S.init(p,N,N,-8.0,-8.0,16.0/N);
+  S.C_DC=CDC; S.C_MAX=CMAX; S.C_SUPG=g_csupg;
+  S.epsM = g_epsm>0? g_epsm : 0.1;
+  S.wallBeta = getenv("IGA2_WBETA")? atof(getenv("IGA2_WBETA")) : 16.0;
+  double r=1.0, c=1.0, pr=r*c*c/GAM, u=M*c;
+  S.Uinf[0]=r; S.Uinf[1]=r*u; S.Uinf[2]=0; S.Uinf[3]=pr/(GAM-1)+0.5*r*u*u;
+  Circle G{0.0,0.0,0.5};
+  S.classify(G); S.buildMass();
+  std::vector<double> U((size_t)NF*S.n);
+  for (i32 a=0;a<S.n;a++) for (i32 k=0;k<NF;k++) U[(size_t)NF*a+k]=S.Uinf[k];
+  // Udot stays 0: the sensor becomes the SPATIAL entropy residual, which is
+  // exactly the quantity PTC drives to zero -- self-limiting viscosity.
+  std::fill(S.Udot.begin(), S.Udot.end(), 0.0);
+  Ptc ptc(S);
+  std::vector<double> delta, y, pz, scr, Rtrial, Utrial;
+  double lam0 = u+c;
+  double dtau = 10.0*S.h/lam0;                  // pseudo-CFL 10 start
+  S.nuFrozen=0; S.rhs(U, ptc.Rbase);
+  double R0=ptc.normv(ptc.Rbase), Rn=R0;
+  double qd=0.5*r*u*u;
+  printf("%4s %10s %10s %8s %6s %9s %9s %9s\n",
+         "it","||R||/R0","dtau","gmres","rej","Cd","max u.n","nuMax");
+  i32 rejects=0;
+  for (i32 it=1; it<=maxIt; it++) {
+    S.nuFrozen=1;                               // lagged viscosity in the solve
+    const i32 gm=60;
+    i32 gi = ptc.gmres(U, ptc.Rbase, dtau, y, gm, 1e-3);
+    // right-prec closure: delta = P^-1 y
+    S.precApply(y.data(), (delta.resize(y.size()), delta.data()), scr);
+    for (size_t i=0;i<delta.size();i++) delta[i]*=dtau;
+    Utrial=U;
+    for (size_t i=0;i<U.size();i++) Utrial[i]+=delta[i];
+    // positivity + sanity guard on control coefficients
+    bool ok=true;
+    for (i32 a=0;a<S.n && ok;a++){ if(!S.act[a])continue;
+      const double *Ua=&Utrial[(size_t)NF*a];
+      double rr=Ua[0], pp=(GAM-1)*(Ua[3]-0.5*(Ua[1]*Ua[1]+Ua[2]*Ua[2])/fmax(rr,1e-12));
+      if (!(rr>1e-8) || !(pp>1e-10) || !std::isfinite(Ua[3])) ok=false; }
+    double Rt=1e300;
+    if (ok) { S.nuFrozen=0; S.rhs(Utrial, Rtrial); Rt=ptc.normv(Rtrial); ok = (Rt < 3.0*Rn); }
+    if (!ok) {
+      dtau*=0.3; rejects++;
+      S.nuFrozen=0; S.rhs(U, ptc.Rbase);        // restore nu state for U
+      if (dtau < 1e-6*S.h/lam0) { printf("  STALL: dtau collapsed\n"); break; }
+      continue;
+    }
+    U=Utrial; ptc.Rbase=Rtrial;
+    // SER growth ONLY when the linear solve actually converged inside its
+    // budget -- growing dtau on an unconverged solve compounds: J dominates,
+    // the mass preconditioner fades, and the nonlinear rate stalls at the
+    // linear-solve accuracy (measured 0.93/iter with a hard 120 cap).
+    if (gi < 3*gm-2) {
+      double grow = Rn/fmax(Rt,1e-300);
+      dtau *= fmin(fmax(grow,0.5),2.0);
+      dtau = fmin(dtau, 1e5*S.h/lam0);
+    }
+    Rn=Rt;
+    // wall diagnostics
+    double fx=0, unmax=0, numax=0;
+    for (i32 cc=0;cc<N*N;cc++){
+      if (S.cls[cc]!=1) continue;
+      const CutCellQ &Q=S.cq[S.cutIdx[cc]];
+      i32 cx=cc%N, cy=cc/N;
+      for (size_t q=0;q<Q.ww.size();q++){
+        double xi=(Q.wx[q]-S.x0d)/S.h-cx, yi=(Q.wy[q]-S.y0d)/S.h-cy;
+        double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
+        S.evalCell(U,cx,cy,xi,yi,Uq,Ux,Uy,Ut);
+        double rr,uu,vv,pp,ccs; primEval(Uq,rr,uu,vv,pp,ccs);
+        fx+=Q.ww[q]*pp*(-Q.wnx[q]);
+        unmax=fmax(unmax, fabs(uu*Q.wnx[q]+vv*Q.wny[q])/u);
+      } }
+    for (i32 cc=0;cc<N*N;cc++) numax=fmax(numax,S.nuCell[cc]);
+    printf("%4d %10.3e %10.3e %8d %6d %9.4f %9.2e %9.2e\n",
+           it, Rn/R0, dtau, gi, rejects, fx/qd, unmax, numax);
+    fflush(stdout);
+    if (Rn/R0 < 1e-8) { printf("  CONVERGED\n"); break; }
+  }
+  if (getenv("IGA2_DUMP")) {
+    FILE *fp=fopen(getenv("IGA2_DUMP"),"w");
+    fprintf(fp,"theta,cp,un\n");
+    for (i32 cc=0;cc<N*N;cc++){
+      if (S.cls[cc]!=1) continue;
+      const CutCellQ &Q=S.cq[S.cutIdx[cc]];
+      i32 cx=cc%N, cy=cc/N;
+      for (size_t q=0;q<Q.ww.size();q++){
+        double xi=(Q.wx[q]-S.x0d)/S.h-cx, yi=(Q.wy[q]-S.y0d)/S.h-cy;
+        double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
+        S.evalCell(U,cx,cy,xi,yi,Uq,Ux,Uy,Ut);
+        double rr,uu,vv,pp,ccs; primEval(Uq,rr,uu,vv,pp,ccs);
+        double th=atan2(Q.wy[q],Q.wx[q]);
+        fprintf(fp,"%.6f,%.6e,%.6e\n",th,(pp-pr)/qd,(uu*Q.wnx[q]+vv*Q.wny[q])/u);
+      } }
+    fclose(fp);
+    printf("  wrote %s\n", getenv("IGA2_DUMP"));
+  }
+}
+
 static void gateCyl(i32 p, double CFL, double CDC, double CMAX) {
   const double M = getenv("IGA2_MACH")? atof(getenv("IGA2_MACH")) : 0.3;
   const double T = getenv("IGA2_TEND")? atof(getenv("IGA2_TEND")) : 30.0;
@@ -973,6 +1168,7 @@ int main(int argc, char **argv) {
   if (!strcmp(mode,"vortex")||!strcmp(mode,"all")) ok &= gateVortex(p,CFL,CDC,CMAX);
   if (!strcmp(mode,"fsp")   ||!strcmp(mode,"all")) ok &= gateFsp(p);
   if (!strcmp(mode,"cyl")) gateCyl(p,CFL,CDC,CMAX);
+  if (!strcmp(mode,"steady")) gateSteady(p,CDC,CMAX);
   printf("\n%s\n", ok? "ALL GATES PASS":"GATE FAILURE");
   return ok?0:1;
 }
