@@ -1549,6 +1549,42 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
     fflush(stdout);
     if (Rn/R0 < 1e-8) { printf("  CONVERGED\n"); break; }
   }
+  // L2 entropy deviation over the near-body annulus r in [R, 3R]: the exact
+  // steady inviscid solution has s == s_inf EVERYWHERE, so this is an error
+  // norm with an EXACT reference (Karman-Tsien Cp is itself only ~1%).
+  { double s2i=0, ar=0, s2o=0, aro=0;
+    const double sref=log(pr)-GAM*log(r);
+    for (i32 cc=0;cc<N*N;cc++){
+      i32 c2=S.cls[cc]; if (c2==2) continue;
+      i32 cx=cc%N, cy=cc/N;
+      double xc=S.x0d+(cx+0.5)*S.h, yc=S.y0d+(cy+0.5)*S.h;
+      double rr2=xc*xc+yc*yc;
+      if (rr2 > 2.25) continue;                  // annulus outer radius 1.5
+      i32 off = (rr2 > 1.0);                     // off-band window r in [1, 1.5]
+      double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
+      if (c2==0) {
+        for (i32 qx=0;qx<S.gv.n;qx++) for (i32 qy=0;qy<S.gv.n;qy++) {
+          S.evalCell(U,cx,cy,S.gv.x[qx],S.gv.x[qy],Uq,Ux,Uy,Ut);
+          double rq,uq,vq,pq,cq; primEval(Uq,rq,uq,vq,pq,cq);
+          double sd=log(pq)-GAM*log(rq)-sref;
+          double w=(double)S.gv.w[qx]*(double)S.gv.w[qy]*S.h*S.h;
+          s2i+=w*sd*sd; ar+=w;
+          if (off){ s2o+=w*sd*sd; aro+=w; }
+        }
+      } else {
+        const CutCellQ &Q=S.cq[S.cutIdx[cc]];
+        for (size_t q=0;q<Q.vw.size();q++) {
+          S.evalCell(U,cx,cy,(Q.vx[q]-S.x0d)/S.h-cx,(Q.vy[q]-S.y0d)/S.h-cy,Uq,Ux,Uy,Ut);
+          double rq,uq,vq,pq,cq; primEval(Uq,rq,uq,vq,pq,cq);
+          double sd=log(pq)-GAM*log(rq)-sref;
+          s2i+=Q.vw[q]*sd*sd; ar+=Q.vw[q];
+          if (off){ s2o+=Q.vw[q]*sd*sd; aro+=Q.vw[q]; }
+        }
+      }
+    }
+    printf("  L2 entropy deviation (annulus r<1.5): %.6e  off-band [1,1.5]: %.6e\n",
+           sqrt(s2i/ar), sqrt(s2o/fmax(aro,1e-300)));
+  }
   if (getenv("IGA2_FDUMP")) {
     // regular-grid sample of the spline solution for field plots
     FILE *fp=fopen(getenv("IGA2_FDUMP"),"w");
@@ -1673,6 +1709,42 @@ static void gateCyl(i32 p, double CFL, double CDC, double CMAX) {
     }
   }
   // Cp(theta) dump
+  // L2 entropy deviation over the near-body annulus r in [R, 3R]: the exact
+  // steady inviscid solution has s == s_inf EVERYWHERE, so this is an error
+  // norm with an EXACT reference (Karman-Tsien Cp is itself only ~1%).
+  { double s2i=0, ar=0, s2o=0, aro=0;
+    const double sref=log(pr)-GAM*log(r);
+    for (i32 cc=0;cc<N*N;cc++){
+      i32 c2=S.cls[cc]; if (c2==2) continue;
+      i32 cx=cc%N, cy=cc/N;
+      double xc=S.x0d+(cx+0.5)*S.h, yc=S.y0d+(cy+0.5)*S.h;
+      double rr2=xc*xc+yc*yc;
+      if (rr2 > 2.25) continue;                  // annulus outer radius 1.5
+      i32 off = (rr2 > 1.0);                     // off-band window r in [1, 1.5]
+      double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
+      if (c2==0) {
+        for (i32 qx=0;qx<S.gv.n;qx++) for (i32 qy=0;qy<S.gv.n;qy++) {
+          S.evalCell(U,cx,cy,S.gv.x[qx],S.gv.x[qy],Uq,Ux,Uy,Ut);
+          double rq,uq,vq,pq,cq; primEval(Uq,rq,uq,vq,pq,cq);
+          double sd=log(pq)-GAM*log(rq)-sref;
+          double w=(double)S.gv.w[qx]*(double)S.gv.w[qy]*S.h*S.h;
+          s2i+=w*sd*sd; ar+=w;
+          if (off){ s2o+=w*sd*sd; aro+=w; }
+        }
+      } else {
+        const CutCellQ &Q=S.cq[S.cutIdx[cc]];
+        for (size_t q=0;q<Q.vw.size();q++) {
+          S.evalCell(U,cx,cy,(Q.vx[q]-S.x0d)/S.h-cx,(Q.vy[q]-S.y0d)/S.h-cy,Uq,Ux,Uy,Ut);
+          double rq,uq,vq,pq,cq; primEval(Uq,rq,uq,vq,pq,cq);
+          double sd=log(pq)-GAM*log(rq)-sref;
+          s2i+=Q.vw[q]*sd*sd; ar+=Q.vw[q];
+          if (off){ s2o+=Q.vw[q]*sd*sd; aro+=Q.vw[q]; }
+        }
+      }
+    }
+    printf("  L2 entropy deviation (annulus r<1.5): %.6e  off-band [1,1.5]: %.6e\n",
+           sqrt(s2i/ar), sqrt(s2o/fmax(aro,1e-300)));
+  }
   if (getenv("IGA2_FDUMP")) {
     // regular-grid sample of the spline solution for field plots
     FILE *fp=fopen(getenv("IGA2_FDUMP"),"w");
