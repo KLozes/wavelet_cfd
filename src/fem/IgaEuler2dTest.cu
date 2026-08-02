@@ -238,8 +238,9 @@ struct Solver2d {
   double evNorm = 1.0, evDelta = 0.05;
   std::vector<double> Udot;
   // knobs
-  double C_DC=1.0, C_MAX=0.5, C_SUPG=1.0, epsM=0.0, wallBeta=1.0; i32 fsp=0;
-  i32 nuFrozen=0;   // JFNK: freeze nuCell/evNorm during J*v differencing
+  double C_DC=1.0, C_MAX=0.5, C_SUPG=1.0, epsM=0.0, wallBeta=1.0, gpM=0.0; i32 fsp=0;
+  i32 nuFrozen=0;
+  double bandEVscale=1.0;   // JFNK: freeze nuCell/evNorm during J*v differencing
                     // (max/abs in the sensor are non-differentiable; lagged
                     // viscosity is the standard Newton treatment)
 
@@ -289,6 +290,71 @@ struct Solver2d {
     const i32 W=2*p+1, WW=W*W;
     Mell.assign((size_t)n*WW, 0.0);
     real Nvx[BS_NMAX], Nvy[BS_NMAX];
+    // GHOST-PENALTY mass (the elasticity stack's stabilizer, ported): for
+    // C^{p-1} splines only the l=p normal-derivative jump survives at knot
+    // lines; gamma h^{2p+1} * sum_F int_F [d^p_n psi_a][d^p_n psi_b] ds over
+    // faces of cut cells.  Spectrally equivalent to h^2 on ALL active dofs
+    // (ties small-support rows to their neighbours THROUGH the solid) and --
+    // unlike the eps-mass -- row sums against constants are ZERO (the jump of
+    // d^p(sum psi)=0), so conservation is untouched and no solid inertia is
+    // added.  p=2 only here (analytic B'' knot jumps {+1,-3,+3,-1}).
+    if (gpM > 0 && p==2) {
+      const double J[4]={1.0,-3.0,3.0,-1.0};
+      // 1-D span mass of the tangential direction (unit span, scaled by h)
+      double Mt[3][3]={{0}};
+      { GaussRule g1=gaussLegendre(p+1); real Nv[BS_NMAX];
+        for (i32 q=0;q<g1.n;q++){ Sx.val(g1.x[q],Nv);
+          for (i32 a2=0;a2<=p;a2++) for (i32 b2=0;b2<=p;b2++)
+            Mt[a2][b2]+=(double)g1.w[q]*h*(double)Nv[a2]*(double)Nv[b2]; } }
+      const double gam = gpM*pow(h,2*p+1)/(h*h*h*h);  // h^{2p+1} * (1/h^2)^2
+      auto addFaceX=[&](i32 gx, i32 cy){        // vertical knot line x-index gx,
+        for (i32 ia=gx-p; ia<=gx; ia++) {       // tangential span cy
+          if (ia<0||ia>=nx) continue;
+          double Ja=J[gx-ia];
+          for (i32 ib=gx-p; ib<=gx; ib++) {
+            if (ib<0||ib>=nx) continue;
+            double Jb=J[gx-ib];
+            for (i32 ja=0;ja<=p;ja++) for (i32 jb=0;jb<=p;jb++) {
+              i32 arow=aidx(ia,cy+ja);
+              i32 di=ib-ia+p, dj=(cy+jb)-(cy+ja)+p;
+              if (di<0||di>2*p||dj<0||dj>2*p) continue;
+              Mell[(size_t)arow*(2*p+1)*(2*p+1) + dj*(2*p+1)+di]
+                += gam*Ja*Jb*Mt[ja][jb];
+            } }
+        } };
+      auto addFaceY=[&](i32 gy, i32 cx){
+        for (i32 ja=gy-p; ja<=gy; ja++) {
+          if (ja<0||ja>=ny) continue;
+          double Ja=J[gy-ja];
+          for (i32 jb=gy-p; jb<=gy; jb++) {
+            if (jb<0||jb>=ny) continue;
+            double Jb=J[gy-jb];
+            for (i32 ia=0;ia<=p;ia++) for (i32 ib=0;ib<=p;ib++) {
+              i32 arow=aidx(cx+ia,ja);
+              i32 di=(cx+ib)-(cx+ia)+p, dj=jb-ja+p;
+              if (di<0||di>2*p||dj<0||dj>2*p) continue;
+              Mell[(size_t)arow*(2*p+1)*(2*p+1) + dj*(2*p+1)+di]
+                += gam*Ja*Jb*Mt[ia][ib];
+            } }
+        } };
+      std::vector<char> fx((size_t)(Nx+1)*Ny,0), fy((size_t)Nx*(Ny+1),0);
+      for (i32 cy=0;cy<Ny;cy++) for (i32 cx=0;cx<Nx;cx++) {
+        if (cls[(size_t)cx+Nx*cy]!=1) continue;
+        fx[(size_t)cx  +(Nx+1)*cy]=1; fx[(size_t)cx+1+(Nx+1)*cy]=1;
+        fy[(size_t)cx+Nx*cy]=1;       fy[(size_t)cx+Nx*(cy+1)]=1;
+      }
+      for (i32 cy=0;cy<Ny;cy++) for (i32 g=0;g<=Nx;g++)
+        if (fx[(size_t)g+(Nx+1)*cy]) addFaceX(g,cy);
+      for (i32 cx=0;cx<Nx;cx++) for (i32 g=0;g<=Ny;g++)
+        if (fy[(size_t)cx+Nx*g]) addFaceY(g,cx);
+      // NOTE: do NOT widen the active set here.  A first version activated
+      // every dof of solid cells adjacent to cut cells, but GP faces only tie
+      // dofs whose support CROSSES a cut-cell face -- the rest became active
+      // rows with ~zero mass, GMRES filled them with garbage, and every
+      // Newton step tripped the positivity guard (dtau collapsed to 1e-7).
+      // The fluid-support active set is the correct one; GP just conditions
+      // its small rows.
+    }
     // fictitious-domain mass (finite-cell alpha): epsM * solid-part mass on
     // cut cells and on solid cells with active dofs.  Bounds every active
     // mass row below (min support fraction 6.7e-3 otherwise), at the price
@@ -550,6 +616,22 @@ struct Solver2d {
         v=fmax(v,nuS[(size_t)ii+Nx*jj]);
       }
       nuCell[(size_t)cx+Nx*cy]=v;
+    }
+    if (bandEVscale != 1.0) {
+      // The EV band smears the wall (measured: killing it lifts the suction
+      // peak -1.93 -> -2.39 and fixes stagnation) BUT zero band dissipation
+      // leaves the aft flow's neutral modes undamped and PTC STALLS (dtau
+      // 9e-6, residual frozen 1.3e-3): steady inviscid cylinder needs SOME
+      // dissipation to select the steady solution.  Scale, don't switch.
+      for (i32 cy=0;cy<Ny;cy++) for (i32 cx=0;cx<Nx;cx++) {
+        bool band=false;
+        for (i32 dj=-1;dj<=1&&!band;dj++) for (i32 di=-1;di<=1;di++) {
+          i32 ii=cx+di, jj=cy+dj;
+          if (ii<0||ii>=Nx||jj<0||jj>=Ny) continue;
+          if (cls[(size_t)ii+Nx*jj]==1) { band=true; break; }
+        }
+        if (band) nuCell[(size_t)cx+Nx*cy]*=bandEVscale;
+      }
     }
   }
   void rhsPass2(const std::vector<double> &U, std::vector<double> &R) {
@@ -988,8 +1070,10 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
          g_epsm>0? g_epsm:0.1);
   Solver2d S; S.init(p,N,N,-8.0,-8.0,16.0/N);
   S.C_DC=CDC; S.C_MAX=CMAX; S.C_SUPG=g_csupg;
-  S.epsM = g_epsm>0? g_epsm : 0.1;
+  S.gpM  = getenv("IGA2_GPM")? atof(getenv("IGA2_GPM")) : 0.0;
+  S.epsM = g_epsm>0? g_epsm : (S.gpM>0? 0.0 : 0.1);
   S.wallBeta = getenv("IGA2_WBETA")? atof(getenv("IGA2_WBETA")) : 16.0;
+  S.bandEVscale = getenv("IGA2_BEV")? atof(getenv("IGA2_BEV")) : (getenv("IGA2_NOBEV")? 0.0 : 1.0);
   double r=1.0, c=1.0, pr=r*c*c/GAM, u=M*c;
   S.Uinf[0]=r; S.Uinf[1]=r*u; S.Uinf[2]=0; S.Uinf[3]=pr/(GAM-1)+0.5*r*u*u;
   Circle G{0.0,0.0,0.5};
