@@ -1583,6 +1583,41 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
   }
 }
 
+static void gateGeom(i32 p) {
+  const i32 N = getenv("IGA2_N")? atoi(getenv("IGA2_N")) : 160;
+  Solver2d S; S.init(p,N,N,-8.0,-8.0,16.0/N);
+  Circle G{0.0,0.0,0.5};
+  S.classify(G);
+  FILE *fc=fopen("output/geo_cells.csv","w");
+  fprintf(fc,"cx,cy,x0,y0,h,cls,relArea\n");
+  for (i32 cc=0;cc<N*N;cc++){
+    i32 cx=cc%N, cy=cc/N;
+    double x0=S.x0d+cx*S.h, y0=S.y0d+cy*S.h;
+    if (fabs(x0+0.5*S.h)>1.1 || fabs(y0+0.5*S.h)>1.1) continue;
+    double ra = S.cls[cc]==0?1.0:(S.cls[cc]==2?0.0:S.cq[S.cutIdx[cc]].area/(S.h*S.h));
+    fprintf(fc,"%d,%d,%.6f,%.6f,%.6f,%d,%.6e\n",cx,cy,x0,y0,S.h,S.cls[cc],ra);
+  }
+  fclose(fc);
+  FILE *fv=fopen("output/geo_vq.csv","w");
+  fprintf(fv,"x,y,w,cell\n");
+  FILE *fw=fopen("output/geo_wq.csv","w");
+  fprintf(fw,"x,y,w,nx,ny,cell\n");
+  i32 ncut=0; double amin=1e300; i32 ccmin=-1;
+  for (i32 cc=0;cc<N*N;cc++){
+    if (S.cls[cc]!=1) continue;
+    ncut++;
+    const CutCellQ &Q=S.cq[S.cutIdx[cc]];
+    if (Q.area/(S.h*S.h) < amin){ amin=Q.area/(S.h*S.h); ccmin=cc; }
+    for (size_t q=0;q<Q.vw.size();q++)
+      fprintf(fv,"%.6f,%.6f,%.6e,%d\n",Q.vx[q],Q.vy[q],Q.vw[q],cc);
+    for (size_t q=0;q<Q.ww.size();q++)
+      fprintf(fw,"%.6f,%.6f,%.6e,%.6f,%.6f,%d\n",Q.wx[q],Q.wy[q],Q.ww[q],Q.wnx[q],Q.wny[q],cc);
+  }
+  fclose(fv); fclose(fw);
+  printf("geom: N=%d, %d cut cells, min rel area %.3e at cell (%d,%d)\n",
+         N, ncut, amin, ccmin%N, ccmin/N);
+}
+
 static void gateCyl(i32 p, double CFL, double CDC, double CMAX) {
   const double M = getenv("IGA2_MACH")? atof(getenv("IGA2_MACH")) : 0.3;
   const double T = getenv("IGA2_TEND")? atof(getenv("IGA2_TEND")) : 30.0;
@@ -1688,6 +1723,7 @@ int main(int argc, char **argv) {
   if (!strcmp(mode,"fsp")   ||!strcmp(mode,"all")) ok &= gateFsp(p);
   if (!strcmp(mode,"cyl")) gateCyl(p,CFL,CDC,CMAX);
   if (!strcmp(mode,"steady")) gateSteady(p,CDC,CMAX);
+  if (!strcmp(mode,"geom")) gateGeom(p);
   printf("\n%s\n", ok? "ALL GATES PASS":"GATE FAILURE");
   return ok?0:1;
 }
