@@ -257,6 +257,10 @@ dgcutrhs_test: $(SRC_DIR)/dg/DgCutRhsTest.cu $(HDRS)
 dgsrd_test: $(SRC_DIR)/dg/DgSrdTest.cu $(HDRS)
 	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
 
+# IGA compressible flow, step 1: 1-D Euler + classic FEM shock capturing (Sod gate)
+iga_euler1d: $(SRC_DIR)/fem/IgaEuler1dTest.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) $< -o $@
+
 femtests: saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
 clean:
