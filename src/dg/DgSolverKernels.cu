@@ -3437,6 +3437,12 @@ __global__ void dgPositivityKernel(DgSolver &grid) {
   const real eps_rho = 1e-12, eps_p = 1e-12;
   DG_BLOCK_LOOP(bIdx) {
     if (grid.bLocList[bIdx] == kEmpty) continue;
+    // CUT elements: Zhang-Shu is meaningless there -- its cell mean is the
+    // full-tensor GLL mean, which on a cut element mixes solid-side extension
+    // values into the "conserved" mean, and rescaling toward a garbage mean
+    // INFLATES good nodes (measured: 1e33 momentum in one stage).  State
+    // redistribution is the cut elements' stabilizer.
+    if (grid.cutOn && grid.blkCut && grid.blkCut[bIdx] >= 0) continue;
     if (!dgIbLive(grid, bIdx)) continue;   // ghost fills are non-conservative
     // by design: never Zhang-Shu-limit them.  Evolving IB_CUT elements ARE
     // limited (their fluid-side nodes integrate; the fill re-writes the

@@ -6,6 +6,7 @@
 #include <cmath>
 
 #include "DgSolver.cuh"
+#include "DgSolverKernels.cuh"
 
 //
 // Usage:  ./wavedg3d --case N [--flag value ...]
@@ -194,6 +195,7 @@ int main(int argc, char* argv[]) {
   solver->ibSbm       = argI("--ibsbm", 0);   // 1 = shifted boundary wall (no ghosts)
   solver->cutOn       = argI("--cutcell", 0);   // cut-cell DG (replaces the IB family)
   solver->cutFsp      = argI("--cutfsp", 0);    // transparent-wall free-stream gate
+  solver->cutDbgMask  = argI("--cutmask", 15);  // term mask (debug bisection)
   i32 cutProbe        = argI("--cutprobe", 0);  // isolate cut RHS terms and exit
   solver->ibBrink     = argI("--ibbrink", 0);      // 1 = volume-penalization IB
   solver->ibBrinkEps  = argF("--ibbrinkeps", 1e-4);
@@ -425,6 +427,35 @@ int main(int argc, char* argv[]) {
   solver->paintTroubled("output/dg_troubled_final.png");
 
   cudaDeviceSynchronize();
+  // nodal field dump for external plotting (x, y, rho, u, v, p per node)
+  if (argI("--cutdump", 0)) {
+    cudaDeviceSynchronize();
+    FILE *fp = fopen("output/cut_field.csv", "w");
+    fprintf(fp, "x,y,rho,u,v,p,cls,cut\n");
+    for (i32 b = 0; b < solver->hashTable.nKeys; b++) {
+      if (solver->bLocList[b] == kEmpty) continue;
+      i32 lvl, ib, jb, kb; solver->decode(solver->bLocList[b], lvl, ib, jb, kb);
+      double h[3];
+      h[0] = (double)solver->domainSize[0] / ((double)(solver->baseGridSize[0]/blockSize) * powi(2,lvl));
+      h[1] = (double)solver->domainSize[1] / ((double)(solver->baseGridSize[1]/blockSize) * powi(2,lvl));
+      double w[NNODE], xi[NNODE]; dgGetHostOps(w, xi, solver->gauss);
+      i32 kk = blockSize/2;                       // mid-z sheet (pseudo-2D)
+      for (i32 jj = 0; jj < NNODE; jj++)
+      for (i32 ii = 0; ii < NNODE; ii++) {
+        i32 nd = ii + NNODE*(jj + NNODE*kk);
+        double X = (ib + 0.5*(xi[ii]+1.0))*h[0], Y = (jb + 0.5*(xi[jj]+1.0))*h[1];
+        double U[5];
+        for (i32 q = 0; q < 5; q++) U[q] = (double)solver->getField(D_RHO+q)[(size_t)b*blockSizeTot+nd];
+        double rho = U[0], u = U[1]/rho, v = U[2]/rho;
+        double p = ((double)dgGam-1.0)*(U[4]-0.5*rho*(u*u+v*v+(U[3]/rho)*(U[3]/rho)));
+        fprintf(fp, "%.8f,%.8f,%.8e,%.8e,%.8e,%.8e,%d,%d\n", X, Y, rho, u, v, p,
+                solver->ibClassList[b], solver->blkCut ? (solver->blkCut[b]>=0?1:0) : 0);
+      }
+    }
+    fclose(fp);
+    printf("[cutdump] wrote output/cut_field.csv\n");
+  }
+
   // Cut-cell uniform-preservation gate: with a uniform IC, the exact solution
   // is u(t) == u(0) (transparent wall under --cutfsp, or any-Mach uniform flow
   // in a wall-free domain).  Any drift is a scheme defect.

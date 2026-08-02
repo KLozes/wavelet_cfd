@@ -314,7 +314,17 @@ void DgSolver::buildSrd(void) {
 
   srd->S.buildNeighborhoods(srd->elems);
   srd->S.buildReverse();
-  srd->S.factor(srd->elems, srd->qpool.data(), dgOrder);
+  // PROJECTION DEGREE 0, deliberately.  ||S|| = 1 holds in L2 -- but L2
+  // contractivity is NOT a max principle: at degree N the neighbourhood
+  // projection of shock-like data OVERSHOOTS pointwise (measured: max 8.2 in
+  // -> 30.2 out on the Mach-3 startup, negative rho, sanitizer feedback,
+  // blowup).  Berger & Giuliani's original FV form projects CELL AVERAGES:
+  // degree 0 makes S a volume-weighted CONVEX combination of conservative
+  // states, positivity-preserving by construction.  Raising this together
+  // with the cut elements' own degree needs a trouble detector (cut-MOOD);
+  // that is the accuracy roadmap, not the stability baseline.
+  { const char *se = getenv("CUT_SRDDEG");
+    srd->S.factor(srd->elems, srd->qpool.data(), se ? atoi(se) : 0); }
   for (i32 k = 0; k < srd->S.nElem; k++) if (!srd->S.trivial[k]) srd->nMerged++;
   const size_t nd = (size_t)srd->elems.size()*blockSizeTot*5;
   srd->u.resize(nd); srd->su.resize(nd);
@@ -327,6 +337,7 @@ void DgSolver::buildSrd(void) {
 
 void DgSolver::applySrd(void) {
   if (!srd || srd->nMerged == 0) return;
+  if (getenv("CUT_NOSRD")) return;
   cudaDeviceSynchronize();
   const i32 nE = (i32)srd->elems.size();
   for (i32 e = 0; e < nE; e++) {
@@ -338,6 +349,23 @@ void DgSolver::applySrd(void) {
   }
   srdApply(srd->S, srd->elems, srd->qpool.data(), srd->B,
            srd->u.data(), srd->su.data(), 5);
+  if (getenv("SRD_DBG")) {
+    static i32 nCall = 0;
+    if (nCall < 12) {
+      double mi=0, mo=0; i32 eo=-1;
+      for (size_t t = 0; t < srd->u.size(); t++) {
+        if (fabs(srd->u[t]) > mi) mi = fabs(srd->u[t]);
+        if (fabs(srd->su[t]) > mo) { mo = fabs(srd->su[t]); eo = (i32)(t/(blockSizeTot*5)); }
+      }
+      i32 ei=-1; double mi2=0;
+      for (size_t t = 0; t < srd->u.size(); t++)
+        if (fabs(srd->u[t]) > mi2) { mi2 = fabs(srd->u[t]); ei = (i32)(t/(blockSizeTot*5)); }
+      printf("[srddbg] call %d  max|in| %.3e at srdElem %d (blk %d, %s)   max|out| %.3e\n",
+             nCall, mi, ei, ei>=0?srd->blk[ei]:-1,
+             (ei>=0 && blkCut[srd->blk[ei]]>=0)?"CUT":"cart", mo);
+      nCall++;
+    }
+  }
   for (i32 e = 0; e < nE; e++) {
     i32 b = srd->blk[e];
     for (i32 nd = 0; nd < blockSizeTot; nd++)

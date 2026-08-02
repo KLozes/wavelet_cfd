@@ -43,6 +43,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cmath>
+#include <cstdlib>
 #include <vector>
 
 #include "Util.cuh"
@@ -400,6 +401,22 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
       M[(size_t)i*nb+j]=t/d;
     } }
   if (!spd) continue;                      // this degree does not fit: try lower
+  // KAPPA CAP.  Factorability is not enough: a small cut cell can factor a
+  // full-degree mass matrix whose inverse still amplifies by 1e6, and the RHS
+  // then produces intermediates the sanitizer mangles before state
+  // redistribution can act (measured: 7.8e6 modal RHS on a physical wall load
+  // of ~1.5e2, blowing up in three stages).  A cell whose quadrature cannot
+  // SUPPORT a mode must not own it -- the neighbourhood polynomial SRD builds
+  // carries the accuracy there instead.  Estimate kappa from the Cholesky
+  // diagonal and drop the degree until it is tame.
+  {
+    double dmin=1e300, dmax=0;
+    for (i32 i=0;i<nb;i++){ double d=M[(size_t)i*nb+i]; dmin=fmin(dmin,d); dmax=fmax(dmax,d); }
+    double kap=(dmax/dmin)*(dmax/dmin);
+    const char *ke = getenv("CUT_KAPMAX");
+    double kapMax = ke ? atof(ke) : 1e4;
+    if (kap > kapMax && deg > 0) continue;   // too ill-conditioned: try lower
+  }
   E.Mchol.swap(M);
   E.B = Bs;                                // keep the SOLUTION basis actually used
   E.ok = true;
