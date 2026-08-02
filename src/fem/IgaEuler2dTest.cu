@@ -44,13 +44,13 @@ static constexpr i32 NF = 4;               // rho, rho u, rho v, E
 // ---------------------------------------------------------------------------
 //  Euler helpers
 // ---------------------------------------------------------------------------
-static inline void primEval(const double U[NF], double &r, double &u, double &v,
+__host__ __device__ static inline void primEval(const double U[NF], double &r, double &u, double &v,
                             double &pr, double &c) {
   r = fmax(U[0], 1e-12); u = U[1]/r; v = U[2]/r;
   pr = (GAM-1.0)*(U[3] - 0.5*r*(u*u+v*v)); pr = fmax(pr, 1e-12);
   c = sqrt(GAM*pr/r);
 }
-static inline void eulerFlux2(const double U[NF], double Fx[NF], double Fy[NF],
+__host__ __device__ static inline void eulerFlux2(const double U[NF], double Fx[NF], double Fy[NF],
                               double &u, double &v, double &c) {
   double r, pr; primEval(U, r, u, v, pr, c);
   Fx[0]=U[1]; Fx[1]=U[1]*u+pr; Fx[2]=U[1]*v;    Fx[3]=(U[3]+pr)*u;
@@ -65,22 +65,22 @@ static inline double entQdir(const double U[NF], double dx, double dy) {
   return (u*dx+v*dy)*entEta2(U);
 }
 // analytic Euler flux Jacobians A_x = dFx/dU, A_y = dFy/dU
-static inline void eulerJac2(const double U[NF], double Ax[NF][NF], double Ay[NF][NF]) {
+__host__ __device__ static inline void eulerJac2(const double U[NF],
+                                double Ax[NF][NF], double Ay[NF][NF]) {
   double r,u,v,pr,c; primEval(U,r,u,v,pr,c);
   double q2=u*u+v*v, H=(U[3]+pr)/r, ph=0.5*(GAM-1.0)*q2, g1=GAM-1.0;
-  double ax[NF][NF]={{0,1,0,0},
-    {ph-u*u, (3.0-GAM)*u, -g1*v, g1},
-    {-u*v, v, u, 0},
-    {u*(ph-H), H-g1*u*u, -g1*u*v, GAM*u}};
-  double ay[NF][NF]={{0,0,1,0},
-    {-u*v, v, u, 0},
-    {ph-v*v, -g1*u, (3.0-GAM)*v, g1},
-    {v*(ph-H), -g1*u*v, H-g1*v*v, GAM*v}};
-  memcpy(Ax,ax,sizeof(ax)); memcpy(Ay,ay,sizeof(ay));
+  Ax[0][0]=0;        Ax[0][1]=1;           Ax[0][2]=0;        Ax[0][3]=0;
+  Ax[1][0]=ph-u*u;   Ax[1][1]=(3.0-GAM)*u; Ax[1][2]=-g1*v;    Ax[1][3]=g1;
+  Ax[2][0]=-u*v;     Ax[2][1]=v;           Ax[2][2]=u;        Ax[2][3]=0;
+  Ax[3][0]=u*(ph-H); Ax[3][1]=H-g1*u*u;    Ax[3][2]=-g1*u*v;  Ax[3][3]=GAM*u;
+  Ay[0][0]=0;        Ay[0][1]=0;           Ay[0][2]=1;        Ay[0][3]=0;
+  Ay[1][0]=-u*v;     Ay[1][1]=v;           Ay[1][2]=u;        Ay[1][3]=0;
+  Ay[2][0]=ph-v*v;   Ay[2][1]=-g1*u;       Ay[2][2]=(3.0-GAM)*v; Ay[2][3]=g1;
+  Ay[3][0]=v*(ph-H); Ay[3][1]=-g1*u*v;     Ay[3][2]=H-g1*v*v; Ay[3][3]=GAM*v;
 }
 
 // Rusanov flux through unit normal n, exterior state Ue
-static inline void rusanov(const double Ub[NF], const double Ue[NF],
+__host__ __device__ static inline void rusanov(const double Ub[NF], const double Ue[NF],
                            double nx, double ny, double Fh[NF]) {
   double Fxb[NF],Fyb[NF],Fxe[NF],Fye[NF],ub,vb,cb,ue,ve,ce;
   eulerFlux2(Ub,Fxb,Fyb,ub,vb,cb); eulerFlux2(Ue,Fxe,Fye,ue,ve,ce);
