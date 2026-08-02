@@ -371,6 +371,7 @@ real DgSolver::step(real tStep) {
         DG_RHS(stageT);   // DG trial
         dgMoodDetectKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage, deltaT);
         DG_RHS(stageT);   // FV redo for flagged
+        if (cutOn) redistributeFlux();
         dgRk3StageKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage, deltaT);
         dgPositivityKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // last-resort net
         if (ibOn && (ibFillEvery == 0 || stage == 2))
@@ -384,6 +385,7 @@ real DgSolver::step(real tStep) {
         // subcell-FV blend factor, and/or the bulk-viscosity gate (slot 1)
       if (cutOn) applySrd();     // SRD on the stage INPUT: dU/dt = A S U
       DG_RHS(stageT);
+      if (cutOn) redistributeFlux();
       dgRk3StageKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage, deltaT);
       dgPositivityKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
       if (esLim)   // ES limiter: bound the cell entropy by the RHS's slots 3/4

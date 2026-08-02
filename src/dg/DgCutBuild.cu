@@ -413,3 +413,69 @@ void DgSolver::applySrd(void) {
           (real)srd->su[((size_t)e*blockSizeTot+nd)*5+q];
   }
 }
+
+// ---------------------------------------------------------------------------
+//  FLUX REDISTRIBUTION (Chern & Colella).  The P0 wedge's pathology is not its
+//  STATE but its UPDATE RATE: a full-area face over an 0.087 volume is an 11x
+//  amplification, and the resulting stage-frequency dent flicker is what pumps
+//  a P^N neighbour at supersonic speeds (measured: byte-identical blowup
+//  whether that neighbour is cut or Cartesian -- the wedge drives it).
+//
+//  Fix at the source: the small member takes the MERGED rate,
+//      r_merged = sum_j vol_j r_j / vol_k   over its neighbourhood,
+//  and the excess flux  delta = vol_small (r_own - r_merged)  is deposited
+//  into the partners, volume-weighted.  Total change:
+//      vol_s (r_merged - r_own) + delta = 0   -- exactly conservative.
+//  First-order at the wedge; it is P0 by the thin-cell rule anyway.
+// ---------------------------------------------------------------------------
+void DgSolver::redistributeFlux(void) {
+  if (!srd || srd->nMerged == 0) return;
+  if (getenv("CUT_NOFRD")) return;
+  cudaDeviceSynchronize();
+  const double vFull = srd->elems.empty() ? 1.0 : srd->elems[0].hv();
+  for (i32 k = 0; k < srd->S.nElem; k++) {
+    if (srd->S.trivial[k]) continue;
+    // the flagged (small) member is k itself by construction
+    const i32 bS = srd->blk[k];
+    if (blkCut[bS] < 0) continue;              // only small CUT members
+    if (srd->elems[k].vol >= srd->S.volFrac*vFull) continue;
+    // rates: small member = its (P0) nodal constant; partners = GLL-mean RHS
+    double rS[5], rM[5] = {0,0,0,0,0};
+    for (i32 q = 0; q < 5; q++)
+      rS[q] = (double)getField(D_RHS+q)[(size_t)bS*blockSizeTot];
+    double volK = 0, volP = 0;
+    double w[NNODE], xi[NNODE]; dgGetHostOps(w, xi, gauss);
+    for (i32 j : srd->S.M[k]) {
+      const double vj = srd->elems[j].vol; volK += vj;
+      if (j != k) volP += vj;
+      const i32 bj = srd->blk[j];
+      if (j == k) { for (i32 q = 0; q < 5; q++) rM[q] += vj*rS[q]; continue; }
+      for (i32 q = 0; q < 5; q++) {
+        double m = 0, ws = 0;
+        for (i32 nd = 0; nd < blockSizeTot; nd++) {
+          i32 i2 = nd % NNODE, j2 = (nd/NNODE) % NNODE, k2 = nd/(NNODE*NNODE);
+          double wn = w[i2]*w[j2]*w[k2];
+          m += wn*(double)getField(D_RHS+q)[(size_t)bj*blockSizeTot+nd]; ws += wn;
+        }
+        rM[q] += vj*(m/ws);
+      }
+    }
+    if (volK <= 0 || volP <= 0) continue;
+    for (i32 q = 0; q < 5; q++) rM[q] /= volK;
+    // small member -> merged rate; excess -> partners, volume-weighted
+    double dlt[5];
+    for (i32 q = 0; q < 5; q++) dlt[q] = srd->elems[k].vol*(rS[q]-rM[q]);
+    for (i32 q = 0; q < 5; q++)
+      for (i32 nd = 0; nd < blockSizeTot; nd++)
+        getField(D_RHS+q)[(size_t)bS*blockSizeTot+nd] = (real)rM[q];
+    for (i32 j : srd->S.M[k]) {
+      if (j == k) continue;
+      const i32 bj = srd->blk[j];
+      for (i32 q = 0; q < 5; q++) {
+        real add = (real)(dlt[q]/volP);
+        for (i32 nd = 0; nd < blockSizeTot; nd++)
+          getField(D_RHS+q)[(size_t)bj*blockSizeTot+nd] += add;
+      }
+    }
+  }
+}

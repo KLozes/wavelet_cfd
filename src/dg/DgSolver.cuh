@@ -535,6 +535,13 @@ public:
                                 // operators once, upload.  Requires a STATIC wall band.
   void probeCutRhs(void);       // one RHS apply + per-class |RHS| report (debug)
   void buildSrd(void);          // build the SRD operator (once, after buildCutElems)
+  void redistributeFlux(void);  // FLUX redistribution (Chern-Colella): a small
+                                // cut member's RHS is clipped to its merge
+                                // neighbourhood's volume-weighted rate and the
+                                // EXCESS deposited into the partners -- exactly
+                                // conservative, removes the 1/vol update spike
+                                // at the source.  Runs between DG_RHS and the
+                                // RK stage kernel.
   void applySrd(void);          // stage-wise state redistribution on the HOST via
                                 // managed memory -- microseconds at wall-band size;
                                 // port to a kernel only if a profile says so
