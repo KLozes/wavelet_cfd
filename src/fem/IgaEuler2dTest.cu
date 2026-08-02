@@ -803,6 +803,262 @@ struct Solver2d {
 static double g_csupg = 0.0;
 static double g_epsm = 0.0;
 
+// ===========================================================================
+//  GPU path (IGA2_GPU=1): the GMRES-resident pieces on device -- frozen-nu
+//  RHS (full cells + cut volume + wall + far field), ELL mass, Kronecker
+//  banded preconditioner, and all Krylov vectors.  Host touches the device
+//  once per OUTER PTC iteration (U/nu up, delta down).  Host path unchanged
+//  and kept as the validation reference (IGA2_GPUCHECK=1).
+// ===========================================================================
+#define CUCHK(x) do{ cudaError_t e_=(x); if(e_!=cudaSuccess){ \
+  printf("CUDA %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(1);} }while(0)
+
+struct DevPar {                       // POD, passed by value to kernels
+  i32 p, Nx, Ny, nx, ny, ng, ngg;
+  double h, x0d, y0d, C_SUPG, wallBeta;
+  double Uinf[NF];
+  const double *U; double *R;
+  const double *nuCell;
+  const i32 *fullList; i32 nFull;
+  const double *vqx,*vqy,*vqw; const i32 *vqCell; i32 nVq;
+  const double *wqx,*wqy,*wqw,*wqnx,*wqny; const i32 *wqCell; i32 nWq;
+  IgaBasis Bx, By;
+  GaussRule g;
+};
+
+__device__ static void devVolPoint(const DevPar &P, i32 cc, double xi, double yi,
+                                   double w) {
+  i32 cx=cc%P.Nx, cy=cc/P.Nx;
+  real Nvx[BS_NMAX],Nvy[BS_NMAX],Dvx[BS_NMAX],Dvy[BS_NMAX];
+  P.Bx.val((real)xi,Nvx); P.Bx.der((real)xi,Dvx);
+  P.By.val((real)yi,Nvy); P.By.der((real)yi,Dvy);
+  double Uq[NF]={0,0,0,0}, Ux[NF]={0,0,0,0}, Uy[NF]={0,0,0,0};
+  for (i32 a=0;a<=P.p;a++) for (i32 b=0;b<=P.p;b++) {
+    double Pv=(double)Nvx[a]*(double)Nvy[b];
+    double Px=(double)Dvx[a]/P.h*(double)Nvy[b];
+    double Py=(double)Nvx[a]*(double)Dvy[b]/P.h;
+    const double *uu=&P.U[(size_t)NF*((cx+a)+P.nx*(cy+b))];
+    for (i32 k=0;k<NF;k++){ Uq[k]+=Pv*uu[k]; Ux[k]+=Px*uu[k]; Uy[k]+=Py*uu[k]; }
+  }
+  double Fx[NF],Fy[NF],u,v,cs;
+  eulerFlux2(Uq,Fx,Fy,u,v,cs);
+  double nu=P.nuCell[cc];
+  double gx[NF]={0,0,0,0}, gy[NF]={0,0,0,0};
+  if (P.C_SUPG>0) {
+    double Ax[NF][NF], Ay[NF][NF], Res[NF];
+    eulerJac2(Uq,Ax,Ay);
+    for (i32 k=0;k<NF;k++){ Res[k]=0;
+      for (i32 m2=0;m2<NF;m2++) Res[k]+=Ax[k][m2]*Ux[m2]+Ay[k][m2]*Uy[m2]; }
+    double lam=sqrt(u*u+v*v)+cs, tau=0.5*P.C_SUPG*P.h/fmax(lam,1e-12);
+    for (i32 k=0;k<NF;k++) for (i32 m2=0;m2<NF;m2++){
+      gx[k]+=tau*Ax[m2][k]*Res[m2]; gy[k]+=tau*Ay[m2][k]*Res[m2]; }
+  }
+  real Nvx2[BS_NMAX],Nvy2[BS_NMAX];   // re-use loaded values
+  (void)Nvx2;(void)Nvy2;
+  for (i32 a=0;a<=P.p;a++) for (i32 b=0;b<=P.p;b++) {
+    double Px=(double)Dvx[a]/P.h*(double)Nvy[b];
+    double Py=(double)Nvx[a]*(double)Dvy[b]/P.h;
+    double *out=&P.R[(size_t)NF*((cx+a)+P.nx*(cy+b))];
+    for (i32 k=0;k<NF;k++)
+      atomicAdd(&out[k], w*( Fx[k]*Px + Fy[k]*Py - nu*(Ux[k]*Px+Uy[k]*Py)
+                             - Px*gx[k] - Py*gy[k] ));
+  }
+}
+
+__global__ static void kVolFull(DevPar P) {
+  i32 t=blockIdx.x*blockDim.x+threadIdx.x;
+  if (t >= P.nFull*P.ngg) return;
+  i32 cc=P.fullList[t/P.ngg], q=t%P.ngg, qx=q/P.ng, qy=q%P.ng;
+  double w=(double)P.g.w[qx]*(double)P.g.w[qy]*P.h*P.h;
+  devVolPoint(P, cc, (double)P.g.x[qx], (double)P.g.x[qy], w);
+}
+__global__ static void kVolCut(DevPar P) {
+  i32 t=blockIdx.x*blockDim.x+threadIdx.x;
+  if (t >= P.nVq) return;
+  i32 cc=P.vqCell[t], cx=cc%P.Nx, cy=cc/P.Nx;
+  devVolPoint(P, cc, (P.vqx[t]-P.x0d)/P.h-cx, (P.vqy[t]-P.y0d)/P.h-cy, P.vqw[t]);
+}
+__global__ static void kWall(DevPar P) {
+  i32 t=blockIdx.x*blockDim.x+threadIdx.x;
+  if (t >= P.nWq) return;
+  i32 cc=P.wqCell[t], cx=cc%P.Nx, cy=cc/P.Nx;
+  double xi=(P.wqx[t]-P.x0d)/P.h-cx, yi=(P.wqy[t]-P.y0d)/P.h-cy;
+  real Nvx[BS_NMAX],Nvy[BS_NMAX];
+  P.Bx.val((real)xi,Nvx); P.By.val((real)yi,Nvy);
+  double Uq[NF]={0,0,0,0};
+  for (i32 a=0;a<=P.p;a++) for (i32 b=0;b<=P.p;b++) {
+    double Pv=(double)Nvx[a]*(double)Nvy[b];
+    const double *uu=&P.U[(size_t)NF*((cx+a)+P.nx*(cy+b))];
+    for (i32 k=0;k<NF;k++) Uq[k]+=Pv*uu[k];
+  }
+  double nxq=P.wqnx[t], nyq=P.wqny[t], Fh[NF];
+  double Um[NF]; double un=(Uq[1]*nxq+Uq[2]*nyq);
+  Um[0]=Uq[0]; Um[1]=Uq[1]-2*un*nxq; Um[2]=Uq[2]-2*un*nyq; Um[3]=Uq[3];
+  rusanov(Uq,Um,nxq,nyq,Fh);
+  if (P.wallBeta != 1.0) {
+    double u2,v2,cs2,r2,pr2; primEval(Uq,r2,u2,v2,pr2,cs2);
+    double lam=fabs(u2*nxq+v2*nyq)+cs2;
+    double ex=(P.wallBeta-1.0)*0.5*lam*2.0*un;
+    Fh[1]+=ex*nxq; Fh[2]+=ex*nyq;
+  }
+  for (i32 a=0;a<=P.p;a++) for (i32 b=0;b<=P.p;b++) {
+    double Pv=(double)Nvx[a]*(double)Nvy[b];
+    double *out=&P.R[(size_t)NF*((cx+a)+P.nx*(cy+b))];
+    for (i32 k=0;k<NF;k++) atomicAdd(&out[k], -P.wqw[t]*Pv*Fh[k]);
+  }
+}
+__global__ static void kFar(DevPar P) {
+  i32 nsp=2*P.Ny+2*P.Nx;
+  i32 t=blockIdx.x*blockDim.x+threadIdx.x;
+  if (t >= nsp*P.ng) return;
+  i32 sq=t/P.ng, q=t%P.ng;
+  i32 e, s2;
+  if (sq < P.Ny) { e=0; s2=sq; }
+  else if (sq < 2*P.Ny) { e=1; s2=sq-P.Ny; }
+  else if (sq < 2*P.Ny+P.Nx) { e=2; s2=sq-2*P.Ny; }
+  else { e=3; s2=sq-2*P.Ny-P.Nx; }
+  i32 tang=(e<2)?1:0;
+  double nxq,nyq,lx,ly; i32 cx,cy;
+  if (e==0){ lx=0; ly=(double)P.g.x[q]; nxq=-1; nyq=0; }
+  else if (e==1){ lx=1; ly=(double)P.g.x[q]; nxq=1; nyq=0; }
+  else if (e==2){ lx=(double)P.g.x[q]; ly=0; nxq=0; nyq=-1; }
+  else { lx=(double)P.g.x[q]; ly=1; nxq=0; nyq=1; }
+  cx = tang? (e==0?0:P.Nx-1) : s2;
+  cy = tang? s2 : (e==2?0:P.Ny-1);
+  real Nvx[BS_NMAX],Nvy[BS_NMAX];
+  P.Bx.val((real)lx,Nvx); P.By.val((real)ly,Nvy);
+  double Uq[NF]={0,0,0,0};
+  for (i32 a=0;a<=P.p;a++) for (i32 b=0;b<=P.p;b++) {
+    double Pv=(double)Nvx[a]*(double)Nvy[b];
+    const double *uu=&P.U[(size_t)NF*((cx+a)+P.nx*(cy+b))];
+    for (i32 k=0;k<NF;k++) Uq[k]+=Pv*uu[k];
+  }
+  double Fh[NF]; rusanov(Uq,P.Uinf,nxq,nyq,Fh);
+  double w=(double)P.g.w[q]*P.h;
+  for (i32 a=0;a<=P.p;a++) for (i32 b=0;b<=P.p;b++) {
+    double Pv=(double)Nvx[a]*(double)Nvy[b];
+    double *out=&P.R[(size_t)NF*((cx+a)+P.nx*(cy+b))];
+    for (i32 k=0;k<NF;k++) atomicAdd(&out[k], -w*Pv*Fh[k]);
+  }
+}
+__global__ static void kMassEll(i32 n, i32 nx, i32 ny, i32 p,
+                                const double *Mell, const char *act,
+                                const double *v, double *out) {
+  i32 a=blockIdx.x*blockDim.x+threadIdx.x;
+  if (a>=n) return;
+  const i32 W=2*p+1, WW=W*W;
+  i32 i=a%nx, j=a/nx;
+  double s[NF]={0,0,0,0};
+  const double *row=&Mell[(size_t)a*WW];
+  for (i32 dj=-p;dj<=p;dj++){ i32 jj=j+dj; if(jj<0||jj>=ny) continue;
+    for (i32 di=-p;di<=p;di++){ i32 ii=i+di; if(ii<0||ii>=nx) continue;
+      double m=row[(dj+p)*W+(di+p)]; if(m==0.0) continue;
+      const double *vv=&v[(size_t)NF*(ii+nx*jj)];
+      for (i32 k=0;k<NF;k++) s[k]+=m*vv[k]; } }
+  for (i32 k=0;k<NF;k++) out[(size_t)NF*a+k]=s[k];
+}
+__device__ static void devBandSolve(i32 n, i32 b, const double *L, double *x,
+                                    size_t stride) {
+  for (i32 i=0;i<n;i++){ i32 i0=(i-b>0)?(i-b):0; double s2=x[(size_t)i*stride];
+    for (i32 k=i0;k<i;k++) s2-=L[(size_t)i*(b+1)+(k-i+b)]*x[(size_t)k*stride];
+    x[(size_t)i*stride]=s2/L[(size_t)i*(b+1)+b]; }
+  for (i32 i=n-1;i>=0;i--){ double s2=x[(size_t)i*stride];
+    for (i32 k=i+1;k<=i+b && k<n;k++) s2-=L[(size_t)k*(b+1)+(i-k+b)]*x[(size_t)k*stride];
+    x[(size_t)i*stride]=s2/L[(size_t)i*(b+1)+b]; }
+}
+__global__ static void kPrecX(i32 nx, i32 ny, i32 b, const double *L, double *x) {
+  i32 j=blockIdx.x*blockDim.x+threadIdx.x;
+  if (j>=ny) return;
+  devBandSolve(nx,b,L,&x[(size_t)j*nx],1);
+}
+__global__ static void kPrecY(i32 nx, i32 ny, i32 b, const double *L, double *x) {
+  i32 i=blockIdx.x*blockDim.x+threadIdx.x;
+  if (i>=nx) return;
+  devBandSolve(ny,b,L,&x[(size_t)i],nx);
+}
+__global__ static void kFieldGather(i32 n, i32 k, const double *v, double *sc) {
+  i32 a=blockIdx.x*blockDim.x+threadIdx.x;
+  if (a<n) sc[a]=v[(size_t)NF*a+k];
+}
+__global__ static void kFieldScatter(i32 n, i32 k, const double *sc,
+                                     const double *sd, const char *act,
+                                     double sc2, double *z) {
+  i32 a=blockIdx.x*blockDim.x+threadIdx.x;
+  if (a<n) z[(size_t)NF*a+k] = act[a]? sc2*sd[a]*sc[a] : 0.0;
+}
+__global__ static void kScaleD(i32 n, const double *sd, const double *v, double *out) {
+  i32 t=blockIdx.x*blockDim.x+threadIdx.x;
+  if (t>=n*NF) return;
+  out[t]=sd[t/NF]*v[t];
+}
+__global__ static void kAxpy(size_t m, double a, const double *x, double *y) {
+  size_t t=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+  if (t<m) y[t]+=a*x[t];
+}
+__global__ static void kScalCopy(size_t m, double a, const double *x, double *y) {
+  size_t t=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+  if (t<m) y[t]=a*x[t];
+}
+__global__ static void kAddScaled(size_t m, const double *U, double eps,
+                                  const double *v, double *out) {
+  size_t t=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+  if (t<m) out[t]=U[t]+eps*v[t];
+}
+__global__ static void kFormA(size_t m, const char *act, const double *Mv,
+                              double dtau, const double *R2, const double *R1,
+                              double eps, const double *v, double *out) {
+  size_t t=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+  if (t>=m) return;
+  out[t] = act[t/NF] ? Mv[t]/dtau - (R2[t]-R1[t])/eps : v[t];
+}
+__global__ static void kDot(size_t m, const double *a, const double *b, double *res) {
+  __shared__ double sh[256];
+  size_t t=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+  double v=0;
+  for (size_t i=t; i<m; i+=(size_t)gridDim.x*blockDim.x) v+=a[i]*b[i];
+  sh[threadIdx.x]=v; __syncthreads();
+  for (i32 s2=128;s2>0;s2>>=1){ if (threadIdx.x<s2) sh[threadIdx.x]+=sh[threadIdx.x+s2];
+    __syncthreads(); }
+  if (threadIdx.x==0) atomicAdd(res, sh[0]);
+}
+
+struct Dev {
+  i32 on=0; size_t m=0; i32 n=0, gm=0;
+  DevPar P;
+  double *U,*R1,*R2,*Mv,*pz,*scr,*w,*x,*V,*dres;
+  double *Mell,*nuCell,*sdiag,*Lx,*Ly,*scal;
+  char *act;
+  i32 *fullList,*vqCell,*wqCell;
+  double *vqx,*vqy,*vqw,*wqx,*wqy,*wqw,*wqnx,*wqny;
+  double dot(const double *a, const double *b) {
+    CUCHK(cudaMemset(dres,0,sizeof(double)));
+    kDot<<<256,256>>>(m,a,b,dres);
+    double h2; CUCHK(cudaMemcpy(&h2,dres,sizeof(double),cudaMemcpyDeviceToHost));
+    return h2;
+  }
+  void prec(const double *r, double *z, double scale) {   // z = scale*D K^-1 D r (masked)
+    kScaleD<<<(i32)((m+255)/256),256>>>(n,sdiag,r,z);
+    for (i32 k=0;k<NF;k++) {
+      kFieldGather<<<(n+255)/256,256>>>(n,k,z,scal);
+      kPrecX<<<(P.ny+63)/64,64>>>(P.nx,P.ny,P.p,Lx,scal);
+      kPrecY<<<(P.nx+63)/64,64>>>(P.nx,P.ny,P.p,Ly,scal);
+      kFieldScatter<<<(n+255)/256,256>>>(n,k,scal,sdiag,act,scale,w);
+    }
+    CUCHK(cudaMemcpy(z,w,m*sizeof(double),cudaMemcpyDeviceToDevice));
+  }
+  void rhs(const double *Ustate, double *Rout) {
+    CUCHK(cudaMemset(Rout,0,m*sizeof(double)));
+    P.U=Ustate; P.R=Rout;
+    i32 nt1=P.nFull*P.ngg;
+    if (nt1) kVolFull<<<(nt1+127)/128,128>>>(P);
+    if (P.nVq) kVolCut<<<(P.nVq+127)/128,128>>>(P);
+    if (P.nWq) kWall<<<(P.nWq+127)/128,128>>>(P);
+    i32 nt4=(2*P.Ny+2*P.Nx)*P.ng;
+    kFar<<<(nt4+127)/128,128>>>(P);
+  }
+};
+
+
 // SSP-RK3 driver with lagged Udot
 struct Stepper {
   Solver2d &S;
@@ -911,6 +1167,140 @@ struct Ptc {
     return pz;
   }
 };
+
+
+static void devInit(Dev &D, Solver2d &S, i32 gm) {
+  D.on=1; D.n=S.n; D.m=(size_t)NF*S.n; D.gm=gm;
+  DevPar &P=D.P;
+  P.p=S.p; P.Nx=S.Nx; P.Ny=S.Ny; P.nx=S.nx; P.ny=S.ny;
+  P.ng=S.gv.n; P.ngg=S.gv.n*S.gv.n;
+  P.h=S.h; P.x0d=S.x0d; P.y0d=S.y0d; P.C_SUPG=S.C_SUPG; P.wallBeta=S.wallBeta;
+  for (i32 k=0;k<NF;k++) P.Uinf[k]=S.Uinf[k];
+  P.Bx=S.Sx.B; P.By=S.Sy.B; P.g=S.gv;
+  std::vector<i32> full;
+  for (i32 cc=0;cc<S.Nx*S.Ny;cc++) if (S.cls[cc]==0) full.push_back(cc);
+  P.nFull=(i32)full.size();
+  std::vector<double> vx,vy,vw,wx,wy,ww,wnx,wny; std::vector<i32> vc,wc;
+  for (i32 cc=0;cc<S.Nx*S.Ny;cc++) {
+    if (S.cls[cc]!=1) continue;
+    const CutCellQ &Q=S.cq[S.cutIdx[cc]];
+    for (size_t q=0;q<Q.vw.size();q++){ vx.push_back(Q.vx[q]); vy.push_back(Q.vy[q]);
+      vw.push_back(Q.vw[q]); vc.push_back(cc); }
+    for (size_t q=0;q<Q.ww.size();q++){ wx.push_back(Q.wx[q]); wy.push_back(Q.wy[q]);
+      ww.push_back(Q.ww[q]); wnx.push_back(Q.wnx[q]); wny.push_back(Q.wny[q]);
+      wc.push_back(cc); }
+  }
+  P.nVq=(i32)vw.size(); P.nWq=(i32)ww.size();
+  auto up=[&](void **d, const void *h, size_t bytes){
+    CUCHK(cudaMalloc(d,bytes)); CUCHK(cudaMemcpy(*d,h,bytes,cudaMemcpyHostToDevice)); };
+  auto al=[&](void **d, size_t bytes){ CUCHK(cudaMalloc(d,bytes)); };
+  up((void**)&D.fullList, full.data(), full.size()*sizeof(i32));
+  if (P.nVq) { up((void**)&D.vqx,vx.data(),vx.size()*8); up((void**)&D.vqy,vy.data(),vy.size()*8);
+    up((void**)&D.vqw,vw.data(),vw.size()*8); up((void**)&D.vqCell,vc.data(),vc.size()*4); }
+  if (P.nWq) { up((void**)&D.wqx,wx.data(),wx.size()*8); up((void**)&D.wqy,wy.data(),wy.size()*8);
+    up((void**)&D.wqw,ww.data(),ww.size()*8); up((void**)&D.wqnx,wnx.data(),wnx.size()*8);
+    up((void**)&D.wqny,wny.data(),wny.size()*8); up((void**)&D.wqCell,wc.data(),wc.size()*4); }
+  P.fullList=D.fullList; P.vqx=D.vqx; P.vqy=D.vqy; P.vqw=D.vqw; P.vqCell=D.vqCell;
+  P.wqx=D.wqx; P.wqy=D.wqy; P.wqw=D.wqw; P.wqnx=D.wqnx; P.wqny=D.wqny; P.wqCell=D.wqCell;
+  up((void**)&D.Mell, S.Mell.data(), S.Mell.size()*8);
+  up((void**)&D.act, S.act.data(), S.act.size());
+  up((void**)&D.sdiag, S.sdiag.data(), S.sdiag.size()*8);
+  up((void**)&D.Lx, S.Mx1.L.data(), S.Mx1.L.size()*8);
+  up((void**)&D.Ly, S.My1.L.data(), S.My1.L.size()*8);
+  al((void**)&D.nuCell, (size_t)S.Nx*S.Ny*8);
+  P.nuCell=D.nuCell;
+  al((void**)&D.U,D.m*8); al((void**)&D.R1,D.m*8); al((void**)&D.R2,D.m*8);
+  al((void**)&D.Mv,D.m*8); al((void**)&D.pz,D.m*8); al((void**)&D.scr,D.m*8);
+  al((void**)&D.w,D.m*8); al((void**)&D.x,D.m*8);
+  al((void**)&D.V,(size_t)(gm+1)*D.m*8);
+  al((void**)&D.scal,(size_t)S.n*8); al((void**)&D.dres,8);
+  size_t fre,tot; cudaMemGetInfo(&fre,&tot);
+  printf("  [gpu] %d full cells, %d cut vol pts, %d wall pts, V=%zu MB, free %zu MB\n",
+         P.nFull, P.nVq, P.nWq, (size_t)(gm+1)*D.m*8>>20, fre>>20);
+}
+
+// device right-preconditioned GMRES; returns Krylov count, delta on host
+static i32 gmresGpu(Dev &D, Solver2d &S, const std::vector<double> &Uhost,
+                    double dtau, i32 gm, double rtol,
+                    std::vector<double> &delta, i32 check) {
+  const size_t m=D.m; const i32 B=256; const i32 gb=(i32)((m+B-1)/B);
+  CUCHK(cudaMemcpy((void*)D.U, Uhost.data(), m*8, cudaMemcpyHostToDevice));
+  CUCHK(cudaMemcpy((void*)D.nuCell, S.nuCell.data(),
+                   (size_t)S.Nx*S.Ny*8, cudaMemcpyHostToDevice));
+  D.rhs(D.U, D.R1);
+  if (check) {
+    std::vector<double> Rg(m), Rh;
+    CUCHK(cudaMemcpy(Rg.data(), D.R1, m*8, cudaMemcpyDeviceToHost));
+    S.rhs(Uhost, Rh);                       // frozen host reference
+    double md=0, sc=0;
+    for (size_t i=0;i<m;i++){ md=fmax(md,fabs(Rg[i]-Rh[i])); sc=fmax(sc,fabs(Rh[i])); }
+    printf("  [gpu] RHS check: max|dev-host| %.3e (scale %.3e)\n", md, sc);
+  }
+  double b2=D.dot(D.R1,D.R1);
+  delta.assign(m,0.0);
+  if (b2==0) return 0;
+  double bnorm=sqrt(b2), normU=sqrt(D.dot(D.U,D.U));
+  CUCHK(cudaMemset(D.x,0,m*8));
+  std::vector<double> H((size_t)(gm+1)*gm,0.0), cs(gm),sn(gm),g(gm+1),y;
+  i32 total=0;
+  for (i32 restart=0; restart<3; restart++) {
+    double beta;
+    if (restart==0) {
+      beta=bnorm;
+      kScalCopy<<<gb,B>>>(m, 1.0/beta, D.R1, D.V);
+    } else {
+      D.prec(D.x, D.pz, dtau);
+      double nv=sqrt(D.dot(D.pz,D.pz));
+      double eps=sqrt(1e-13)*sqrt(1.0+normU)/fmax(nv,1e-300);
+      kAddScaled<<<gb,B>>>(m, D.U, eps, D.pz, D.scr);
+      D.rhs(D.scr, D.R2);
+      kMassEll<<<(D.n+255)/256,256>>>(D.n,S.nx,S.ny,S.p,D.Mell,D.act,D.pz,D.Mv);
+      kFormA<<<gb,B>>>(m,D.act,D.Mv,dtau,D.R2,D.R1,eps,D.x,D.w);
+      kScalCopy<<<gb,B>>>(m,1.0,D.R1,D.scr);
+      kAxpy<<<gb,B>>>(m,-1.0,D.w,D.scr);
+      beta=sqrt(D.dot(D.scr,D.scr));
+      if (beta/bnorm<rtol) break;
+      kScalCopy<<<gb,B>>>(m, 1.0/beta, D.scr, D.V);
+    }
+    std::fill(g.begin(),g.end(),0.0); g[0]=beta;
+    i32 k=0;
+    for (; k<gm; k++) {
+      double *Vk=D.V+(size_t)k*m;
+      D.prec(Vk, D.pz, dtau);
+      double nv=sqrt(D.dot(D.pz,D.pz));
+      double eps=sqrt(1e-13)*sqrt(1.0+normU)/fmax(nv,1e-300);
+      kAddScaled<<<gb,B>>>(m, D.U, eps, D.pz, D.scr);
+      D.rhs(D.scr, D.R2);
+      kMassEll<<<(D.n+255)/256,256>>>(D.n,S.nx,S.ny,S.p,D.Mell,D.act,D.pz,D.Mv);
+      kFormA<<<gb,B>>>(m,D.act,D.Mv,dtau,D.R2,D.R1,eps,Vk,D.w);
+      for (i32 j=0;j<=k;j++) {
+        double hjk=D.dot(D.w, D.V+(size_t)j*m);
+        H[(size_t)j*gm+k]=hjk;
+        kAxpy<<<gb,B>>>(m,-hjk,D.V+(size_t)j*m,D.w);
+      }
+      double hk1=sqrt(D.dot(D.w,D.w));
+      H[(size_t)(k+1)*gm+k]=hk1;
+      if (hk1>1e-30) kScalCopy<<<gb,B>>>(m,1.0/hk1,D.w,D.V+(size_t)(k+1)*m);
+      for (i32 j=0;j<k;j++){ double t=cs[j]*H[(size_t)j*gm+k]+sn[j]*H[(size_t)(j+1)*gm+k];
+        H[(size_t)(j+1)*gm+k]=-sn[j]*H[(size_t)j*gm+k]+cs[j]*H[(size_t)(j+1)*gm+k];
+        H[(size_t)j*gm+k]=t; }
+      double d=sqrt(H[(size_t)k*gm+k]*H[(size_t)k*gm+k]+hk1*hk1);
+      cs[k]=H[(size_t)k*gm+k]/d; sn[k]=hk1/d;
+      H[(size_t)k*gm+k]=d; g[k+1]=-sn[k]*g[k]; g[k]=cs[k]*g[k];
+      total++;
+      if (fabs(g[k+1])/bnorm < rtol || hk1<=1e-30) { k++; break; }
+    }
+    y.assign(k,0.0);
+    for (i32 i=k-1;i>=0;i--){ double t=g[i];
+      for (i32 j=i+1;j<k;j++) t-=H[(size_t)i*gm+j]*y[j];
+      y[i]=t/H[(size_t)i*gm+i]; }
+    for (i32 j=0;j<k;j++) kAxpy<<<gb,B>>>(m,y[j],D.V+(size_t)j*m,D.x);
+    if (fabs(g[k>0?k:0])/bnorm < rtol || k<gm) break;
+  }
+  D.prec(D.x, D.pz, dtau);
+  CUCHK(cudaMemcpy(delta.data(), D.pz, m*8, cudaMemcpyDeviceToHost));
+  return total;
+}
 
 // ---------------------------------------------------------------------------
 //  gates
@@ -1084,6 +1474,9 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
   // exactly the quantity PTC drives to zero -- self-limiting viscosity.
   std::fill(S.Udot.begin(), S.Udot.end(), 0.0);
   Ptc ptc(S);
+  const i32 gm=60;
+  Dev dev; i32 useGpu=getenv("IGA2_GPU")?1:0, gcheck=getenv("IGA2_GPUCHECK")?1:0;
+  if (useGpu) devInit(dev,S,gm);
   std::vector<double> delta, y, pz, scr, Rtrial, Utrial;
   double lam0 = u+c;
   double dtau = 10.0*S.h/lam0;                  // pseudo-CFL 10 start
@@ -1095,11 +1488,15 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
   i32 rejects=0;
   for (i32 it=1; it<=maxIt; it++) {
     S.nuFrozen=1;                               // lagged viscosity in the solve
-    const i32 gm=60;
-    i32 gi = ptc.gmres(U, ptc.Rbase, dtau, y, gm, 1e-3);
-    // right-prec closure: delta = P^-1 y
-    S.precApply(y.data(), (delta.resize(y.size()), delta.data()), scr);
-    for (size_t i=0;i<delta.size();i++) delta[i]*=dtau;
+    i32 gi;
+    if (useGpu) {
+      gi = gmresGpu(dev,S,U,dtau,gm,1e-3,delta,gcheck); gcheck=0;
+    } else {
+      gi = ptc.gmres(U, ptc.Rbase, dtau, y, gm, 1e-3);
+      // right-prec closure: delta = P^-1 y
+      S.precApply(y.data(), (delta.resize(y.size()), delta.data()), scr);
+      for (size_t i=0;i<delta.size();i++) delta[i]*=dtau;
+    }
     Utrial=U;
     for (size_t i=0;i<U.size();i++) Utrial[i]+=delta[i];
     // positivity + sanity guard on control coefficients
