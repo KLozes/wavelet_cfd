@@ -1544,6 +1544,25 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
     fflush(stdout);
     if (Rn/R0 < 1e-8) { printf("  CONVERGED\n"); break; }
   }
+  if (getenv("IGA2_FDUMP")) {
+    // regular-grid sample of the spline solution for field plots
+    FILE *fp=fopen(getenv("IGA2_FDUMP"),"w");
+    fprintf(fp,"x,y,rho,u,v,p\n");
+    const i32 NXS=500, NYS=375;
+    const double X0=-3.0, X1=5.0, Y0=-3.0, Y1=3.0;
+    for (i32 jy=0;jy<NYS;jy++) for (i32 ix=0;ix<NXS;ix++) {
+      double x=X0+(X1-X0)*ix/(NXS-1.0), y=Y0+(Y1-Y0)*jy/(NYS-1.0);
+      if (x*x+y*y < 0.25) { fprintf(fp,"%.5f,%.5f,nan,nan,nan,nan\n",x,y); continue; }
+      i32 cx=(i32)floor((x-S.x0d)/S.h), cy=(i32)floor((y-S.y0d)/S.h);
+      cx=cx<0?0:(cx>=N?N-1:cx); cy=cy<0?0:(cy>=N?N-1:cy);
+      double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
+      S.evalCell(U,cx,cy,(x-S.x0d)/S.h-cx,(y-S.y0d)/S.h-cy,Uq,Ux,Uy,Ut);
+      double rr,uu,vv,pp,ccs; primEval(Uq,rr,uu,vv,pp,ccs);
+      fprintf(fp,"%.5f,%.5f,%.6e,%.6e,%.6e,%.6e\n",x,y,rr,uu,vv,pp);
+    }
+    fclose(fp);
+    printf("  wrote %s\n", getenv("IGA2_FDUMP"));
+  }
   if (getenv("IGA2_DUMP")) {
     FILE *fp=fopen(getenv("IGA2_DUMP"),"w");
     fprintf(fp,"theta,cp,un\n");
@@ -1614,6 +1633,25 @@ static void gateCyl(i32 p, double CFL, double CDC, double CMAX) {
     }
   }
   // Cp(theta) dump
+  if (getenv("IGA2_FDUMP")) {
+    // regular-grid sample of the spline solution for field plots
+    FILE *fp=fopen(getenv("IGA2_FDUMP"),"w");
+    fprintf(fp,"x,y,rho,u,v,p\n");
+    const i32 NXS=500, NYS=375;
+    const double X0=-3.0, X1=5.0, Y0=-3.0, Y1=3.0;
+    for (i32 jy=0;jy<NYS;jy++) for (i32 ix=0;ix<NXS;ix++) {
+      double x=X0+(X1-X0)*ix/(NXS-1.0), y=Y0+(Y1-Y0)*jy/(NYS-1.0);
+      if (x*x+y*y < 0.25) { fprintf(fp,"%.5f,%.5f,nan,nan,nan,nan\n",x,y); continue; }
+      i32 cx=(i32)floor((x-S.x0d)/S.h), cy=(i32)floor((y-S.y0d)/S.h);
+      cx=cx<0?0:(cx>=N?N-1:cx); cy=cy<0?0:(cy>=N?N-1:cy);
+      double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
+      S.evalCell(U,cx,cy,(x-S.x0d)/S.h-cx,(y-S.y0d)/S.h-cy,Uq,Ux,Uy,Ut);
+      double rr,uu,vv,pp,ccs; primEval(Uq,rr,uu,vv,pp,ccs);
+      fprintf(fp,"%.5f,%.5f,%.6e,%.6e,%.6e,%.6e\n",x,y,rr,uu,vv,pp);
+    }
+    fclose(fp);
+    printf("  wrote %s\n", getenv("IGA2_FDUMP"));
+  }
   if (getenv("IGA2_DUMP")) {
     FILE *fp=fopen(getenv("IGA2_DUMP"),"w");
     fprintf(fp,"theta,cp,un\n");
