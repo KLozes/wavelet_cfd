@@ -374,12 +374,13 @@ real DgSolver::step(real tStep) {
         dgMoodResetKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
         if (bulkC > (real)0.0)   // bulk gate needs a fresh sensor even under MOOD
           dgAvNuKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this);
-        if (cutOn) applySrd();   // SRD on the stage INPUT: dU/dt = A S U
         DG_RHS(stageT);   // DG trial
         dgMoodDetectKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage, deltaT);
         DG_RHS(stageT);   // FV redo for flagged
         if (cutOn) redistributeFlux();
         dgRk3StageKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage, deltaT);
+        // Giuliani's ordering: update -> SRD (postprocess) -> characteristic limit
+        if (cutOn) { applySrd(); applyCutLimiter(); }
         dgPositivityKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // last-resort net
         if (ibOn && (ibFillEvery == 0 || stage == 2))
           dgIbFillKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
@@ -390,10 +391,11 @@ real DgSolver::step(real tStep) {
       if (avOn || subFv || bulkC > (real)0.0)   // per-element nu (AV jump
         dgAvNuKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this);  // penalty),
         // subcell-FV blend factor, and/or the bulk-viscosity gate (slot 1)
-      if (cutOn) applySrd();     // SRD on the stage INPUT: dU/dt = A S U
       DG_RHS(stageT);
       if (cutOn) redistributeFlux();
       dgRk3StageKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage, deltaT);
+      // Giuliani's ordering: update -> SRD (postprocess) -> characteristic limit
+      if (cutOn) { applySrd(); applyCutLimiter(); }
       dgPositivityKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
       if (esLim)   // ES limiter: bound the cell entropy by the RHS's slots 3/4
         dgEntropyLimitKernel<<<cudaGridSize, cudaBlockSize>>>(*this, deltaT);

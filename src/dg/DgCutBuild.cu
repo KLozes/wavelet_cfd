@@ -162,6 +162,7 @@ void DgSolver::buildCutElems(void) {
   memset(cutM11, 0, (size_t)nCutElem*CUT_NBMAX_H*CUT_NBMAX_H*sizeof(real));
   cudaMallocManaged(&cutCen,  (size_t)nCutElem*4*sizeof(real));
   cudaMallocManaged(&cutQual, (size_t)nCutElem*sizeof(real));
+  cudaMallocManaged(&cutWallN, (size_t)nCutElem*2*sizeof(real));
   cudaMallocManaged(&cutMinv, (size_t)nCutElem*CUT_NBMAX_H*CUT_NBMAX_H*sizeof(real));
   memset(cutMinv, 0, (size_t)nCutElem*CUT_NBMAX_H*CUT_NBMAX_H*sizeof(real));
   cudaMallocManaged(&blkCut,  nBlocksMax*sizeof(i32));
@@ -177,6 +178,12 @@ void DgSolver::buildCutElems(void) {
       cutM11[(size_t)c*CUT_NBMAX_H*CUT_NBMAX_H + (size_t)i*CUT_NBMAX_H + j] =
         (real)E.M11inv[(size_t)i*E.nbLo + j];
     cutQual[c] = (real)E.bndIncons;
+    { double nx=0, ny=0;
+      for (const SayeNode &sn : E.wall) { nx += (double)sn.w*(double)sn.n[0];
+                                          ny += (double)sn.w*(double)sn.n[1]; }
+      double nm = sqrt(nx*nx+ny*ny);
+      cutWallN[2*c]   = (real)(nm>1e-14 ? nx/nm : 1.0);
+      cutWallN[2*c+1] = (real)(nm>1e-14 ? ny/nm : 0.0); }
     cutCen[4*c+0]=(real)E.B.c[0]; cutCen[4*c+1]=(real)E.B.c[1];
     cutCen[4*c+2]=(real)E.B.c[2]; cutCen[4*c+3]=(real)E.B.s;
     for (const SayeNode &s : E.vol)  cutVolP[nVolT++] = s;
@@ -476,6 +483,158 @@ void DgSolver::redistributeFlux(void) {
         for (i32 nd = 0; nd < blockSizeTot; nd++)
           getField(D_RHS+q)[(size_t)bj*blockSizeTot+nd] += add;
       }
+    }
+  }
+}
+
+// ===========================================================================
+//  CHARACTERISTIC BARTH-JESPERSEN LIMITER for cut elements
+//  (Giuliani, SIAM J. Sci. Comput. 44 (2022): the working shock recipe for
+//  SRD-stabilized cut-cell DG, demonstrated through a Mach-10 DMR with volume
+//  fractions of 4e-6.)
+//
+//  Two of his findings drive the design:
+//    * limiting in CONSERVED variables "produced unsatisfactory and
+//      oscillatory results" -- the transform to CHARACTERISTIC variables of
+//      the flux Jacobian is load-bearing;
+//    * for cut cells the eigendirection is taken PARALLEL TO THE BOUNDARY
+//      (the wall tangent), not axis-aligned.
+//
+//  Form: nodal deviation scaling.  With cell mean Ubar and the p-degree nodal
+//  polynomial U(x), evaluate U at the four lateral NEIGHBOUR CENTROIDS
+//  (reference points outside [0,1] -- extrapolation is exactly what BJ tests),
+//  transform deviations to characteristic variables, and compute per-field
+//  phi in [0,1] so the extrapolated values lie within the range spanned by the
+//  neighbours' mean deviations.  Then U := Ubar + R diag(phi) L (U - Ubar).
+//  P0 elements are untouched (no deviation); the state's conservative mean is
+//  exactly preserved.
+// ===========================================================================
+
+// right/left eigenvector matrices of dF.n/dU for the gamma-law Euler system,
+// normal n (2-D flow in x-y; z velocity rides along as a passive component).
+static void dgEulerEigH(const double W[5], const double n[2],
+                        double R[5][5], double L[5][5]) {
+  const double g = (double)dgGam;
+  double rho = fmax(W[0], 1e-12), u = W[1], v = W[2], w = W[3], p = fmax(W[4], 1e-12);
+  double c = sqrt(g*p/rho), c2 = c*c;
+  double q2 = u*u+v*v+w*w, H = c2/(g-1.0) + 0.5*q2;
+  double un = u*n[0]+v*n[1], ut = -u*n[1]+v*n[0];
+  // R columns: [un-c, entropy, shear-t, shear-z, un+c]
+  double Rc[5][5] = {
+    {1,            1,        0,     0, 1           },
+    {u-c*n[0],     u,       -n[1],  0, u+c*n[0]    },
+    {v-c*n[1],     v,        n[0],  0, v+c*n[1]    },
+    {w,            w,        0,     1, w           },
+    {H-c*un,       0.5*q2,   ut,    w, H+c*un      }};
+  for (int i=0;i<5;i++) for (int j=0;j<5;j++) R[i][j]=Rc[i][j];
+  double gm = g-1.0;
+  double L0[5][5] = {
+    { 0.5*(gm*0.5*q2/c2 + un/c), -0.5*(gm*u/c2 + n[0]/c), -0.5*(gm*v/c2 + n[1]/c), -0.5*gm*w/c2, 0.5*gm/c2 },
+    { 1.0-gm*0.5*q2/c2,           gm*u/c2,                 gm*v/c2,                 gm*w/c2,     -gm/c2     },
+    { -ut,                        -n[1],                    n[0],                    0,            0         },
+    { -w,                          0,                       0,                       1,            0         },
+    { 0.5*(gm*0.5*q2/c2 - un/c), -0.5*(gm*u/c2 - n[0]/c), -0.5*(gm*v/c2 - n[1]/c), -0.5*gm*w/c2, 0.5*gm/c2 }};
+  for (int i=0;i<5;i++) for (int j=0;j<5;j++) L[i][j]=L0[i][j];
+}
+
+void DgSolver::applyCutLimiter(void) {
+  if (!srd || !cutOn || nCutElem == 0) return;
+  if (getenv("CUT_NOBJ")) return;
+  cudaDeviceSynchronize();
+  double w[NNODE], xi[NNODE]; dgGetHostOps(w, xi, gauss);
+  // 1-D Lagrange values at an arbitrary reference point (extrapolation allowed)
+  auto lag1 = [&](double x, double *Lv){
+    for (i32 a = 0; a < NNODE; a++) {
+      double t = 1;
+      for (i32 b2 = 0; b2 < NNODE; b2++) if (b2 != a) t *= (x - xi[b2])/(xi[a] - xi[b2]);
+      Lv[a] = t;
+    } };
+  const double ctr[4][2] = {{-1,0},{1,0},{0,-1},{0,1}};   // lateral neighbour centres
+  const i32 faceSlot2[4] = {0+3*1+9*1, 2+3*1+9*1, 1+3*0+9*1, 1+3*2+9*1};
+
+  for (i32 c = 0; c < nCutElem; c++) {
+    const i32 b = cutBlk[c];
+    if (cutNbOf[c] <= 1) continue;                       // P0: nothing to limit
+    // cell mean (GLL over the tensor cell -- the state's natural mean)
+    double Ub[5] = {0,0,0,0,0}, wsum = 0, U[5][blockSizeTot];
+    for (i32 nd = 0; nd < blockSizeTot; nd++) {
+      i32 i2=nd%NNODE, j2=(nd/NNODE)%NNODE, k2=nd/(NNODE*NNODE);
+      double wn = w[i2]*w[j2]*w[k2]; wsum += wn;
+      for (i32 q = 0; q < 5; q++) {
+        U[q][nd] = (double)getField(D_RHO+q)[(size_t)b*blockSizeTot+nd];
+        Ub[q] += wn*U[q][nd];
+      } }
+    for (i32 q = 0; q < 5; q++) Ub[q] /= wsum;
+    // characteristic frame at the wall tangent (Giuliani's direction choice)
+    double Wb[5] = { Ub[0], Ub[1]/fmax(Ub[0],1e-12), Ub[2]/fmax(Ub[0],1e-12),
+                     Ub[3]/fmax(Ub[0],1e-12), 0 };
+    Wb[4] = (dgGam-1.0)*(Ub[4]-0.5*(Ub[1]*Ub[1]+Ub[2]*Ub[2]+Ub[3]*Ub[3])/fmax(Ub[0],1e-12));
+    if (Wb[0] <= 1e-12 || Wb[4] <= 1e-12) continue;
+    double tan2[2] = { -(double)cutWallN[2*c+1], (double)cutWallN[2*c] };
+    double R[5][5], L[5][5];
+    dgEulerEigH(Wb, tan2, R, L);
+    // neighbour mean deviations in characteristic variables
+    double wlo[5], whi[5]; bool anyN = false;
+    for (i32 q = 0; q < 5; q++) { wlo[q] = 0; whi[q] = 0; }
+    for (i32 fdir = 0; fdir < 4; fdir++) {
+      i32 nn = nbrIdxList[27*b + faceSlot2[fdir]];
+      if (nn == bEmpty || nn < 0) continue;
+      if (ibClassList[nn] == IB_DEAD) continue;
+      double Un[5] = {0,0,0,0,0};
+      for (i32 nd = 0; nd < blockSizeTot; nd++) {
+        i32 i2=nd%NNODE, j2=(nd/NNODE)%NNODE, k2=nd/(NNODE*NNODE);
+        double wn = w[i2]*w[j2]*w[k2];
+        for (i32 q = 0; q < 5; q++)
+          Un[q] += wn*(double)getField(D_RHO+q)[(size_t)nn*blockSizeTot+nd];
+      }
+      for (i32 q = 0; q < 5; q++) Un[q] /= wsum;
+      anyN = true;
+      double dw[5];
+      for (i32 k2 = 0; k2 < 5; k2++) {
+        double s2 = 0;
+        for (i32 q = 0; q < 5; q++) s2 += L[k2][q]*(Un[q]-Ub[q]);
+        dw[k2] = s2;
+      }
+      for (i32 k2 = 0; k2 < 5; k2++) { wlo[k2] = fmin(wlo[k2], dw[k2]); whi[k2] = fmax(whi[k2], dw[k2]); }
+    }
+    if (!anyN) continue;
+    // extrapolate MY polynomial to the neighbour centroids; per-field BJ phi
+    double phi[5] = {1,1,1,1,1};
+    for (i32 fdir = 0; fdir < 4; fdir++) {
+      double xr[3] = { 0.5+ctr[fdir][0], 0.5+ctr[fdir][1], 0.5 };
+      double Lx[NNODE], Ly[NNODE], Lz[NNODE];
+      lag1(2.0*xr[0]-1.0, Lx); lag1(2.0*xr[1]-1.0, Ly); lag1(2.0*xr[2]-1.0, Lz);
+      double Ue[5] = {0,0,0,0,0};
+      for (i32 nd = 0; nd < blockSizeTot; nd++) {
+        i32 i2=nd%NNODE, j2=(nd/NNODE)%NNODE, k2=nd/(NNODE*NNODE);
+        double ph = Lx[i2]*Ly[j2]*Lz[k2];
+        for (i32 q = 0; q < 5; q++) Ue[q] += ph*U[q][nd];
+      }
+      for (i32 k2 = 0; k2 < 5; k2++) {
+        double d = 0;
+        for (i32 q = 0; q < 5; q++) d += L[k2][q]*(Ue[q]-Ub[q]);
+        if (d > 1e-14)       phi[k2] = fmin(phi[k2], fmax(0.0, whi[k2])/d);
+        else if (d < -1e-14) phi[k2] = fmin(phi[k2], fmax(0.0, -wlo[k2])/(-d));
+      }
+    }
+    bool active = false;
+    for (i32 k2 = 0; k2 < 5; k2++) { phi[k2] = fmin(phi[k2], 1.0); if (phi[k2] < 1.0) active = true; }
+    if (!active) continue;
+    // U := Ubar + R diag(phi) L (U - Ubar), nodal
+    for (i32 nd = 0; nd < blockSizeTot; nd++) {
+      double dw[5], du[5];
+      for (i32 k2 = 0; k2 < 5; k2++) {
+        double s2 = 0;
+        for (i32 q = 0; q < 5; q++) s2 += L[k2][q]*(U[q][nd]-Ub[q]);
+        dw[k2] = phi[k2]*s2;
+      }
+      for (i32 q = 0; q < 5; q++) {
+        double s2 = 0;
+        for (i32 k2 = 0; k2 < 5; k2++) s2 += R[q][k2]*dw[k2];
+        du[q] = s2;
+      }
+      for (i32 q = 0; q < 5; q++)
+        getField(D_RHO+q)[(size_t)b*blockSizeTot+nd] = (real)(Ub[q] + du[q]);
     }
   }
 }

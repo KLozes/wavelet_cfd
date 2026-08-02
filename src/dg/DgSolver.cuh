@@ -275,6 +275,9 @@ public:
   real *cutCen = nullptr;  // [nCutElem*4] basis centroid (3) + scale (1)
   real *cutMinv= nullptr;  // [nCutElem*cutNb*cutNb] DENSE inverse mass matrix
   real *cutQual= nullptr;  // [nCutElem] bndIncons -- per-element geometry quality
+  real *cutWallN= nullptr; // [nCutElem*2] mean wall normal (x,y) -- the
+                           // characteristic limiter's eigendirection is the
+                           // wall TANGENT, per Giuliani SISC 2022
   // rule pools, reference coords, CSR-offset addressed
   SayeNode *cutVolP = nullptr;  i32 *cutVolOff = nullptr;   // [nCutElem+1]
   SayeNode *cutWalP = nullptr;  i32 *cutWalOff = nullptr;   // [nCutElem+1]
@@ -542,6 +545,9 @@ public:
                                 // conservative, removes the 1/vol update spike
                                 // at the source.  Runs between DG_RHS and the
                                 // RK stage kernel.
+  void applyCutLimiter(void);   // characteristic Barth-Jespersen on cut elements
+                                // (Giuliani SISC 2022) -- wall-tangent eigenframe,
+                                // range condition vs neighbour means, post-SRD
   void applySrd(void);          // stage-wise state redistribution on the HOST via
                                 // managed memory -- microseconds at wall-band size;
                                 // port to a kernel only if a profile says so
