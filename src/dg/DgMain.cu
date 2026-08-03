@@ -134,8 +134,8 @@ int main(int argc, char* argv[]) {
                                  (testCase == 5 ? 8 :
                                  (testCase == 8 ? 40 :
                                  (testCase == 9 ? 24 : 16))))))));
-  i32 nElemY = cube ? nElemX : (square ? nElemX : (dmr ? nElemX/4 :
-               (ibcyl ? (nElemX*2)/3 : 4)));
+  i32 nElemY = argI("--nblocksy", cube ? nElemX : (square ? nElemX :
+               (dmr ? nElemX/4 : (ibcyl ? (nElemX*2)/3 : 4))));
   i32 nElemZ = cube ? nElemX : 1;
 
   i32 nLvls = argI("--nlvls", testCase == 0 ? 3 :
@@ -147,8 +147,9 @@ int main(int argc, char* argv[]) {
                               (testCase == 8 ? 1 :
                               (testCase == 9 ? 4 : 4))))))));
 
-  real domainLenX = (testCase == 2 || testCase == 7) ? 10.0
-                  : (dmr ? 4.0 : (ibcyl ? 6.0 : 1.0));
+  real domainLenX = argF("--domx", (testCase == 2 || testCase == 7) ? 10.0
+                  : (dmr ? 4.0 : (ibcyl ? 6.0 : 1.0)));   // --domx: free-air
+                  // parity runs (16x16 box, cylinder at center via --ibx/--iby)
   real hElem = domainLenX / nElemX;
   real domainSize[3]   = {domainLenX, hElem*nElemY, hElem*nElemZ};
   i32  baseGridSize[3] = {blockSize*nElemX, blockSize*nElemY, blockSize*nElemZ};
@@ -205,6 +206,8 @@ int main(int argc, char* argv[]) {
   solver->ibSbmCurv   = argF("--ibsbmcurv", 1.0);  // SBM wall curvature coefficient
   solver->ibShift2    = argI("--ibshift2", 0);     // 2nd-order Taylor velocity shift
   solver->ibSbmPen    = argF("--ibsbmpen", 0.2);   // SBM slip Nitsche penalty alpha
+  solver->recov       = argI("--recov", 0);        // binary-recovery interface flux
+  solver->recovK      = argF("--recovk", 0.1);     // recovery dissipation fraction
   solver->ibSingle    = argI("--ibsingle", 0);    // 1 = single-IP state, 2 = +gradient
   solver->ibRecon     = argI("--ibrecon", 1);      // 0 = H/S (paper) image line; 1 =
                                                    // primitive (p,rho) DEFAULT 2026-07-15:

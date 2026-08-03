@@ -1628,8 +1628,49 @@ __device__ void dgFaceLift(DgSolver &grid, const real (*sWe)[blockSizeTot],
     dgConsToPrimSane(U, Wn);
     real fs[5];
     real afN = fmax(aOwn, grid.subFv ? grid.getField(D_SCRATCH)[(u64)nSame*blockSizeTot + 6] : (real)0.0);
+    // ── binary-recovery interface flux (--recov, p=2 / NNODE==3 only): the
+    // central flux is evaluated at the quintic trace that L2-matches BOTH
+    // elements' P2 solutions on the union (Van Leer recovery; interface
+    // weights [-3,12,23,23,12,-3]/64 on the 6 line dofs), and the Rusanov
+    // jump dissipation of the raw traces is retained at fraction recovK --
+    // interface dissipation drops from the O(h^3) trace jump to a tunable
+    // sliver of it while the central part gains two orders of face accuracy.
+    // Fluid-fluid, shock-blend-quiet faces only; everything else falls back.
+    if (grid.recov && NNODE == 3 && afN <= (real)0.0
+        && grid.ibClassList[bIdx] == IB_FLUID
+        && grid.ibClassList[nSame] == IB_FLUID) {
+      const real rw[6] = {(real)(-3.0/64.0), (real)(12.0/64.0), (real)(23.0/64.0),
+                          (real)( 23.0/64.0), (real)(12.0/64.0), (real)(-3.0/64.0)};
+      real WR[5];
+      for (i32 q = 0; q < 5; q++) WR[q] = (real)0.0;
+      for (i32 k = 0; k < NNODE; k++) {
+        // my line node k (normal index) from shared prims; neighbor's from global
+        i32 ndM = dgFaceNode(dir, k, a, b);
+        real Un[5], Wnb[5];
+        for (i32 q = 0; q < 5; q++) Un[q] = grid.getField(D_RHO+q)[nSame*blockSizeTot + ndM];
+        dgConsToPrimSane(Un, Wnb);
+        // +dir-ordered 6-line: [upstream elem k=0..2 | downstream elem k=0..2]
+        i32 jMe = side ? k : (3 + k);       // side=1: neighbor is at +dir
+        i32 jNb = side ? (3 + k) : k;
+        for (i32 q = 0; q < 5; q++) {
+          WR[q] += rw[jMe] * sWe[q][ndM];
+          WR[q] += rw[jNb] * Wnb[q];
+        }
+      }
+      dgSanitizePrim(WR);
+      real fc[5], fL[5], fR[5], fr[5];
+      dgEulerFluxAxis(WR, dir, fc);
+      const real *WLs = side ? Wme : Wn;
+      const real *WRs = side ? Wn  : Wme;
+      dgRusanovAxis(WLs, WRs, dir, fr);
+      dgEulerFluxAxis(WLs, dir, fL);
+      dgEulerFluxAxis(WRs, dir, fR);
+      for (i32 q = 0; q < 5; q++)
+        fs[q] = fc[q] + grid.recovK*(fr[q] - (real)0.5*(fL[q] + fR[q]));
+    } else {
     if (side) dgIfaceFlux(grid, Wme, Wn, dir, afN, fs);
     else      dgIfaceFlux(grid, Wn, Wme, dir, afN, fs);
+    }
     if (grid.avOn) {
       real nuN = grid.getField(D_SCRATCH)[(u64)nSame*blockSizeTot];
       real sig = side ? dgPenaltySigma(grid, nuOwn, nuN, Wme, Wn)

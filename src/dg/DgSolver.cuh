@@ -359,6 +359,12 @@ public:
                        // Hessian from the element polynomial).  A/B knob: the
                        // FRIB --ibord 3 lesson says 2nd derivatives amplify
                        // node-scale noise -- measure, don't assume.  Default 0.
+  i32  recov;          // 1 = binary-recovery interface flux on conforming
+                       // same-level fluid faces: central flux at the L2
+                       // moment-matched quintic trace (Van Leer recovery,
+                       // weights [-3,12,23,23,12,-3]/64), Rusanov jump
+                       // dissipation scaled by recovK (uniform grids)
+  real recovK;         // recovery dissipation fraction (default 0.1)
   real ibSbmPen;       // SBM slip-wall Nitsche penalty coefficient (alpha_slip,
                        // paper default 0.2): weight on c_s*rho*u_n in the wall
                        // momentum flux that drives the SHIFTED normal velocity
@@ -499,6 +505,8 @@ public:
     ibBrinkRate = 1.0;
     ibSbmCurv   = 1.0;
     ibSbmPen    = 0.2;
+    recov       = 0;
+    recovK      = 0.1;
     ibShift2    = 0;
     ibSingle    = 0;
     ibRecon     = 0;
