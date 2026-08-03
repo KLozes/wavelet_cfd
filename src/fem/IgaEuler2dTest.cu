@@ -212,6 +212,104 @@ static void buildCutCell(const Circle &G, double x0, double y0, double h,
   }
 }
 
+// IGA2_WPROJ=1: evaluate the wall flux at the CONSTRAINED state (normal
+// momentum projected out) instead of averaging interior and mirror states.
+// Mirror-Rusanov's central part carries the INTERIOR pressure; the projected
+// state carries p_b = p + (gam-1)/2 rho (u.n)^2 -- the discrepancy is O(un^2)
+// in the equation but it is exactly the term adjoint consistency of the
+// force/entropy functionals depends on (Hartmann's adjoint-consistent Euler
+// wall in DG).  The u.n penalty (wallBeta) is kept identical in both forms.
+static i32 g_wproj = 0;
+// IGA2_SKEW=1: skew-symmetric (split-form) convective term -- the 1/2:1/2
+// average of the divergence form (integrate by parts, current default) and the
+// advective form (test against A grad U).  For C^{p-1>=1} splines the chain
+// rule A(U_h) grad U_h = div F(U_h) holds POINTWISE, so the two forms differ
+// only through quadrature: the average is a pure aliasing-cancellation device
+// (the canonical split-form mechanism), with no interior jumps to book-keep.
+// Boundary integrals then need the compensating +1/2 psi F(U).n alongside the
+// full -psi Fhat.n (SAT form: -psi (Fhat - F/2).n).
+static i32 g_skew = 0;
+// IGA2_SUPGT=1: TIME-CONSISTENT SUPG -- stabilize the full residual
+// Ut + A grad U instead of the steady part only (Ziggaf-Torlo-Ricchiuto
+// eq. 38: transient consistency requires the time term; the code's GLS is the
+// steady-residual special case, identical to SUPG for a steady 1st-order
+// system).  Ut is the LAGGED Udot the EV sensor already maintains (set from
+// the first RK stage of the previous step), a cheap proxy for the implicit
+// M^SU mass modification.  Prime suspect test for the p3 explicit GLS
+// instability: a growing mode has large Ut that steady-residual GLS is blind
+// to.  Host path only (PTC/GPU has Udot = 0, where SUPGT == GLS).
+static i32 g_supgt = 0;
+// IGA2_MSU=1: IMPLICIT time-consistent SUPG.  The stabilization of the full
+// residual contributes an extra "SUPG mass" C(U)_ab = int (A grad psi_a)^T tau
+// psi_b dx acting on dU/dt: the semi-discrete system becomes
+// (M + C(U)) dU/dt = R(U) with R carrying the spatial GLS as before.  This is
+// the M^SU of Ziggaf-Torlo-Ricchiuto eq. 39-40, solved implicitly per RK
+// stage (the LAGGED proxy IGA2_SUPGT is delayed feedback and destabilizes --
+// measured).  C is O(1) vs M (tau*A*grad psi ~ 1/2), so Richardson iteration
+// preconditioned by the exact Kronecker mass converges at ~0.5/pass.
+// NOTE: C multiplies dU/dt, so this CANNOT change any converged steady state
+// -- it is an explicit-path consistency/stability lever only.
+static i32 g_msu = 0;
+// IGA2_DEC=1: deferred-correction time stepping (see Stepper::stepDec)
+static i32 g_dec = 0;
+// IGA2_WVAR=1: ENTROPY-VARIABLE formulation (Hughes-Franca-Mallet).  The
+// spline dofs are the entropy variables w = d(eta)/dU (eta = -rho s/(gam-1));
+// U, fluxes and Jacobians are recovered pointwise at quadrature via the
+// closed-form perfect-gas map, gradients via Ux = A0 wx with A0 = dU/dw SPD,
+// and the GLS pairing is symmetrized gx -> A0 gx so the stabilization is a
+// nonnegative quadratic form in the ENTROPY inner product -- the
+// Clausius-Duhem guarantee the conservative-variable pairing lacks.  Host
+// PTC only (M is only continuation scaling there, so the Kronecker mass
+// preconditioner survives unchanged).
+static i32 g_wvar = 0;
+// IGA2_SUNT: streamline-upwind pairing WITHOUT the least-squares transpose --
+// gx = tau A Res instead of tau A^T Res (Ziggaf-Torlo-Ricchiuto eq. 39-40).
+// DEFAULT since the pairing verdict: the transpose IS the p3 explicit
+// instability (blows up at CFL 0.01 on N>=128; SU is stable at design order
+// 4, tracking pure Galerkin to 5 digits on the steady vortex) and SU is also
+// the best steady p3 cylinder result (off-band 1.365e-4 at N=160 vs 3.372e-4
+// for the transpose).  IGA2_SUNT=0 restores the legacy least-squares pairing.
+static i32 g_sunt = 1;
+
+__host__ __device__ static inline void consToEntr(const double U[NF], double w[NF]) {
+  double r=U[0], u=U[1]/r, v=U[2]/r;
+  double p=(GAM-1.0)*(U[3]-0.5*r*(u*u+v*v));
+  double st=log(p)-GAM*log(r);
+  w[0]=(GAM-st)/(GAM-1.0)-0.5*r*(u*u+v*v)/p;
+  w[1]=r*u/p; w[2]=r*v/p; w[3]=-r/p;
+}
+__host__ __device__ static inline void entrToCons(const double w[NF], double U[NF]) {
+  double k=(w[1]*w[1]+w[2]*w[2])/(2.0*w[3]);          // negative
+  double st=GAM-(GAM-1.0)*(w[0]-k);
+  double lp=(st+GAM*log(-w[3]))/(1.0-GAM);
+  double p=exp(lp), r=-w[3]*p;
+  double u=-w[1]/w[3], v=-w[2]/w[3];
+  U[0]=r; U[1]=r*u; U[2]=r*v; U[3]=p/(GAM-1.0)+0.5*r*(u*u+v*v);
+}
+// A0 = dU/dw by central differences of the closed-form map (probe-grade; the
+// JFNK outer loop differentiates everything numerically anyway)
+__host__ __device__ static inline void entrA0(const double w[NF], double A0[NF][NF]) {
+  double wp[NF], Up[NF], Um2[NF];
+  for (i32 j=0;j<NF;j++) {
+    double ee=1e-7*fmax(1.0,fabs(w[j]));
+    for (i32 i=0;i<NF;i++) wp[i]=w[i];
+    wp[j]=w[j]+ee; entrToCons(wp,Up);
+    wp[j]=w[j]-ee; entrToCons(wp,Um2);
+    for (i32 i=0;i<NF;i++) A0[i][j]=(Up[i]-Um2[i])/(2.0*ee);
+  }
+}
+// in-place: (wq,wx,wy) -> (Uq,Ux,Uy); optionally returns A0
+__host__ __device__ static inline void wvarPoint(double Uq[NF], double Ux[NF], double Uy[NF],
+                                      double A0out[NF][NF]) {
+  double A0[NF][NF], w0[NF], gx0[NF], gy0[NF];
+  for (i32 k=0;k<NF;k++){ w0[k]=Uq[k]; gx0[k]=Ux[k]; gy0[k]=Uy[k]; }
+  entrA0(w0,A0);
+  entrToCons(w0,Uq);
+  for (i32 k=0;k<NF;k++){ Ux[k]=0; Uy[k]=0;
+    for (i32 m=0;m<NF;m++){ Ux[k]+=A0[k][m]*gx0[m]; Uy[k]+=A0[k][m]*gy0[m]; } }
+  if (A0out) for (i32 k=0;k<NF;k++) for (i32 m=0;m<NF;m++) A0out[k][m]=A0[k][m];
+}
+
 // ---------------------------------------------------------------------------
 //  solver
 // ---------------------------------------------------------------------------
@@ -608,6 +706,7 @@ struct Solver2d {
       if (c==0) {
         for (i32 qx=0;qx<gv.n;qx++) for (i32 qy=0;qy<gv.n;qy++) {
           evalCell(U,cx,cy,gv.x[qx],gv.x[qy],Uq,Ux,Uy,Ut);
+          if (g_wvar) wvarPoint(Uq,Ux,Uy,nullptr);
           double u,v,cs,r,pr; primEval(Uq,r,u,v,pr,cs);
           lamM=fmax(lamM, sqrt(u*u+v*v)+cs);
           double eA, res=sensorAt(Uq,Ux,Uy,Ut,eA);
@@ -622,6 +721,7 @@ struct Solver2d {
         for (size_t q=0;q<Q.vw.size();q++) {
           double xi=(Q.vx[q]-x0d)/h-cx, yi=(Q.vy[q]-y0d)/h-cy;
           evalCell(U,cx,cy,xi,yi,Uq,Ux,Uy,Ut);
+          if (g_wvar) wvarPoint(Uq,Ux,Uy,nullptr);
           double u,v,cs,r,pr; primEval(Uq,r,u,v,pr,cs);
           lamM=fmax(lamM, sqrt(u*u+v*v)+cs);
           double eA, res=sensorAt(Uq,Ux,Uy,Ut,eA);
@@ -694,8 +794,9 @@ struct Solver2d {
       real Nvx[BS_NMAX],Nvy[BS_NMAX],Dvx[BS_NMAX],Dvy[BS_NMAX];
       auto scatterVol=[&](i32 cx,i32 cy,double xi,double yi,double w,
                           const std::vector<double> &Uc){
-        double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
+        double Uq[NF],Ux[NF],Uy[NF],Ut[NF],A0w[NF][NF];
         evalCell(Uc,cx,cy,xi,yi,Uq,Ux,Uy,Ut);
+        if (g_wvar) wvarPoint(Uq,Ux,Uy,A0w);
         double Fx[NF],Fy[NF],u,v,cs;
         eulerFlux2(Uq,Fx,Fy,u,v,cs);
         double nu=nuCell[(size_t)cx+Nx*cy];
@@ -711,22 +812,39 @@ struct Solver2d {
         // carries a dt-independent unstable mode without it (measured blowup
         // at CFL 0.3 and 0.02 alike).  Residual-based: vanishes at steady
         // state; conservative (sum_a grad psi_a = 0).
-        double gx[NF]={0,0,0,0}, gy[NF]={0,0,0,0};
-        { double Ax[NF][NF], Ay[NF][NF], Res[NF];
+        double gx[NF]={0,0,0,0}, gy[NF]={0,0,0,0}, Res[NF]={0,0,0,0};
+        { double Ax[NF][NF], Ay[NF][NF];
           eulerJac2(Uq,Ax,Ay);
-          for (i32 k=0;k<NF;k++){ Res[k]=0;
+          for (i32 k=0;k<NF;k++){
+            if (g_supgt) Res[k]=Ut[k];
             for (i32 m=0;m<NF;m++) Res[k]+=Ax[k][m]*Ux[m]+Ay[k][m]*Uy[m]; }
           double lam=sqrt(u*u+v*v)+cs, tau=0.5*C_SUPG*h/fmax(lam,1e-12);
-          for (i32 k=0;k<NF;k++) for (i32 m=0;m<NF;m++){
-            gx[k]+=tau*Ax[m][k]*Res[m]; gy[k]+=tau*Ay[m][k]*Res[m]; }
+          if (g_sunt)
+            for (i32 k=0;k<NF;k++) for (i32 m=0;m<NF;m++){
+              gx[k]+=tau*Ax[k][m]*Res[m]; gy[k]+=tau*Ay[k][m]*Res[m]; }
+          else
+            for (i32 k=0;k<NF;k++) for (i32 m=0;m<NF;m++){
+              gx[k]+=tau*Ax[m][k]*Res[m]; gy[k]+=tau*Ay[m][k]*Res[m]; }
+          // HFM symmetrization: in w-dofs the test perturbation is A grad psi
+          // acting on a w-variation, i.e. (A A0) grad psi_w -- fold the A0 in
+          if (g_wvar) {
+            double t1[NF],t2[NF];
+            for (i32 k=0;k<NF;k++){ t1[k]=gx[k]; t2[k]=gy[k]; gx[k]=gy[k]=0; }
+            for (i32 k=0;k<NF;k++) for (i32 m=0;m<NF;m++){
+              gx[k]+=A0w[m][k]*t1[m]; gy[k]+=A0w[m][k]*t2[m]; }
+          }
         }
+        const double sf = g_skew? 0.5 : 1.0;   // divergence-form weight
         Sx.val(xi,Nvx); Sx.der(xi,Dvx); Sy.val(yi,Nvy); Sy.der(yi,Dvy);
         for (i32 a=0;a<=p;a++) for (i32 b=0;b<=p;b++) {
+          double Pv=(double)Nvx[a]*(double)Nvy[b];
           double Px=(double)Dvx[a]/h*(double)Nvy[b];
           double Py=(double)Nvx[a]*(double)Dvy[b]/h;
           double *out=&Rt[(size_t)NF*aidx(cx+a,cy+b)];
           for (i32 k=0;k<NF;k++)
-            out[k]+= w*( Fx[k]*Px + Fy[k]*Py - nu*(Ux[k]*Px+Uy[k]*Py)
+            out[k]+= w*( sf*(Fx[k]*Px + Fy[k]*Py)
+                         - (g_skew? 0.5*Pv*Res[k] : 0.0)
+                         - nu*(Ux[k]*Px+Uy[k]*Py)
                          - Px*gx[k] - Py*gy[k] );
         }
       };
@@ -750,10 +868,19 @@ struct Solver2d {
             double xi=(Q.wx[q]-x0d)/h-cx, yi=(Q.wy[q]-y0d)/h-cy;
             double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
             evalCell(U,cx,cy,xi,yi,Uq,Ux,Uy,Ut);
+            if (g_wvar){ double w0[NF]={Uq[0],Uq[1],Uq[2],Uq[3]}; entrToCons(w0,Uq); }
             double nxq=Q.wnx[q], nyq=Q.wny[q], Fh[NF];
             if (fsp) {
               double Fx[NF],Fy[NF],u,v,cs; eulerFlux2(Uq,Fx,Fy,u,v,cs);
               for (i32 k=0;k<NF;k++) Fh[k]=Fx[k]*nxq+Fy[k]*nyq;
+            } else if (g_wproj) {
+              double un=(Uq[1]*nxq+Uq[2]*nyq);
+              double mt1=Uq[1]-un*nxq, mt2=Uq[2]-un*nyq;
+              double pb=(GAM-1)*(Uq[3]-0.5*(mt1*mt1+mt2*mt2)/fmax(Uq[0],1e-12));
+              Fh[0]=0; Fh[1]=pb*nxq; Fh[2]=pb*nyq; Fh[3]=0;
+              double u2,v2,cs2,r2,pr2; primEval(Uq,r2,u2,v2,pr2,cs2);
+              double lam=fabs(u2*nxq+v2*nyq)+cs2;
+              Fh[1]+=wallBeta*lam*un*nxq; Fh[2]+=wallBeta*lam*un*nyq;
             } else {
               double Um[NF]; double un=(Uq[1]*nxq+Uq[2]*nyq);
               Um[0]=Uq[0]; Um[1]=Uq[1]-2*un*nxq; Um[2]=Uq[2]-2*un*nyq; Um[3]=Uq[3];
@@ -767,6 +894,10 @@ struct Solver2d {
                 double ex=(wallBeta-1.0)*0.5*lam*2.0*un;   // -0.5*lam*(Um-Uq) extra
                 Fh[1]+=ex*nxq; Fh[2]+=ex*nyq;
               }
+            }
+            if (g_skew) {                        // SAT: -psi (Fhat - F/2).n
+              double Fxq[NF],Fyq[NF],u2,v2,cs2; eulerFlux2(Uq,Fxq,Fyq,u2,v2,cs2);
+              for (i32 k=0;k<NF;k++) Fh[k]-=0.5*(Fxq[k]*nxq+Fyq[k]*nyq);
             }
             Sx.val(xi,Nvx); Sy.val(yi,Nvy);
             for (i32 a=0;a<=p;a++) for (i32 b=0;b<=p;b++) {
@@ -797,7 +928,12 @@ struct Solver2d {
             double ly = tang? yi : (e==2?0.0:1.0);
             double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
             evalCell(U,cx,cy,lx,ly,Uq,Ux,Uy,Ut);
+            if (g_wvar){ double w0[NF]={Uq[0],Uq[1],Uq[2],Uq[3]}; entrToCons(w0,Uq); }
             double Fh[NF]; rusanov(Uq,Uinf,nxq,nyq,Fh);
+            if (g_skew) {
+              double Fxq[NF],Fyq[NF],u2,v2,cs2; eulerFlux2(Uq,Fxq,Fyq,u2,v2,cs2);
+              for (i32 k=0;k<NF;k++) Fh[k]-=0.5*(Fxq[k]*nxq+Fyq[k]*nyq);
+            }
             Sx.val(lx,Nvx); Sy.val(ly,Nvy);
             double w=(double)gv.w[q]*h;
             for (i32 a=0;a<=p;a++) for (i32 b=0;b<=p;b++) {
@@ -814,6 +950,126 @@ struct Solver2d {
     for (i32 a=0;a<n;a++) if (!act[a]) for (i32 k=0;k<NF;k++) R[(size_t)NF*a+k]=0;
   }
 
+  // SUPG mass apply: out_a = int (A(U) grad psi_a)^T tau V_h dx over the fluid
+  // (volume term only; the transpose pairing matches the GLS gx/gy convention)
+  void applyMsu(const std::vector<double> &U, const std::vector<double> &V,
+                std::vector<double> &out) const {
+#ifdef _OPENMP
+    i32 nth=omp_get_max_threads();
+#else
+    i32 nth=1;
+#endif
+    out.assign((size_t)NF*n, 0.0);
+    static std::vector<std::vector<double>> Oloc;
+    Oloc.resize(nth);
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+    {
+#ifdef _OPENMP
+      i32 tid=omp_get_thread_num();
+#else
+      i32 tid=0;
+#endif
+      std::vector<double> &Ot=Oloc[tid];
+      Ot.assign(out.size(),0.0);
+      real Nvx[BS_NMAX],Nvy[BS_NMAX],Dvx[BS_NMAX],Dvy[BS_NMAX];
+      auto pt=[&](i32 cx,i32 cy,double xi,double yi,double w){
+        double Uq[NF],Ux[NF],Uy[NF],Ut[NF],Vq[NF],Vx[NF],Vy[NF],Vt[NF];
+        evalCell(U,cx,cy,xi,yi,Uq,Ux,Uy,Ut);
+        evalCell(V,cx,cy,xi,yi,Vq,Vx,Vy,Vt);
+        double Ax[NF][NF],Ay[NF][NF],r,u,v,pr,cs;
+        primEval(Uq,r,u,v,pr,cs);
+        eulerJac2(Uq,Ax,Ay);
+        double lam=sqrt(u*u+v*v)+cs, tau=0.5*C_SUPG*h/fmax(lam,1e-12);
+        double cxv[NF]={0,0,0,0}, cyv[NF]={0,0,0,0};
+        if (g_sunt)
+          for (i32 k=0;k<NF;k++) for (i32 m=0;m<NF;m++){
+            cxv[k]+=tau*Ax[k][m]*Vq[m]; cyv[k]+=tau*Ay[k][m]*Vq[m]; }
+        else
+          for (i32 k=0;k<NF;k++) for (i32 m=0;m<NF;m++){
+            cxv[k]+=tau*Ax[m][k]*Vq[m]; cyv[k]+=tau*Ay[m][k]*Vq[m]; }
+        Sx.val(xi,Nvx); Sx.der(xi,Dvx); Sy.val(yi,Nvy); Sy.der(yi,Dvy);
+        for (i32 a=0;a<=p;a++) for (i32 b=0;b<=p;b++) {
+          double Px=(double)Dvx[a]/h*(double)Nvy[b];
+          double Py=(double)Nvx[a]*(double)Dvy[b]/h;
+          double *o=&Ot[(size_t)NF*aidx(cx+a,cy+b)];
+          for (i32 k=0;k<NF;k++) o[k]+= w*(Px*cxv[k]+Py*cyv[k]);
+        }
+      };
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic,16)
+#endif
+      for (i32 cc=0;cc<Nx*Ny;cc++) {
+        i32 cx=cc%Nx, cy=cc/Nx, c=cls[cc]; if (c==2) continue;
+        if (c==0) {
+          for (i32 qx=0;qx<gv.n;qx++) for (i32 qy=0;qy<gv.n;qy++)
+            pt(cx,cy,gv.x[qx],gv.x[qy],(double)gv.w[qx]*(double)gv.w[qy]*h*h);
+        } else {
+          const CutCellQ &Q=cq[cutIdx[cc]];
+          for (size_t q=0;q<Q.vw.size();q++)
+            pt(cx,cy,(Q.vx[q]-x0d)/h-cx,(Q.vy[q]-y0d)/h-cy,Q.vw[q]);
+        }
+      }
+    }
+    for (i32 t=0;t<nth;t++)
+      for (size_t i=0;i<out.size();i++) out[i]+=Oloc[t][i];
+    for (i32 a=0;a<n;a++) if (!act[a]) for (i32 k=0;k<NF;k++) out[(size_t)NF*a+k]=0;
+  }
+
+  // solve (M + C(U)) X = B via GMRES on the mass-preconditioned operator
+  // T(x) = x + M^-1 C x  with rhs b = M^-1 B.  (Richardson diverges: the
+  // spectral radius of M^-1 C is ~ C_SUPG*p/2 > 1 at p=3 -- the test-function
+  // gradient scales like p/h, measured as an instant 1-step NaN.)  T's
+  // spectrum sits in a disk about 1, GMRES needs O(20) iterations.
+  i32 msuSolve(const std::vector<double> &U, std::vector<double> &B,
+               std::vector<double> &X) const {
+    massSolve(B,X);
+    if (C_SUPG<=0) return 0;
+    const size_t nn=B.size();
+    const i32 mK=40;
+    static thread_local std::vector<std::vector<double>> Vk;
+    static thread_local std::vector<double> w, CX, b;
+    b=X;                                   // b = M^-1 B, x0 = 0
+    double bn=0; for (size_t i=0;i<nn;i++) bn+=b[i]*b[i];
+    bn=sqrt(bn); if (bn==0) { return 0; }
+    Vk.assign(mK+1, std::vector<double>());
+    double H[mK+1][mK], g[mK+1], cG[mK], sG[mK];
+    for (i32 i=0;i<=mK;i++){ g[i]=0; for (i32 j=0;j<mK;j++) H[i][j]=0; }
+    Vk[0]=b; for (size_t i=0;i<nn;i++) Vk[0][i]/=bn;
+    g[0]=bn;
+    i32 it=0;
+    for (; it<mK; it++) {
+      // w = T v = v + M^-1 C v
+      applyMsu(U,Vk[it],CX);
+      massSolve(CX,w);
+      for (size_t i=0;i<nn;i++) w[i]+=Vk[it][i];
+      for (i32 j=0;j<=it;j++){ double d=0;
+        for (size_t i=0;i<nn;i++) d+=w[i]*Vk[j][i];
+        H[j][it]=d; for (size_t i=0;i<nn;i++) w[i]-=d*Vk[j][i]; }
+      double hn=0; for (size_t i=0;i<nn;i++) hn+=w[i]*w[i];
+      hn=sqrt(hn); H[it+1][it]=hn;
+      if (hn>1e-30){ Vk[it+1]=w; for (size_t i=0;i<nn;i++) Vk[it+1][i]/=hn; }
+      for (i32 j=0;j<it;j++){ double t1=cG[j]*H[j][it]+sG[j]*H[j+1][it];
+        double t2=-sG[j]*H[j][it]+cG[j]*H[j+1][it]; H[j][it]=t1; H[j+1][it]=t2; }
+      double dd=sqrt(H[it][it]*H[it][it]+H[it+1][it]*H[it+1][it]);
+      cG[it]=H[it][it]/dd; sG[it]=H[it+1][it]/dd;
+      H[it][it]=dd; g[it+1]=-sG[it]*g[it]; g[it]=cG[it]*g[it];
+      if (fabs(g[it+1]) < 1e-12*bn || hn<=1e-30) { it++; break; }
+    }
+    if (getenv("IGA2_MSUDBG"))
+      fprintf(stderr,"  [msu] its=%d rel=%.2e\n", it, fabs(g[it])/bn);
+    // back substitution + solution assembly
+    std::vector<double> yk(it,0.0);
+    for (i32 i=it-1;i>=0;i--){ double s2=g[i];
+      for (i32 j=i+1;j<it;j++) s2-=H[i][j]*yk[j];
+      yk[i]=s2/H[i][i]; }
+    X.assign(nn,0.0);
+    for (i32 j=0;j<it;j++)
+      for (size_t i=0;i<nn;i++) X[i]+=yk[j]*Vk[j][i];
+    return it;
+  }
+
   // integral of a conserved component over the fluid
   double integrate(const std::vector<double> &U, i32 comp) const {
     double s=0;
@@ -823,12 +1079,14 @@ struct Solver2d {
       if (c==0) {
         for (i32 qx=0;qx<gv.n;qx++) for (i32 qy=0;qy<gv.n;qy++) {
           evalCell(U,cx,cy,gv.x[qx],gv.x[qy],Uq,Ux,Uy,Ut);
+          if (g_wvar){ double w0[NF]={Uq[0],Uq[1],Uq[2],Uq[3]}; entrToCons(w0,Uq); }
           s+=(double)gv.w[qx]*(double)gv.w[qy]*h*h*Uq[comp];
         }
       } else {
         const CutCellQ &Q=cq[cutIdx[cc]];
         for (size_t q=0;q<Q.vw.size();q++) {
           evalCell(U,cx,cy,(Q.vx[q]-x0d)/h-cx,(Q.vy[q]-y0d)/h-cy,Uq,Ux,Uy,Ut);
+          if (g_wvar){ double w0[NF]={Uq[0],Uq[1],Uq[2],Uq[3]}; entrToCons(w0,Uq); }
           s+=Q.vw[q]*Uq[comp];
         }
       }
@@ -851,7 +1109,7 @@ static double g_epsm = 0.0;
   printf("CUDA %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(1);} }while(0)
 
 struct DevPar {                       // POD, passed by value to kernels
-  i32 p, Nx, Ny, nx, ny, ng, ngg;
+  i32 p, Nx, Ny, nx, ny, ng, ngg, wproj, skew, sunt, wvar;
   double h, x0d, y0d, C_SUPG, wallBeta;
   double Uinf[NF];
   const double *U; double *R;
@@ -877,27 +1135,41 @@ __device__ static void devVolPoint(const DevPar &P, i32 cc, double xi, double yi
     const double *uu=&P.U[(size_t)NF*((cx+a)+P.nx*(cy+b))];
     for (i32 k=0;k<NF;k++){ Uq[k]+=Pv*uu[k]; Ux[k]+=Px*uu[k]; Uy[k]+=Py*uu[k]; }
   }
+  double A0w[NF][NF];
+  if (P.wvar) wvarPoint(Uq,Ux,Uy,A0w);
   double Fx[NF],Fy[NF],u,v,cs;
   eulerFlux2(Uq,Fx,Fy,u,v,cs);
   double nu=P.nuCell[cc];
-  double gx[NF]={0,0,0,0}, gy[NF]={0,0,0,0};
-  if (P.C_SUPG>0) {
-    double Ax[NF][NF], Ay[NF][NF], Res[NF];
+  double gx[NF]={0,0,0,0}, gy[NF]={0,0,0,0}, Res[NF]={0,0,0,0};
+  if (P.C_SUPG>0 || P.skew) {
+    double Ax[NF][NF], Ay[NF][NF];
     eulerJac2(Uq,Ax,Ay);
-    for (i32 k=0;k<NF;k++){ Res[k]=0;
+    for (i32 k=0;k<NF;k++){
       for (i32 m2=0;m2<NF;m2++) Res[k]+=Ax[k][m2]*Ux[m2]+Ay[k][m2]*Uy[m2]; }
     double lam=sqrt(u*u+v*v)+cs, tau=0.5*P.C_SUPG*P.h/fmax(lam,1e-12);
-    for (i32 k=0;k<NF;k++) for (i32 m2=0;m2<NF;m2++){
-      gx[k]+=tau*Ax[m2][k]*Res[m2]; gy[k]+=tau*Ay[m2][k]*Res[m2]; }
+    if (P.sunt)
+      for (i32 k=0;k<NF;k++) for (i32 m2=0;m2<NF;m2++){
+        gx[k]+=tau*Ax[k][m2]*Res[m2]; gy[k]+=tau*Ay[k][m2]*Res[m2]; }
+    else
+      for (i32 k=0;k<NF;k++) for (i32 m2=0;m2<NF;m2++){
+        gx[k]+=tau*Ax[m2][k]*Res[m2]; gy[k]+=tau*Ay[m2][k]*Res[m2]; }
+    if (P.wvar) {
+      double t1[NF],t2[NF];
+      for (i32 k=0;k<NF;k++){ t1[k]=gx[k]; t2[k]=gy[k]; gx[k]=gy[k]=0; }
+      for (i32 k=0;k<NF;k++) for (i32 m2=0;m2<NF;m2++){
+        gx[k]+=A0w[m2][k]*t1[m2]; gy[k]+=A0w[m2][k]*t2[m2]; }
+    }
   }
-  real Nvx2[BS_NMAX],Nvy2[BS_NMAX];   // re-use loaded values
-  (void)Nvx2;(void)Nvy2;
+  const double sf = P.skew? 0.5 : 1.0;
   for (i32 a=0;a<=P.p;a++) for (i32 b=0;b<=P.p;b++) {
+    double Pv=(double)Nvx[a]*(double)Nvy[b];
     double Px=(double)Dvx[a]/P.h*(double)Nvy[b];
     double Py=(double)Nvx[a]*(double)Dvy[b]/P.h;
     double *out=&P.R[(size_t)NF*((cx+a)+P.nx*(cy+b))];
     for (i32 k=0;k<NF;k++)
-      atomicAdd(&out[k], w*( Fx[k]*Px + Fy[k]*Py - nu*(Ux[k]*Px+Uy[k]*Py)
+      atomicAdd(&out[k], w*( sf*(Fx[k]*Px + Fy[k]*Py)
+                             - (P.skew? 0.5*Pv*Res[k] : 0.0)
+                             - nu*(Ux[k]*Px+Uy[k]*Py)
                              - Px*gx[k] - Py*gy[k] ));
   }
 }
@@ -928,15 +1200,30 @@ __global__ static void kWall(DevPar P) {
     const double *uu=&P.U[(size_t)NF*((cx+a)+P.nx*(cy+b))];
     for (i32 k=0;k<NF;k++) Uq[k]+=Pv*uu[k];
   }
+  if (P.wvar){ double w0[NF]={Uq[0],Uq[1],Uq[2],Uq[3]}; entrToCons(w0,Uq); }
   double nxq=P.wqnx[t], nyq=P.wqny[t], Fh[NF];
-  double Um[NF]; double un=(Uq[1]*nxq+Uq[2]*nyq);
-  Um[0]=Uq[0]; Um[1]=Uq[1]-2*un*nxq; Um[2]=Uq[2]-2*un*nyq; Um[3]=Uq[3];
-  rusanov(Uq,Um,nxq,nyq,Fh);
-  if (P.wallBeta != 1.0) {
+  double un=(Uq[1]*nxq+Uq[2]*nyq);
+  if (P.wproj) {
+    double mt1=Uq[1]-un*nxq, mt2=Uq[2]-un*nyq;
+    double pb=(GAM-1)*(Uq[3]-0.5*(mt1*mt1+mt2*mt2)/fmax(Uq[0],1e-12));
+    Fh[0]=0; Fh[1]=pb*nxq; Fh[2]=pb*nyq; Fh[3]=0;
     double u2,v2,cs2,r2,pr2; primEval(Uq,r2,u2,v2,pr2,cs2);
     double lam=fabs(u2*nxq+v2*nyq)+cs2;
-    double ex=(P.wallBeta-1.0)*0.5*lam*2.0*un;
-    Fh[1]+=ex*nxq; Fh[2]+=ex*nyq;
+    Fh[1]+=P.wallBeta*lam*un*nxq; Fh[2]+=P.wallBeta*lam*un*nyq;
+  } else {
+    double Um[NF];
+    Um[0]=Uq[0]; Um[1]=Uq[1]-2*un*nxq; Um[2]=Uq[2]-2*un*nyq; Um[3]=Uq[3];
+    rusanov(Uq,Um,nxq,nyq,Fh);
+    if (P.wallBeta != 1.0) {
+      double u2,v2,cs2,r2,pr2; primEval(Uq,r2,u2,v2,pr2,cs2);
+      double lam=fabs(u2*nxq+v2*nyq)+cs2;
+      double ex=(P.wallBeta-1.0)*0.5*lam*2.0*un;
+      Fh[1]+=ex*nxq; Fh[2]+=ex*nyq;
+    }
+  }
+  if (P.skew) {
+    double Fxq[NF],Fyq[NF],u3,v3,cs3; eulerFlux2(Uq,Fxq,Fyq,u3,v3,cs3);
+    for (i32 k=0;k<NF;k++) Fh[k]-=0.5*(Fxq[k]*nxq+Fyq[k]*nyq);
   }
   for (i32 a=0;a<=P.p;a++) for (i32 b=0;b<=P.p;b++) {
     double Pv=(double)Nvx[a]*(double)Nvy[b];
@@ -970,7 +1257,12 @@ __global__ static void kFar(DevPar P) {
     const double *uu=&P.U[(size_t)NF*((cx+a)+P.nx*(cy+b))];
     for (i32 k=0;k<NF;k++) Uq[k]+=Pv*uu[k];
   }
+  if (P.wvar){ double w0[NF]={Uq[0],Uq[1],Uq[2],Uq[3]}; entrToCons(w0,Uq); }
   double Fh[NF]; rusanov(Uq,P.Uinf,nxq,nyq,Fh);
+  if (P.skew) {
+    double Fxq[NF],Fyq[NF],u3,v3,cs3; eulerFlux2(Uq,Fxq,Fyq,u3,v3,cs3);
+    for (i32 k=0;k<NF;k++) Fh[k]-=0.5*(Fxq[k]*nxq+Fyq[k]*nyq);
+  }
   double w=(double)P.g.w[q]*P.h;
   for (i32 a=0;a<=P.p;a++) for (i32 b=0;b<=P.p;b++) {
     double Pv=(double)Nvx[a]*(double)Nvy[b];
@@ -1096,12 +1388,22 @@ struct Dev {
 };
 
 
-// SSP-RK3 driver with lagged Udot
+// Explicit driver with lagged Udot.  SSP-RK3 (default) or classical RK4
+// (IGA2_RK=4).  With dt ~ h the time error is O(dt^q) = O(h^q), so SSP-RK3
+// caps the achievable spatial order at 3 no matter what p is: the p=3 vortex
+// gate measures 3.00/3.05 against a design order of 4 for exactly this reason.
+// RK4 lifts that cap to 4.  RK4 is NOT SSP -- the positivity/monotonicity
+// argument behind the SSP-RK3 choice is lost, so it is opt-in and belongs on
+// smooth flow (order verification); shock runs should stay on RK3.
 struct Stepper {
   Solver2d &S;
-  std::vector<double> U0, Us, R, X;
+  std::vector<double> U0, Us, R, X, K1, K2, Kacc;
   i32 lastIt=0;
-  Stepper(Solver2d &s):S(s){}
+  i32 order;
+  Stepper(Solver2d &s):S(s){
+    order = getenv("IGA2_RK")? atoi(getenv("IGA2_RK")) : 3;
+    if (order!=3 && order!=4) order=3;
+  }
   double wavespeedMax(const std::vector<double> &U) {
     double lm=0;
     for (i32 a=0;a<S.n;a++) {
@@ -1111,15 +1413,86 @@ struct Stepper {
     }
     return lm;
   }
+  // stage solve: (M + C(Ustage)) X = R when IGA2_MSU, else M X = R
+  i32 stageSolve(const std::vector<double> &Ustage, std::vector<double> &Rr,
+                 std::vector<double> &Xx) {
+    return g_msu? S.msuSolve(Ustage,Rr,Xx) : S.massSolve(Rr,Xx);
+  }
+  // Deferred correction (IGA2_DEC=1): Ziggaf-Torlo-Ricchiuto sec. 2.4 -- the
+  // time integrator built FOR the SUPG-mass system.  3 LobattoIIIA subnodes
+  // {0,1/2,1} (order 4), K=4 corrections; the defect is measured against the
+  // FULL system  M(U^m-U^0) + dt sum_r th_rm [C(U^r)K^r - R(U^r)] = 0  with
+  // K^r the collocation time derivative, but each correction only inverts the
+  // cheap Galerkin mass:  U^{k+1,m} = U^{k,m} - M^-1 D_m.  Standard RK4 with
+  // (M+C)^-1 per stage is unstable at p3 (measured, all consistency
+  // variants); DeC is the paper's remedy.
+  void stepDec(std::vector<double> &U, double dt) {
+    static const double th[2][3]={{5.0/24,1.0/3,-1.0/24},{1.0/6,2.0/3,1.0/6}};
+    static const double dm[3][3]={{-3,4,-1},{-1,0,1},{1,-4,3}};
+    const size_t m=U.size();
+    std::vector<double> Um[3], Rm[3], CK[3], Kr, D, dU, X;
+    for (i32 r=0;r<3;r++) Um[r]=U;
+    S.rhs(U,Rm[0]); S.massSolve(Rm[0],X); S.Udot=X;   // subnode-0 residual + lagged Udot
+    Rm[1]=Rm[0]; Rm[2]=Rm[0];
+    for (i32 k=0;k<4;k++) {
+      if (k>0){ S.rhs(Um[1],Rm[1]); S.rhs(Um[2],Rm[2]); }
+      if (g_msu) {
+        Kr.resize(m);
+        for (i32 r=0;r<3;r++) {
+          for (size_t i=0;i<m;i++)
+            Kr[i]=(dm[r][0]*Um[0][i]+dm[r][1]*Um[1][i]+dm[r][2]*Um[2][i])/dt;
+          S.applyMsu(Um[r],Kr,CK[r]);
+        }
+      }
+      for (i32 mn=1;mn<=2;mn++) {
+        dU.resize(m);
+        for (size_t i=0;i<m;i++) dU[i]=Um[mn][i]-Um[0][i];
+        S.massApply(dU.data(), (D.resize(m), D.data()));
+        for (i32 r=0;r<3;r++) {
+          double t=th[mn-1][r];
+          if (g_msu) for (size_t i=0;i<m;i++) D[i]+=dt*t*(CK[r][i]-Rm[r][i]);
+          else       for (size_t i=0;i<m;i++) D[i]-=dt*t*Rm[r][i];
+        }
+        lastIt=S.massSolve(D,X);
+        for (size_t i=0;i<m;i++) Um[mn][i]-=X[i];
+      }
+    }
+    U=Um[2];
+  }
   void step(std::vector<double> &U, double dt) {
+    if (g_dec) { stepDec(U,dt); return; }
+    if (order==4) { stepRk4(U,dt); return; }
     size_t m=U.size(); U0=U;
-    S.rhs(U,R); S.massSolve(R,X); S.Udot=X;
+    S.rhs(U,R); stageSolve(U,R,X); S.Udot=X;
     Us.resize(m);
     for (size_t i=0;i<m;i++) Us[i]=U0[i]+dt*X[i];
-    S.rhs(Us,R); lastIt=S.massSolve(R,X);
+    S.rhs(Us,R); lastIt=stageSolve(Us,R,X);
     for (size_t i=0;i<m;i++) Us[i]=0.75*U0[i]+0.25*(Us[i]+dt*X[i]);
-    S.rhs(Us,R); S.massSolve(R,X);
+    S.rhs(Us,R); stageSolve(Us,R,X);
     for (size_t i=0;i<m;i++) U[i]=(U0[i]+2.0*(Us[i]+dt*X[i]))/3.0;
+  }
+  // classical 4-stage RK4 on M dU/dt = R(U), i.e. f(U) = M^-1 R(U):
+  //   k1=f(U)  k2=f(U+dt/2 k1)  k3=f(U+dt/2 k2)  k4=f(U+dt k3)
+  //   U += dt/6 (k1 + 2k2 + 2k3 + k4)
+  // Udot is set from k1, exactly as RK3 sets it from its first stage, so the
+  // entropy-viscosity sensor keeps its d(eta)/dt term (Guermond-Popov's
+  // residual is eta_t + div q -- dropping eta_t would change the sensor, not
+  // just the time integrator).
+  void stepRk4(std::vector<double> &U, double dt) {
+    size_t m=U.size(); U0=U;
+    Us.resize(m); K1.resize(m); K2.resize(m); Kacc.resize(m);
+    S.rhs(U0,R); stageSolve(U0,R,K1); S.Udot=K1;        // k1
+    for (size_t i=0;i<m;i++) Kacc[i]=K1[i];
+    for (size_t i=0;i<m;i++) Us[i]=U0[i]+0.5*dt*K1[i];
+    S.rhs(Us,R); lastIt=stageSolve(Us,R,K2);            // k2
+    for (size_t i=0;i<m;i++) Kacc[i]+=2.0*K2[i];
+    for (size_t i=0;i<m;i++) Us[i]=U0[i]+0.5*dt*K2[i];
+    S.rhs(Us,R); stageSolve(Us,R,K2);                   // k3 (reuses K2)
+    for (size_t i=0;i<m;i++) Kacc[i]+=2.0*K2[i];
+    for (size_t i=0;i<m;i++) Us[i]=U0[i]+dt*K2[i];
+    S.rhs(Us,R); stageSolve(Us,R,K2);                   // k4
+    for (size_t i=0;i<m;i++) Kacc[i]+=K2[i];
+    for (size_t i=0;i<m;i++) U[i]=U0[i]+(dt/6.0)*Kacc[i];
   }
 };
 
@@ -1212,6 +1585,7 @@ static void devInit(Dev &D, Solver2d &S, i32 gm) {
   P.p=S.p; P.Nx=S.Nx; P.Ny=S.Ny; P.nx=S.nx; P.ny=S.ny;
   P.ng=S.gv.n; P.ngg=S.gv.n*S.gv.n;
   P.h=S.h; P.x0d=S.x0d; P.y0d=S.y0d; P.C_SUPG=S.C_SUPG; P.wallBeta=S.wallBeta;
+  P.wproj=g_wproj; P.skew=g_skew; P.sunt=g_sunt; P.wvar=g_wvar;
   for (i32 k=0;k<NF;k++) P.Uinf[k]=S.Uinf[k];
   P.Bx=S.Sx.B; P.By=S.Sy.B; P.g=S.gv;
   std::vector<i32> full;
@@ -1342,9 +1716,15 @@ static i32 gmresGpu(Dev &D, Solver2d &S, const std::vector<double> &Uhost,
 // ---------------------------------------------------------------------------
 //  gates
 // ---------------------------------------------------------------------------
+// Vortex-gate domain length.  The vortex sits at the box centre; enlarging the
+// box at FIXED h pushes the far-field Rusanov edges away without changing the
+// discretisation, which is how the boundary contribution to the error is
+// separated from the discretisation error.
+static double g_vL = 10.0;
+
 static void vortexExact(double x, double y, double t, double beta,
                         double u0, double v0, double U[NF]) {
-  double xc=5.0+u0*t, yc=5.0+v0*t;
+  double xc=0.5*g_vL+u0*t, yc=0.5*g_vL+v0*t;
   double dx=x-xc, dy=y-yc, r2=dx*dx+dy*dy;
   double ex=exp(0.5*(1.0-r2));
   double du=-beta/(2*M_PI)*ex*dy, dv=beta/(2*M_PI)*ex*dx;
@@ -1354,16 +1734,33 @@ static void vortexExact(double x, double y, double t, double beta,
 }
 
 static i32 gateVortex(i32 p, double CFL, double CDC, double CMAX) {
-  printf("\n[vortex] isentropic vortex, UNCUT grid, L2(rho) orders (design %d)\n", p+1);
+  const i32 rkOrd = getenv("IGA2_RK")? atoi(getenv("IGA2_RK")) : 3;
+  // the achievable order is min(p+1, rkOrd) with dt ~ h
+  printf("\n[vortex] isentropic vortex, UNCUT grid, RK%d, L2(rho) orders "
+         "(design %d = min(p+1,RK))\n", rkOrd, (p+1<rkOrd)?(p+1):rkOrd);
   printf("%6s %10s %12s %8s %10s %8s\n","N","dofs","L2(rho)","order","nuMax/cap","CGit");
   double prev=0; i32 ok=1;
   // T and the error window are chosen so the window (r<=3 around the moved
   // center) stays CAUSALLY clean of the far-field boxes: the Rusanov edges see
   // the vortex tail (~4e-6) as free-stream error, and at N=128 that floor was
   // the biggest term in a whole-domain L2 (measured 8e-7 stall).
-  const double beta=1.0, u0=1.0, v0=0.5, T=0.5;
-  for (i32 N : {32, 64, 128}) {
-    Solver2d S; S.init(p,N,N,0.0,0.0,10.0/N);
+  // IGA2_VADV=0 -> STEADY vortex (u0=v0=0): the state is a genuine 2-D
+  // equilibrium (div F = 0 with curved streamlines), so the measured error is
+  // pure STATIONARITY-PRESERVATION error of the scheme -- the quantity
+  // Ziggaf-Torlo-Ricchiuto (arXiv 2603.23185) prove classical SUPG cannot
+  // keep.  T is then a physics-free dwell time; IGA2_VT overrides.
+  const i32 adv = getenv("IGA2_VADV")? atoi(getenv("IGA2_VADV")) : 1;
+  const double beta=1.0, u0=adv?1.0:0.0, v0=adv?0.5:0.0;
+  const double T = getenv("IGA2_VT")? atof(getenv("IGA2_VT")) : 0.5;
+  // grid ladder, overridable for order studies (IGA2_VNS="32,64,128,256")
+  std::vector<i32> Nlist;
+  { const char *e=getenv("IGA2_VNS");
+    if (e) { for (const char *q=e; *q; ) {
+               i32 v=atoi(q); if (v>0) Nlist.push_back(v);
+               const char *c=strchr(q,','); if (!c) break; q=c+1; } }
+    if (Nlist.empty()) Nlist = {32,64,128}; }
+  for (i32 N : Nlist) {
+    Solver2d S; S.init(p,N,N,0.0,0.0,g_vL/N);
     S.C_DC=CDC; S.C_MAX=CMAX; S.C_SUPG=g_csupg;
     for (i32 k=0;k<NF;k++) S.Uinf[k]=0;
     { double Ui[NF]; vortexExact(-100,-100,0,beta,u0,v0,Ui);
@@ -1405,7 +1802,7 @@ static i32 gateVortex(i32 p, double CFL, double CDC, double CMAX) {
         for (i32 qx=0;qx<S.gv.n;qx++) for (i32 qy=0;qy<S.gv.n;qy++) {
           double x=(cx+(double)S.gv.x[qx])*S.h, y=(cy+(double)S.gv.x[qy])*S.h;
           S.evalCell(U,cx,cy,S.gv.x[qx],S.gv.x[qy],Uq,Ux,Uy,Ut);
-          double dxc=x-(5.0+u0*T), dyc=y-(5.0+v0*T);
+          double dxc=x-(0.5*g_vL+u0*T), dyc=y-(0.5*g_vL+v0*T);
           if (dxc*dxc+dyc*dyc > 9.0) continue;
           double Ue[NF]; vortexExact(x,y,T,beta,u0,v0,Ue);
           double w=(double)S.gv.w[qx]*(double)S.gv.w[qy]*S.h*S.h;
@@ -1415,7 +1812,11 @@ static i32 gateVortex(i32 p, double CFL, double CDC, double CMAX) {
     double cap=CMAX*S.h*2.0;
     printf("%6d %10d %12.4e %8.2f %10.2e %8.1f\n", N, NF*S.n, e2,
            prev>0? log2(prev/e2):0.0, numax/cap, itacc/fmax(nst,1.0));
-    if (prev>0 && log2(prev/e2) < p+0.4) ok=0;
+    // gate against the ACHIEVABLE order min(p+1,RK), not p+1: with SSP-RK3 and
+    // dt ~ h the p=3 run is time-limited to 3, so the old p+0.4 threshold made
+    // that case permanently red for a reason that is not the spatial scheme.
+    const i32 des=(p+1<rkOrd)?(p+1):rkOrd;
+    if (prev>0 && log2(prev/e2) < des-0.6) ok=0;
     prev=e2;
   }
   printf("[vortex] %s\n", ok? "PASS":"FAIL (order below design)");
@@ -1503,10 +1904,17 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
   S.bandEVscale = getenv("IGA2_BEV")? atof(getenv("IGA2_BEV")) : (getenv("IGA2_NOBEV")? 0.0 : 1.0);
   double r=1.0, c=1.0, pr=r*c*c/GAM, u=M*c;
   S.Uinf[0]=r; S.Uinf[1]=r*u; S.Uinf[2]=0; S.Uinf[3]=pr/(GAM-1)+0.5*r*u*u;
-  Circle G{0.0,0.0,0.5};
+  // body radius (IGA2_R, default 0.5 = D 1).  Varying R at FIXED h is the probe
+  // for the rotating-normal trace limit: the normal turns (p+1)h/R across one
+  // basis support, so if that is the binding error the wall leak must scale
+  // with 1/R at fixed h.  A generic trace-approximation limit would not.
+  const double Rbody = getenv("IGA2_R")? atof(getenv("IGA2_R")) : 0.5;
+  Circle G{0.0,0.0,Rbody};
   S.classify(G); S.buildMass();
   std::vector<double> U((size_t)NF*S.n);
-  for (i32 a=0;a<S.n;a++) for (i32 k=0;k<NF;k++) U[(size_t)NF*a+k]=S.Uinf[k];
+  { double W0[NF]={S.Uinf[0],S.Uinf[1],S.Uinf[2],S.Uinf[3]};
+    if (g_wvar) consToEntr(S.Uinf,W0);      // dofs are w in WVAR mode
+    for (i32 a=0;a<S.n;a++) for (i32 k=0;k<NF;k++) U[(size_t)NF*a+k]=W0[k]; }
   // Udot stays 0: the sensor becomes the SPATIAL entropy residual, which is
   // exactly the quantity PTC drives to zero -- self-limiting viscosity.
   std::fill(S.Udot.begin(), S.Udot.end(), 0.0);
@@ -1540,8 +1948,10 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
     bool ok=true;
     for (i32 a=0;a<S.n && ok;a++){ if(!S.act[a])continue;
       const double *Ua=&Utrial[(size_t)NF*a];
-      double rr=Ua[0], pp=(GAM-1)*(Ua[3]-0.5*(Ua[1]*Ua[1]+Ua[2]*Ua[2])/fmax(rr,1e-12));
-      if (!(rr>1e-8) || !(pp>1e-10) || !std::isfinite(Ua[3])) ok=false; }
+      if (g_wvar) { if (!(Ua[3] < -1e-10) || !std::isfinite(Ua[0])) ok=false; }
+      else {
+        double rr=Ua[0], pp=(GAM-1)*(Ua[3]-0.5*(Ua[1]*Ua[1]+Ua[2]*Ua[2])/fmax(rr,1e-12));
+        if (!(rr>1e-8) || !(pp>1e-10) || !std::isfinite(Ua[3])) ok=false; } }
     double Rt=1e300;
     if (ok) { S.nuFrozen=0; S.rhs(Utrial, Rtrial); Rt=ptc.normv(Rtrial); ok = (Rt < 3.0*Rn); }
     if (!ok) {
@@ -1571,6 +1981,7 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
         double xi=(Q.wx[q]-S.x0d)/S.h-cx, yi=(Q.wy[q]-S.y0d)/S.h-cy;
         double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
         S.evalCell(U,cx,cy,xi,yi,Uq,Ux,Uy,Ut);
+        if (g_wvar){ double w0[NF]={Uq[0],Uq[1],Uq[2],Uq[3]}; entrToCons(w0,Uq); }
         double rr,uu,vv,pp,ccs; primEval(Uq,rr,uu,vv,pp,ccs);
         fx+=Q.ww[q]*pp*(-Q.wnx[q]);
         unmax=fmax(unmax, fabs(uu*Q.wnx[q]+vv*Q.wny[q])/u);
@@ -1591,13 +2002,15 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
       i32 cx=cc%N, cy=cc/N;
       double xc=S.x0d+(cx+0.5)*S.h, yc=S.y0d+(cy+0.5)*S.h;
       double rr2=xc*xc+yc*yc;
-      if (rr2 > 2.25) continue;                  // annulus outer radius 1.5
-      i32 off = (rr2 > 1.0);                     // off-band window r in [1, 1.5]
+      if (rr2 > 9.0*Rbody*Rbody) continue;        // annulus outer radius 3R
+      i32 off = (rr2 > 4.0*Rbody*Rbody);         // off-band window r in [2R, 3R]
       double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
       if (c2==0) {
         for (i32 qx=0;qx<S.gv.n;qx++) for (i32 qy=0;qy<S.gv.n;qy++) {
           S.evalCell(U,cx,cy,S.gv.x[qx],S.gv.x[qy],Uq,Ux,Uy,Ut);
-          double rq,uq,vq,pq,cq; primEval(Uq,rq,uq,vq,pq,cq);
+          double rq,uq,vq,pq,cq;
+          if (g_wvar){ double w0[NF]={Uq[0],Uq[1],Uq[2],Uq[3]}; entrToCons(w0,Uq); }
+          primEval(Uq,rq,uq,vq,pq,cq);
           double sd=log(pq)-GAM*log(rq)-sref;
           double w=(double)S.gv.w[qx]*(double)S.gv.w[qy]*S.h*S.h;
           s2i+=w*sd*sd; ar+=w;
@@ -1607,7 +2020,9 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
         const CutCellQ &Q=S.cq[S.cutIdx[cc]];
         for (size_t q=0;q<Q.vw.size();q++) {
           S.evalCell(U,cx,cy,(Q.vx[q]-S.x0d)/S.h-cx,(Q.vy[q]-S.y0d)/S.h-cy,Uq,Ux,Uy,Ut);
-          double rq,uq,vq,pq,cq; primEval(Uq,rq,uq,vq,pq,cq);
+          double rq,uq,vq,pq,cq;
+          if (g_wvar){ double w0[NF]={Uq[0],Uq[1],Uq[2],Uq[3]}; entrToCons(w0,Uq); }
+          primEval(Uq,rq,uq,vq,pq,cq);
           double sd=log(pq)-GAM*log(rq)-sref;
           s2i+=Q.vw[q]*sd*sd; ar+=Q.vw[q];
           if (off){ s2o+=Q.vw[q]*sd*sd; aro+=Q.vw[q]; }
@@ -1616,6 +2031,30 @@ static void gateSteady(i32 p, double CDC, double CMAX) {
     }
     printf("  L2 entropy deviation (annulus r<1.5): %.6e  off-band [1,1.5]: %.6e\n",
            sqrt(s2i/ar), sqrt(s2o/fmax(aro,1e-300)));
+  }
+  // ---- wall-leak anatomy (IGA2_WDUMP=<file>): per wall quadrature point ----
+  // theta, u.n/uinf, p, and the host cell's fluid area fraction.  Separates
+  // trace-space structure (u.n oscillating on the (p+1)h support scale) from
+  // sliver conditioning (spikes at frac << 1).
+  if (getenv("IGA2_WDUMP")) {
+    FILE *fp=fopen(getenv("IGA2_WDUMP"),"w");
+    fprintf(fp,"theta,un,p,frac\n");
+    for (i32 cc=0;cc<N*N;cc++){
+      if (S.cls[cc]!=1) continue;
+      const CutCellQ &Q=S.cq[S.cutIdx[cc]];
+      double frac=Q.area/(S.h*S.h);
+      i32 cx=cc%N, cy=cc/N;
+      for (size_t q=0;q<Q.ww.size();q++){
+        double xi=(Q.wx[q]-S.x0d)/S.h-cx, yi=(Q.wy[q]-S.y0d)/S.h-cy;
+        double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
+        S.evalCell(U,cx,cy,xi,yi,Uq,Ux,Uy,Ut);
+        if (g_wvar){ double w0[NF]={Uq[0],Uq[1],Uq[2],Uq[3]}; entrToCons(w0,Uq); }
+        double rr,uu,vv,pp,ccs; primEval(Uq,rr,uu,vv,pp,ccs);
+        fprintf(fp,"%.10e,%.10e,%.10e,%.6e\n",
+                atan2(Q.wy[q],Q.wx[q]), (uu*Q.wnx[q]+vv*Q.wny[q])/u, pp, frac);
+      } }
+    fclose(fp);
+    printf("  wall dump -> %s\n", getenv("IGA2_WDUMP"));
   }
   // ---- where does the entropy-viscosity sensor fire, and is it capped? -----
   // "band" = the cells the 3x3 neighbour-max smoothing reaches from a cut cell,
@@ -1728,7 +2167,12 @@ static void gateCyl(i32 p, double CFL, double CDC, double CMAX) {
   S.wallBeta = getenv("IGA2_WBETA")? atof(getenv("IGA2_WBETA")) : 1.0;
   double r=1.0, c=1.0, pr=r*c*c/GAM, u=M*c;
   S.Uinf[0]=r; S.Uinf[1]=r*u; S.Uinf[2]=0; S.Uinf[3]=pr/(GAM-1)+0.5*r*u*u;
-  Circle G{0.0,0.0,0.5};
+  // body radius (IGA2_R, default 0.5 = D 1).  Varying R at FIXED h is the probe
+  // for the rotating-normal trace limit: the normal turns (p+1)h/R across one
+  // basis support, so if that is the binding error the wall leak must scale
+  // with 1/R at fixed h.  A generic trace-approximation limit would not.
+  const double Rbody = getenv("IGA2_R")? atof(getenv("IGA2_R")) : 0.5;
+  Circle G{0.0,0.0,Rbody};
   S.classify(G); S.buildMass();
   std::vector<double> U((size_t)NF*S.n);
   for (i32 a=0;a<S.n;a++) for (i32 k=0;k<NF;k++) U[(size_t)NF*a+k]=S.Uinf[k];
@@ -1777,13 +2221,15 @@ static void gateCyl(i32 p, double CFL, double CDC, double CMAX) {
       i32 cx=cc%N, cy=cc/N;
       double xc=S.x0d+(cx+0.5)*S.h, yc=S.y0d+(cy+0.5)*S.h;
       double rr2=xc*xc+yc*yc;
-      if (rr2 > 2.25) continue;                  // annulus outer radius 1.5
-      i32 off = (rr2 > 1.0);                     // off-band window r in [1, 1.5]
+      if (rr2 > 9.0*Rbody*Rbody) continue;        // annulus outer radius 3R
+      i32 off = (rr2 > 4.0*Rbody*Rbody);         // off-band window r in [2R, 3R]
       double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
       if (c2==0) {
         for (i32 qx=0;qx<S.gv.n;qx++) for (i32 qy=0;qy<S.gv.n;qy++) {
           S.evalCell(U,cx,cy,S.gv.x[qx],S.gv.x[qy],Uq,Ux,Uy,Ut);
-          double rq,uq,vq,pq,cq; primEval(Uq,rq,uq,vq,pq,cq);
+          double rq,uq,vq,pq,cq;
+          if (g_wvar){ double w0[NF]={Uq[0],Uq[1],Uq[2],Uq[3]}; entrToCons(w0,Uq); }
+          primEval(Uq,rq,uq,vq,pq,cq);
           double sd=log(pq)-GAM*log(rq)-sref;
           double w=(double)S.gv.w[qx]*(double)S.gv.w[qy]*S.h*S.h;
           s2i+=w*sd*sd; ar+=w;
@@ -1793,7 +2239,9 @@ static void gateCyl(i32 p, double CFL, double CDC, double CMAX) {
         const CutCellQ &Q=S.cq[S.cutIdx[cc]];
         for (size_t q=0;q<Q.vw.size();q++) {
           S.evalCell(U,cx,cy,(Q.vx[q]-S.x0d)/S.h-cx,(Q.vy[q]-S.y0d)/S.h-cy,Uq,Ux,Uy,Ut);
-          double rq,uq,vq,pq,cq; primEval(Uq,rq,uq,vq,pq,cq);
+          double rq,uq,vq,pq,cq;
+          if (g_wvar){ double w0[NF]={Uq[0],Uq[1],Uq[2],Uq[3]}; entrToCons(w0,Uq); }
+          primEval(Uq,rq,uq,vq,pq,cq);
           double sd=log(pq)-GAM*log(rq)-sref;
           s2i+=Q.vw[q]*sd*sd; ar+=Q.vw[q];
           if (off){ s2o+=Q.vw[q]*sd*sd; aro+=Q.vw[q]; }
@@ -1839,6 +2287,102 @@ static void gateCyl(i32 p, double CFL, double CDC, double CMAX) {
       } }
     fclose(fp);
     printf("  wrote %s\n", getenv("IGA2_DUMP"));
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  stationarity-preservation gate (mode "svort"): PTC on the STEADY isentropic
+//  vortex, UNCUT grid, no body.  The exact state is a genuine 2-D equilibrium
+//  (div F = 0 with curved streamlines), so the L2 distance between the
+//  converged DISCRETE steady state and the exact vortex is pure stationarity-
+//  preservation error of the spatial scheme + stabilization -- the quantity
+//  Ziggaf-Torlo-Ricchiuto (arXiv 2603.23185) prove classical SUPG cannot keep
+//  and their GFQ construction restores.  GLS is explicit-diffusion-limited
+//  (blows up at CFL 0.3; survives CFL 0.01), so this is measured under PTC,
+//  the same regime the production steady solver uses.  Host path (no body ->
+//  no GPU arrays needed).
+// ---------------------------------------------------------------------------
+static void gateSvort(i32 p, double CDC, double CMAX) {
+  const i32 maxIt = getenv("IGA2_PITS")? atoi(getenv("IGA2_PITS")) : 200;
+  printf("\n[svort] STEADY vortex PTC, UNCUT, GLS C=%.2f EV C=%.2f, L=%.0f\n",
+         g_csupg, CDC, g_vL);
+  printf("%6s %10s %12s %8s %12s %6s\n","N","dofs","L2(rho)","order","||R||/R0","its");
+  double prev=0;
+  std::vector<i32> Nlist={32,64,128};
+  { const char *e=getenv("IGA2_VNS");
+    if (e) { Nlist.clear(); for (const char *q=e; *q; ) {
+               i32 v=atoi(q); if (v>0) Nlist.push_back(v);
+               const char *c=strchr(q,','); if (!c) break; q=c+1; } } }
+  const double beta=1.0;
+  for (i32 N : Nlist) {
+    Solver2d S; S.init(p,N,N,0.0,0.0,g_vL/N);
+    S.C_DC=CDC; S.C_MAX=CMAX; S.C_SUPG=g_csupg;
+    { double Ui[NF]; vortexExact(-100,-100,0,beta,0,0,Ui);
+      for (i32 k=0;k<NF;k++) S.Uinf[k]=Ui[k]; }
+    S.buildMass();
+    std::vector<double> U((size_t)NF*S.n,0.0), b((size_t)NF*S.n,0.0);
+    { real Nvx[BS_NMAX],Nvy[BS_NMAX];
+      for (i32 cy=0;cy<N;cy++) for (i32 cx=0;cx<N;cx++)
+        for (i32 qx=0;qx<S.gv.n;qx++) for (i32 qy=0;qy<S.gv.n;qy++) {
+          double x=(cx+(double)S.gv.x[qx])*S.h, y=(cy+(double)S.gv.x[qy])*S.h;
+          double Ue[NF]; vortexExact(x,y,0,beta,0,0,Ue);
+          S.Sx.val(S.gv.x[qx],Nvx); S.Sy.val(S.gv.x[qy],Nvy);
+          double w=(double)S.gv.w[qx]*(double)S.gv.w[qy]*S.h*S.h;
+          for (i32 a=0;a<=p;a++) for (i32 b2=0;b2<=p;b2++) {
+            double P=(double)Nvx[a]*(double)Nvy[b2];
+            for (i32 k=0;k<NF;k++)
+              b[(size_t)NF*S.aidx(cx+a,cy+b2)+k]+=w*P*Ue[k];
+          } }
+      S.massSolve(b,U);
+    }
+    std::fill(S.Udot.begin(), S.Udot.end(), 0.0);
+    Ptc ptc(S);
+    std::vector<double> delta, y, scr, Rtrial, Utrial;
+    double lam0=1.2;                              // ~c at vortex core
+    double dtau=10.0*S.h/lam0;
+    S.nuFrozen=0; S.rhs(U, ptc.Rbase);
+    double R0=ptc.normv(ptc.Rbase), Rn=R0;
+    i32 it=1, itsDone=0; const i32 gm=60;
+    for (; it<=maxIt; it++) {
+      S.nuFrozen=1;
+      i32 gi=ptc.gmres(U, ptc.Rbase, dtau, y, gm, 1e-3);
+      S.precApply(y.data(), (delta.resize(y.size()), delta.data()), scr);
+      for (size_t i=0;i<delta.size();i++) delta[i]*=dtau;
+      Utrial=U;
+      for (size_t i=0;i<U.size();i++) Utrial[i]+=delta[i];
+      bool ok=true;
+      for (i32 a=0;a<S.n && ok;a++){
+        const double *Ua=&Utrial[(size_t)NF*a];
+        double rr=Ua[0], pp=(GAM-1)*(Ua[3]-0.5*(Ua[1]*Ua[1]+Ua[2]*Ua[2])/fmax(rr,1e-12));
+        if (!(rr>1e-8) || !(pp>1e-10) || !std::isfinite(Ua[3])) ok=false; }
+      double Rt=1e300;
+      if (ok) { S.nuFrozen=0; S.rhs(Utrial, Rtrial); Rt=ptc.normv(Rtrial); ok=(Rt<3.0*Rn); }
+      if (!ok) { dtau*=0.3; S.nuFrozen=0; S.rhs(U, ptc.Rbase);
+                 if (dtau<1e-8*S.h/lam0){ printf("  STALL N=%d\n",N); break; } continue; }
+      U=Utrial; ptc.Rbase=Rtrial;
+      if (gi<3*gm-2){ dtau*=fmin(fmax(Rn/fmax(Rt,1e-300),0.5),2.0);
+                      dtau=fmin(dtau,1e5*S.h/lam0); }
+      Rn=Rt; itsDone=it;
+      if (Rn/R0 < 1e-10) break;
+    }
+    // L2(rho) error vs the exact steady vortex, window r<=3 about the center
+    double e2=0, area=0;
+    { double Uq[NF],Ux[NF],Uy[NF],Ut[NF];
+      for (i32 cy=0;cy<N;cy++) for (i32 cx=0;cx<N;cx++)
+        for (i32 qx=0;qx<S.gv.n;qx++) for (i32 qy=0;qy<S.gv.n;qy++) {
+          double x=(cx+(double)S.gv.x[qx])*S.h, y2=(cy+(double)S.gv.x[qy])*S.h;
+          double dxc=x-0.5*g_vL, dyc=y2-0.5*g_vL;
+          if (dxc*dxc+dyc*dyc > 9.0) continue;
+          S.evalCell(U,cx,cy,S.gv.x[qx],S.gv.x[qy],Uq,Ux,Uy,Ut);
+          double Ue[NF]; vortexExact(x,y2,0,beta,0,0,Ue);
+          double w=(double)S.gv.w[qx]*(double)S.gv.w[qy]*S.h*S.h;
+          e2+=w*(Uq[0]-Ue[0])*(Uq[0]-Ue[0]); area+=w;
+        } }
+    e2=sqrt(e2/fmax(area,1e-300));
+    printf("%6d %10d %12.4e %8.2f %12.3e %6d\n", N, NF*S.n, e2,
+           prev>0? log2(prev/e2):0.0, Rn/R0, itsDone);
+    fflush(stdout);
+    prev=e2;
   }
 }
 
@@ -1991,6 +2535,14 @@ int main(int argc, char **argv) {
   const double CMAX = getenv("IGA2_CMAX")? atof(getenv("IGA2_CMAX")): 0.5;
   const double CSUP = getenv("IGA2_CSUPG")? atof(getenv("IGA2_CSUPG")): 0.0;
   g_epsm = getenv("IGA2_EPSM")? atof(getenv("IGA2_EPSM")) : 0.0;
+  if (getenv("IGA2_VL")) g_vL = atof(getenv("IGA2_VL"));
+  g_wproj = getenv("IGA2_WPROJ")? atoi(getenv("IGA2_WPROJ")) : 0;
+  g_skew  = getenv("IGA2_SKEW")? atoi(getenv("IGA2_SKEW")) : 0;
+  g_supgt = getenv("IGA2_SUPGT")? atoi(getenv("IGA2_SUPGT")) : 0;
+  g_msu   = getenv("IGA2_MSU")? atoi(getenv("IGA2_MSU")) : 0;
+  g_dec   = getenv("IGA2_DEC")? atoi(getenv("IGA2_DEC")) : 0;
+  g_wvar  = getenv("IGA2_WVAR")? atoi(getenv("IGA2_WVAR")) : 0;
+  g_sunt  = getenv("IGA2_SUNT")? atoi(getenv("IGA2_SUNT")) : 1;
   printf("IGA 2-D Euler, C^%d tensor B-splines (p=%d), entropy viscosity "
          "(C=%.2f cap=%.2f), cut-cell cylinder\n", p-1, p, CDC, CMAX);
   i32 ok=1;
@@ -2001,6 +2553,7 @@ int main(int argc, char **argv) {
   if (!strcmp(mode,"cyl")) gateCyl(p,CFL,CDC,CMAX);
   if (!strcmp(mode,"steady")) gateSteady(p,CDC,CMAX);
   if (!strcmp(mode,"geom")) gateGeom(p);
+  if (!strcmp(mode,"svort")) gateSvort(p,CDC,CMAX);
   printf("\n%s\n", ok? "ALL GATES PASS":"GATE FAILURE");
   return ok?0:1;
 }
