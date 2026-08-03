@@ -600,7 +600,7 @@ struct StagCyl {
   std::vector<i32>    wcc;
   std::vector<i32>    fullList;                 // fluid full cells
   double Uinf[4];
-  double sponW=2.0, sponSig=2.0, wbeta=16.0, csu=0.0;
+  double sponW=2.0, sponSig=2.0, wbeta=16.0, csu=0.0; i32 csuMass=1;
   i32 piMode=0;
 
   void build(i32 p, i32 N) {
@@ -650,7 +650,7 @@ struct CylPar {
   const i32 *fullList; i32 nFull;
   const double *cvx,*cvy,*cvw; const i32 *cvc; i32 nCv;
   const double *wxp,*wyp,*wwp,*wnx,*wny; const i32 *wcc; i32 nW;
-  double Uinf[4], sponW,sponSig,wbeta,csu; i32 piMode;
+  double Uinf[4], sponW,sponSig,wbeta,csu; i32 piMode,csuMass;
 };
 
 // evaluate all fields (+ derivatives for div m) at one reference point
@@ -736,14 +736,21 @@ __host__ __device__ static void cylPoint(const CylPar &P, i32 cx, i32 cy,
     double tau=0.5*P.csu*h/fmax(lamq,1e-12);
     for (i32 k=0;k<4;k++) for (i32 m2=0;m2<4;m2++){
       gxS[k]+=tau*Ax[k][m2]*Res[m2]; gyS[k]+=tau*Ay[k][m2]*Res[m2]; }
-    gxS[0]=gyS[0]=0.0;                    // mass equation stays EXACT
+    // STAG_CSUM=1 (default): FULL Shakib-style SUPG -- the mass equation is
+    // stabilized too, sacrificing pointwise div m = 0 at the discrete steady
+    // state (the term is residual-proportional, same status as collocated
+    // GLS) in exchange for steady-state SELECTION: the mass-exempt variant
+    // (STAG_CSUM=0) preserves exactness but the aft density/entropy modes
+    // get no dissipation and the cylinder SHEDS (measured, T=120 march).
+    if (!P.csuMass) { gxS[0]=gyS[0]=0.0; }
   }
   for (i32 a=0;a<=p-1;a++) for (i32 b=0;b<=p-1;b++) {   // rho & E tests
     i32 gi=((cx+a)%N)+N*((cy+b)%N);
     double sc=(double)Bm[a]*(double)Cm[b];
     double sx=(double)Dm[a]/h*(double)Cm[b];
     double sy=(double)Bm[a]*(double)Em[b]/h;
-    double rr = w*( sx*mx + sy*my - sc*sg*(rho-P.Uinf[0]) );
+    double rr = w*( sx*mx + sy*my - sc*sg*(rho-P.Uinf[0])
+                    - sx*gxS[0] - sy*gyS[0] );
     double re = w*( sx*(E+pr)*u + sy*(E+pr)*v2 - sc*sg*(E-P.Uinf[3])
                     - sx*gxS[3] - sy*gyS[3] );
 #ifdef __CUDA_ARCH__
@@ -952,7 +959,7 @@ static void cylPar(StagCyl &C, CylDev &D, CylPar &P) {
   P.nFull=(i32)C.fullList.size(); P.nCv=(i32)C.cvw.size(); P.nW=(i32)C.wwp.size();
   for (i32 k=0;k<4;k++) P.Uinf[k]=C.Uinf[k];
   P.sponW=C.sponW; P.sponSig=C.sponSig; P.wbeta=C.wbeta; P.piMode=C.piMode;
-  P.csu=C.csu;
+  P.csu=C.csu; P.csuMass=C.csuMass;
   P.fullList=D.fullList; P.cvc=D.cvc; P.wcc=D.wcc;
   P.cvx=D.cvx; P.cvy=D.cvy; P.cvw=D.cvw;
   P.wxp=D.wxp; P.wyp=D.wyp; P.wwp=D.wwp; P.wnx=D.wnx; P.wny=D.wny;
@@ -1042,6 +1049,7 @@ static void gateCyl(i32 p) {
   C.wbeta  = getenv("STAG_WBETA")? atof(getenv("STAG_WBETA")) : 16.0;
   C.piMode = getenv("STAG_PI")? atoi(getenv("STAG_PI")) : 0;
   C.csu    = getenv("STAG_CSU")? atof(getenv("STAG_CSU")) : 1.0;
+  C.csuMass= getenv("STAG_CSUM")? atoi(getenv("STAG_CSUM")) : 1;
   C.sponSig= getenv("STAG_SIG")? atof(getenv("STAG_SIG")) : 2.0;
   C.sponW  = getenv("STAG_SW")? atof(getenv("STAG_SW")) : 2.0;
   CylDev D; D.useGpu=getenv("STAG_GPU")? atoi(getenv("STAG_GPU")) : 1;
@@ -1226,6 +1234,7 @@ static void gateCylMarch(i32 p) {
   C.wbeta  = getenv("STAG_WBETA")? atof(getenv("STAG_WBETA")) : 16.0;
   C.piMode = getenv("STAG_PI")? atoi(getenv("STAG_PI")) : 0;
   C.csu    = getenv("STAG_CSU")? atof(getenv("STAG_CSU")) : 1.0;
+  C.csuMass= getenv("STAG_CSUM")? atoi(getenv("STAG_CSUM")) : 1;
   C.sponSig= getenv("STAG_SIG")? atof(getenv("STAG_SIG")) : 2.0;
   C.sponW  = getenv("STAG_SW")? atof(getenv("STAG_SW")) : 2.0;
   CylDev D; D.useGpu=getenv("STAG_GPU")? atoi(getenv("STAG_GPU")) : 1;
