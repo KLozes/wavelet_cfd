@@ -85,6 +85,16 @@ struct PerMass {
       }
     }
   }
+  std::vector<double> Minv;                     // explicit dense inverse
+  void buildInv() {
+    Minv.assign((size_t)N*N,0.0);
+    std::vector<double> e(N);
+    for (i32 c=0;c<N;c++){
+      std::fill(e.begin(),e.end(),0.0); e[c]=1.0;
+      solve(e.data(),1);
+      for (i32 r=0;r<N;r++) Minv[(size_t)r*N+c]=e[r];
+    }
+  }
   void solve(double *x, i32 stride) const {     // in place, one 1-D system
     for (i32 i=0;i<N;i++){ double s2=x[(size_t)i*stride];
       for (i32 k=0;k<i;k++) s2-=L[(size_t)i*N+k]*x[(size_t)k*stride];
@@ -108,12 +118,20 @@ struct Stag {
   void init(i32 p_, i32 N_) {
     p=p_; N=N_; h=g_L/N; nn=(size_t)N*N;
     Mq[0].build(p-1,N,h); Mq[1].build(p,N,h);
+    Mq[0].buildInv(); Mq[1].buildInv();
     Q.assign(4*nn,0.0); Pi.assign(nn,0.0);
   }
   // Kronecker mass solve on one field with per-direction degrees (qx,qy)
   void massSolve(double *f, i32 qx, i32 qy) const {
-    for (i32 j=0;j<N;j++) const_cast<PerMass&>(Mq[qx==p]).solve(&f[(size_t)j*N],1);
-    for (i32 i=0;i<N;i++) const_cast<PerMass&>(Mq[qy==p]).solve(&f[(size_t)i],N);
+    const PerMass &Mx=Mq[qx==p], &My=Mq[qy==p];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (i32 j=0;j<N;j++) Mx.solve(&f[(size_t)j*N],1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (i32 i=0;i<N;i++) My.solve(&f[(size_t)i],N);
   }
 };
 
@@ -554,6 +572,23 @@ static void buildCutCell(const Circle &G, double x0, double y0, double h,
   }
 }
 
+
+// Euler flux Jacobians (ported from IgaEuler2dTest)
+__host__ __device__ static inline void stagJac2(const double U[4],
+    double Ax[4][4], double Ay[4][4]) {
+  double r=U[0], u=U[1]/r, v=U[2]/r, E=U[3];
+  double q2=u*u+v*v, gm=GAM-1.0;
+  double H=(E+gm*(E-0.5*r*q2))/r;
+  Ax[0][0]=0; Ax[0][1]=1; Ax[0][2]=0; Ax[0][3]=0;
+  Ax[1][0]=0.5*gm*q2-u*u; Ax[1][1]=(3.0-GAM)*u; Ax[1][2]=-gm*v; Ax[1][3]=gm;
+  Ax[2][0]=-u*v; Ax[2][1]=v; Ax[2][2]=u; Ax[2][3]=0;
+  Ax[3][0]=u*(0.5*gm*q2-H); Ax[3][1]=H-gm*u*u; Ax[3][2]=-gm*u*v; Ax[3][3]=GAM*u;
+  Ay[0][0]=0; Ay[0][1]=0; Ay[0][2]=1; Ay[0][3]=0;
+  Ay[1][0]=-u*v; Ay[1][1]=v; Ay[1][2]=u; Ay[1][3]=0;
+  Ay[2][0]=0.5*gm*q2-v*v; Ay[2][1]=-gm*u; Ay[2][2]=(3.0-GAM)*v; Ay[2][3]=gm;
+  Ay[3][0]=v*(0.5*gm*q2-H); Ay[3][1]=-gm*u*v; Ay[3][2]=H-gm*v*v; Ay[3][3]=GAM*v;
+}
+
 struct StagCyl {
   Stag S;                                       // spaces + masses (periodic)
   Circle body;
@@ -565,7 +600,7 @@ struct StagCyl {
   std::vector<i32>    wcc;
   std::vector<i32>    fullList;                 // fluid full cells
   double Uinf[4];
-  double sponW=2.0, sponSig=2.0, wbeta=16.0;
+  double sponW=2.0, sponSig=2.0, wbeta=16.0, csu=0.0;
   i32 piMode=0;
 
   void build(i32 p, i32 N) {
@@ -615,7 +650,7 @@ struct CylPar {
   const i32 *fullList; i32 nFull;
   const double *cvx,*cvy,*cvw; const i32 *cvc; i32 nCv;
   const double *wxp,*wyp,*wwp,*wnx,*wny; const i32 *wcc; i32 nW;
-  double Uinf[4], sponW,sponSig,wbeta; i32 piMode;
+  double Uinf[4], sponW,sponSig,wbeta,csu; i32 piMode;
 };
 
 // evaluate all fields (+ derivatives for div m) at one reference point
@@ -668,13 +703,49 @@ __host__ __device__ static void cylPoint(const CylPar &P, i32 cx, i32 cy,
     for (i32 k=0;k<=p;k++){ real a=(k>=1)?T[k-1]:(real)0,b=(k<=p-1)?T[k]:(real)0; Ep2[k]=a-b; } }
   { real T[BS_NMAX]; IgaBasis::evalDeg(p-2,(real)yi,T);
     for (i32 k=0;k<=p-1;k++){ real a=(k>=1)?T[k-1]:(real)0,b=(k<=p-2)?T[k]:(real)0; Em[k]=a-b; } }
+  // ---- SU streamline term (STAG_CSU), non-transposed pairing (the stable
+  // convention from the collocated campaign), applied to MOMENTUM and ENERGY
+  // ONLY: the mass equation stays untouched, so at any discrete steady state
+  // div m remains pointwise zero and the complex's exactness is preserved.
+  double gxS[4]={0,0,0,0}, gyS[4]={0,0,0,0};
+  if (P.csu>0) {
+    // full gradients of (rho, mx, my, E)
+    double drx=0,dry=0,dmx_y=0,dmy_x=0,dEx=0,dEy=0;
+    for (i32 a=0;a<=p;a++) for (i32 b=0;b<=p-1;b++) {
+      i32 gi=((cx+a)%N)+N*((cy+b)%N); double vq=P.Q[nn+gi];
+      dmx_y += vq*(double)Bp[a]*(double)Em[b]/h; }
+    for (i32 a=0;a<=p-1;a++) for (i32 b=0;b<=p;b++) {
+      i32 gi=((cx+a)%N)+N*((cy+b)%N); double vq=P.Q[2*nn+gi];
+      dmy_x += vq*(double)Dm[a]/h*(double)Cp[b]; }
+    for (i32 a=0;a<=p-1;a++) for (i32 b=0;b<=p-1;b++) {
+      i32 gi=((cx+a)%N)+N*((cy+b)%N);
+      double sxr=(double)Dm[a]/h*(double)Cm[b];
+      double syr=(double)Bm[a]*(double)Em[b]/h;
+      drx+=P.Q[gi]*sxr; dry+=P.Q[gi]*syr;
+      dEx+=P.Q[3*nn+gi]*sxr; dEy+=P.Q[3*nn+gi]*syr; }
+    double Uv[4]={rho,mx,my,E};
+    double Ux[4]={drx,dmx,dmy_x,dEx};      // dmx = d(mx)/dx from cylEval
+    double Uy[4]={dry,dmx_y,dmy,dEy};      // dmy = d(my)/dy from cylEval
+    double Ax[4][4],Ay[4][4],Res[4]={0,0,0,0};
+    stagJac2(Uv,Ax,Ay);
+    for (i32 k=0;k<4;k++) for (i32 m2=0;m2<4;m2++)
+      Res[k]+=Ax[k][m2]*Ux[m2]+Ay[k][m2]*Uy[m2];
+    double prq=(GAM-1.0)*(E-0.5*(mx*mx+my*my)/rho);
+    double cs=sqrt(GAM*fmax(prq,1e-12)/fmax(rho,1e-12));
+    double lamq=sqrt(u*u+v2*v2)+cs;
+    double tau=0.5*P.csu*h/fmax(lamq,1e-12);
+    for (i32 k=0;k<4;k++) for (i32 m2=0;m2<4;m2++){
+      gxS[k]+=tau*Ax[k][m2]*Res[m2]; gyS[k]+=tau*Ay[k][m2]*Res[m2]; }
+    gxS[0]=gyS[0]=0.0;                    // mass equation stays EXACT
+  }
   for (i32 a=0;a<=p-1;a++) for (i32 b=0;b<=p-1;b++) {   // rho & E tests
     i32 gi=((cx+a)%N)+N*((cy+b)%N);
     double sc=(double)Bm[a]*(double)Cm[b];
     double sx=(double)Dm[a]/h*(double)Cm[b];
     double sy=(double)Bm[a]*(double)Em[b]/h;
     double rr = w*( sx*mx + sy*my - sc*sg*(rho-P.Uinf[0]) );
-    double re = w*( sx*(E+pr)*u + sy*(E+pr)*v2 - sc*sg*(E-P.Uinf[3]) );
+    double re = w*( sx*(E+pr)*u + sy*(E+pr)*v2 - sc*sg*(E-P.Uinf[3])
+                    - sx*gxS[3] - sy*gyS[3] );
 #ifdef __CUDA_ARCH__
     atomicAdd(&P.R[gi],rr); atomicAdd(&P.R[3*nn+gi],re);
 #else
@@ -686,7 +757,8 @@ __host__ __device__ static void cylPoint(const CylPar &P, i32 cx, i32 cy,
     double sc=(double)Bp[a]*(double)Cm[b];
     double sx=(double)Dp[a]/h*(double)Cm[b];
     double sy=(double)Bp[a]*(double)Em[b]/h;
-    double r = w*( sx*(mx*u+pr) + sy*(mx*v2) - sc*sg*(mx-P.Uinf[1]) );
+    double r = w*( sx*(mx*u+pr) + sy*(mx*v2) - sc*sg*(mx-P.Uinf[1])
+                   - sx*gxS[1] - sy*gyS[1] );
 #ifdef __CUDA_ARCH__
     atomicAdd(&P.R[nn+gi],r);
 #else
@@ -698,7 +770,8 @@ __host__ __device__ static void cylPoint(const CylPar &P, i32 cx, i32 cy,
     double sc=(double)Bm[a]*(double)Cp[b];
     double sx=(double)Dm[a]/h*(double)Cp[b];
     double sy=(double)Bm[a]*(double)Ep2[b]/h;
-    double r = w*( sx*(my*u) + sy*(my*v2+pr) - sc*sg*(my-P.Uinf[2]) );
+    double r = w*( sx*(my*u) + sy*(my*v2+pr) - sc*sg*(my-P.Uinf[2])
+                   - sx*gxS[2] - sy*gyS[2] );
 #ifdef __CUDA_ARCH__
     atomicAdd(&P.R[2*nn+gi],r);
 #else
@@ -784,11 +857,47 @@ __global__ static void kCylPi(CylPar P, double *B) {
     atomicAdd(&B[((cx+a)%N)+N*((cy+b)%N)], w*pr*(double)Bm[a]*(double)Cm[b]);
 }
 
+
+// ---------------------------------------------------------------------------
+//  device-resident Kronecker mass solve + RK4 (mode "cylm", GPU path):
+//  dense periodic Cholesky factors live on device; one thread per 1-D system.
+// ---------------------------------------------------------------------------
+// mass-inverse apply as a fully parallel matvec: out = (I (x) Minv) in
+// (rows) or (Minv (x) I) in (cols); one thread per output entry.
+__global__ static void kInvRows(const double *Minv, i32 n, const double *fin,
+                                double *fout) {
+  i32 t=blockIdx.x*blockDim.x+threadIdx.x; if (t>=n*n) return;
+  i32 j=t/n, i=t%n;
+  const double *x=&fin[(size_t)j*n];
+  const double *Mi=&Minv[(size_t)i*n];
+  double s2=0; for (i32 k=0;k<n;k++) s2+=Mi[k]*x[k];
+  fout[(size_t)j*n+i]=s2;
+}
+__global__ static void kInvCols(const double *Minv, i32 n, const double *fin,
+                                double *fout) {
+  i32 t=blockIdx.x*blockDim.x+threadIdx.x; if (t>=n*n) return;
+  i32 i0=t/n, i=t%n;
+  const double *Mi=&Minv[(size_t)i*n];
+  double s2=0; for (i32 k=0;k<n;k++) s2+=Mi[k]*fin[i0+(size_t)n*k];
+  fout[i0+(size_t)n*i]=s2;
+}
+__global__ static void kComb2(size_t m, double *y, const double *a, double ca,
+                              const double *b, double cb) {
+  size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if (i>=m) return;
+  y[i]=ca*a[i]+cb*b[i];
+}
+__global__ static void kAcc(size_t m, double *y, const double *x, double c) {
+  size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if (i>=m) return;
+  y[i]+=c*x[i];
+}
+
 struct CylDev {
   double *Q=nullptr,*Pi=nullptr,*R=nullptr,*B=nullptr;
   i32 *fullList=nullptr,*cvc=nullptr,*wcc=nullptr;
   double *cvx=nullptr,*cvy=nullptr,*cvw=nullptr;
   double *wxp=nullptr,*wyp=nullptr,*wwp=nullptr,*wnx=nullptr,*wny=nullptr;
+  double *Lm=nullptr,*Lp=nullptr,*T=nullptr;    // dense mass INVERSES + scratch
+  double *Q0=nullptr,*Qs=nullptr,*K=nullptr;    // RK4 device buffers
   i32 useGpu=1;
   void init(StagCyl &C) {
     if (!useGpu) return;
@@ -808,8 +917,34 @@ struct CylDev {
     up((void**)&wwp,C.wwp.data(),C.wwp.size()*8);
     up((void**)&wnx,C.wnx.data(),C.wnx.size()*8);
     up((void**)&wny,C.wny.data(),C.wny.size()*8);
+    up((void**)&Lm,C.S.Mq[0].Minv.data(),C.S.Mq[0].Minv.size()*8);
+    up((void**)&Lp,C.S.Mq[1].Minv.data(),C.S.Mq[1].Minv.size()*8);
+    cudaMalloc(&Q0,4*nn*8); cudaMalloc(&Qs,4*nn*8); cudaMalloc(&K,4*nn*8);
+    cudaMalloc(&T,nn*8);
+  }
+  void massSolveDev(i32 p, i32 N) {
+    const i32 TB=256, GB=(N*N+TB-1)/TB;
+    for (i32 f=0;f<4;f++) {
+      i32 qx,qy; fieldDeg(f,p,qx,qy);
+      double *F=&R[(size_t)f*N*N];
+      kInvRows<<<GB,TB>>>((qx==p)?Lp:Lm,N,F,T);
+      kInvCols<<<GB,TB>>>((qy==p)?Lp:Lm,N,T,F);
+    }
   }
 };
+
+static void cylPar(StagCyl &C, CylDev &D, CylPar &P);
+
+// device RHS with NO host transfers (piMode 0 path)
+static void cylRhsDev(StagCyl &C, CylDev &D, const double *devQ) {
+  CylPar P; cylPar(C,D,P);
+  P.Q=devQ; P.R=D.R; P.Pi=D.Pi;
+  cudaMemset(D.R,0,4*C.S.nn*8);
+  i32 nptF=P.nFull*P.ng*P.ng;
+  if (nptF) kCylFull<<<(nptF+255)/256,256>>>(P);
+  if (P.nCv) kCylCut<<<(P.nCv+255)/256,256>>>(P);
+  if (P.nW)  kCylWall<<<(P.nW+255)/256,256>>>(P);
+}
 
 static void cylPar(StagCyl &C, CylDev &D, CylPar &P) {
   P.p=C.S.p; P.N=C.S.N; P.h=C.S.h; P.L=g_L;
@@ -817,6 +952,7 @@ static void cylPar(StagCyl &C, CylDev &D, CylPar &P) {
   P.nFull=(i32)C.fullList.size(); P.nCv=(i32)C.cvw.size(); P.nW=(i32)C.wwp.size();
   for (i32 k=0;k<4;k++) P.Uinf[k]=C.Uinf[k];
   P.sponW=C.sponW; P.sponSig=C.sponSig; P.wbeta=C.wbeta; P.piMode=C.piMode;
+  P.csu=C.csu;
   P.fullList=D.fullList; P.cvc=D.cvc; P.wcc=D.wcc;
   P.cvx=D.cvx; P.cvy=D.cvy; P.cvw=D.cvw;
   P.wxp=D.wxp; P.wyp=D.wyp; P.wwp=D.wwp; P.wnx=D.wnx; P.wny=D.wny;
@@ -882,7 +1018,13 @@ static void cylMassApply(Stag &S, const std::vector<double> &v,
   for (i32 f=0;f<4;f++) {
     i32 qx,qy; fieldDeg(f,S.p,qx,qy);
     double *F=&out[(size_t)f*S.nn];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (i32 j=0;j<N;j++) ap1(S.Mq[qx==S.p],&F[(size_t)j*N],1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (i32 i=0;i<N;i++) ap1(S.Mq[qy==S.p],&F[(size_t)i],N);
   }
 }
@@ -899,6 +1041,7 @@ static void gateCyl(i32 p) {
   StagCyl C; C.build(p,N);
   C.wbeta  = getenv("STAG_WBETA")? atof(getenv("STAG_WBETA")) : 16.0;
   C.piMode = getenv("STAG_PI")? atoi(getenv("STAG_PI")) : 0;
+  C.csu    = getenv("STAG_CSU")? atof(getenv("STAG_CSU")) : 1.0;
   C.sponSig= getenv("STAG_SIG")? atof(getenv("STAG_SIG")) : 2.0;
   C.sponW  = getenv("STAG_SW")? atof(getenv("STAG_SW")) : 2.0;
   CylDev D; D.useGpu=getenv("STAG_GPU")? atoi(getenv("STAG_GPU")) : 1;
@@ -1082,6 +1225,7 @@ static void gateCylMarch(i32 p) {
   StagCyl C; C.build(p,N);
   C.wbeta  = getenv("STAG_WBETA")? atof(getenv("STAG_WBETA")) : 16.0;
   C.piMode = getenv("STAG_PI")? atoi(getenv("STAG_PI")) : 0;
+  C.csu    = getenv("STAG_CSU")? atof(getenv("STAG_CSU")) : 1.0;
   C.sponSig= getenv("STAG_SIG")? atof(getenv("STAG_SIG")) : 2.0;
   C.sponW  = getenv("STAG_SW")? atof(getenv("STAG_SW")) : 2.0;
   CylDev D; D.useGpu=getenv("STAG_GPU")? atoi(getenv("STAG_GPU")) : 1;
@@ -1102,7 +1246,32 @@ static void gateCylMarch(i32 p) {
   i32 prstep = getenv("STAG_PR")? atoi(getenv("STAG_PR")) : 2000;
   printf("%8s %8s %9s %9s %10s\n","step","t","Cd","max u.n","dU/dt");
   double lastnorm=0;
+  const size_t mm=4*S.nn;
+  if (D.useGpu) cudaMemcpy(D.Q0,U.data(),mm*8,cudaMemcpyHostToDevice);
+  std::vector<double> Uprev;
   for (i32 st=1; st<=nst; st++) {
+    if (D.useGpu) {
+      const i32 TB=256; const i32 GB=(i32)((mm+TB-1)/TB);
+      cylRhsDev(C,D,D.Q0); D.massSolveDev(S.p,S.N);            // k1
+      cudaMemcpy(D.K,D.R,mm*8,cudaMemcpyDeviceToDevice);
+      kComb2<<<GB,TB>>>(mm,D.Qs,D.Q0,1.0,D.R,0.5*dt);
+      cylRhsDev(C,D,D.Qs); D.massSolveDev(S.p,S.N);            // k2
+      kAcc<<<GB,TB>>>(mm,D.K,D.R,2.0);
+      kComb2<<<GB,TB>>>(mm,D.Qs,D.Q0,1.0,D.R,0.5*dt);
+      cylRhsDev(C,D,D.Qs); D.massSolveDev(S.p,S.N);            // k3
+      kAcc<<<GB,TB>>>(mm,D.K,D.R,2.0);
+      kComb2<<<GB,TB>>>(mm,D.Qs,D.Q0,1.0,D.R,dt);
+      cylRhsDev(C,D,D.Qs); D.massSolveDev(S.p,S.N);            // k4
+      kAcc<<<GB,TB>>>(mm,D.K,D.R,1.0);
+      kAcc<<<GB,TB>>>(mm,D.Q0,D.K,dt/6.0);
+      if (st%200==0 || st==nst || st%prstep==0) {
+        double q0; cudaMemcpy(&q0,D.Q0,8,cudaMemcpyDeviceToHost);
+        if (!std::isfinite(q0)||fabs(q0)>1e3){ printf("  BLOWUP step %d\n",st); return; }
+      }
+      if (!(st%prstep==0 || st==nst)) continue;
+      cudaMemcpy(U.data(),D.Q0,mm*8,cudaMemcpyDeviceToHost);
+      Q0=U;
+    } else {
     Q0=U;
     cylRhs(C,D,U,R); solve4(R); K=R;
     Qs=Q0; for (size_t i=0;i<R.size();i++) Qs[i]=Q0[i]+0.5*dt*R[i];
@@ -1113,9 +1282,17 @@ static void gateCylMarch(i32 p) {
     cylRhs(C,D,Qs,R); solve4(R);
     for (size_t i=0;i<R.size();i++) U[i]=Q0[i]+(dt/6.0)*(K[i]+R[i]);
     if (!std::isfinite(U[0]) || fabs(U[0])>1e3) { printf("  BLOWUP step %d\n",st); return; }
+    }
     if (st%prstep==0 || st==nst) {
-      double du=0; for (size_t i=0;i<U.size();i++){ double d=U[i]-Q0[i]; du+=d*d; }
-      du=sqrt(du)/dt;
+      double du=0;
+      if (D.useGpu) {
+        if (Uprev.empty()) Uprev.assign(U.size(),0.0);
+        for (size_t i=0;i<U.size();i++){ double d=U[i]-Uprev[i]; du+=d*d; }
+        du=sqrt(du)/(dt*prstep); Uprev=U;
+      } else {
+        for (size_t i=0;i<U.size();i++){ double d=U[i]-Q0[i]; du+=d*d; }
+        du=sqrt(du)/dt;
+      }
       double fx=0, unmax=0;
       CylPar P; cylPar(C,D,P); P.Q=U.data(); P.Pi=nullptr; P.R=nullptr;
       for (i32 t2=0;t2<(i32)C.wwp.size();t2++){
