@@ -25,7 +25,7 @@
 // ---------------------------------------------------------------------------
 #include "Util.cuh"
 
-static constexpr i32 BS_PMAX = 4;
+static constexpr i32 BS_PMAX = 8;
 static constexpr i32 BS_NMAX = BS_PMAX + 1;
 
 struct IgaBasis {
