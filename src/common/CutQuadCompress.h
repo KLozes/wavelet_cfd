@@ -38,20 +38,40 @@ static inline void legShift(double x,int K,double*P){ double t=2*x-1; P[0]=1; if
 // 1e-9 is what the FEM compression path has always used and is kept so that
 // path is bit-identical; the cut-element fit passes a value scaled to its own
 // data.  nOuter caps the passive set; default m reproduces the old behaviour.
+// instrumentation (CUT_NNLSSTAT=1): where does the prune time actually go?
+struct NnlsStat { long long reformCalls=0, reformFlops=0, scanFlops=0, outer=0; };
+extern NnlsStat g_nnlsStat;
+#pragma omp threadprivate(g_nnlsStat)
+NnlsStat g_nnlsStat;
 static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,int n,std::vector<double>&w,
                  double gtol=1e-9, int nOuter=-1){
   if (nOuter<0 || nOuter>m) nOuter=m;   // G/L are m x m: the passive set
                                        // cannot exceed m columns
   w.assign(n,0.0); std::vector<char> P(n,0); std::vector<double> r(b),z(n),zk(m),y(m);
   std::vector<int> idx; idx.reserve(m);
+  std::vector<int> keep, keepPos; keep.reserve(m); keepPos.reserve(m);   // hoisted out of the inner loop
   std::vector<double> G((size_t)m*m,0.0), L((size_t)m*m,0.0), rhs(m,0.0); int k=0;
   auto dot=[&](const double*u,const double*v){ double s=0; for(int i=0;i<m;i++)s+=u[i]*v[i]; return s; };
-  auto reform=[&](){ k=(int)idx.size();
-    for(int a=0;a<k;a++){ const double*Aa=&A[(size_t)idx[a]*m]; rhs[a]=dot(Aa,b.data());
-      for(int c=0;c<=a;c++) G[(size_t)a*m+c]=G[(size_t)c*m+a]=dot(Aa,&A[(size_t)idx[c]*m]); }
-    for(int a=0;a<k;a++) G[(size_t)a*m+a]+=1e-12;
+  // Cholesky of the leading k x k of G (G assumed already correct).
+  auto refactor=[&](){
     for(int j=0;j<k;j++){ double d=G[(size_t)j*m+j]; for(int q=0;q<j;q++) d-=L[(size_t)j*m+q]*L[(size_t)j*m+q]; d=d>1e-300?sqrt(d):1e-150; L[(size_t)j*m+j]=d;
       for(int i=j+1;i<k;i++){ double s=G[(size_t)i*m+j]; for(int q=0;q<j;q++) s-=L[(size_t)i*m+q]*L[(size_t)j*m+q]; L[(size_t)i*m+j]=s/d; } } };
+  // Drop columns from the passive set.  G's ENTRIES are unchanged by a removal --
+  // only their POSITIONS shift -- so compact in place (k^2/2 copies) instead of
+  // recomputing them as k^2 dot products of length m.  That rebuild was measured
+  // at 76% of the p3 prune's flops (reform/scan 3.1x at p3, 0.5x at p2), and it
+  // is the (2p+1)^9 scaling: k^2*m grows as m^3 while the useful work does not.
+  // kp = kept POSITIONS in the old passive set, ascending; the copy is safe in
+  // place because kp[a] >= a, so every source (kp[a],kp[c]) is at or after its
+  // destination (a,c) in both index directions.
+  auto shrink=[&](const std::vector<int>&kp){
+    int kn=(int)kp.size();
+    g_nnlsStat.reformCalls++;
+    g_nnlsStat.reformFlops += (long long)kn*kn/2 + (long long)kn*kn*kn/3;
+    for(int a=0;a<kn;a++){ int oa=kp[a]; rhs[a]=rhs[oa];
+      for(int c=0;c<=a;c++){ int oc=kp[c]; double v=G[(size_t)oa*m+oc];
+        G[(size_t)a*m+c]=v; G[(size_t)c*m+a]=v; } }
+    k=kn; refactor(); };
   auto addcol=[&](int jn){ const double*Aj=&A[(size_t)jn*m];        // append candidate jn to passive set
     for(int a=0;a<k;a++){ double g=dot(&A[(size_t)idx[a]*m],Aj); G[(size_t)a*m+k]=G[(size_t)k*m+a]=g; }
     G[(size_t)k*m+k]=dot(Aj,Aj)+1e-12;
@@ -62,6 +82,7 @@ static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,i
     for(int i=k-1;i>=0;i--){ double s=y[i]; for(int q=i+1;q<k;q++) s-=L[(size_t)q*m+i]*zk[q]; zk[i]=s/L[(size_t)i*m+i]; } };
   for(int outer=0;outer<nOuter;outer++){
     int jm=-1; double gm=gtol;
+    g_nnlsStat.outer++; g_nnlsStat.scanFlops += (long long)n*m;
     for(int j=0;j<n;j++) if(!P[j]){ double g=dot(&A[(size_t)j*m],r.data()); if(g>gm){gm=g;jm=j;} }
     if(jm<0) break; P[jm]=1; addcol(jm);
     for(int inner=0;inner<3*n;inner++){
@@ -70,9 +91,10 @@ static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,i
       if(zmin>1e-13){ for(int a=0;a<k;a++) w[idx[a]]=zk[a]; break; }
       double alpha=1e300; for(int a=0;a<k;a++){ int j=idx[a]; if(z[j]<=1e-13){ double t=w[j]/(w[j]-z[j]); if(t<alpha)alpha=t; } }
       for(int a=0;a<k;a++){ int j=idx[a]; w[j]+=alpha*(z[j]-w[j]); }
-      std::vector<int> keep; keep.reserve(k); bool rem=false;
-      for(int a=0;a<k;a++){ int j=idx[a]; if(w[j]<=1e-13){ P[j]=0; w[j]=0; rem=true; } else keep.push_back(j); }
-      if(rem){ idx.swap(keep); reform(); }
+      keep.clear(); keepPos.clear(); bool rem=false;
+      for(int a=0;a<k;a++){ int j=idx[a]; if(w[j]<=1e-13){ P[j]=0; w[j]=0; rem=true; }
+                            else { keep.push_back(j); keepPos.push_back(a); } }
+      if(rem){ idx.swap(keep); shrink(keepPos); }
     }
     for(int i=0;i<m;i++){ double s=b[i]; for(int a=0;a<k;a++) s-=w[idx[a]]*A[(size_t)idx[a]*m+i]; r[i]=s; }
   }

@@ -525,6 +525,13 @@ void CutFemSolver::runIga(void) {
     printf("prune  : NNLS %s volume %zu -> %zu pts (%.1fx, %.0f/cell -> %.0f/cell) in %.2fs\n",
            gN>0?"uniform-grid":"Saye", n0, vp2.size(), (double)n0/std::max<size_t>(vp2.size(),1),
            (double)n0/nCutQ, (double)vp2.size()/nCutQ, (qpNowUs()-t0)*1e-6);
+    if(getenv("CUT_NNLSSTAT")){          // where does the prune time go? (reform vs gradient scan)
+      long long rc=0,rf=0,sf=0,ou=0;
+      #pragma omp parallel reduction(+:rc,rf,sf,ou)
+      { rc+=g_nnlsStat.reformCalls; rf+=g_nnlsStat.reformFlops;
+        sf+=g_nnlsStat.scanFlops;   ou+=g_nnlsStat.outer; }
+      printf("       : nnls outer %lld, reform calls %lld (%.2f/outer) | flops: reform %.3e  scan %.3e  (reform/scan %.1fx)\n",
+             ou, rc, ou? (double)rc/ou : 0.0, (double)rf, (double)sf, sf? (double)rf/sf : 0.0); }
     if(gN>0){ double mr=0,ar=0; for(double v:resid){ if(v>mr)mr=v; ar+=v; }
       printf("       : uniform grid %d^3, moment residual: max %.2e, mean %.2e (0 => reproduces Saye moments exactly)\n",gN,mr,ar/nCutQ); }
     volPool.swap(vp2); volOff.swap(vo2);
