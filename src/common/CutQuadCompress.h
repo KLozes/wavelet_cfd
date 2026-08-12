@@ -43,14 +43,38 @@ struct NnlsStat { long long reformCalls=0, reformFlops=0, scanFlops=0, outer=0; 
 extern NnlsStat g_nnlsStat;
 #pragma omp threadprivate(g_nnlsStat)
 NnlsStat g_nnlsStat;
-static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,int n,std::vector<double>&w,
-                 double gtol=1e-9, int nOuter=-1){
+// PF holds the FACTORED candidate matrix: 3*n1 Legendre factors per node
+// (Px,Py,Pz), from which column q of A is the tensor product
+// A_q[(i0*n1+i1)*n1+i2] = (Px[i0]*Py[i1])*Pz[i2].
+//
+// Storing the factors instead of the expanded n1^3 column is a 16x smaller
+// working set at p3 (3*7 vs 343 doubles/node: 414 KB vs 6.8 MB per cell), which
+// is the whole ballgame: CUT_NNLSSTAT showed the gradient scan re-streams the
+// candidate matrix EVERY outer iteration -- 329 GB at p3, i.e. ~18 GB/s = DDR4
+// saturation, and essentially 100% of the prune time.  Expanding on the fly
+// costs 2 extra multiplies per element (free -- we were never compute-bound) and
+// keeps the working set L2-resident.  Products and summation order are UNCHANGED,
+// so results stay bit-identical.
+static void nnls(const std::vector<double>&PF,const std::vector<double>&b,int m,int n,int n1,
+                 std::vector<double>&w, double gtol=1e-9, int nOuter=-1){
   if (nOuter<0 || nOuter>m) nOuter=m;   // G/L are m x m: the passive set
                                        // cannot exceed m columns
   w.assign(n,0.0); std::vector<char> P(n,0); std::vector<double> r(b),z(n),zk(m),y(m);
   std::vector<int> idx; idx.reserve(m);
   std::vector<int> keep, keepPos; keep.reserve(m); keepPos.reserve(m);   // hoisted out of the inner loop
   std::vector<double> G((size_t)m*m,0.0), L((size_t)m*m,0.0), rhs(m,0.0); int k=0;
+  std::vector<double> col(m);          // scratch: one expanded column
+  auto fac=[&](int q){ return &PF[(size_t)q*3*n1]; };
+  // expand column q of A into dst (same product order as the original build)
+  auto expand=[&](int q,double*dst){ const double*F=fac(q); const double*Px=F,*Py=F+n1,*Pz=F+2*n1;
+    for(int i0=0;i0<n1;i0++)for(int i1=0;i1<n1;i1++){ double pxy=Px[i0]*Py[i1]; int base=(i0*n1+i1)*n1;
+      for(int i2=0;i2<n1;i2++) dst[base+i2]=pxy*Pz[i2]; } };
+  // A_q . v  -- expanded on the fly, i ascending exactly as before
+  auto dotAv=[&](int q,const double*v){ const double*F=fac(q); const double*Px=F,*Py=F+n1,*Pz=F+2*n1;
+    double s=0;
+    for(int i0=0;i0<n1;i0++)for(int i1=0;i1<n1;i1++){ double pxy=Px[i0]*Py[i1]; int base=(i0*n1+i1)*n1;
+      for(int i2=0;i2<n1;i2++) s+=pxy*Pz[i2]*v[base+i2]; }
+    return s; };
   auto dot=[&](const double*u,const double*v){ double s=0; for(int i=0;i<m;i++)s+=u[i]*v[i]; return s; };
   // Cholesky of the leading k x k of G (G assumed already correct).
   auto refactor=[&](){
@@ -72,8 +96,8 @@ static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,i
       for(int c=0;c<=a;c++){ int oc=kp[c]; double v=G[(size_t)oa*m+oc];
         G[(size_t)a*m+c]=v; G[(size_t)c*m+a]=v; } }
     k=kn; refactor(); };
-  auto addcol=[&](int jn){ const double*Aj=&A[(size_t)jn*m];        // append candidate jn to passive set
-    for(int a=0;a<k;a++){ double g=dot(&A[(size_t)idx[a]*m],Aj); G[(size_t)a*m+k]=G[(size_t)k*m+a]=g; }
+  auto addcol=[&](int jn){ expand(jn,col.data()); const double*Aj=col.data();   // append candidate jn
+    for(int a=0;a<k;a++){ double g=dotAv(idx[a],Aj); G[(size_t)a*m+k]=G[(size_t)k*m+a]=g; }
     G[(size_t)k*m+k]=dot(Aj,Aj)+1e-12;
     for(int a=0;a<k;a++){ double s=G[(size_t)k*m+a]; for(int q=0;q<a;q++) s-=L[(size_t)k*m+q]*L[(size_t)a*m+q]; L[(size_t)k*m+a]=s/L[(size_t)a*m+a]; }
     { double s=G[(size_t)k*m+k]; for(int q=0;q<k;q++) s-=L[(size_t)k*m+q]*L[(size_t)k*m+q]; L[(size_t)k*m+k]=s>1e-300?sqrt(s):1e-150; }
@@ -83,7 +107,7 @@ static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,i
   for(int outer=0;outer<nOuter;outer++){
     int jm=-1; double gm=gtol;
     g_nnlsStat.outer++; g_nnlsStat.scanFlops += (long long)n*m;
-    for(int j=0;j<n;j++) if(!P[j]){ double g=dot(&A[(size_t)j*m],r.data()); if(g>gm){gm=g;jm=j;} }
+    for(int j=0;j<n;j++) if(!P[j]){ double g=dotAv(j,r.data()); if(g>gm){gm=g;jm=j;} }
     if(jm<0) break; P[jm]=1; addcol(jm);
     for(int inner=0;inner<3*n;inner++){
       solveLS(); std::fill(z.begin(),z.end(),0.0); double zmin=1e300;
@@ -96,7 +120,11 @@ static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,i
                             else { keep.push_back(j); keepPos.push_back(a); } }
       if(rem){ idx.swap(keep); shrink(keepPos); }
     }
-    for(int i=0;i<m;i++){ double s=b[i]; for(int a=0;a<k;a++) s-=w[idx[a]]*A[(size_t)idx[a]*m+i]; r[i]=s; }
+    // r = b - sum_a w_a A_{idx[a]}.  Column-outer so each column is expanded once;
+    // per-i the subtractions still happen in ascending a, so rounding is unchanged.
+    for(int i=0;i<m;i++) r[i]=b[i];
+    for(int a=0;a<k;a++){ expand(idx[a],col.data()); double wa=w[idx[a]];
+      for(int i=0;i<m;i++) r[i]-=wa*col[i]; }
   }
 }
 // compress a Saye VOLUME rule (points in the reference cube [0,1]^3) to a positive rule
@@ -104,11 +132,14 @@ static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,i
 static void compressVol(const SayeNode*in,int nIn,int p,std::vector<SayeNode>&out){
   int K=2*p,n1=K+1,m=n1*n1*n1,n=nIn; out.clear();
   if(n<=m){ for(int q=0;q<n;q++) out.push_back(in[q]); return; }   // already minimal
-  std::vector<double> A((size_t)n*m),b(m,0.0),Px(n1),Py(n1),Pz(n1);   // node-major
+  // FACTORED candidate matrix: 3*n1 Legendre factors per node, expanded on the fly
+  // inside nnls (16x smaller working set at p3, L2-resident -- see the note there).
+  std::vector<double> PF((size_t)n*3*n1),b(m,0.0),Px(n1),Py(n1),Pz(n1);
   for(int q=0;q<n;q++){ legShift(in[q].x[0],K,Px.data()); legShift(in[q].x[1],K,Py.data()); legShift(in[q].x[2],K,Pz.data());
-    double*Aq=&A[(size_t)q*m];
-    for(int i=0;i<n1;i++)for(int j=0;j<n1;j++)for(int k=0;k<n1;k++){ int rr=(i*n1+j)*n1+k; double v=Px[i]*Py[j]*Pz[k]; Aq[rr]=v; b[rr]+=(double)in[q].w*v; } }
-  std::vector<double> w; nnls(A,b,m,n,w);
+    double*F=&PF[(size_t)q*3*n1];
+    for(int i=0;i<n1;i++){ F[i]=Px[i]; F[n1+i]=Py[i]; F[2*n1+i]=Pz[i]; }
+    for(int i=0;i<n1;i++)for(int j=0;j<n1;j++)for(int k=0;k<n1;k++){ int rr=(i*n1+j)*n1+k; double v=Px[i]*Py[j]*Pz[k]; b[rr]+=(double)in[q].w*v; } }
+  std::vector<double> w; nnls(PF,b,m,n,n1,w);
   for(int q=0;q<n;q++) if(w[q]>1e-13){ SayeNode s=in[q]; s.w=(real)w[q]; out.push_back(s); }
   if(out.empty()){ for(int q=0;q<nIn;q++) out.push_back(in[q]); }   // NNLS failed -> keep original
 }
@@ -125,11 +156,17 @@ static double compressVolUniform(const SayeNode*sayeIn,int nSaye,const PolyND&ph
     if(phi.eval(x)<0){ SayeNode s{}; s.x[0]=x[0];s.x[1]=x[1];s.x[2]=x[2]; cand.push_back(s); } }
   int n=(int)cand.size();
   if(n<m){ for(int q=0;q<nSaye;q++) out.push_back(sayeIn[q]); return 0; }
-  std::vector<double> A((size_t)n*m);
+  std::vector<double> PF((size_t)n*3*n1);
   for(int q=0;q<n;q++){ legShift(cand[q].x[0],K,Px.data()); legShift(cand[q].x[1],K,Py.data()); legShift(cand[q].x[2],K,Pz.data());
-    double*Aq=&A[(size_t)q*m]; for(int i=0;i<n1;i++)for(int j=0;j<n1;j++)for(int k=0;k<n1;k++) Aq[(i*n1+j)*n1+k]=Px[i]*Py[j]*Pz[k]; }
-  std::vector<double> w; nnls(A,b,m,n,w);
-  double res=0; for(int r=0;r<m;r++){ double s=-b[r]; for(int q=0;q<n;q++) s+=A[(size_t)q*m+r]*w[q]; if(fabs(s)>res)res=fabs(s); }
+    double*F=&PF[(size_t)q*3*n1];
+    for(int i=0;i<n1;i++){ F[i]=Px[i]; F[n1+i]=Py[i]; F[2*n1+i]=Pz[i]; } }
+  std::vector<double> w; nnls(PF,b,m,n,n1,w);
+  double res=0;
+  { std::vector<double> acc(m,0.0);
+    for(int q=0;q<n;q++){ if(w[q]==0.0) continue; const double*F=&PF[(size_t)q*3*n1];
+      for(int i=0;i<n1;i++)for(int j=0;j<n1;j++){ double pxy=F[i]*F[n1+j]; int base=(i*n1+j)*n1;
+        for(int kk=0;kk<n1;kk++) acc[base+kk]+=pxy*F[2*n1+kk]*w[q]; } }
+    for(int r2=0;r2<m;r2++){ double s=acc[r2]-b[r2]; if(fabs(s)>res)res=fabs(s); } }
   for(int q=0;q<n;q++) if(w[q]>1e-13){ SayeNode s=cand[q]; s.w=(real)w[q]; out.push_back(s); }
   if(out.empty()){ for(int q=0;q<nSaye;q++) out.push_back(sayeIn[q]); }
   return res;

@@ -265,9 +265,6 @@ iga_euler1d: $(SRC_DIR)/fem/IgaEuler1dTest.cu $(HDRS)
 iga_euler2d: $(SRC_DIR)/fem/IgaEuler2dTest.cu $(HDRS)
 	$(NVCC) $(FEMTEST_FLAGS) -Xcompiler -fopenmp $< -o $@
 
-iga_stag: $(SRC_DIR)/fem/IgaEulerStagTest.cu $(HDRS)
-	$(NVCC) $(FEMTEST_FLAGS) -Xcompiler -fopenmp $< -o $@ -lcufft
-
 femtests: saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
 clean:
