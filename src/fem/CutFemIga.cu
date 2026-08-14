@@ -352,7 +352,23 @@ void CutFemSolver::runIga(void) {
   long t0 = qpNowUs(); long tSolveEnd = 0;
   initialize();
   buildMesh();
-  real tgll[PNC]; gllNodes(p, tgll);
+  // GEOMETRY fit degree, DECOUPLED from the solution degree p (CUT_GEOMDEG).
+  // The level set is cut against a per-cell degree-gq polynomial; its zero
+  // contour is only as accurate as that fit, and the surface displacement error
+  // is O(h^{gq+1}).  Tying gq to p was costing p2 dearly on the blade: at res48
+  // the degree-2 fit put one face 0.010 outward and inflated the local thickness
+  // 5.4%, biasing peak stress ~11% LOW (sigma ~ 1/t^2).  Degree 4 cuts that to
+  // -0.66%.  Sampling more phi is cheap -- the oracle is the only cost, and it
+  // is not the bottleneck.  Capped at PDEG (PolyND storage / Saye root count).
+  // NOTE: fitting grad(phi) too (Hermite) was tried and is WORSE at every
+  // weight -- a signed distance has a medial axis, and for a body thinner than
+  // ~2 cells that axis lies INSIDE the cell, where grad(phi) jumps by 2|grad|.
+  // A smooth polynomial cannot fit that; value-only at higher degree can.
+  i32 gq = p; if (const char*ge=getenv("CUT_GEOMDEG")) gq = atoi(ge);
+  if (gq < 1) gq = 1; if (gq > PDEG) gq = PDEG;
+  const i32 gn = gq + 1, gnd = gn*gn*gn;
+  real tgll[PNC]; gllNodes(gq, tgll);
+  if (gq != p) printf("geom   : level-set fit degree %d (solution p = %d), %d^3 phi samples/cell\n", gq, p, gn);
 
   // -------------------------------------------------------------------------
   //  active elements: sample phi at the (p+1)^3 GLL nodes via the oracle
@@ -375,14 +391,14 @@ void CutFemSolver::runIga(void) {
         i32 ci = ib*blockSize + cx, cj = jb*blockSize + cy, ck = kb*blockSize + cz;
         real v[PNC*PNC*PNC];
         bool anyNeg=false, anyPos=false;
-        for (i32 k=0;k<n;k++) for(i32 j=0;j<n;j++) for(i32 i=0;i<n;i++){
+        for (i32 k=0;k<gn;k++) for(i32 j=0;j<gn;j++) for(i32 i=0;i<gn;i++){
           real f = ls.phi((ci+tgll[i])*h, (cj+tgll[j])*h, (ck+tgll[k])*h);
-          v[i+n*(j+n*k)]=f; if(f<0)anyNeg=true; else anyPos=true;
+          v[i+gn*(j+gn*k)]=f; if(f<0)anyNeg=true; else anyPos=true;
         }
         if (!anyNeg) continue;
         QElem E; E.ci=ci; E.cj=cj; E.ck=ck; E.cut=anyPos;
         le.push_back(E);
-        for (i32 t=0;t<ndof;t++) lp.push_back(v[t]);
+        for (i32 t=0;t<gnd;t++) lp.push_back(v[t]);
       }
     }
     #pragma omp critical
@@ -493,20 +509,40 @@ void CutFemSolver::runIga(void) {
   // -------------------------------------------------------------------------
   std::vector<PolyND> ePoly(nE);
   std::vector<i32> cutIdx(nE,-1); i32 nCutQ=0;
-  for (i32 e=0;e<nE;e++){ ePoly[e]=fitPoly3(p,&ephi[(size_t)e*ndof]); if (elems[e].cut) cutIdx[e]=nCutQ++; }
+  for (i32 e=0;e<nE;e++){ ePoly[e]=fitPoly3(gq,&ephi[(size_t)e*gnd]); if (elems[e].cut) cutIdx[e]=nCutQ++; }
   std::vector<SayeNode> volPool, surfPool;
   std::vector<i32> volOff(nCutQ+1,0), surfOff(nCutQ+1,0);
   { std::vector<SayeNode> arena(1<<18), out(1<<16);
+    // CUT_SAYEDBG=<us>: report any cut cell whose Saye build exceeds that many
+    // microseconds, separately for the VOLUME and SURFACE rules.  Added to locate
+    // the p4-on-the-blade hang: Potter's point is that the moments need not come
+    // from a subcell decomposition at all (divergence theorem instead), so knowing
+    // WHICH of the two rules explodes decides whether dropping the volume
+    // recursion would actually buy anything.
+    const long dbgUs = getenv("CUT_SAYEDBG")? atol(getenv("CUT_SAYEDBG")) : 0;
+    long tVol=0, tSurf=0; i32 nSlowV=0, nSlowS=0;
     for (i32 e=0;e<nE;e++) if (elems[e].cut){ i32 c=cutIdx[e];
+      long t0=dbgUs?qpNowUs():0;
       SayeArena ar; ar.buf=arena.data(); ar.cap=1<<18; ar.top=0;
       SayeSet ov; ov.p=out.data(); ov.n=0; ov.cap=1<<16; ov.ovf=false;
       sayeVolume(ePoly[e],&ov,&ar,SayeCfg::def());
+      long t1=dbgUs?qpNowUs():0;
       for (i32 q=0;q<ov.n;q++) volPool.push_back(ov.p[q]); volOff[c+1]=(i32)volPool.size();
       SayeArena ar2; ar2.buf=arena.data(); ar2.cap=1<<18; ar2.top=0;
       SayeSet sv; sv.p=out.data(); sv.n=0; sv.cap=1<<16; sv.ovf=false;
       sayeSurface(ePoly[e],&sv,&ar2,SayeCfg::def());
+      long t2=dbgUs?qpNowUs():0;
       for (i32 q=0;q<sv.n;q++) surfPool.push_back(sv.p[q]); surfOff[c+1]=(i32)surfPool.size();
-    } }
+      if (dbgUs) { tVol+=t1-t0; tSurf+=t2-t1;
+        if (t1-t0>dbgUs){ nSlowV++; printf("  [saye] elem %d cell(%d,%d,%d) VOLUME  %.1f ms -> %d pts%s\n",
+              e,elems[e].ci,elems[e].cj,elems[e].ck,(t1-t0)*1e-3,ov.n,ov.ovf?" OVERFLOW":""); fflush(stdout); }
+        if (t2-t1>dbgUs){ nSlowS++; printf("  [saye] elem %d cell(%d,%d,%d) SURFACE %.1f ms -> %d pts%s\n",
+              e,elems[e].ci,elems[e].cj,elems[e].ck,(t2-t1)*1e-3,sv.n,sv.ovf?" OVERFLOW":""); fflush(stdout); }
+      }
+    }
+    if (dbgUs) printf("  [saye] TOTAL volume %.2f s (%d slow cells), surface %.2f s (%d slow cells)\n",
+                      tVol*1e-6,nSlowV,tSurf*1e-6,nSlowS);
+  }
 
   // ---- NNLS quadrature compression (ON by default; CUT_NOPRUNE=1 to disable): shrink each
   //      cut cell's Saye volume rule to a minimal positive rule with the same Q_{2p} moments.
@@ -2208,8 +2244,23 @@ void CutFemSolver::runIga(void) {
       for (i32 nd=0;nd<nNodeQ;nd++){ if(cntN[nd]>0){ vmN[nd]/=cntN[nd];
           for(i32 c6=0;c6<6;c6++) sigN[6*(size_t)nd+c6]/=cntN[nd]; }
         if (phiN[nd]<0 && vmN[nd]>vmMax){ vmMax=vmN[nd]; ndMax=nd; } }
-      if (ndMax>=0) printf("stress : peak von Mises %.6e at (%.4f, %.4f, %.4f)  [solid nodes only, phi<0]\n",
-                           vmMax,nodeXQ[3*ndMax],nodeXQ[3*ndMax+1],nodeXQ[3*ndMax+2]);
+      // NODAL stress is a DIAGNOSTIC ONLY (CUT_NODALSTRESS=1) -- do not quote it.
+      // It is wrong in both directions and by up to 2.15x on the blade:
+      //   p2 res8 -8%, p2 res32 +7%, p2 res48 -15%, p4 res32 +115%, p4 res48 +105%
+      // Two independent defects: (a) B-splines are not interpolatory, so a node
+      // is not a material point and averaging over sharing elements smooths the
+      // concentration; (b) the loop evaluates at GLL positions in EVERY element,
+      // including the fictitious extension outside Omega where the spline is an
+      // unconstrained extrapolation -- and the phi<0 guard does not stop it,
+      // because phiN[] is last-writer-wins across the elements sharing a node.
+      // Higher p extrapolates more violently, which is why p4 is hit ~15x harder
+      // than p2 and why it faked a 2.4x "order effect" that is really 1.1-1.2x.
+      // Use the qp / wall values below: they sample only points inside Omega or
+      // on Gamma by construction, with no averaging.
+      static const bool wantNodal = getenv("CUT_NODALSTRESS") && atoi(getenv("CUT_NODALSTRESS"));
+      if (ndMax>=0 && wantNodal)
+        printf("stress : nodal peak von Mises %.6e at (%.4f, %.4f, %.4f)  [DIAGNOSTIC ONLY -- unreliable]\n",
+               vmMax,nodeXQ[3*ndMax],nodeXQ[3*ndMax+1],nodeXQ[3*ndMax+2]);
       // DIMENSIONAL conversion (CUT_LUNIT = metres per geometry unit).  The solve
       // runs in FILE units; for linear elasticity with x = L*x~ the exact map is
       // sigma = L^2 * sigma~ and u = L^3 * u~ (derive: grad_x = grad_x~/L and the
@@ -2222,6 +2273,84 @@ void CutFemSolver::runIga(void) {
           double m2=sqrt(u3[0]*u3[0]+u3[1]*u3[1]+u3[2]*u3[2]); if(m2>umx)umx=m2; }
         printf("dimensional: L = %g m/unit  ->  peak von Mises %.6e Pa (%.4g MPa),  max |u| %.6e m\n",
                L, vmMax*L*L, vmMax*L*L/1e6, umx*L*L*L);
+      }
+      // ---- QUADRATURE-POINT stress (the physically meaningful sample) ----
+      // The nodal values above are control-point averages, which is wrong twice
+      // over for IGA: B-splines are not interpolatory so a "node" is not a
+      // material point, and averaging over the elements that share it smooths
+      // exactly the concentration being measured.  It also biases the p-ladder,
+      // since p2 averages 27 nodes/elem and p4 averages 125.
+      // The Saye VOLUME points lie inside Omega by construction; the SURFACE
+      // points lie ON the wall, which is where bending stress peaks in a thin
+      // blade and where the nodal sample is least trustworthy.  No averaging,
+      // no phi threshold -- every point here is in the solid by construction.
+      {
+        double vmVol=0, vmSrf=0; real xVol[3]={0,0,0}, xSrf[3]={0,0,0};
+        double uVol=0, uSrf=0;
+        size_t nVol=0, nSrf=0;
+        real vb[QN_MAX*QN_MAX*QN_MAX];
+        // |u| at a real point.  max|u| over NODES is also wrong: the control net
+        // bounds the field from outside (convex hull), so nodal max|u| is an
+        // over-estimate, not a sample.
+        auto uMagAt=[&](i32 e,const real xr[3])->double{
+          Bp.allVal(xr,vb); double u3[3]={0,0,0};
+          for (i32 a=0;a<ndof;a++){ double N=vb[a];
+            u3[0]+=uloc[3*a]*N; u3[1]+=uloc[3*a+1]*N; u3[2]+=uloc[3*a+2]*N; }
+          return sqrt(u3[0]*u3[0]+u3[1]*u3[1]+u3[2]*u3[2]); };
+        auto vmAt=[&](i32 e,const real xr[3])->double{
+          double Jinv[3][3],detJ;
+          if (cyl) metric(elems[e],xr,Jinv,detJ);
+          else { for(i32 i2=0;i2<3;i2++)for(i32 j2=0;j2<3;j2++) Jinv[i2][j2]=0;
+                 Jinv[0][0]=Jinv[1][1]=Jinv[2][2]=1.0/h; detJ=h*h*h; }
+          Bp.allGradRef(xr,gb);
+          double gU[3][3]={{0,0,0},{0,0,0},{0,0,0}};
+          for (i32 a=0;a<ndof;a++){ double gX[3];
+            for(i32 d=0;d<3;d++) gX[d]=Jinv[0][d]*gb[3*a+0]+Jinv[1][d]*gb[3*a+1]+Jinv[2][d]*gb[3*a+2];
+            for(i32 i2=0;i2<3;i2++){ gU[i2][0]+=uloc[3*a+i2]*gX[0];
+              gU[i2][1]+=uloc[3*a+i2]*gX[1]; gU[i2][2]+=uloc[3*a+i2]*gX[2]; } }
+          double eps[3][3];
+          for(i32 i2=0;i2<3;i2++)for(i32 j2=0;j2<3;j2++) eps[i2][j2]=0.5*(gU[i2][j2]+gU[j2][i2]);
+          double trc=eps[0][0]+eps[1][1]+eps[2][2], sg[3][3];
+          for(i32 i2=0;i2<3;i2++)for(i32 j2=0;j2<3;j2++) sg[i2][j2]=2*mu*eps[i2][j2]+(i2==j2?lam*trc:0);
+          return sqrt(0.5*((sg[0][0]-sg[1][1])*(sg[0][0]-sg[1][1])
+                          +(sg[1][1]-sg[2][2])*(sg[1][1]-sg[2][2])
+                          +(sg[2][2]-sg[0][0])*(sg[2][2]-sg[0][0]))
+                      +3.0*(sg[0][1]*sg[0][1]+sg[1][2]*sg[1][2]+sg[2][0]*sg[2][0])); };
+        for (i32 e=0;e<nE;e++){
+          const i32*nod=&eNodeQ[(size_t)e*ndof];
+          for (i32 a=0;a<ndof;a++){ double u3[3]; gather3(uv,nod[a],u3);
+            uloc[3*a]=u3[0]; uloc[3*a+1]=u3[1]; uloc[3*a+2]=u3[2]; }
+          if (elems[e].cut){
+            i32 c=cutIdx[e];
+            for (i32 q=volOff[c];q<volOff[c+1];q++){
+              real xr[3]={volPool[q].x[0],volPool[q].x[1],volPool[q].x[2]};
+              double vm=vmAt(e,xr); nVol++; double um=uMagAt(e,xr); if(um>uVol)uVol=um;
+              if(vm>vmVol){ vmVol=vm; physOf(elems[e],xr,xVol); } }
+            for (i32 q=surfOff[c];q<surfOff[c+1];q++){
+              real xr[3]={surfPool[q].x[0],surfPool[q].x[1],surfPool[q].x[2]};
+              double vm=vmAt(e,xr); nSrf++; double um=uMagAt(e,xr); if(um>uSrf)uSrf=um;
+              if(vm>vmSrf){ vmSrf=vm; physOf(elems[e],xr,xSrf); } }
+          } else {
+            // Uncut cells: sample the GAUSS points qx[], which is what the CSR
+            // assembly integrates on -- NOT t[], which IgaBasis documents as the
+            // GEOMETRY sampling nodes for the level-set fit.  (Note the GPU
+            // matrix-free kernel integrates uncut cells on t/wq instead; the two
+            // paths disagree on the uncut rule, which is worth reconciling.)
+            for (i32 kk=0;kk<n;kk++)for(i32 jj=0;jj<n;jj++)for(i32 ii=0;ii<n;ii++){
+              real xr[3]={Bp.qx[ii],Bp.qx[jj],Bp.qx[kk]};
+              double vm=vmAt(e,xr); nVol++; double um=uMagAt(e,xr); if(um>uVol)uVol=um;
+              if(vm>vmVol){ vmVol=vm; physOf(elems[e],xr,xVol); } }
+          } }
+        printf("stress : qp   peak von Mises %.6e at (%.4f, %.4f, %.4f)  [%zu interior pts]\n",
+               vmVol,xVol[0],xVol[1],xVol[2],nVol);
+        printf("stress : wall peak von Mises %.6e at (%.4f, %.4f, %.4f)  [%zu surface pts]\n",
+               vmSrf,xSrf[0],xSrf[1],xSrf[2],nSrf);
+        double uAll = uVol>uSrf?uVol:uSrf;
+        printf("displ  : max |u| %.6e  [basis-evaluated at quadrature points]\n", uAll);
+        if (getenv("CUT_LUNIT")) { double L=atof(getenv("CUT_LUNIT"));
+          printf("dimensional: qp %.4g MPa,  wall %.4g MPa,  max |u| %.6e m\n",
+                 vmVol*L*L/1e6, vmSrf*L*L/1e6, uAll*L*L*L);
+          if (wantNodal) printf("dimensional: [diagnostic] nodal was %.4g MPa\n", vmMax*L*L/1e6); }
       }
     }
     // ---- constant-z SECTION sample (CUT_SLICEZ=<z>, CUT_SLICEN=<pts/elem/axis>) ----

@@ -28,7 +28,11 @@
 // Nothing here knows about a solution basis, a dof numbering, or an equation:
 // input is a level set, output is points and weights on {phi<0} and on {phi=0}.
 
-static constexpr i32 PDEG   = 4;            // max polynomial degree per axis
+static constexpr i32 PDEG   = 6;            // max polynomial degree per axis
+// Raised 4 -> 6 to allow HIGHER-ORDER level-set fits (CUT_GEOMDEG).  Cost is host
+// memory only: PolyND grows PNC^3 = 125 -> 343 reals, and no __global__ kernel
+// takes a PolyND (the FEM path builds Saye on the host and ships SayeNode points
+// to the device), so device registers/stack are unaffected.
 static constexpr i32 PNC    = PDEG + 1;     // coefficients per axis
 static constexpr i32 PMAXRT = PDEG;         // max real roots of a 1-D poly
 
@@ -87,7 +91,9 @@ __host__ __device__ inline i32 poly1Roots(const Poly1 &p, real a, real b,
 
   // deg 3: sample the sign on a fine bracket, Newton-polish each sign change.
   // (a cut cell's 1-D slice is well separated; a handful of brackets suffices.)
-  const i32 NB = 16;
+  // brackets must out-number the roots: a degree-d polynomial has up to d of
+  // them, so scale with d rather than assuming the old PDEG=4 worst case.
+  const i32 NB = 8 + 4*d;
   real prev_t = a, prev_f = p.eval(a);
   for (i32 i = 1; i <= NB; i++) {
     real t = a + (b - a)*i/NB, f = p.eval(t);

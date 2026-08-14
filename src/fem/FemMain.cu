@@ -85,12 +85,37 @@
 #include "PolyFit.h"        // fitPoly3 (per-cell parabolic reconstruction, --recon)
 #include "SayeQuad.h"
 #include "SbmSolve.h"      // host-only shifted-boundary solver (--sbm)
+#include "../common/HermiteFit.h"  // Hermite (phi + grad phi) least-squares level-set fit
 
 // adapter: let SbmSolve.h evaluate the real BladeSdf level set
 static const BladeSdf *g_bladeSdf = nullptr;
 static double bladeSdfEval(double x,double y,double z){
   return (double)g_bladeSdf->phi((real)x,(real)y,(real)z);
 }       // sayeSurface (3-D reconstructed boundary, --recon3d)
+
+// phi AND its analytic gradient.  The oracle already forms the gradient on its
+// way to the pseudonormal sign, so the normal costs nothing extra -- which is
+// what makes the Hermite fit below cheap.
+static double bladeSdfGradEval(double x,double y,double z,double g[3]){
+  real gg[3]; real v = g_bladeSdf->phiGrad((real)x,(real)y,(real)z,gg);
+  g[0]=(double)gg[0]; g[1]=(double)gg[1]; g[2]=(double)gg[2];
+  return (double)v;
+}
+
+// Least-squares Hermite fit of one cell: match phi and grad(phi) at HF.m^3
+// Chebyshev-Lobatto nodes.  Gradients are converted to the REFERENCE frame
+// (x = x0 + xi*h  =>  d/dxi = h d/dx) because the polynomial lives on [0,1]^3.
+static PolyND fitSdfCellHermite(double x0,double y0,double z0,double h,
+                                const HermiteFit &HF){
+  const i32 m = HF.m;
+  std::vector<real> v((size_t)m*m*m), g((size_t)3*m*m*m);
+  for (i32 k=0;k<m;k++) for (i32 j=0;j<m;j++) for (i32 i=0;i<m;i++){
+    i32 n = i + m*(j + m*k); double gg[3];
+    v[n] = (real)bladeSdfGradEval(x0+HF.t[i]*h, y0+HF.t[j]*h, z0+HF.t[k]*h, gg);
+    for (i32 d=0;d<3;d++) g[(size_t)3*n+d] = (real)(gg[d]*h);
+  }
+  return HF.apply(v.data(), g.data());
+}
 
 static std::string baseName(const std::string &path) {
   size_t s = path.find_last_of("/\\");
@@ -114,6 +139,8 @@ int main(int argc, char *argv[]) {
   i32   sbmP = 0, sbmRes = 0; std::vector<i32> sbmResList;
   double fitSliceZ = -1e30; i32 fitNF = 700, fitDeg = 2;
   double fitWin[3] = {0,0,-1};     // --fitwin cx,cy,half : zoom sub-box for the slice
+  int   fitHerm = 0, fitM = 0;     // --fithermite [m] : Hermite LSQ fit instead of value-only
+  double fitGw = 1.0;              // --fitgw : weight on the gradient equations
   double sbmBox[4] = {0,0,0,-1};   // cx,cy,cz,half : solve a SUB-BOX instead of the whole model
   double sbmK = 0;                 // MMS wave number (0 => one wavelength across the box)
   i32   femMethod = 0;
@@ -177,6 +204,9 @@ int main(int argc, char *argv[]) {
     else if (s == "--fitslice")  fitSliceZ = atof(next());  // dump fitted vs true zero contour
     else if (s == "--fitnf")     fitNF = atoi(next());
     else if (s == "--fitdeg")    fitDeg = atoi(next());
+    else if (s == "--fithermite"){ fitHerm = 1; }
+    else if (s == "--fitm")      fitM = atoi(next());
+    else if (s == "--fitgw")     fitGw = atof(next());
     else if (s == "--fitwin") { std::string v=next(); size_t q=0; int c3=0;
       while(q<v.size()&&c3<3){ size_t c=v.find(',',q);
         std::string t=v.substr(q,c==std::string::npos?c:c-q);
@@ -522,6 +552,18 @@ int main(int argc, char *argv[]) {
             fitSliceZ, N, h, fitDeg, lo3[0], lo3[1], lo3[2], L);
     fprintf(fp, "# gridlo=%.8f %.8f  gridh=%.8f\n", lo3[0], lo3[1], h);
     fprintf(fp, "# x y phi_true phi_fit\n");
+    // --fithermite: match phi AND grad(phi) (least squares) instead of
+    // interpolating phi alone.  Degree is --fitdeg (capped at PDEG); the sample
+    // count m defaults to the smallest value that keeps the system
+    // overdetermined by 30%.
+    HermiteFit HF;
+    if (fitHerm) {
+      i32 q = fitDeg > PDEG ? PDEG : fitDeg;
+      i32 mm = fitM > 0 ? fitM : HermiteFit::autoM(q);
+      HF.init(q, mm, fitGw);
+      printf("fitslice: HERMITE fit deg %d, %d^3 nodes (%d eqs / %d coeffs), grad weight %g\n",
+             q, mm, 4*mm*mm*mm, (q+1)*(q+1)*(q+1), fitGw);
+    }
     // cache one fitted polynomial per (cx,cy) column at this z-layer
     std::vector<PolyND> cache((size_t)N*N);
     std::vector<char> have((size_t)N*N, 0);
@@ -539,7 +581,9 @@ int main(int argc, char *argv[]) {
         if (cx < 0) cx = 0; if (cx >= N) cx = N-1;
         if (cy < 0) cy = 0; if (cy >= N) cy = N-1;
         size_t key = (size_t)cy*N + cx;
-        if (!have[key]) { cache[key] = fitSdfCell(lo3[0]+cx*h, lo3[1]+cy*h, z0c, h, fitDeg);
+        if (!have[key]) { cache[key] = HF.ok()
+                            ? fitSdfCellHermite(lo3[0]+cx*h, lo3[1]+cy*h, z0c, h, HF)
+                            : fitSdfCell(lo3[0]+cx*h, lo3[1]+cy*h, z0c, h, fitDeg);
                           have[key] = 1; }
         real xr[3] = { (real)((x - (lo3[0]+cx*h))/h), (real)((y - (lo3[1]+cy*h))/h),
                        (real)((fitSliceZ - z0c)/h) };

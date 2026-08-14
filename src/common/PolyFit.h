@@ -18,18 +18,31 @@
 // FEM solution points, and the cut-cell detector samples the level set at them.  A stale
 // `else` here silently returned the p=3 nodes (and left t[4] uninitialised) for p=4, so the
 // deg-4 fit was built on a degenerate node set and Saye returned an EMPTY rule.
+// NOTE: every branch must fill EXACTLY p+1 entries.  The catch-all `else` is the
+// trap described above and it has now bitten twice -- once returning p=3 nodes
+// for p=4, and again returning p=4 nodes for p=5/6 after PDEG was raised to 6,
+// which left t[5..6] uninitialised and produced a NaN fit.  Keep one branch per
+// degree up to PDEG and clamp anything beyond it.
 __host__ __device__ inline void gllNodes(i32 p, real t[PNC]) {
   if (p == 1) { t[0]=0; t[1]=1; }
   else if (p == 2) { t[0]=0; t[1]=(real)0.5; t[2]=1; }
   else if (p == 3) { t[0]=0; t[1]=(real)0.2763932023; t[2]=(real)0.7236067977; t[3]=1; }
-  else { t[0]=0; t[1]=(real)0.1726731646; t[2]=(real)0.5; t[3]=(real)0.8273268354; t[4]=1; }
+  else if (p == 4) { t[0]=0; t[1]=(real)0.1726731646; t[2]=(real)0.5; t[3]=(real)0.8273268354; t[4]=1; }
+  else if (p == 5) { t[0]=0; t[1]=(real)0.1174723381; t[2]=(real)0.3573842418;
+                     t[3]=(real)0.6426157582; t[4]=(real)0.8825276619; t[5]=1; }
+  else { t[0]=0; t[1]=(real)0.0848880519; t[2]=(real)0.2655756033; t[3]=(real)0.5;
+         t[4]=(real)0.7344243967; t[5]=(real)0.9151119481; t[6]=1; }   // p >= 6
 }
 
 // invert the (p+1)x(p+1) Vandermonde  V[i][j] = t_i^j  ->  Vinv (row-major)
-__host__ __device__ inline void vandermondeInv(i32 p, const real t[PNC],
-                                              real Vinv[PNC][PNC]) {
+// Templated on the array extent: the level-set fit passes PNC-sized arrays while
+// the SBM shift passes QN_MAX-sized ones.  These used to coincide at 5; raising
+// PDEG split them, so deduce the extent rather than hard-wiring PNC.
+template <int NC>
+__host__ __device__ inline void vandermondeInv(i32 p, const real t[NC],
+                                              real Vinv[NC][NC]) {
   i32 n = p+1;
-  real A[PNC][2*PNC];
+  real A[NC][2*NC];
   for (i32 i = 0; i < n; i++) {
     real tp = 1;
     for (i32 j = 0; j < n; j++) { A[i][j] = tp; tp *= t[i]; }
