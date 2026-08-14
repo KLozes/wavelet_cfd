@@ -8,18 +8,27 @@
 //  (measured: 216 pts/cut-cell on a sphere, 1478 on the cylindrical blade at
 //  res16, 2485 at p3).  Potter, "Fast Construction of Efficient Cut Cell
 //  Quadratures", prunes it to a minimal POSITIVE rule reproducing the SAME
-//  polynomial moments, via Lawson-Hanson NNLS.  The result has at most
-//  m = (2p+1)^3 points and is EXACT for polynomial integrands, so the stiffness
-//  operator is unchanged while the matvec gets 13-22x cheaper.
+//  polynomial moments, via Lawson-Hanson NNLS.  The result has at most m points,
+//  m = dim of the target moment space, so the matvec gets 13-60x cheaper.
+//
+//  The TARGET SPACE is Potter's TOTAL degree P^d_{2p} (m = C(2p+3,3) = 35/84/165
+//  for p = 2/3/4), NOT the tensor space (m = (2p+1)^3 = 125/343/729).  See the
+//  long note at the moment-target switch in compressVol: total degree is 3.6-4.4x
+//  smaller, preserves convergence order, and is invisible on real cut geometry --
+//  at the price of ~30% higher L2 on SMOOTH geometry at fine h, where it
+//  underintegrates the tensor-product stiffness integrand.
 //
 //  Solver-agnostic: it takes SayeNode rules in and gives SayeNode rules out, so
 //  it serves any method that integrates over a cut cell -- continuous FEM, IGA,
 //  or a cut-cell DG.  Compresses VOLUME rules only; a Saye SURFACE rule is
 //  already at or below its own moment count and has nothing to prune.
 //
-//  NOTE the cost: NNLS scales roughly as m^3 = (2p+1)^9, which at p3-p4 makes
-//  this the dominant setup cost (95 s on the blade at p3 res32).  reform()'s
-//  O(k^2 m) Gram rebuild is the suspect.
+//  COST: NNLS scales roughly as m^3, so shrinking m is the single biggest lever
+//  on setup time -- the total-degree target cut the blade res64 prune 7.46 -> 0.62 s
+//  (12x).  Two earlier fixes are also in here: reform() now COMPACTS the Gram
+//  matrix in place instead of rebuilding it (it only loses a row/col on a removal),
+//  and the candidate matrix is stored FACTORED (3*n1 Legendre factors per node,
+//  expanded on the fly) because the gradient scan was DDR-bandwidth-bound.
 // ---------------------------------------------------------------------------
 
 #include <cmath>
@@ -55,26 +64,26 @@ NnlsStat g_nnlsStat;
 // costs 2 extra multiplies per element (free -- we were never compute-bound) and
 // keeps the working set L2-resident.  Products and summation order are UNCHANGED,
 // so results stay bit-identical.
-static void nnls(const std::vector<double>&PF,const std::vector<double>&b,int m,int n,int n1,
-                 std::vector<double>&w, double gtol=1e-9, int nOuter=-1){
-  if (nOuter<0 || nOuter>m) nOuter=m;   // G/L are m x m: the passive set
-                                       // cannot exceed m columns
+// mi holds the moment index TRIPLES (i0,i1,i2), 3 ints per moment, in the order
+// that defines the moment vector.  Passing the full tensor set reproduces the
+// previous behaviour exactly; passing the total-degree subset (i0+i1+i2 <= 2p)
+// is Potter's P^d_N target, which is 3.6-4.4x smaller in 3D.
+// Core NNLS, parameterized on HOW a candidate column is accessed, so the two
+// callers can store A differently: the FEM path keeps it FACTORED (Legendre
+// factors, expanded on the fly -- bandwidth), while the cut-element DG path
+// passes a DENSE A built from a general basis it evaluates itself.
+//   Acc must provide:  void expand(int q,double*dst)   and
+//                      double dotv (int q,const double*v)
+template<class Acc>
+static void nnlsCore(const Acc&acc,const std::vector<double>&b,int m,int n,
+                     std::vector<double>&w, double gtol, int nOuter){
   w.assign(n,0.0); std::vector<char> P(n,0); std::vector<double> r(b),z(n),zk(m),y(m);
   std::vector<int> idx; idx.reserve(m);
   std::vector<int> keep, keepPos; keep.reserve(m); keepPos.reserve(m);   // hoisted out of the inner loop
   std::vector<double> G((size_t)m*m,0.0), L((size_t)m*m,0.0), rhs(m,0.0); int k=0;
   std::vector<double> col(m);          // scratch: one expanded column
-  auto fac=[&](int q){ return &PF[(size_t)q*3*n1]; };
-  // expand column q of A into dst (same product order as the original build)
-  auto expand=[&](int q,double*dst){ const double*F=fac(q); const double*Px=F,*Py=F+n1,*Pz=F+2*n1;
-    for(int i0=0;i0<n1;i0++)for(int i1=0;i1<n1;i1++){ double pxy=Px[i0]*Py[i1]; int base=(i0*n1+i1)*n1;
-      for(int i2=0;i2<n1;i2++) dst[base+i2]=pxy*Pz[i2]; } };
-  // A_q . v  -- expanded on the fly, i ascending exactly as before
-  auto dotAv=[&](int q,const double*v){ const double*F=fac(q); const double*Px=F,*Py=F+n1,*Pz=F+2*n1;
-    double s=0;
-    for(int i0=0;i0<n1;i0++)for(int i1=0;i1<n1;i1++){ double pxy=Px[i0]*Py[i1]; int base=(i0*n1+i1)*n1;
-      for(int i2=0;i2<n1;i2++) s+=pxy*Pz[i2]*v[base+i2]; }
-    return s; };
+  auto expand=[&](int q,double*dst){ acc.expand(q,dst); };
+  auto dotAv =[&](int q,const double*v){ return acc.dotv(q,v); };
   auto dot=[&](const double*u,const double*v){ double s=0; for(int i=0;i<m;i++)s+=u[i]*v[i]; return s; };
   // Cholesky of the leading k x k of G (G assumed already correct).
   auto refactor=[&](){
@@ -127,10 +136,76 @@ static void nnls(const std::vector<double>&PF,const std::vector<double>&b,int m,
       for(int i=0;i<m;i++) r[i]-=wa*col[i]; }
   }
 }
+
+// --- accessor: DENSE A, row-major n x m (the cut-element DG path builds this
+//     from its own basis, so there is no tensor factorization to exploit) ---
+struct NnlsDenseAcc {
+  const double*A; int m;
+  void   expand(int q,double*dst)          const { const double*Aq=A+(size_t)q*m; for(int i=0;i<m;i++) dst[i]=Aq[i]; }
+  double dotv  (int q,const double*v)      const { const double*Aq=A+(size_t)q*m; double s=0; for(int i=0;i<m;i++) s+=Aq[i]*v[i]; return s; }
+};
+// --- accessor: FACTORED A (FEM/IGA path).  Column q is the tensor product of
+//     3*n1 Legendre factors, expanded on the fly over the moment list mi. ---
+struct NnlsFactAcc {
+  const double*PF; const int*mi; int m,n1;
+  void expand(int q,double*dst) const {
+    const double*F=PF+(size_t)q*3*n1,*Px=F,*Py=F+n1,*Pz=F+2*n1;
+    for(int t=0;t<m;t++){ const int*I=mi+3*t; dst[t]=Px[I[0]]*Py[I[1]]*Pz[I[2]]; } }
+  double dotv(int q,const double*v) const {
+    const double*F=PF+(size_t)q*3*n1,*Px=F,*Py=F+n1,*Pz=F+2*n1; double s=0;
+    for(int t=0;t<m;t++){ const int*I=mi+3*t; s+=Px[I[0]]*Py[I[1]]*Pz[I[2]]*v[t]; }
+    return s; }
+};
+// Original DENSE entry point -- signature unchanged, so existing callers
+// (src/common/CutElem.h) are untouched.
+static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,int n,
+                 std::vector<double>&w, double gtol=1e-9, int nOuter=-1){
+  if (nOuter<0 || nOuter>m) nOuter=m;
+  NnlsDenseAcc acc{A.data(),m};
+  nnlsCore(acc,b,m,n,w,gtol,nOuter);
+}
+// FACTORED entry point (FEM/IGA compressVol).
+static void nnlsFactored(const std::vector<double>&PF,const std::vector<double>&b,
+                         const std::vector<int>&mi,int m,int n,int n1,
+                         std::vector<double>&w, double gtol=1e-9, int nOuter=-1){
+  if (nOuter<0 || nOuter>m) nOuter=m;
+  NnlsFactAcc acc{PF.data(),mi.data(),m,n1};
+  nnlsCore(acc,b,m,n,w,gtol,nOuter);
+}
+
 // compress a Saye VOLUME rule (points in the reference cube [0,1]^3) to a positive rule
 // matching all tensor Q_{2p} moments; reuses a subset of the input node positions.
 static void compressVol(const SayeNode*in,int nIn,int p,std::vector<SayeNode>&out){
-  int K=2*p,n1=K+1,m=n1*n1*n1,n=nIn; out.clear();
+  int K=2*p,n1=K+1,n=nIn; out.clear();
+  // MOMENT TARGET -- DEFAULT IS POTTER'S TOTAL-DEGREE SPACE P^d_{2p} (i0+i1+i2 <= 2p).
+  //  The alternative (CUT_PRUNETOTAL=0) is the full TENSOR set (partial degree
+  //  <= 2p), which is what a tensor-product FEM stiffness integrand formally needs
+  //  -- d(phi_a)/dx * d(phi_b)/dx has partial degrees (2p-2, 2p, 2p), so tensor is
+  //  EXACT and total-degree UNDERINTEGRATES.  Potter Sec 2.2 explicitly sanctions
+  //  systematic underintegration in FEM, and measurement says the exactness is not
+  //  worth its price here:
+  //    m: 125->35 (p2), 343->84 (p3), 729->165 (p4)  = 3.6-4.4x fewer moments, and
+  //    the compressed rule floors at ~m points/cell, so the rule shrinks likewise.
+  //    sphere p2 res16: 119 -> 28 pts/cell, prune 0.37 -> 0.04 s, solve 751 -> 480 ms
+  //    sphere p3 res16: 183 -> 61 pts/cell, prune 3.56 -> 0.23 s, wall 12.4 -> 6.3 s
+  //    blade  res64 p2: 110 -> 27 pts/cell, prune 7.46 -> 0.62 s, wall 18.1 -> 8.9 s
+  //  CONVERGENCE ORDER IS PRESERVED (sphere p2 L2 orders 3.42/3.40 vs tensor's
+  //  3.36/3.86, both above the design 3) and CG iteration counts are unchanged
+  //  (629 vs 634), so conditioning is untouched.
+  //  THE COST, stated honestly: on SMOOTH geometry at fine h the underintegration
+  //  error becomes visible -- ~30% higher L2 (sphere p2 res32 +31%, p3 res16 +27%),
+  //  because tensor's error keeps dropping at 3.86 while total's drops at 3.40.
+  //  On the BLADE it is invisible (peak stress 293.0 -> 292.5 MPa = 0.16%, tip
+  //  deflection 0.8788 -> 0.8772 mm = 0.18%, same peak location) because geometry
+  //  error dominates there by orders of magnitude.
+  //  => Set CUT_PRUNETOTAL=0 for convergence studies on smooth geometry where the
+  //     last 30% of L2 matters; leave the default everywhere else.
+  static const int useTotal = getenv("CUT_PRUNETOTAL") ? atoi(getenv("CUT_PRUNETOTAL")) : 1;
+  std::vector<int> mi; mi.reserve((size_t)3*n1*n1*n1);
+  for(int i=0;i<n1;i++)for(int j=0;j<n1;j++)for(int k=0;k<n1;k++){
+    if(useTotal && (i+j+k)>K) continue;
+    mi.push_back(i); mi.push_back(j); mi.push_back(k); }
+  const int m=(int)(mi.size()/3);
   if(n<=m){ for(int q=0;q<n;q++) out.push_back(in[q]); return; }   // already minimal
   // FACTORED candidate matrix: 3*n1 Legendre factors per node, expanded on the fly
   // inside nnls (16x smaller working set at p3, L2-resident -- see the note there).
@@ -138,8 +213,8 @@ static void compressVol(const SayeNode*in,int nIn,int p,std::vector<SayeNode>&ou
   for(int q=0;q<n;q++){ legShift(in[q].x[0],K,Px.data()); legShift(in[q].x[1],K,Py.data()); legShift(in[q].x[2],K,Pz.data());
     double*F=&PF[(size_t)q*3*n1];
     for(int i=0;i<n1;i++){ F[i]=Px[i]; F[n1+i]=Py[i]; F[2*n1+i]=Pz[i]; }
-    for(int i=0;i<n1;i++)for(int j=0;j<n1;j++)for(int k=0;k<n1;k++){ int rr=(i*n1+j)*n1+k; double v=Px[i]*Py[j]*Pz[k]; b[rr]+=(double)in[q].w*v; } }
-  std::vector<double> w; nnls(PF,b,m,n,n1,w);
+    for(int t=0;t<m;t++){ const int*I=&mi[3*t]; b[t]+=(double)in[q].w*Px[I[0]]*Py[I[1]]*Pz[I[2]]; } }
+  std::vector<double> w; nnlsFactored(PF,b,mi,m,n,n1,w);
   for(int q=0;q<n;q++) if(w[q]>1e-13){ SayeNode s=in[q]; s.w=(real)w[q]; out.push_back(s); }
   if(out.empty()){ for(int q=0;q<nIn;q++) out.push_back(in[q]); }   // NNLS failed -> keep original
 }
@@ -160,7 +235,9 @@ static double compressVolUniform(const SayeNode*sayeIn,int nSaye,const PolyND&ph
   for(int q=0;q<n;q++){ legShift(cand[q].x[0],K,Px.data()); legShift(cand[q].x[1],K,Py.data()); legShift(cand[q].x[2],K,Pz.data());
     double*F=&PF[(size_t)q*3*n1];
     for(int i=0;i<n1;i++){ F[i]=Px[i]; F[n1+i]=Py[i]; F[2*n1+i]=Pz[i]; } }
-  std::vector<double> w; nnls(PF,b,m,n,n1,w);
+  std::vector<int> mi; mi.reserve((size_t)3*m);
+  for(int i=0;i<n1;i++)for(int j=0;j<n1;j++)for(int k=0;k<n1;k++){ mi.push_back(i); mi.push_back(j); mi.push_back(k); }
+  std::vector<double> w; nnlsFactored(PF,b,mi,m,n,n1,w);
   double res=0;
   { std::vector<double> acc(m,0.0);
     for(int q=0;q<n;q++){ if(w[q]==0.0) continue; const double*F=&PF[(size_t)q*3*n1];

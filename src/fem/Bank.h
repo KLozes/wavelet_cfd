@@ -56,6 +56,10 @@ struct Row {
   std::string label, type;
   int index = 0;
   double nblades = 0;
+  // shaft speed from the row's own RPM record.  Signed in the file (the sign is
+  // the direction of rotation); the centrifugal load goes as omega^2 so only the
+  // magnitude matters here.  0 = the file did not state one.
+  double rpm = 0;
   int nEdge = 27, nSurface = 80;
   std::vector<Section> sections;
   std::vector<double> leZ, leR;   // leading-edge locus, per section
@@ -78,6 +82,34 @@ struct Bank {
   }
   double hubAt(double z) const { return interpWall(hubZ, hubR, z); }
   double casAt(double z) const { return interpWall(casZ, casR, z); }
+
+  // Rescale every LENGTH in the bank by s (angles/theta are untouched).  The IDS
+  // format states no unit; for assets/bank_v98d.txt two independent checks say
+  // INCHES -- ROTOR 1's tip radius 6.77369 gives U_tip = 450 m/s at its own
+  // 24970 rpm (a transonic HPC rotor; cm would give 177 m/s), and the AXIAL VEL
+  // block only makes sense as ft/s (119-143 m/s; as m/s it would be supersonic
+  // axial).  Pass 0.0254 to work in metres so SI material constants mean what
+  // they say -- centrifugal stress goes as rho*omega^2*L^2, so the length unit
+  // is squared into the answer and getting it wrong is not a small error.
+  void scaleLengths(double s) {
+    if (s == 1.0) return;
+    for (Station &st : stations) {
+      for (double &v : st.R) v *= s;
+      for (double &v : st.Z) v *= s;
+      for (double &v : st.SL) v *= s;
+    }
+    for (Row &r : rows) {
+      for (Section &sc : r.sections) {
+        for (double &v : sc.z) v *= s;
+        for (double &v : sc.r) v *= s;    // sc.t is an ANGLE: leave it
+        for (double &v : sc.zg) v *= s;
+      }
+      for (double &v : r.leZ) v *= s;  for (double &v : r.leR) v *= s;
+      for (double &v : r.teZ) v *= s;  for (double &v : r.teR) v *= s;
+    }
+    for (double &v : hubZ) v *= s;  for (double &v : hubR) v *= s;
+    for (double &v : casZ) v *= s;  for (double &v : casR) v *= s;
+  }
 
   static double interpWall(const std::vector<double> &X,
                            const std::vector<double> &Y, double x) {
@@ -263,6 +295,11 @@ inline bool read(const std::string &path, Bank &B) {
     }
     if (head == "NO." && tok.size() > 2 && tok[1] == "BLADES") {
       if (cur && cur->nblades == 0) cur->nblades = std::atof(tok[2].c_str());
+      i++;
+      continue;
+    }
+    if (head == "RPM" && tok.size() > 1) {
+      if (cur && cur->rpm == 0) cur->rpm = std::atof(tok[1].c_str());
       i++;
       continue;
     }

@@ -46,7 +46,13 @@
 //                      ~p^3 fewer dofs for the same h.
 //     --E v --nu v     Young's modulus / Poisson ratio        (default 1, 0.3)
 //     --rho v          density                                    (default 1)
-//     --rpm v          shaft speed -> centrifugal body load    (default 0)
+//     --rpm v          shaft speed -> centrifugal body load    (default: the
+//                      bank row's own RPM record; 0 for STL input)
+//     --lunit L        metres per bank length unit; 0.0254 = inches.  The IDS
+//                      format states no unit, so this is EXPLICIT.  Does NOT
+//                      rescale the mesh -- the solve stays in file units and this
+//                      is applied as the exact linear-elasticity conversion
+//                      sigma *= L^2, u *= L^3 when reporting     (default 1)
 //     --gravity a,b,c  uniform body force per unit volume
 //     --k a,b,c        MMS wave numbers                       (default 2,3,4)
 //     --gammad v       Nitsche penalty beta                    (default 1000)
@@ -116,6 +122,7 @@ int main(int argc, char *argv[]) {
   real  gammaD = 1000, gammaA = -1, tol = (real)1e-10;
   real  platThick = (real)0.5, platMargin = (real)0.25;
   real  filletR = (real)0.05, tipGap = (real)0.02, rpm = 0;
+  double lunit = 1.0;            // metres per bank length unit (0.0254 = inches)
   real  kw[3] = {2, 3, 4}, grav[3] = {0,0,0};
 
   for (i32 a = 1; a < argc; a++) {
@@ -141,6 +148,7 @@ int main(int argc, char *argv[]) {
     else if (s == "--nu")        nu = (real)atof(next());
     else if (s == "--rho")       rhoMat = (real)atof(next());
     else if (s == "--rpm")       rpm = (real)atof(next());
+    else if (s == "--lunit")     lunit = atof(next());
     else if (s == "--gravity")   parse3(next(), grav);
     else if (s == "--k")         parse3(next(), kw);
     else if (s == "--gammad")    gammaD = (real)atof(next());
@@ -206,6 +214,14 @@ int main(int argc, char *argv[]) {
     }
     printf("bank   : %s  (%zu stations, %zu blade rows)\n",
            bankPath.c_str(), B.stations.size(), B.rows.size());
+    // NOTE: --lunit does NOT rescale the geometry.  Rescaling the bank arrays was
+    // tried and is WRONG -- the SDF construction carries length assumptions that
+    // the bank arrays do not reach, so the body came out a different SHAPE, not a
+    // scaled one (at lunit=2 the domain aspect went 28x36x20 -> 36x36x28 and
+    // |Omega_h| 17.29 instead of the exact 21.64).  Instead the solve stays in
+    // FILE units -- the validated numerical regime -- and --lunit is applied as
+    // the exact post-hoc conversion below, which is rigorous for linear
+    // elasticity: with x = L*x~, sigma = L^2*sigma~ and u = L^3*u~.
     if (listRows) {
       for (const bank::Row &r : B.rows)
         printf("  %-9s blades=%3.0f  sections=%2zu  LE r = %.3f .. %.3f  z = %.3f\n",
@@ -216,6 +232,16 @@ int main(int argc, char *argv[]) {
     const bank::Row *row = B.findRow(rowLabel);
     if (!row) { fprintf(stderr, "error: no blade row '%s' (try --rows)\n", rowLabel.c_str()); return 1; }
     if (nSectors <= 0) nSectors = (i32)llround(row->nblades);
+    // Default the shaft speed to the row's OWN design speed.  It was previously
+    // 0 unless --rpm was passed, so every load case ran at whatever number the
+    // caller happened to type -- not the design point the geometry belongs to.
+    // Sign in the file is the direction of rotation; the centrifugal load goes
+    // as omega^2, so take the magnitude.
+    if (rpm == 0 && row->rpm != 0) {
+      rpm = (real)std::fabs(row->rpm);
+      printf("load   : shaft speed from the bank file: %g rpm (row '%s'; override with --rpm)\n",
+             (double)rpm, rowLabel.c_str());
+    }
     tag = baseName(bankPath) + "_" + baseName(rowLabel);
     for (char &c : tag) if (c == ' ') c = '_';
 

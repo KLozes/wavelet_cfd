@@ -2210,6 +2210,19 @@ void CutFemSolver::runIga(void) {
         if (phiN[nd]<0 && vmN[nd]>vmMax){ vmMax=vmN[nd]; ndMax=nd; } }
       if (ndMax>=0) printf("stress : peak von Mises %.6e at (%.4f, %.4f, %.4f)  [solid nodes only, phi<0]\n",
                            vmMax,nodeXQ[3*ndMax],nodeXQ[3*ndMax+1],nodeXQ[3*ndMax+2]);
+      // DIMENSIONAL conversion (CUT_LUNIT = metres per geometry unit).  The solve
+      // runs in FILE units; for linear elasticity with x = L*x~ the exact map is
+      // sigma = L^2 * sigma~ and u = L^3 * u~ (derive: grad_x = grad_x~/L and the
+      // body force rho*omega^2*r picks up one L).  Reported here rather than
+      // rescaling the mesh, which was tried and produced a different SHAPE.
+      if (ndMax>=0 && getenv("CUT_LUNIT")) {
+        double L=atof(getenv("CUT_LUNIT"));
+        double umx=0; for (i32 nd=0;nd<nNodeQ;nd++){ if(phiN[nd]>=0) continue;
+          double u3[3]; gather3(uv,nd,u3);
+          double m2=sqrt(u3[0]*u3[0]+u3[1]*u3[1]+u3[2]*u3[2]); if(m2>umx)umx=m2; }
+        printf("dimensional: L = %g m/unit  ->  peak von Mises %.6e Pa (%.4g MPa),  max |u| %.6e m\n",
+               L, vmMax*L*L, vmMax*L*L/1e6, umx*L*L*L);
+      }
     }
     // ---- constant-z SECTION sample (CUT_SLICEZ=<z>, CUT_SLICEN=<pts/elem/axis>) ----
     // Samples u and von Mises on a plane by EVALUATING THE BASIS at reference
@@ -2273,6 +2286,89 @@ void CutFemSolver::runIga(void) {
           nOut++;
         } }
       printf("slice  : axis %d at %.6f, %zu samples (%d^2/elem) -> %s\n", sax, z0, nOut, ms, fn.c_str());
+    }
+    // ---- FIELD VTU for isosurfacing (CUT_FIELDVTU=<sub-cells/elem/axis>) ----
+    //  The nodal VTU below stores control-point coefficients at node positions,
+    //  which is MEANINGLESS for IGA: B-splines are not interpolatory, so a
+    //  coefficient is not the displacement there.  This one samples each element
+    //  on a uniform reference sub-grid and EVALUATES THE BASIS at every sample,
+    //  carrying phi alongside u / sigma / vonMises.  Contour it at phi=0 (ParaView
+    //  or PyVista) to get displacement and stress on the true immersed boundary.
+    //  Points are per-element (duplicated on shared faces); the fields are
+    //  C^{p-1>=1} continuous so both sides agree and the contour closes cleanly.
+    if (getenv("CUT_FIELDVTU") && !outTag.empty()){
+      mkdir("output",0755);
+      const i32 ms = std::max(1, atoi(getenv("CUT_FIELDVTU")));
+      long tvf = qpNowUs();
+      const i64 npe=(i64)(ms+1)*(ms+1)*(ms+1), nce=(i64)ms*ms*ms;
+      const i64 nPt=(i64)nE*npe, nCl=(i64)nE*nce;
+      std::string fn="output/"+outTag+"_field.vtu";
+      std::ofstream os(fn.c_str());
+      os.precision(7);
+      std::vector<float> PX,UU,SG,VM,PH;
+      PX.reserve(3*nPt); UU.reserve(3*nPt); SG.reserve(6*nPt); VM.reserve(nPt); PH.reserve(nPt);
+      real gb3[3*QN_MAX*QN_MAX*QN_MAX], vb3[QN_MAX*QN_MAX*QN_MAX];
+      std::vector<double> ul3((size_t)3*ndof);
+      for (i32 e=0;e<nE;e++){
+        const i32*nod=&eNodeQ[(size_t)e*ndof];
+        for (i32 a=0;a<ndof;a++){ double u3[3]; gather3(uv,nod[a],u3);
+          ul3[3*a]=u3[0]; ul3[3*a+1]=u3[1]; ul3[3*a+2]=u3[2]; }
+        for (i32 kk=0;kk<=ms;kk++)for(i32 jj=0;jj<=ms;jj++)for(i32 ii=0;ii<=ms;ii++){
+          real xr[3]={(real)((double)ii/ms),(real)((double)jj/ms),(real)((double)kk/ms)};
+          real X[3]; physOf(elems[e],xr,X);
+          double Jinv[3][3],detJ;
+          if (cyl) metric(elems[e],xr,Jinv,detJ);
+          else { for(i32 i2=0;i2<3;i2++)for(i32 j2=0;j2<3;j2++) Jinv[i2][j2]=0;
+                 Jinv[0][0]=Jinv[1][1]=Jinv[2][2]=1.0/h; detJ=h*h*h; }
+          Bp.allVal(xr,vb3); Bp.allGradRef(xr,gb3);
+          double uu[3]={0,0,0}, gU[3][3]={{0,0,0},{0,0,0},{0,0,0}};
+          for (i32 a=0;a<ndof;a++){ double gX[3];
+            for(i32 d=0;d<3;d++) gX[d]=Jinv[0][d]*gb3[3*a+0]+Jinv[1][d]*gb3[3*a+1]+Jinv[2][d]*gb3[3*a+2];
+            for(i32 i2=0;i2<3;i2++){ double ua=ul3[3*a+i2]; uu[i2]+=ua*vb3[a];
+              gU[i2][0]+=ua*gX[0]; gU[i2][1]+=ua*gX[1]; gU[i2][2]+=ua*gX[2]; } }
+          double eps[3][3];
+          for(i32 i2=0;i2<3;i2++)for(i32 j2=0;j2<3;j2++) eps[i2][j2]=0.5*(gU[i2][j2]+gU[j2][i2]);
+          double trc=eps[0][0]+eps[1][1]+eps[2][2], sg[3][3];
+          for(i32 i2=0;i2<3;i2++)for(i32 j2=0;j2<3;j2++) sg[i2][j2]=2*mu*eps[i2][j2]+(i2==j2?lam*trc:0);
+          double vm=sqrt(0.5*((sg[0][0]-sg[1][1])*(sg[0][0]-sg[1][1])
+                             +(sg[1][1]-sg[2][2])*(sg[1][1]-sg[2][2])
+                             +(sg[2][2]-sg[0][0])*(sg[2][2]-sg[0][0]))
+                         +3.0*(sg[0][1]*sg[0][1]+sg[1][2]*sg[1][2]+sg[2][0]*sg[2][0]));
+          double ph=(double)ls.phi((elems[e].ci+xr[0])*h,(elems[e].cj+xr[1])*h,(elems[e].ck+xr[2])*h);
+          PX.push_back((float)X[0]); PX.push_back((float)X[1]); PX.push_back((float)X[2]);
+          UU.push_back((float)uu[0]); UU.push_back((float)uu[1]); UU.push_back((float)uu[2]);
+          SG.push_back((float)sg[0][0]); SG.push_back((float)sg[1][1]); SG.push_back((float)sg[2][2]);
+          SG.push_back((float)sg[0][1]); SG.push_back((float)sg[1][2]); SG.push_back((float)sg[0][2]);
+          VM.push_back((float)vm); PH.push_back((float)ph);
+        } }
+      static const i32 HEXV[8][3]={{0,0,0},{1,0,0},{1,1,0},{0,1,0},{0,0,1},{1,0,1},{1,1,1},{0,1,1}};
+      os<<"<?xml version=\"1.0\"?>\n<VTKFile type=\"UnstructuredGrid\" version=\"1.0\" byte_order=\"LittleEndian\">\n"
+        <<"  <UnstructuredGrid>\n    <Piece NumberOfPoints=\""<<nPt<<"\" NumberOfCells=\""<<nCl<<"\">\n";
+      os<<"      <Points>\n        <DataArray type=\"Float32\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+      for (i64 i=0;i<nPt;i++) os<<PX[3*i]<<" "<<PX[3*i+1]<<" "<<PX[3*i+2]<<"\n";
+      os<<"        </DataArray>\n      </Points>\n";
+      os<<"      <PointData Scalars=\"phi\" Vectors=\"u\">\n";
+      os<<"        <DataArray type=\"Float32\" Name=\"phi\" format=\"ascii\">\n";
+      for (i64 i=0;i<nPt;i++) os<<PH[i]<<"\n";
+      os<<"        </DataArray>\n        <DataArray type=\"Float32\" Name=\"u\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+      for (i64 i=0;i<nPt;i++) os<<UU[3*i]<<" "<<UU[3*i+1]<<" "<<UU[3*i+2]<<"\n";
+      os<<"        </DataArray>\n        <DataArray type=\"Float32\" Name=\"vonMises\" format=\"ascii\">\n";
+      for (i64 i=0;i<nPt;i++) os<<VM[i]<<"\n";
+      os<<"        </DataArray>\n        <DataArray type=\"Float32\" Name=\"sigma\" NumberOfComponents=\"6\" format=\"ascii\">\n";
+      for (i64 i=0;i<nPt;i++){ for(i32 c6=0;c6<6;c6++) os<<SG[6*i+c6]<<" "; os<<"\n"; }
+      os<<"        </DataArray>\n      </PointData>\n";
+      os<<"      <Cells>\n        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">\n";
+      for (i32 e=0;e<nE;e++){ i64 b=(i64)e*npe;
+        for (i32 kk=0;kk<ms;kk++)for(i32 jj=0;jj<ms;jj++)for(i32 ii=0;ii<ms;ii++){
+          for (i32 v=0;v<8;v++){ i32 a2=ii+HEXV[v][0],b2=jj+HEXV[v][1],c2=kk+HEXV[v][2];
+            os<<(b+(i64)((c2*(ms+1)+b2)*(ms+1)+a2))<<" "; } os<<"\n"; } }
+      os<<"        </DataArray>\n        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">\n";
+      for (i64 s=0;s<nCl;s++) os<<8*(s+1)<<"\n";
+      os<<"        </DataArray>\n        <DataArray type=\"UInt8\" Name=\"types\" format=\"ascii\">\n";
+      for (i64 s=0;s<nCl;s++) os<<"12\n";
+      os<<"        </DataArray>\n      </Cells>\n    </Piece>\n  </UnstructuredGrid>\n</VTKFile>\n";
+      printf("fieldvtu: %lld pts, %lld hexes (%d^3/elem), basis-evaluated -> %s (%.2fs)\n",
+             (long long)nPt,(long long)nCl,ms,fn.c_str(),(qpNowUs()-tvf)*1e-6);
     }
     // ---- VTU (p^3 sub-hexes) ----
     if (wantVtu && !outTag.empty()){ mkdir("output",0755);
