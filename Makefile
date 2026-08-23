@@ -257,6 +257,12 @@ dgcutrhs_test: $(SRC_DIR)/dg/DgCutRhsTest.cu $(HDRS)
 dgsrd_test: $(SRC_DIR)/dg/DgSrdTest.cu $(HDRS)
 	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
 
+# ES1 gate: entropy-stable (skew-hybridized SBP) cut-element operators -- the
+# hybridized SBP property, Taylor & Chan's Eq 47, free stream, and discrete
+# entropy conservation of the flux-differenced RHS at P1/P2
+dges_test: $(SRC_DIR)/dg/DgEsCutTest.cu $(HDRS)
+	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
+
 # IGA compressible flow, step 1: 1-D Euler + classic FEM shock capturing (Sod gate)
 iga_euler1d: $(SRC_DIR)/fem/IgaEuler1dTest.cu $(HDRS)
 	$(NVCC) $(FEMTEST_FLAGS) $< -o $@

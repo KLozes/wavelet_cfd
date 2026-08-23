@@ -144,11 +144,15 @@ struct CutElemOps {
                                     // anyway.
   double bndIncons=0;               // SELF-INCONSISTENCY of the boundary rules:
                                     // max |CLOSED INT psi_m n_d - CLOSED INT psi_m' n_d'|
-                                    // over pairs whose derivative functions COINCIDE.
+                                    // over pairs whose derivative functions COINCIDE,
+                                    // TOGETHER WITH |CLOSED INT n_d dS| (the constant
+                                    // mode, which has no pair -- and is the only row that
+                                    // survives at nb == 1).
                                     // The true identity forces these equal, so this is a
                                     // pure boundary-quadrature defect -- and it is the part
                                     // of the GCL residual NO volume-weight correction can
-                                    // remove, because those rows of G are identical.
+                                    // remove, because those rows of G are identical (or,
+                                    // for the constant mode, identically zero).
   bool   ok=false;
 
   // solve M z = b in place using the stored factor
@@ -353,6 +357,25 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
           double diff = fabs(g[3*m+d]/s1 - g[3*m2+d2]/s2)*fmin(s1,s2);
           if (diff>E.bndIncons) E.bndIncons=diff;
         } }
+      // THE CONSTANT MODE'S ROWS, which the pairwise measure above cannot see:
+      // psi_0 == 1 has no derivative row to pair with, so its three GCL rows
+      //     SUM_q w_q d(psi_0)/dx_d == CLOSED INT n_d dS
+      // reduce to  CLOSED INT n_d dS == 0, a pure geometry statement the volume
+      // correction can NEVER touch (grad psi_0 is identically zero, so those
+      // rows of G vanish).  It is condition Q_{H,d} 1 = 0 of Taylor & Chan,
+      // "An Entropy Stable High-Order DG Method on Cut Meshes" (arXiv:2412.13002
+      // Sec. 2.1.4, docs/CutCellEntropyStable.pdf) -- in their framework the
+      // constant-differentiation condition is what free-stream preservation AND
+      // entropy stability both rest on, so it belongs in the quality metric
+      // that gates the epsilon repair below.
+      // AT nb == 1 THERE ARE NO PAIRS AT ALL, so bndIncons was identically 0 on
+      // every P0 element and the repair was silently disabled exactly where the
+      // geometry needed it most: measured on the case-9 tangency wedge (vol
+      // 0.087), the unperturbed rule closes to only 1.35e-02 and emits
+      // |RHS| ~ 1e1 on a uniform state, while the SAME cell at eps = -1e-5
+      // closes to 6.9e-13.  The ladder found that branch at every degree >= 1
+      // and never even ran at degree 0.
+      for (i32 d=0; d<3; d++) E.bndIncons = fmax(E.bndIncons, fabs(g[3*0+d]));
     }
     // residual r = g - G w
     std::vector<double> r(nG,0.0);
