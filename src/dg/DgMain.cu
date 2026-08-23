@@ -432,6 +432,8 @@ int main(int argc, char* argv[]) {
 
   cudaDeviceSynchronize();
   // nodal field dump for external plotting (x, y, rho, u, v, p per node)
+  if (solver->cutOn) solver->writeCutFields("output/cut");
+
   if (argI("--cutdump", 0)) {
     cudaDeviceSynchronize();
     FILE *fp = fopen("output/cut_field.csv", "w");

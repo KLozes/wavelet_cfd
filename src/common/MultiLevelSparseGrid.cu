@@ -544,13 +544,19 @@ void MultiLevelSparseGrid::paintField(i32 f, const char *fileName) {
 #endif
   png::image<png::gray_pixel_16> image(imageSizeX[0], imageSizeX[1]);
 
-  // normalize image data and fill png image
+  // normalize image data and fill png image.  VOID pixels (solid side of a cut
+  // element, or a dead block) are EXCLUDED from the range and reserved to
+  // value 0 -- otherwise -1e30 sets minVal and every real value collapses onto
+  // one grey level.  Live data therefore maps to [1, 65535].
   real maxVal = -1e32;
   real minVal = 1e32;
+  i64 nVoid = 0;
   for (i32 idx=0; idx<imageSizeX[0]*imageSizeX[1]; idx++) {
+    if (imageDataX[idx] <= (real)(0.5*kPaintVoid)) { nVoid++; continue; }
     maxVal = fmax(maxVal, imageDataX[idx]);
     minVal = fmin(minVal, imageDataX[idx]);
   }
+  if (nVoid == (i64)imageSizeX[0]*imageSizeX[1]) { minVal = 0; maxVal = 1; }
   if (f == -1) {
     minVal = 0;
     maxVal = nLvls;
@@ -559,10 +565,29 @@ void MultiLevelSparseGrid::paintField(i32 f, const char *fileName) {
   for (i32 j=0; j<imageSizeX[1]; j++) {
     for (i32 i=0; i<imageSizeX[0]; i++) {
       i32 idx = j*imageSizeX[0] + i;
-      image[j][i] = (imageDataX[idx] - minVal) / (maxVal - minVal + 1e-16) * 65535;
+      if (imageDataX[idx] <= (real)(0.5*kPaintVoid)) { image[j][i] = 0; continue; }
+      double t = (imageDataX[idx] - minVal) / (maxVal - minVal + 1e-16);
+      image[j][i] = (png::gray_pixel_16)(1.0 + t*65534.0);
     }
   }
   image.write(fileName);
+
+  // THE SCALE SIDECAR.  paintField rescales by the frame's own min/max and the
+  // PNG records neither, so absolute values were unrecoverable from the file
+  // and no two frames shared a scale -- which makes an animation of a decaying
+  // or growing field actively misleading.  One append-only CSV fixes both.
+  {
+    static bool hdr = false;
+    FILE *fp = fopen("output/paint_scale.csv", hdr ? "a" : "w");
+    if (fp) {
+      if (!hdr) { fprintf(fp, "file,field,min,max,nvoid,nx,ny,domx,domy\n"); hdr = true; }
+      fprintf(fp, "%s,%d,%.10e,%.10e,%lld,%d,%d,%.8f,%.8f\n", fileName, (i32)f,
+              (double)minVal, (double)maxVal, (long long)nVoid,
+              imageSizeX[0], imageSizeX[1],
+              (double)domainSize[0], (double)domainSize[1]);
+      fclose(fp);
+    }
+  }
 }
 
 #ifdef USE_MGPU

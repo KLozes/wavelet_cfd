@@ -8,6 +8,14 @@
 #define BLOCK_SIZE 4
 #endif
 static constexpr int blockSize = BLOCK_SIZE;
+
+// "no data at this pixel" for the image path.  A cut element's tensor nodes
+// include points buried INSIDE the solid, where the solution is an
+// unconstrained polynomial extension, and a DEAD block holds the frozen
+// analytic IC forever -- painting either draws values that are not the
+// solution.  paintField excludes VOID pixels from the autoscale (they would
+// otherwise set the colour range) and maps them to 0, which is reserved.
+static constexpr double kPaintVoid = -1e30;
 static constexpr int haloSize = 2;
 static constexpr int cudaBlockSize = 256;
 static constexpr int cudaGridSize = 1000;

@@ -3872,6 +3872,33 @@ __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
       continue;
     }
 
+    // ---- CUT MODE MASK ---------------------------------------------------
+    // buildCutElems relabels every cut block IB_FLUID and sets ibOn = 0
+    // (DgCutBuild.cu:208-209), so the SDF-aware branch above is never taken in
+    // a --cutcell run and both of these paint values that are not the solution:
+    //   * a DEAD block holds the FROZEN analytic IC forever (dgSetICKernel has
+    //     no class gate and is re-run after the cut build), so the body renders
+    //     as pristine freestream -- the obstacle is INVISIBLE;
+    //   * a cut element's solid-side tensor nodes hold the unconstrained
+    //     extension of a polynomial supported on {phi>0} only.
+    // blkCut is the only cut marker, and it is null until buildCutElems runs
+    // (the bootstrap paints happen before that), hence the null guard.
+    const bool cutMask = (f >= 0 && grid.cutOn && grid.blkCut && grid.blkCut[bIdx] >= 0);
+    if (f >= 0 && grid.cutOn && grid.ibClassList[bIdx] == IB_DEAD) {
+      real hD[3]; dgElemSize(grid, lvl, hD);
+      i32 spanD = blockSize*powi(2, grid.nLvls-1-lvl);
+      for (i32 py = 0; py < spanD; py++) {
+        i32 jP = jb*spanD + py;
+        if (jP < 0 || jP >= grid.imageSizeX[1]) continue;
+        for (i32 px = 0; px < spanD; px++) {
+          i32 iP = ib*spanD + px;
+          if (iP < 0 || iP >= grid.imageSizeX[0]) continue;
+          grid.imageDataX[(u64)jP*grid.imageSizeX[0] + iP] = (real)kPaintVoid;
+        }
+      }
+      continue;
+    }
+
     // this element must intersect the mid-z slice
     real h[3]; dgElemSize(grid, lvl, h);
     real zeta = 0.0;
@@ -3907,6 +3934,14 @@ __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
       for (i32 px = 0; px < span; px++) {
         i32 iPxl = ib*span + px;
         if (iPxl < 0 || iPxl >= grid.imageSizeX[0]) continue;
+        if (cutMask) {   // solid side of a cut element: not a solution value
+          real xw = (ib + (px + (real)0.5)/span)*h[0];
+          real yw = (jb + (py + (real)0.5)/span)*h[1];
+          if (dgIbPhi(grid, xw, yw) < (real)0.0) {
+            grid.imageDataX[(u64)jPxl*grid.imageSizeX[0] + iPxl] = (real)kPaintVoid;
+            continue;
+          }
+        }
         real val;
         if (f >= 0) {
           real xi = (real)2.0*(px + (real)0.5)/span - (real)1.0;

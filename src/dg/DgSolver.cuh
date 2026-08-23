@@ -592,6 +592,8 @@ public:
   void ibClassify(void);                         // geometry classes (2 kernels), post-sort
   void ibFill(void);                             // Hermite ghost reconstruction
   void computeIbGates(void);                     // standoff + stagnation pressure + Cd
+  void writeCutFields(const char *stem);         // cut geometry + the modal solution
+                                                 // sampled at Saye volume/wall points
   void writeIbSurface(const char *fileName);     // Cp(theta) around the cylinder
   void paintIbClass(const char *fileName);       // debug: class map
   void paintTroubled(const char *fileName);      // shock indicator / FV blend factor

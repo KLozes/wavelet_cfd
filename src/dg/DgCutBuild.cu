@@ -633,3 +633,143 @@ void DgSolver::applyCutLimiter(void) {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+//  CUT-CELL OUTPUT.  The first writer in this solver that samples a cut
+//  element's ACTUAL solution.
+//
+//  A cut element's state is a modal polynomial in the orthonormal basis
+//  psi~ = L^-1 psi, supported on the FLUID region {phi>0} of its cell.  Those
+//  coefficients exist only in shared memory inside dgRhsCutKernel and are never
+//  persisted, so every existing artifact -- the PNGs, --cutdump -- has instead
+//  been reading the block's tensor Lobatto node slots, which on a cut element
+//  include points buried inside the solid where the polynomial is an
+//  unconstrained extension.  Same trap as reporting nodal values in a B-spline
+//  basis: the numbers are real, they are just not samples of the field.
+//
+//  So: re-run the kernel's own nodal->modal projection on the host (identical
+//  arithmetic, DgSolverKernels.cu:5920-5932), then evaluate at points that are
+//  inside the region the polynomial represents BY CONSTRUCTION -- the Saye
+//  volume rule for the interior, the Saye surface rule for the wall.  The wall
+//  samples are also the first wall data a --cutcell run has ever produced:
+//  computeIbGates/writeIbSurface are gated on ibOn, which buildCutElems sets to
+//  0, so cut runs emitted no Cp, no wall pressure and no drag at all.
+// ---------------------------------------------------------------------------
+void DgSolver::writeCutFields(const char *stem) {
+  if (!cutOn || nCutElem == 0) return;
+  cudaDeviceSynchronize();
+
+  double wq[NNODE], xi[NNODE];
+  dgGetHostOps(wq, xi, gauss);
+
+  // 1-D Lagrange at the LGL nodes, argument on [-1,1]
+  auto lag1 = [&](double x, double *L) {
+    for (i32 a = 0; a < NNODE; a++) {
+      double v = 1.0;
+      for (i32 m = 0; m < NNODE; m++) if (m != a) v *= (x - xi[m])/(xi[a] - xi[m]);
+      L[a] = v;
+    }
+  };
+  // orthonormal cut basis at a reference point of [0,1]^3 -- the host twin of
+  // dgCutPsiO (DgSolverKernels.cu:5841); ordering and stride must match or the
+  // coefficients mean nothing
+  auto psiO = [&](i32 c, const double xr[3], i32 nb, double *psi) {
+    const real *cen = cutCen + 4*c;
+    double u[3];
+    for (i32 d = 0; d < 3; d++) u[d] = (xr[d] - (double)cen[d])/(double)cen[3];
+    i32 m = 0;
+    for (i32 deg = 0; deg <= dgOrder && m < nb; deg++)
+    for (i32 i = deg; i >= 0 && m < nb; i--)
+    for (i32 j = deg-i; j >= 0 && m < nb; j--) {
+      const i32 e[3] = { i, j, deg-i-j };
+      double v = 1.0;
+      for (i32 d = 0; d < 3; d++) for (i32 a = 0; a < e[d]; a++) v *= u[d];
+      psi[m++] = v;
+    }
+    const real *Lc = cutLc + (size_t)c*CUT_NBMAX_H*CUT_NBMAX_H;
+    for (i32 i = 0; i < nb; i++) {                 // forward solve L z = psi
+      double t = psi[i];
+      for (i32 j = 0; j < i; j++) t -= (double)Lc[(size_t)i*CUT_NBMAX_H+j]*psi[j];
+      psi[i] = t/(double)Lc[(size_t)i*CUT_NBMAX_H+i];
+    }
+  };
+
+  char fn[256];
+  snprintf(fn, sizeof fn, "%s_geom.csv", stem);
+  FILE *fg = fopen(fn, "w");
+  snprintf(fn, sizeof fn, "%s_wall.csv", stem);
+  FILE *fw = fopen(fn, "w");
+  snprintf(fn, sizeof fn, "%s_vol.csv", stem);
+  FILE *fv = fopen(fn, "w");
+  if (!fg || !fw || !fv) { if(fg)fclose(fg); if(fw)fclose(fw); if(fv)fclose(fv); return; }
+  fprintf(fg, "elem,block,ib,jb,lvl,x0,y0,hx,hy,volfrac,wallarea,nmodes,bndincons\n");
+  fprintf(fw, "elem,x,y,w,nx,ny,rho,u,v,p,cp,mach\n");
+  fprintf(fv, "elem,x,y,w,rho,u,v,p\n");
+
+  const double pInf = 1.0/(double)dgGam, qInf = 0.5*(double)machInf*(double)machInf;
+  std::vector<double> psi(CUT_NBMAX_H), cmod((size_t)CUT_NBMAX_H*5), Lx(NNODE), Ly(NNODE), Lz(NNODE);
+
+  for (i32 c = 0; c < nCutElem; c++) {
+    const i32 b = cutBlk[c], nb = cutNbOf[c];
+    i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
+    double h[3]; hostElemSizeLocal(*this, lvl, h);
+
+    // ---- nodal -> modal, exactly as the kernel does it -------------------
+    for (size_t t = 0; t < (size_t)nb*5; t++) cmod[t] = 0.0;
+    double volFrac = 0.0;
+    for (i32 g = cutVolOff[c]; g < cutVolOff[c+1]; g++) {
+      const SayeNode &s = cutVolP[g];
+      const double xr[3] = {(double)s.x[0], (double)s.x[1], (double)s.x[2]};
+      volFrac += (double)s.w;
+      psiO(c, xr, nb, psi.data());
+      lag1(2.0*xr[0]-1.0, Lx.data());
+      lag1(2.0*xr[1]-1.0, Ly.data());
+      lag1(2.0*xr[2]-1.0, Lz.data());
+      for (i32 q = 0; q < 5; q++) {
+        double uq = 0.0;
+        for (i32 k = 0; k < NNODE; k++) for (i32 j = 0; j < NNODE; j++) for (i32 i = 0; i < NNODE; i++)
+          uq += Lx[i]*Ly[j]*Lz[k]
+              * (double)getField(D_RHO+q)[(size_t)b*blockSizeTot + i + NNODE*(j + NNODE*k)];
+        for (i32 m = 0; m < nb; m++) cmod[(size_t)m*5+q] += (double)s.w*psi[m]*uq;
+      }
+    }
+    auto sampleAt = [&](const double xr[3], double W[5]) {
+      psiO(c, xr, nb, psi.data());
+      double U[5] = {0,0,0,0,0};
+      for (i32 q = 0; q < 5; q++)
+        for (i32 m = 0; m < nb; m++) U[q] += cmod[(size_t)m*5+q]*psi[m];
+      W[0] = U[0];
+      W[1] = U[1]/U[0]; W[2] = U[2]/U[0]; W[3] = U[3]/U[0];
+      W[4] = ((double)dgGam-1.0)*(U[4] - 0.5*(U[1]*U[1]+U[2]*U[2]+U[3]*U[3])/U[0]);
+    };
+
+    double wallArea = 0;
+    for (i32 g = cutWalOff[c]; g < cutWalOff[c+1]; g++) wallArea += (double)cutWalP[g].w;
+    fprintf(fg, "%d,%d,%d,%d,%d,%.8f,%.8f,%.8f,%.8f,%.8e,%.8e,%d,%.6e\n",
+            c, b, ib, jb, lvl, ib*h[0], jb*h[1], h[0], h[1],
+            volFrac, wallArea, nb, cutQual ? (double)cutQual[c] : -1.0);
+
+    for (i32 g = cutWalOff[c]; g < cutWalOff[c+1]; g++) {
+      const SayeNode &s = cutWalP[g];
+      const double xr[3] = {(double)s.x[0], (double)s.x[1], (double)s.x[2]};
+      double W[5]; sampleAt(xr, W);
+      const double X = (ib + xr[0])*h[0], Y = (jb + xr[1])*h[1];
+      const double aSnd = sqrt((double)dgGam*fmax(W[4],1e-30)/fmax(W[0],1e-30));
+      fprintf(fw, "%d,%.8f,%.8f,%.8e,%.6f,%.6f,%.8e,%.8e,%.8e,%.8e,%.8e,%.6f\n",
+              c, X, Y, (double)s.w, (double)s.n[0], (double)s.n[1],
+              W[0], W[1], W[2], W[4], (W[4]-pInf)/fmax(qInf,1e-30),
+              sqrt(W[1]*W[1]+W[2]*W[2])/aSnd);
+    }
+    for (i32 g = cutVolOff[c]; g < cutVolOff[c+1]; g++) {
+      const SayeNode &s = cutVolP[g];
+      if ((double)s.w <= 0.0) continue;             // padded zero-weight point
+      const double xr[3] = {(double)s.x[0], (double)s.x[1], (double)s.x[2]};
+      double W[5]; sampleAt(xr, W);
+      fprintf(fv, "%d,%.8f,%.8f,%.8e,%.8e,%.8e,%.8e,%.8e\n",
+              c, (ib + xr[0])*h[0], (jb + xr[1])*h[1], (double)s.w,
+              W[0], W[1], W[2], W[4]);
+    }
+  }
+  fclose(fg); fclose(fw); fclose(fv);
+  printf("[cutfields] wrote %s_{geom,wall,vol}.csv  (%d cut elements)\n", stem, nCutElem);
+}
