@@ -6,35 +6,31 @@
 static constexpr real gam = 1.4;
 
 //
-// 3D compressible Euler solver.  Two discretizations share the same data layout,
-// selected by `scheme`:
-//   scheme 0 : finite volume    (HLLC flux + TVD reconstruction + TVD-RK3)
-//   scheme 1 : RT0/P0 DG        (ported from ../fvStuff/rt_dg_euler_2d.cu)
-//              density ρ, energy E : P0 (cell average)
-//              momentum ρu         : RT0 (cell-average mode + per-axis slope mode)
+// 3D compressible flow solver: cell-centred finite volume, HLLC flux with
+// TVD/ROUND reconstruction, low-storage (Williamson 2N) RK3 in time, on the
+// MultiLevelSparseGrid wavelet AMR core.
 //
-// The RT0 slope DOFs are stored as the *physical* momentum gradients
-//   Gx = ∂(ρu)/∂x,  Gy = ∂(ρv)/∂y,  Gz = ∂(ρw)/∂z          (modal mxs = (dx/2)·Gx)
-// so that, being level-independent smooth fields, they ride the existing
-// interpolating-wavelet AMR machinery unchanged.  The FV scheme leaves them 0.
+// field layout (nFields = 15).  fields 0-4 and 5-6 alternate between
+// conservative and primitive storage in place (see the conservative/primitive
+// conversion kernels):
 //
-// field layout (nFields = 17).  fields 0-4 alternate between conservative and
-// primitive storage in place (see conservative/primitive conversion kernels):
+//   0 : Rho    | Rho
+//   1 : RhoU   | U
+//   2 : RhoV   | V
+//   3 : RhoW   | W
+//   4 : RhoE   | P
+//   5 : RhoK   | K      k-tau SST turbulent kinetic energy     (k~)
+//   6 : RhoTau | Tau    k-tau SST inverse specific dissipation (tau~ = 1/omega)
+//   7..13  : shared scratch bank (see below)
+//   14     : DeltaT / MagRhoU / pressure       (scratch, reused)
 //
-//   0 : Rho  | Rho
-//   1 : RhoU | U          (momentum cell-average mxa)
-//   2 : RhoV | V          (mya)
-//   3 : RhoW | W          (mza)
-//   4 : RhoE | P
-//   5 : Gx               RT0 x-momentum slope  (∂(ρu)/∂x)
-//   6 : Gy               RT0 y-momentum slope  (∂(ρv)/∂y)
-//   7 : Gz               RT0 z-momentum slope  (∂(ρw)/∂z)
-//   8..15  : shared scratch bank (see below)
-//   16     : DeltaT / MagRhoU / pressure       (scratch, reused)
+// The turbulence pair (5,6) is inert unless the RANS model is switched on: with
+// no source/flux contribution their RHS is identically zero and, being memset to
+// zero at allocation, they ride the AMR machinery as a pair of zero fields.
 //
 // Time stepping is low-storage (Williamson 2N) RK3, which needs only q plus
-// ONE accumulator bank, so the former separate Old/Rhs banks are a single
-// aliased bank (F_OLD == F_RHS == 8) whose uses are temporally disjoint:
+// ONE accumulator bank, so the Old and Rhs banks are a single aliased bank
+// (F_OLD == F_RHS == 7) whose uses are temporally disjoint:
 //   - during the RK stages: the LSRK accumulator S (the RHS kernels
 //     ACCUMULATE L into it; updateFields does q += B dt S, then S *= A_next)
 //   - between steps (adaptation): the wavelet-transform reference snapshot
@@ -46,48 +42,53 @@ static constexpr real gam = 1.4;
 // so all measured CFL limits are unchanged vs the previous Shu-Osher SSP-RK3;
 // only the formal SSP property is given up.
 //
-// Only fields 0..7 (NEVOLVE) are sorted, restricted, interpolated and wavelet-
-// transformed; 8..16 are transient.  The multiD corner-flux path computes its
+// Only fields 0..6 (NEVOLVE) are sorted, restricted, interpolated and wavelet-
+// transformed; 7..14 are transient.  The multiD corner-flux path computes its
 // corner tensors on the fly (no flux storage fields).
 //
 enum CompressibleField {
   F_RHO = 0, F_RHOU = 1, F_RHOV = 2, F_RHOW = 3, F_RHOE = 4,
-  F_GX  = 5, F_GY  = 6, F_GZ  = 7,
-  F_OLD = 8,       // shared bank 8..15 (snapshot / sort buffer / Hancock)
-  F_RHS = 8,       // alias: the LSRK accumulator during the RK stages
-  F_SCRATCH = 16
+  F_RHOK = 5, F_RHOTAU = 6,
+  F_OLD = 7,       // shared bank 7..13 (snapshot / sort buffer / Hancock)
+  F_RHS = 7,       // alias: the LSRK accumulator during the RK stages
+  F_SCRATCH = 14
 };
-static constexpr i32 NEVOLVE = 8;                 // evolved DOFs (fields 0..7)
-static constexpr i32 nCompressibleFields = 17;
+static constexpr i32 NEVOLVE = 7;                 // evolved DOFs (fields 0..6)
+static constexpr i32 nCompressibleFields = 15;
 
 class CompressibleSolver : public MultiLevelSparseGrid {
 public:
 
   real deltaT;
   real cfl;
-  // wavelet-detail normalization: domain maxima of the 4 field scales
-  // {|rho|, |momentum|, |rhoE|, max|grad|}, reduced device-side each adaptation.
+  // wavelet-detail normalization: domain maxima of the 3 field scales
+  // {|rho|, |momentum|, |rhoE|}, reduced device-side each adaptation.
   // (Local / neighbourhood normalization was tested and is Pareto-dominated by
   // global-with-tighter-threshold on single-feature flows; it over-refines
   // weak-feature regions.)
-  real *globalScale;    // [4]  domain max of the 4 scales
+  real *globalScale;    // [3]  domain max of the 3 scales
   real waveletThresh;
 
-  i32 scheme;           // 0 = finite volume (HLLC+TVD), 1 = RT0/P0 DG
   i32 recon;            // face reconstruction of rho/p/tangential (and FV normal) velocity:
                         // 0 = smooth TVD limiter, 1 = ROUND (default), 2 = LD-ROUND,
                         // 3 = unlimited 3rd-order parabola (kappa=1/3; smooth tests only)
                         // (ROUND/LD-ROUND: Huang, Deng, Matar & Ying, JCP 555 (2026), Eqs. 4.1/4.2)
                         // ROUND: 6-7x lower smooth-wave error than TVD, cleaner low-Mach,
                         // shocks stay spike-free (soft ~1% non-TVD overshoots by design)
-  i32 rt0Face;          // RT0 normal-velocity face state (scheme==1 only):
-                        // 0 = linear modal (default), 1 = c=1/6 biased parabola
-                        // (4th-order face average; see parabolicFace)
   i32 mdFlux;           // 1 = genuinely multidimensional Osher-type corner flux
                         // (Gaburro, Ricchiuto & Dumbser, arXiv:2506.00207, Eq. 23)
-                        // with FIRST-ORDER corner states: FV = P0 cell averages,
-                        // RT0 = P0 rho,E + RT0 modal momentum at the corner.
-                        // pseudo-2D only; recon/rt0Face/reflux do not apply.
+                        // with FIRST-ORDER corner states (P0 cell averages).
+                        // pseudo-2D only; recon/reflux do not apply.
+  // ---- Navier-Stokes viscous terms -------------------------------------
+  // mu <= 0 disables the viscous path entirely (pure Euler, bit-for-bit).
+  // Units: R = 1, so T = p/rho and cp = gam/(gam-1); the thermal conductivity
+  // is kap = mu*gam/((gam-1)*Pr).  Set mu directly (--mu) or via a Reynolds
+  // number (--re, which sets mu = 1/Re for the unit reference state).
+  real mu;              // dynamic viscosity (constant, or the reference value if sutherS > 0)
+  real Pr;              // Prandtl number (default 0.72)
+  real sutherS;         // Sutherland constant S/T_ref; <= 0 selects constant mu
+  real sutherTref;      // reference temperature for the Sutherland law (T = p/rho units)
+
   real vortexAdvect;    // isentropic-vortex IC advection velocity (u0=v0)
   real greshoP0;        // Gresho-vortex background pressure = 1/(gam*Ma^2) (sets Mach)
   i32 staticGrid;       // 1 = fixed refinement (no dynamic wavelet adaptation)
@@ -114,10 +115,12 @@ public:
       immerserdBcType = 0;
       bcType = 0;
       icType = 0;
-      scheme = 0;
       recon = 1;
-      rt0Face = 0;
       mdFlux = 0;
+      mu = 0.0;             // inviscid by default
+      Pr = 0.72;
+      sutherS = 0.0;
+      sutherTref = 1.0;
       vortexAdvect = 0.0;
       greshoP0 = 0.0;
       staticGrid = 0;
@@ -196,6 +199,7 @@ public:
   void writeLineProfile(const char *fileName); // 1D profile dump for validation
   void computeAcousticReflection(const char *fileName); // acoustic wave reflection at coarse/fine interface
   void computeAcousticL2Error(void);            // L2 velocity error for the periodic sine wave (order study)
+  void computeShearDecayError(real t);          // L2 error vs the exact viscous shear-wave decay
   void printDiagnostics(void);                  // AMR-boundary spike / pseudo-2D diagnostics
   void computeVortexError(void);                // L2 error vs the exact stationary isentropic vortex
   void computeGreshoError(void);                // L2 velocity error + KE retention vs the exact Gresho vortex
@@ -205,10 +209,10 @@ public:
 
   __device__ Vec5 prim2cons(Vec5 prim);
   __device__ Vec5 cons2prim(Vec5 cons);
-  __device__ real pressureRT(real rho, real mxa, real mya, real mza, real E);
   __device__ real lim(real &r);
   __device__ real tvdRec(real &ul, real &uc, real &ur);
   __device__ Vec5 hllcFlux(Vec5 qL, Vec5 qR, Vec3 normal);
+  __device__ real viscosity(real T);   // constant mu, or Sutherland when sutherS > 0
 
   __device__ real getBoundaryLevelSet(Vec3 pos);
   __device__ real calcIbMask(real phi);

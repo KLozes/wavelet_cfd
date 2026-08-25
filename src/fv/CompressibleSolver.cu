@@ -19,26 +19,13 @@ void CompressibleSolver::initialize(void) {
     printf("[warn] multiD corner flux is implemented for pseudo-2D only; disabling\n");
     mdFlux = 0;
   }
-  // RT0 low-Mach CFL guard: below Ma ~ 0.09 (greshoP0 = 1/(gam Ma^2) > 100) the
-  // fp32 pressure-from-energy cancellation (E stores the O(1/Ma^2) background;
-  // face dp is O(1)) puts ~5% noise on the momentum forcing, which continuously
-  // seeds the RT0 slope DOFs' near-imaginary modes; at cfl 0.4 they are
-  // marginal (see the mdFlux==2 note above) and the Ma=0.01 Gresho blows up by
-  // t~0.3.  cfl <= 0.3 restores the damping margin (measured: L2(vel) 4.3e-3,
-  // KE 0.9998 at Ma=0.01; fp64 needs no cap).  Only fires for genuinely
-  // low-Mach configurations, so validated RT0 cases are untouched.
-  if (scheme == 1 && icType == 4 && greshoP0 > 100.0 && sizeof(real) == 4 && cfl > 0.3) {
-    printf("[warn] RT0 at low Mach (fp32): capping cfl %.2f -> 0.30 (slope-mode margin)\n", cfl);
-    cfl = 0.3;
+  if (mdFlux && mu > 0) {
+    printf("[warn] multiD corner flux carries no viscous term; disabling (mu = %g)\n", (double)mu);
+    mdFlux = 0;
   }
-  // (mdFlux == 2 with scheme 1: the Hancock predictor time-centres the slope
-  // DOFs' feed -- face momentum fluxes and volume term -- making the g<->p
-  // coupling a partitioned midpoint-like integration, unlike the old
-  // transverse-only CTU whose pure-FE corrector was unconditionally unstable
-  // for the dispersive slope modes.)
   // wavelet-normalization scales (device-side global maxima)
-  cudaMallocManaged(&globalScale, 4*sizeof(real));
-  cudaMemset(globalScale, 0, 4*sizeof(real));
+  cudaMallocManaged(&globalScale, 3*sizeof(real));
+  cudaMemset(globalScale, 0, 3*sizeof(real));
   buildInitialGrid(true);
 #ifdef USE_MGPU
   // Z-curve mode: the uniform-weight cut over-loads the ranks whose curve
@@ -452,13 +439,13 @@ void CompressibleSolver::primitiveToConservative(void) {
 void CompressibleSolver::forwardWaveletTransform(void) {
   // thresholding scales: domain maxima of {|rho|, |mom|, |rhoE|, |grad|},
   // reduced entirely device-side and stream-ordered -- no host round-trip.
-  cudaMemset(globalScale, 0, 4*sizeof(real));
+  cudaMemset(globalScale, 0, 3*sizeof(real));
   computeGlobalScalesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
 #ifdef USE_MGPU
   // the wavelet threshold must use the SAME normalization on every PE, else
   // partitions refine against inconsistent scales -> take the domain-wide max.
   cudaDeviceSynchronize();
-  comm::allreduceMax(globalScale, 4);
+  comm::allreduceMax(globalScale, 3);
 #endif
 
   cudaMemset(bFlagsList, 0, nBlocksMax*sizeof(i32));
@@ -1010,6 +997,73 @@ void CompressibleSolver::computeAcousticReflection(const char *fileName) {
 // scales with the wave amplitude.  Prints absolute and amplitude-relative L2 for
 // order-of-accuracy studies.
 //
+//
+// Viscous shear-wave decay (icType 8): u = U0 sin(k y), v = w = 0 on a periodic
+// box is an EXACT steady solution of the Euler equations (u varies only across
+// the flow, so u du/dx = 0 and d(rho u)/dx = 0), and under constant-mu
+// Navier-Stokes it decays exactly as
+//     u(y,t) = U0 exp(-nu k^2 t) sin(k y),   nu = mu/rho.
+// The nonlinear term stays identically zero throughout, so ANY error here is
+// the viscous operator: this measures both the coefficient (is nu right?) and
+// the spatial order.  Viscous heating contaminates the state at O(Ma^2); the
+// test case runs at Ma ~ 0.01 to keep that far below the discretization error.
+//
+void CompressibleSolver::computeShearDecayError(real t) {
+  cudaDeviceSynchronize();
+  real *Rho  = getField(F_RHO);
+  real *RhoU = getField(F_RHOU);
+  real U0 = vortexAdvect;                     // reused as the shear amplitude
+  real k  = 2.0*PI/domainSize[1];
+  real nu = mu/1.0;                           // rho = 1 in this IC
+  real decay = exp(-nu*k*k*t);
+
+  // amp is the DISCRETE SINE COEFFICIENT (2/N) sum u_j sin(k y_j), not a max:
+  // cell centres never land on the sine peak (at N=32 the nearest is 0.995 of
+  // it), so a max would report that sampling artifact as scheme error.  The
+  // projection is exact for a uniformly sampled full period, which makes
+  // amp/(U0 exp(-nu k^2 t)) a clean check on the viscous coefficient itself.
+  double err2 = 0.0, ref2 = 0.0, proj = 0.0; long n = 0;
+  for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
+    u64 loc = bLocList[bIdx];
+    if (loc == kEmpty) continue;
+    i32 lvl = loc >> 60;
+    i32 kb  = ((loc >> 40) & ((1 << 20)-1)) - 1;
+    i32 jb  = ((loc >> 20) & ((1 << 20)-1)) - 1;
+    i32 ib  = ( loc        & ((1 << 20)-1)) - 1;
+    i32 gx = baseGridSize[0]*powi(2,lvl)/blockSize;
+    i32 gy = baseGridSize[1]*powi(2,lvl)/blockSize;
+    if (ib < 0 || jb < 0 || ib >= gx || jb >= gy) continue;
+#ifdef USE_MGPU
+    if (!isOwnedBlock(lvl, ib, jb, kb)) continue;
+#endif
+    real dyl = domainSize[1]/real(baseGridSize[1]*powi(2,lvl));
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      i32 cIdx = bIdx*blockSizeTot + c;
+      if (cFlagsList[cIdx] != ACTIVE) continue;
+      i32 j = (c/blockSize) % blockSize;
+      real y  = (jb*blockSize + j + 0.5)*dyl;
+      real u  = RhoU[cIdx]/Rho[cIdx];
+      real ue = U0*decay*sin(k*y);
+      err2 += double(u-ue)*double(u-ue);
+      ref2 += double(ue)*double(ue);
+      proj += double(u)*double(sin(k*y));
+      n++;
+    }
+  }
+#ifdef USE_MGPU
+  double red[4] = {err2, ref2, proj, (double)n}; comm::allreduceSum(red, 4);
+  err2 = red[0]; ref2 = red[1]; proj = red[2]; n = (long)red[3];
+#endif
+  double l2 = sqrt(err2/double(n));
+  printf("---- viscous shear-wave decay (mu=%g, Pr=%g, t=%g) ----\n", (double)mu, (double)Pr, (double)t);
+  printf("  N=%d  nu k^2 t = %.6f   exact decay = %.6e\n",
+         baseGridSize[1], (double)(nu*k*k*t), (double)decay);
+  double amp = 2.0*proj/double(n);
+  printf("  projected amplitude = %.6e   exact = %.6e   ratio = %.6f\n",
+         amp, (double)(U0*decay), amp/double(U0*decay));
+  printf("  L2(u error) = %.6e   L2 relative = %.6e\n", l2, l2/sqrt(ref2/double(n)));
+}
+
 void CompressibleSolver::computeAcousticL2Error(void) {
   cudaDeviceSynchronize();
   real *Rho  = getField(F_RHO);
@@ -1139,7 +1193,7 @@ void CompressibleSolver::printDiagnostics(void) {
 // L2 error of the current solution against the exact STATIONARY isentropic
 // vortex (icType 2, vortexAdvect 0), summed over active interior cells.  For a
 // stationary exact solution the error measures how well the scheme preserves the
-// equilibrium (the RT0/P0 DG's headline property); lower is better.
+// equilibrium; lower is better.
 //
 void CompressibleSolver::computeVortexError(void) {
   cudaDeviceSynchronize();
@@ -1206,8 +1260,8 @@ void CompressibleSolver::computeVortexError(void) {
   if (part.rank != 0) return;
 #endif
   printf("---- vortex L2 error (vs exact stationary) ----\n");
-  printf("  scheme %d   L2(rho) = %.4e   L2(|u|) = %.4e   L2(p) = %.4e\n",
-         scheme, sqrt(l2Rho/area), sqrt(l2Vel/area), sqrt(l2P/area));
+  printf("  L2(rho) = %.4e   L2(|u|) = %.4e   L2(p) = %.4e\n",
+         sqrt(l2Rho/area), sqrt(l2Vel/area), sqrt(l2P/area));
   printf("-----------------------------------------------\n");
 }
 
@@ -1272,8 +1326,8 @@ void CompressibleSolver::computeGreshoError(void) {
       if (b >= 0 && b < NBIN) { binErr[b] += e2; binArea[b] += cellA; }
     }
   }
-  printf("---- Gresho vortex diagnostic (scheme %d, Ma=%.3g, %s grid) ----\n",
-         scheme, greshoP0 > 0 ? 1.0/sqrt(gam*greshoP0) : 0.0,
+  printf("---- Gresho vortex diagnostic (Ma=%.3g, %s grid) ----\n",
+         greshoP0 > 0 ? 1.0/sqrt(gam*greshoP0) : 0.0,
          staticGrid ? "static-AMR" : (nLvls > 1 ? "adaptive" : "uniform"));
   printf("  L2(vel error) = %.4e   KE retention KE(t)/KE(0) = %.5f\n",
          sqrt(l2Vel/area), keNum/keExact);
@@ -1343,7 +1397,7 @@ void CompressibleSolver::paintPressure(const char *fileName) {
 // white == would refine.  mode: 0 = max primary, 1 = rho, 2 = momentum, 3 = rhoE.
 void CompressibleSolver::paintDetail(const char *fileName, i32 mode) {
   restrictFields();                            // parents = child averages (as at adapt time)
-  cudaMemset(globalScale, 0, 4*sizeof(real));
+  cudaMemset(globalScale, 0, 3*sizeof(real));
   computeGlobalScalesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   detailToScratchKernel<<<cudaGridSize, cudaBlockSize>>>(*this, mode);
   cudaDeviceSynchronize();
@@ -1440,17 +1494,14 @@ __device__ Vec5 CompressibleSolver::cons2prim(Vec5 cons) {
 }
 
 //
-// Pressure from P0 density/energy and the RT0 momentum cell-averages, evaluated
-// in double precision.  At low Mach number the (E - ½ρ|u|²) subtraction cancels
-// catastrophically and single precision loses all pressure information, so the
-// internals are promoted to double (as in the reference `pressure_from_rt0`).
+// Dynamic viscosity.  sutherS <= 0 gives constant mu; otherwise Sutherland's
+// law nondimensionalized on the reference state (T = p/rho with R = 1):
+//   mu(T)/mu_ref = (T/Tref)^{3/2} (Tref + S) / (T + S)
 //
-__device__ real CompressibleSolver::pressureRT(real rho, real mxa, real mya, real mza, real E) {
-  double u = (double)mxa / (double)rho;
-  double v = (double)mya / (double)rho;
-  double w = (double)mza / (double)rho;
-  double p = ((double)gam - 1.0) * ((double)E - 0.5 * (double)rho * (u*u + v*v + w*w));
-  return (real)p;
+__device__ real CompressibleSolver::viscosity(real T) {
+  if (sutherS <= 0) return mu;
+  real Tr = fmax(T/sutherTref, (real)1e-12);
+  return mu * Tr*sqrt(Tr) * (sutherTref + sutherS) / (T + sutherS + (real)1e-32);
 }
 
 __device__ real CompressibleSolver::getBoundaryLevelSet(Vec3 pos) {

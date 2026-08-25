@@ -10,33 +10,37 @@
 //
 //   testCase 0 : pseudo-2D / quasi-1D Sod shock tube (validated vs exact)
 //   testCase 1 : 2D circular Sod explosion with adaptive mesh refinement
-//   testCase 2 : isentropic vortex on [0,10]^2 (RT0/P0 DG validation, pseudo-2D)
+//   testCase 2 : isentropic vortex on [0,10]^2 (stationarity check, pseudo-2D)
 //   testCase 3 : true-3D spherical Sod explosion (exercises the z / Gz paths)
-//   testCase 4 : Gresho vortex on [0,1]^2, low-Mach (RT0 low-Mach preservation)
+//   testCase 4 : Gresho vortex on [0,1]^2, low-Mach preservation
 //   testCase 5 : Gresho vortex on a STATIC radial AMR grid (fine at centre,
 //                coarse outward) — tests flow crossing fixed coarse/fine faces
 //   testCase 6 : circular Sod explosion on a static radial AMR grid — measures
 //                coarse/fine conservation error (mass/energy drift)
+//   testCase 9 : viscous shear-wave decay (periodic) — exact check on the
+//                Navier-Stokes viscous operator: u = U0 sin(ky) decays as
+//                exp(-nu k^2 t) with the nonlinear term identically zero.
+//                Needs --mu (or --re); --ma sets the shear amplitude.
 //
 //   --case N     test case (default 0); also accepted as the first bare arg
 //   --nlvls N    number of refinement levels           (per-case default)
 //   --nblocks N  base blocks in x                       (per-case default)
 //   --wthresh X  wavelet detail threshold               (per-case default)
-//   --scheme N   0 = finite volume (HLLC+TVD), 1 = RT0/P0 DG  (>=2 -> 1)
 //   --ma X       Gresho Mach / acConv amplitude / testCase-1 inner pressure
 //   --bc N       BC: 0 slip wall, 1 no-slip, 2 periodic, 3 transmissive
 //   --recon N    0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola
 //   --tend X     end time override                      (per-case default)
-//   --rt0face N  RT0 normal face (scheme 1): 0 = linear modal (default),
-//                1 = c=1/6 biased parabola (4th-order face average)
 //   --mdflux N   1 = genuinely multidimensional Osher-type corner flux
 //                (Gaburro-Ricchiuto-Dumbser, arXiv:2506.00207); 2 = CTU-Hancock:
 //                half-step predictor + single-Euler corrector, 2nd order in
-//                time, single flux sweep per step.  Stable CFL: FV ~1.2,
-//                RT0 ~0.35 (the slope DOFs are near-imaginary modes and the
-//                midpoint-class corrector leaks above that; RK3 for margin).
-//                pseudo-2D only; states follow --recon/--rt0face
+//                time, single flux sweep per step.  Stable CFL ~1.2.
+//                pseudo-2D only; states follow --recon
 //   --cfl X      CFL number (default 0.40; dt = cfl * min(dx/(|u|+c)))
+//   --mu X       dynamic viscosity (default 0 = inviscid Euler)
+//   --re X       set mu = 1/Re for the unit reference state (alternative to --mu)
+//   --pr X       Prandtl number (default 0.72)
+//   --suth X     Sutherland constant S/Tref (default 0 = constant mu)
+//   --tref X     Sutherland reference temperature in T = p/rho units (default 1)
 //
 // Back-compat: `./wave3d N` (bare first arg) still selects the test case.
 // testCases 0-2,4 run pseudo-2D (single z block); testCase 3 is fully 3D.
@@ -68,24 +72,28 @@ int main(int argc, char* argv[]) {
   bool sodAmr  = (testCase == 6);                          // Sod shock on a static planar AMR grid
   bool acoustic= (testCase == 7);                          // acoustic pulse crossing a static coarse/fine interface
   bool acConv  = (testCase == 8);                          // periodic sine acoustic wave, order-of-accuracy study
+  bool shear   = (testCase == 9);                          // viscous shear-wave decay (exact viscous-operator check)
   i32 nLvls    = argI("--nlvls", (testCase == 1 ? 4 : (testCase == 5 ? 3 : (sodAmr ? 3 : (acoustic ? 3 : 1)))));
-  i32 nBlocksX = argI("--nblocks", (testCase == 1 ? 16 : (testCase == 2 ? 40 : (testCase == 3 ? 8 : (testCase == 4 ? 40 : (testCase == 5 ? 10 : (sodAmr ? 16 : (acoustic ? 64 : (acConv ? 8 : 100)))))))));
+  i32 nBlocksX = argI("--nblocks", (testCase == 1 ? 16 : (testCase == 2 ? 40 : (testCase == 3 ? 8 : (testCase == 4 ? 40 : (testCase == 5 ? 10 : (sodAmr ? 16 : (acoustic ? 64 : (acConv ? 8 : (shear ? 8 : 100))))))))));
   real wThresh = argF("--wthresh", (testCase == 1 ? 0.004 : 0.01));
-  i32 scheme   = argI("--scheme", (sodAmr ? 0 : (testCase >= 2 ? 1 : 0)));
   bool haveMa  = hasArg("--ma");
   real Ma      = haveMa ? argF("--ma", 0.1) : 0.1;   // Gresho Mach number / acConv amplitude
   i32 bcArg    = argI("--bc", -1);                   // bcType override (-1 = per-testCase default)
   i32 reconA   = argI("--recon", 1);
   i32 debugA   = argI("--debug", 0);                 // 1 = per-cycle integrity/census diagnostics                 // 0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola (smooth only)
   real tEndArg = argF("--tend", -1.0);               // tEnd override (-1 = per-testCase default)
-  i32 rt0FaceA = argI("--rt0face", 0);               // RT0 normal face (scheme==1): 0=linear modal (default), 1=c=1/6 parabola
   i32 mdFluxA  = argI("--mdflux", 0);                // 1 = multidimensional Osher-type corner flux (first-order states)
   real cflArg  = argF("--cfl", -1.0);                // CFL override (-1 = default 0.40; dt = cfl*min(dx/(|u|+c)))
   real advectA = argF("--advect", 0.0);              // isentropic-vortex (case 2) advection velocity u0=v0 (periodic seam-crossing test)
+  real muArg   = argF("--mu",  0.0);                  // dynamic viscosity (0 = inviscid)
+  real reArg   = argF("--re",  0.0);                 // Reynolds number -> mu = 1/Re
+  real prArg   = argF("--pr",  0.72);                // Prandtl number
+  real suthArg = argF("--suth", 0.0);                // Sutherland S/Tref (0 = constant mu)
+  real trefArg = argF("--tref", 1.0);                // Sutherland reference temperature
   i32 detailA  = argI("--detail", 0);                // 1 = paint the wavelet-detail indicator at tEnd (white = refine trigger)
 
   bool cube   = (testCase == 3);
-  bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv);
+  bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv || shear);
   i32 nBlocksY = (square || cube) ? nBlocksX : (nBlocksX + 9) / 10;
   i32 nBlocksZ = cube ? nBlocksX : 1;
 
@@ -104,26 +112,31 @@ int main(int argc, char* argv[]) {
   // shorter tEnd to stay inside the domain.
   real sodPin = (testCase == 1) ? (haveMa ? argF("--ma", 1.0) : 1.0) : 0.0;
   real acPeriod = domainLenX / sqrt(gam);   // sound-crossing time (c0=sqrt(gam), p0=rho0=1)
-  real tEnd  = (testCase == 1 && sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin) : ((testCase == 2) ? 1.0 : (testCase == 3 ? 0.15 : (gresho ? 1.0 : (sodAmr ? 0.15 : (acoustic ? 0.35 : (acConv ? 2.0*acPeriod : 0.20))))));
+  real tEnd  = (testCase == 1 && sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin) : ((testCase == 2) ? 1.0 : (testCase == 3 ? 0.15 : (gresho ? 1.0 : (sodAmr ? 0.15 : (acoustic ? 0.35 : (acConv ? 2.0*acPeriod : (shear ? 0.5 : 0.20)))))));
   if (tEndArg > 0) tEnd = tEndArg;                   // CLI override (arg 10)
-  real tStep = (testCase == 1) ? ((tEndArg > 0) ? tEnd/50.0 : ((sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin)/10.0 : 0.008)) : (testCase == 2 ? 0.1 : (testCase == 3 ? 0.03 : (gresho ? 0.1 : (sodAmr ? 0.02 : (acoustic ? 0.02 : (acConv ? tEnd : 0.01))))));
+  real tStep = (testCase == 1) ? ((tEndArg > 0) ? tEnd/50.0 : ((sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin)/10.0 : 0.008)) : (testCase == 2 ? 0.1 : (testCase == 3 ? 0.03 : (gresho ? 0.1 : (sodAmr ? 0.02 : (acoustic ? 0.02 : (acConv ? tEnd : (shear ? tEnd : 0.01)))))));
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls);
   solver->pseudo2D        = (baseGridSize[2] == blockSize) ? 1 : 0;  // collapse z (pseudo-2D)
   solver->cfl             = cfl;
   solver->waveletThresh   = wThresh;
-  solver->scheme          = scheme;
-  solver->icType          = (testCase == 1 || sodAmr) ? (argI("--dgblast", 0) ? 7 : 1) : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : 0)))));
+  solver->icType          = (testCase == 1 || sodAmr) ? (argI("--dgblast", 0) ? 7 : 1) : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : (shear ? 8 : 0))))));
   // --dgblast 1: DG-matched blast IC (icType 7) for wavedg3d comparison runs
-  solver->bcType          = (bcArg >= 0) ? bcArg : ((acConv || testCase == 1) ? 2 : 3);   // periodic for the acoustic wave and circular Sod; else transmissive
-  solver->vortexAdvect    = acConv ? Ma : (testCase == 2 ? advectA : sodPin);  // acConv: wave amplitude A; case 2: vortex advection; testCase 1: Sod inner pressure
-  solver->greshoP0        = 1.0/(gam*Ma*Ma);            // Gresho background pressure -> Mach = Ma
+  solver->bcType          = (bcArg >= 0) ? bcArg : ((acConv || shear || testCase == 1) ? 2 : 3);   // periodic for the acoustic/shear waves and circular Sod; else transmissive
+  solver->vortexAdvect    = (acConv || shear) ? Ma : (testCase == 2 ? advectA : sodPin);  // acConv/shear: wave amplitude; case 2: vortex advection; testCase 1: Sod inner pressure
+  // shear: fix the background pressure (c ~ 11.8) so --ma sets ONLY the shear
+  // amplitude; the flow Mach number is then ~ma/11.8, low enough that the
+  // O(Ma^2) viscous-heating contamination stays under the truncation error.
+  solver->greshoP0        = shear ? 100.0 : 1.0/(gam*Ma*Ma);   // Gresho background pressure -> Mach = Ma
   solver->staticGrid      = acoustic ? 3 : ((testCase == 5 || sodAmr) ? 1 : 0);   // 1=radial shells, 2=planar band, 3=centre step
   solver->refineRadius    = 0.4;                        // fine-region half-extent (unused for the step)
   solver->recon           = reconA;
   solver->dbgChecks       = debugA;                     // face reconstruction (TVD / ROUND / LD-ROUND)
-  solver->rt0Face         = rt0FaceA;                    // RT0 normal face: 0=linear modal, 1=c=1/6 parabola
   solver->mdFlux          = mdFluxA;                     // multidimensional Osher-type corner flux
+  solver->mu              = (reArg > 0) ? (real)(1.0/reArg) : muArg;
+  solver->Pr              = prArg;
+  solver->sutherS         = suthArg;
+  solver->sutherTref      = trefArg;
   solver->immerserdBcType = 0;
   solver->initialize();
 
@@ -174,6 +187,9 @@ int main(int argc, char* argv[]) {
   }
   if (acoustic) {
     solver->computeAcousticReflection("output/acoustic_profile.dat");
+  }
+  if (shear) {
+    solver->computeShearDecayError(t);
   }
   if (acConv) {
     solver->computeAcousticL2Error();

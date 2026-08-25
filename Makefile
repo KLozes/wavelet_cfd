@@ -1,7 +1,6 @@
 # Build for the solvers, which share the MultiLevelSparseGrid wavelet AMR core:
-#   wave3d   - the compressible Euler flow solver        (16 fields/block)
+#   wave3d   - the compressible flow solver              (15 fields/block)
 #   wavesdf  - the narrowband signed distance field gen   (2 fields/block)
-#   wavedg3d - the multi-resolution DGSEM solver
 #   wavefem  - CutFEM linear elasticity on a cut/immersed STL body
 # archived (still builds via `make wavewsdf`, not part of `all`):
 #   wavewsdf - the wavelet / BVH-oracle SDF + dual contour
@@ -13,7 +12,7 @@
 #                     Stl/Features/Bvh/BvhQuery
 #   src/fv          - CompressibleSolver + Main/MainMgpu       (wave3d*)
 #   src/sdf         - SignedDistanceSolver + MainSdf           (wavesdf)
-#   src/dg          - DgSolver + DgMain                        (wavedg3d*)
+#   src/dg          - standalone cut-cell DG gates (dg*_test only)
 #   src/fem         - CutFemSolver + FemMain                   (wavefem*)
 #   src/archive     - retired solvers, kept buildable but out of `all`
 #     archive/waveletsdf - WaveletSdfSolver, DualContour, NodalOctree (wavewsdf)
@@ -41,7 +40,6 @@ INC_COMMON    = -I./$(SRC_DIR)/common
 WAVE3D_INC    = $(INC_COMMON) -I./$(SRC_DIR)/fv
 WAVESDF_INC   = $(INC_COMMON) -I./$(SRC_DIR)/sdf
 WAVEWSDF_INC  = $(INC_COMMON) -I./$(SRC_DIR)/archive/waveletsdf
-WAVEDG_INC    = $(INC_COMMON) -I./$(SRC_DIR)/dg -I./$(SRC_DIR)/fem
 WAVEFEM_INC   = $(INC_COMMON) -I./$(SRC_DIR)/fem
 
 # per-executable cell cap (blocks = NCELLS_MAX/blockSizeTot).  wave3d gets 64M
@@ -89,19 +87,6 @@ WAVEWSDF_OBJS = $(patsubst %,$(OBJ_DIR)/wavewsdf/%.cu.o,$(WAVEWSDF_SRCS))
 WAVE3D_DP_DEFS = -DUSE_DOUBLE
 WAVE3D_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_dp/%.cu.o,$(WAVE3D_SRCS))
 
-# multi-resolution DGSEM solver (leaf-only AMR, one block = one p=3 element of
-# 4^3 LGL nodes).  16M nodes = 250k elements; 17 node-fields ~ 1.1 GB fp32.
-# wavedg3d_dp: fp64 for conservation/convergence studies (halved node cap).
-# wavedg3d_p2: p=2 variant (3^3 LGL nodes; blockSize must equal p+1).
-WAVEDG_DEFS    = -DNCELLS_MAX=32000000 -DDG_ORDER=3
-WAVEDG_DP_DEFS = -DNCELLS_MAX=8000000 -DDG_ORDER=3 -DUSE_DOUBLE
-WAVEDG_P2_DEFS = -DNCELLS_MAX=32000000 -DDG_ORDER=2 -DBLOCK_SIZE=3
-WAVEDG_SRCS = $(COMMON_SRCS) \
-              dg/DgSolver dg/DgSolverKernels dg/DgCutBuild dg/DgCutEs dg/DgMain
-WAVEDG_OBJS    = $(patsubst %,$(OBJ_DIR)/wavedg3d/%.cu.o,$(WAVEDG_SRCS))
-WAVEDG_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_dp/%.cu.o,$(WAVEDG_SRCS))
-WAVEDG_P2_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_p2/%.cu.o,$(WAVEDG_SRCS))
-
 # CutFEM linear elasticity (steady, matrix-free CG -- the only implicit solver
 # here).  wavefem_dp is the fp64 build: the convergence study needs errors well
 # below the ~1e-5 relative floor fp32 CG leaves.
@@ -135,7 +120,7 @@ ifeq ($(USE_MPI),1)
   WAVE3D_MGPU_LDFLAGS = -L$(MPI_HOME)/lib -lmpi -Xlinker -rpath -Xlinker $(MPI_HOME)/lib
 endif
 
-all: wave3d wavesdf wavedg3d wavefem
+all: wave3d wavesdf wavefem
 
 wave3d: $(WAVE3D_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
@@ -147,15 +132,6 @@ wavewsdf: $(WAVEWSDF_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
 wave3d_dp: $(WAVE3D_DP_OBJS)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
-
-wavedg3d: $(WAVEDG_OBJS)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
-
-wavedg3d_dp: $(WAVEDG_DP_OBJS)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
-
-wavedg3d_p2: $(WAVEDG_P2_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
 wavefem: $(WAVEFEM_OBJS)
@@ -184,18 +160,6 @@ $(OBJ_DIR)/wavewsdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
 $(OBJ_DIR)/wave3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) $(WAVE3D_DP_DEFS) $(WAVE3D_INC) -dc $< -o $@
-
-$(OBJ_DIR)/wavedg3d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
-	@mkdir -p $(dir $@)
-	$(NVCC) $(NVCCFLAGS) $(WAVEDG_DEFS) $(WAVEDG_INC) -dc $< -o $@
-
-$(OBJ_DIR)/wavedg3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
-	@mkdir -p $(dir $@)
-	$(NVCC) $(NVCCFLAGS) $(WAVEDG_DP_DEFS) $(WAVEDG_INC) -dc $< -o $@
-
-$(OBJ_DIR)/wavedg3d_p2/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
-	@mkdir -p $(dir $@)
-	$(NVCC) $(NVCCFLAGS) $(WAVEDG_P2_DEFS) $(WAVEDG_INC) -dc $< -o $@
 
 # -Xcompiler -fopenmp: the Qp path (CutFemIga.cu) parallelizes its host assembly /
 # CG over cores.  The p=1 sources have no OpenMP pragmas, so their generated code
@@ -274,7 +238,7 @@ iga_euler2d: $(SRC_DIR)/fem/IgaEuler2dTest.cu $(HDRS)
 femtests: saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
 clean:
-	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf wave3d_dp wave3d_mgpu wavedg3d wavedg3d_dp wavedg3d_p2 \
+	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf wave3d_dp wave3d_mgpu \
 	       wavefem wavefem_dp saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
 .PHONY: all clean femtests

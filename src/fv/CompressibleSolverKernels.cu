@@ -16,7 +16,7 @@ __global__ void sortFieldDataKernel(CompressibleSolver &grid) {
     i32 bIdxOld = grid.bIdxList[bIdx];
     i32 cIdxOld = bIdxOld * blockSizeTot + cIdx % blockSizeTot;
 
-    // carry all evolved DOFs (P0 ρ,E + momentum avg + RT0 slopes) through the sort
+    // carry all evolved DOFs through the sort
     for (i32 f = 0; f < NEVOLVE; f++) {
       grid.getField(f)[cIdx] = grid.getField(F_OLD + f)[cIdxOld];
     }
@@ -97,9 +97,6 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
   real *V   = grid.getField(F_RHOV);
   real *W   = grid.getField(F_RHOW);
   real *P   = grid.getField(F_RHOE);
-  real *Gx  = grid.getField(F_GX);
-  real *Gy  = grid.getField(F_GY);
-  real *Gz  = grid.getField(F_GZ);
 
   START_CELL_LOOP
     GET_CELL_INDICES
@@ -108,10 +105,6 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
     i32 lvl, ib, jb, kb;
     grid.decode(loc, lvl, ib, jb, kb);
     Vec3 pos = grid.getCellPos(lvl, ib, jb, kb, i, j, k);
-
-    // RT0 slope DOFs default to zero (all zero-velocity ICs); the vortex IC below
-    // overwrites them with the projected momentum gradients.
-    Gx[cIdx] = 0.0; Gy[cIdx] = 0.0; Gz[cIdx] = 0.0;
 
     if (grid.icType == 0) {
       //
@@ -171,7 +164,7 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
 
     if (grid.icType == 3) {
       //
-      // 3D spherical Sod explosion (true 3D — exercises all three RT0 slope DOFs
+      // 3D spherical Sod explosion (true 3D — exercises the z / w paths
       // and the z-flux path).  A high-pressure ball drives a spherical shock.
       //
       real cx = grid.domainSize[0]/2, cy = grid.domainSize[1]/2, cz = grid.domainSize[2]/2;
@@ -183,12 +176,11 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
       else {
         Rho[cIdx] = 0.125; U[cIdx] = 0.0; V[cIdx] = 0.0; W[cIdx] = 0.0; P[cIdx] = 0.1;
       }
-      // zero-velocity IC → RT0 slope DOFs stay 0 (already set above)
     }
 
     if (grid.icType == 2) {
       //
-      // Isentropic vortex, z-uniform (validates the RT0 low-Mach / stationarity
+      // Isentropic vortex, z-uniform (validates low-Mach / stationarity
       // property against the 2D reference).  Advection velocity u0=v0 selects the
       // stationary (0) vs moving (nonzero) case; centred on the domain.
       //
@@ -200,15 +192,6 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
       real rho, uc, vc, p;
       vortexPaperExact(pos[0], pos[1], u0, v0, cx, cy, rho, uc, vc, p);
       Rho[cIdx] = rho;  U[cIdx] = uc;  V[cIdx] = vc;  W[cIdx] = 0.0;  P[cIdx] = p;
-
-      // RT0 slope DOFs from the face-midpoint momenta:  Gx = (ρu|_xR − ρu|_xL)/dx
-      real rR, uR, vR, pR;  vortexPaperExact(pos[0]+0.5*dx, pos[1], u0, v0, cx, cy, rR, uR, vR, pR);
-      real rL, uL, vL, pL;  vortexPaperExact(pos[0]-0.5*dx, pos[1], u0, v0, cx, cy, rL, uL, vL, pL);
-      real rT, uT, vT, pT;  vortexPaperExact(pos[0], pos[1]+0.5*dy, u0, v0, cx, cy, rT, uT, vT, pT);
-      real rB, uB, vB, pB;  vortexPaperExact(pos[0], pos[1]-0.5*dy, u0, v0, cx, cy, rB, uB, vB, pB);
-      Gx[cIdx] = (rR*uR - rL*uL) / dx;
-      Gy[cIdx] = (rT*vT - rB*vB) / dy;
-      Gz[cIdx] = 0.0;   // z-uniform
     }
 
     if (grid.icType == 6) {
@@ -227,8 +210,25 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
       Rho[cIdx] = rho0 + rho0*up/c0;
       U[cIdx]   = up;  V[cIdx] = 0.0;  W[cIdx] = 0.0;
       P[cIdx]   = p0 + rho0*c0*up;
-      Gx[cIdx]  = rho0*dup*(1.0 + 2.0*up/c0);   // d(rho u)/dx, rho u = rho0 up(1+up/c0)
-      Gy[cIdx]  = 0.0;  Gz[cIdx] = 0.0;
+    }
+
+    if (grid.icType == 8) {
+      //
+      // Viscous shear wave: u = U0 sin(k y), v = w = 0, uniform rho and p.
+      // A parallel shear flow is an exact steady solution of the Euler
+      // equations, so under constant-mu Navier-Stokes the profile decays as
+      // exp(-nu k^2 t) with the nonlinear term identically zero -- an exact
+      // check on the viscous operator alone.  Run at low Mach (large p0) so the
+      // O(Ma^2) viscous-heating contamination stays below the truncation error.
+      //
+      real U0 = grid.vortexAdvect;              // shear amplitude
+      real p0 = grid.greshoP0;                  // background pressure (sets Mach)
+      real k  = 2.0*PI/grid.domainSize[1];
+      Rho[cIdx] = 1.0;
+      U[cIdx]   = U0*sin(k*pos[1]);
+      V[cIdx]   = 0.0;
+      W[cIdx]   = 0.0;
+      P[cIdx]   = p0;
     }
 
     if (grid.icType == 5) {
@@ -249,10 +249,6 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
       real rho, uc, p;
       simpleWaveExact(pos[0], A, x0, wid, rho, uc, p);
       Rho[cIdx] = rho;  U[cIdx] = uc;  V[cIdx] = 0.0;  W[cIdx] = 0.0;  P[cIdx] = p;
-      // RT0 slope Gx = d(rho u)/dx from the face-midpoint momenta (as the vortex IC)
-      real rR, uR, pR;  simpleWaveExact(pos[0]+0.5*dx, A, x0, wid, rR, uR, pR);
-      real rL, uL, pL;  simpleWaveExact(pos[0]-0.5*dx, A, x0, wid, rL, uL, pL);
-      Gx[cIdx] = (rR*uR - rL*uL)/dx;  Gy[cIdx] = 0.0;  Gz[cIdx] = 0.0;
     }
 
     if (grid.icType == 4) {
@@ -267,15 +263,6 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
       real rho, uc, vc, p;
       greshoExact(pos[0], pos[1], cx, cy, p0, rho, uc, vc, p);
       Rho[cIdx] = rho;  U[cIdx] = uc;  V[cIdx] = vc;  W[cIdx] = 0.0;  P[cIdx] = p;
-
-      // RT0 slope DOFs from face-midpoint momenta (ρ≡1 here)
-      real rR, uR, vR, pR;  greshoExact(pos[0]+0.5*dx, pos[1], cx, cy, p0, rR, uR, vR, pR);
-      real rL, uL, vL, pL;  greshoExact(pos[0]-0.5*dx, pos[1], cx, cy, p0, rL, uL, vL, pL);
-      real rT, uT, vT, pT;  greshoExact(pos[0], pos[1]+0.5*dy, cx, cy, p0, rT, uT, vT, pT);
-      real rB, uB, vB, pB;  greshoExact(pos[0], pos[1]-0.5*dy, cx, cy, p0, rB, uB, vB, pB);
-      Gx[cIdx] = (rR*uR - rL*uL) / dx;
-      Gy[cIdx] = (rT*vT - rB*vB) / dy;
-      Gz[cIdx] = 0.0;
     }
 
   END_CELL_LOOP
@@ -291,9 +278,8 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff) 
   real *RhoV = grid.getField(fOff + F_RHOV);
   real *RhoW = grid.getField(fOff + F_RHOW);
   real *RhoE = grid.getField(fOff + F_RHOE);
-  real *Gx   = grid.getField(fOff + F_GX);   // RT0 slope DOFs (0 in FV mode)
-  real *Gy   = grid.getField(fOff + F_GY);
-  real *Gz   = grid.getField(fOff + F_GZ);
+  real *RhoK = grid.getField(fOff + F_RHOK);   // k-tau SST pair (0 unless RANS on)
+  real *RhoT = grid.getField(fOff + F_RHOTAU);
 
   START_CELL_LOOP
     GET_CELL_INDICES
@@ -336,11 +322,11 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff) 
           if (imgBlock != bEmpty) { dGap = d; break; }
         }
         if (imgBlock != bEmpty) {   // L=0 always exists (dense base grid)
-          real *F[8] = {Rho, RhoU, RhoV, RhoW, RhoE, Gx, Gy, Gz};
+          real *F[NEVOLVE] = {Rho, RhoU, RhoV, RhoW, RhoE, RhoK, RhoT};
           i32 ox = cx%blockSize, oy = cy%blockSize, oz = cz%blockSize;
           if (dGap == 0) {          // same level: exact periodic copy (as before)
             i32 bcIdx = imgBlock*blockSizeTot + ox + oy*blockSize + oz*blockSize*blockSize;
-            for (i32 f = 0; f < 8; f++) F[f][cIdx] = F[f][bcIdx];
+            for (i32 f = 0; f < NEVOLVE; f++) F[f][cIdx] = F[f][bcIdx];
           }
           else {
             // coarser ancestor: monotone (tri)linear interpolation toward the
@@ -378,7 +364,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff) 
             real w010 = (1-ax)*ay*(1-az),     w110 = ax*ay*(1-az);
             real w001 = (1-ax)*(1-ay)*az,     w101 = ax*(1-ay)*az;
             real w011 = (1-ax)*ay*az,         w111 = ax*ay*az;
-            for (i32 f = 0; f < 8; f++) {
+            for (i32 f = 0; f < NEVOLVE; f++) {
               F[f][cIdx] = w000*F[f][t000] + w100*F[f][t100]
                          + w010*F[f][t010] + w110*F[f][t110]
                          + w001*F[f][t001] + w101*F[f][t101]
@@ -412,13 +398,17 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff) 
           RhoW[cIdx] = (zWall ? -1.0 : 1.0) * RhoW[bcIdx];
         }
         else if (grid.bcType == 1) {
-          // no-slip wall: reflect normal, zero tangential
-          RhoU[cIdx] = xWall ? -RhoU[bcIdx] : 0.0;
-          RhoV[cIdx] = yWall ? -RhoV[bcIdx] : 0.0;
-          RhoW[cIdx] = zWall ? -RhoW[bcIdx] : 0.0;
-          if (!xWall && !yWall && !zWall) {
-            RhoU[cIdx] = RhoU[bcIdx]; RhoV[cIdx] = RhoV[bcIdx]; RhoW[cIdx] = RhoW[bcIdx];
-          }
+          // No-slip wall: MIRROR every velocity component, so the face value
+          // (the average of the interior cell and its ghost) is zero for all
+          // three -- normal AND tangential.  Zeroing the ghost tangential
+          // components instead would put the face velocity at HALF the interior
+          // value, which is not no-slip; harmless while inviscid, but it sets
+          // the wall shear stress once there is a viscous flux.
+          // Energy is copied, so the mirrored velocity leaves rho*e unchanged
+          // -> zero wall-normal temperature gradient (adiabatic wall).
+          RhoU[cIdx] = -RhoU[bcIdx];
+          RhoV[cIdx] = -RhoV[bcIdx];
+          RhoW[cIdx] = -RhoW[bcIdx];
         }
         else {
           // bcType == 3 : transmissive / outflow (zero gradient)
@@ -427,12 +417,11 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff) 
           RhoW[cIdx] = RhoW[bcIdx];
         }
 
-        // RT0 slope DOFs: zero-gradient copy (exact for transmissive; a wall-
-        // normal slope reflection is a follow-up — not exercised by the periodic
-        // RT0 validation).
-        Gx[cIdx] = Gx[bcIdx];
-        Gy[cIdx] = Gy[bcIdx];
-        Gz[cIdx] = Gz[bcIdx];
+        // k-tau SST pair: zero-gradient default (exact for transmissive/farfield;
+        // the wall-model BC of Eq. (39) overrides it on wall faces once RANS is
+        // active).  A no-op while the fields are zero.
+        RhoK[cIdx] = RhoK[bcIdx];
+        RhoT[cIdx] = RhoT[bcIdx];
       }
     }
 
@@ -445,15 +434,23 @@ __global__ void conservativeToPrimitiveKernel(CompressibleSolver &grid) {
   real *RhoV = grid.getField(2);
   real *RhoW = grid.getField(3);
   real *RhoE = grid.getField(4);
+  real *RhoK = grid.getField(F_RHOK);
+  real *RhoT = grid.getField(F_RHOTAU);
 
   START_CELL_LOOP
 
-    Vec5 q = grid.cons2prim(Vec5(Rho[cIdx], RhoU[cIdx], RhoV[cIdx], RhoW[cIdx], RhoE[cIdx]));
+    real r = Rho[cIdx];
+    Vec5 q = grid.cons2prim(Vec5(r, RhoU[cIdx], RhoV[cIdx], RhoW[cIdx], RhoE[cIdx]));
     Rho[cIdx]  = q[0];
     RhoU[cIdx] = q[1];
     RhoV[cIdx] = q[2];
     RhoW[cIdx] = q[3];
     RhoE[cIdx] = q[4];
+    // turbulence pair rides along: rho*k~ -> k~, rho*tau~ -> tau~.  Identically
+    // zero (hence a no-op) unless the RANS model is active.
+    real rInv  = (r > 0) ? 1.0/r : 0.0;
+    RhoK[cIdx] = RhoK[cIdx]*rInv;
+    RhoT[cIdx] = RhoT[cIdx]*rInv;
 
   END_CELL_LOOP
 }
@@ -464,15 +461,20 @@ __global__ void primitiveToConservativeKernel(CompressibleSolver &grid) {
   real *V   = grid.getField(2);
   real *W   = grid.getField(3);
   real *P   = grid.getField(4);
+  real *K   = grid.getField(F_RHOK);
+  real *Tau = grid.getField(F_RHOTAU);
 
   START_CELL_LOOP
 
-    Vec5 q = grid.prim2cons(Vec5(Rho[cIdx], U[cIdx], V[cIdx], W[cIdx], P[cIdx]));
+    real r = Rho[cIdx];
+    Vec5 q = grid.prim2cons(Vec5(r, U[cIdx], V[cIdx], W[cIdx], P[cIdx]));
     Rho[cIdx] = q[0];
     U[cIdx]   = q[1];
     V[cIdx]   = q[2];
     W[cIdx]   = q[3];
     P[cIdx]   = q[4];
+    K[cIdx]   = K[cIdx]*r;      // k~   -> rho*k~
+    Tau[cIdx] = Tau[cIdx]*r;    // tau~ -> rho*tau~
 
   END_CELL_LOOP
 }
@@ -500,8 +502,8 @@ __device__ inline double atomicMaxFloat(double *addr, double val) {
   return __longlong_as_double(old);
 }
 
-// Wavelet-thresholding scales: domain maxima of the 4 field scales
-// {|rho|, |momentum|, |rhoE|, max|grad|} into globalScale[0..3], pre-zeroed by
+// Wavelet-thresholding scales: domain maxima of the 3 field scales
+// {|rho|, |momentum|, |rhoE|} into globalScale[0..2], pre-zeroed by
 // the host.  Warp-level shuffle reduction first, then one atomicMax per warp --
 // all device-side, no host round-trip.
 // DIAG: count near-vacuum cells (rho < 0.05; physical min is the 0.125 ambient),
@@ -538,9 +540,6 @@ __global__ void computeGlobalScalesKernel(CompressibleSolver &grid) {
   real *RhoV = grid.getField(F_RHOV);
   real *RhoW = grid.getField(F_RHOW);
   real *RhoE = grid.getField(F_RHOE);
-  real *Gx   = grid.getField(F_GX);
-  real *Gy   = grid.getField(F_GY);
-  real *Gz   = grid.getField(F_GZ);
 
   START_CELL_LOOP
 
@@ -548,7 +547,6 @@ __global__ void computeGlobalScalesKernel(CompressibleSolver &grid) {
     real mu = RhoU[cIdx], mv = RhoV[cIdx], mw = RhoW[cIdx];
     real m = sqrt(mu*mu + mv*mv + mw*mw);
     real e = fabs(RhoE[cIdx]);
-    real g = fmax(fabs(Gx[cIdx]), fmax(fabs(Gy[cIdx]), fabs(Gz[cIdx])));
 
 #ifdef USE_MGPU
     // owned-only so the threshold normalization is rank-count-invariant: a
@@ -556,7 +554,7 @@ __global__ void computeGlobalScalesKernel(CompressibleSolver &grid) {
     // folds in every PE's owned max.  Zero (the fmax identity for these
     // magnitudes) drops non-owned lanes without breaking the warp shuffle.
     { i32 lvl,ib,jb,kb; grid.decode(grid.bLocList[bIdx], lvl,ib,jb,kb);
-      if (!grid.isOwnedBlock(lvl,ib,jb,kb)) { r = 0; m = 0; e = 0; g = 0; } }
+      if (!grid.isOwnedBlock(lvl,ib,jb,kb)) { r = 0; m = 0; e = 0; } }
 #endif
 
     // warp shuffle reduction (grid-stride loop keeps whole warps in-range)
@@ -564,13 +562,11 @@ __global__ void computeGlobalScalesKernel(CompressibleSolver &grid) {
       r = fmax(r, __shfl_down_sync(0xffffffff, r, off));
       m = fmax(m, __shfl_down_sync(0xffffffff, m, off));
       e = fmax(e, __shfl_down_sync(0xffffffff, e, off));
-      g = fmax(g, __shfl_down_sync(0xffffffff, g, off));
     }
     if ((threadIdx.x & 31) == 0) {
       atomicMaxFloat(&grid.globalScale[0], r);
       atomicMaxFloat(&grid.globalScale[1], m);
       atomicMaxFloat(&grid.globalScale[2], e);
-      atomicMaxFloat(&grid.globalScale[3], g);
     }
 
   END_CELL_LOOP
@@ -628,6 +624,19 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
       real vel = sqrt(q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
       real dx  = min(grid.getDx(lvl), min(grid.getDy(lvl), grid.getDz(lvl)));
       DeltaT[cIdx] = dx / (a + vel + 1e-32);
+
+      // Diffusive limit dt <= dx^2 / (2 * ndim * nu_max).  The binding
+      // diffusivity is the larger of the kinematic viscosity nu = mu/rho and
+      // the thermal diffusivity kap/(rho cp) = nu*gam/Pr (Pr < 1 -> heat wins).
+      // Reported through the same DeltaT array, so the host's cfl scales both.
+      if (grid.mu > 0) {
+        real T     = q[4]/(q[0] + (real)1e-32);
+        real nu    = grid.viscosity(T)/(q[0] + (real)1e-32);
+        real numax = nu*fmax((real)1.0, gam/grid.Pr);
+        real ndim  = grid.pseudo2D ? (real)2.0 : (real)3.0;
+        real dtVis = dx*dx / ((real)2.0*ndim*numax + (real)1e-32);
+        DeltaT[cIdx] = fmin(DeltaT[cIdx], dtVis);
+      }
     }
     else {
       DeltaT[cIdx] = 1e32;
@@ -636,18 +645,73 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
   END_CELL_LOOP
 }
 
-// One-sided biased-parabola face state for the RT0 normal velocity (value+slope
-// from `self`, value from the neighbour); selected by grid.rt0Face == 1.  The
-// weights are set so the AVERAGE of the two face states is the c=1/6 face value
-//   u_f = (uL+uR)/2 + (dx/6)(gL - gR),
-// whose flux difference is the 4th-order-accurate divergence operator.  Each
-// state reduces exactly to the linear RT0 modal value uSelf+sSelf for smooth
-// data (qL==qR: no jump -> low-Mach preserving); across a discontinuity they
-// differ, and HLLC upwinds the jump (shock capture + slope relaxation).  `sSelf`
-// is the signed half-cell RT0 increment toward the face (+mxs/rho on a right
-// face, -mxs/rho on a left face) -- the same term the linear modal state uses.
-__device__ inline real parabolicFace(real uSelf, real uNbr, real sSelf) {
-  return (5.0/6.0)*uSelf + (1.0/6.0)*uNbr + (2.0/3.0)*sSelf;
+
+//
+// ---- Navier-Stokes viscous face flux --------------------------------------
+//
+// Fv at the LOW face of cell (i,j,k) in direction d (the face shared with cell
+// (i,j,k)-e_d), matching the convective fluxL/fluxD/fluxB convention.
+//
+//   tau_dc = mu ( du_d/dx_c + du_c/dx_d ) - (2/3) mu div(u) delta_dc
+//   q_d    = -kap dT/dx_d,   kap = mu*gam/((gam-1)*Pr),   T = p/rho  (R = 1)
+//   Fv     = [ 0, tau_d0, tau_d1, tau_d2, u_c tau_dc - q_d ]
+//
+// Face gradients: the FACE-NORMAL derivative is the compact two-point jump
+// (u_R - u_L)/h -- this is what keeps the viscous operator free of odd-even
+// decoupling.  The two TANGENTIAL derivatives are the average of the two
+// neighbouring cells' central differences.  Both are second-order at the face.
+// Stencil reach is (+-1, +-1), inside the 2-cell halo the convective path
+// already requires.
+//
+__device__ inline void viscFaceFlux(CompressibleSolver &grid,
+                                    real *Rho, real *U, real *V, real *W, real *P,
+                                    i32 bIdx, i32 i, i32 j, i32 k, i32 d,
+                                    real dx, real dy, real dz, real Fv[5]) {
+  const i32 di = (d == 0), dj = (d == 1), dk = (d == 2);
+  const i32 iL = grid.getNbrIdx(bIdx, i-di, j-dj, k-dk);
+  const i32 iR = grid.getNbrIdx(bIdx, i,    j,    k   );
+
+  real h[3]    = {dx, dy, dz};
+  real *Vel[3] = {U, V, W};
+
+  // velocity gradient tensor at the face: g[c][m] = d(u_c)/d(x_m)
+  real g[3][3];
+  for (i32 c = 0; c < 3; c++) {
+    g[c][d] = (Vel[c][iR] - Vel[c][iL]) / h[d];          // normal: compact jump
+    for (i32 m = 0; m < 3; m++) {
+      if (m == d) continue;
+      if (grid.pseudo2D && m == 2) { g[c][m] = 0.0; continue; }   // z is collapsed
+      const i32 mi = (m == 0), mj = (m == 1), mk = (m == 2);
+      i32 Lp = grid.getNbrIdx(bIdx, i-di+mi, j-dj+mj, k-dk+mk);
+      i32 Lm = grid.getNbrIdx(bIdx, i-di-mi, j-dj-mj, k-dk-mk);
+      i32 Rp = grid.getNbrIdx(bIdx, i+mi,    j+mj,    k+mk   );
+      i32 Rm = grid.getNbrIdx(bIdx, i-mi,    j-mj,    k-mk   );
+      g[c][m] = 0.25*((Vel[c][Lp] - Vel[c][Lm]) + (Vel[c][Rp] - Vel[c][Rm])) / h[m];
+    }
+  }
+
+  // face state (arithmetic mean) and transport coefficients
+  const real rL = Rho[iL], rR = Rho[iR];
+  const real TL = P[iL]/(rL + (real)1e-32), TR = P[iR]/(rR + (real)1e-32);
+  const real Tf = (real)0.5*(TL + TR);
+  const real mu  = grid.viscosity(Tf);
+  const real kap = mu*gam/((gam - (real)1.0)*grid.Pr);
+  const real dTdn = (TR - TL) / h[d];
+
+  const real div = g[0][0] + g[1][1] + g[2][2];
+  real tau[3];
+  for (i32 c = 0; c < 3; c++)
+    tau[c] = mu*(g[d][c] + g[c][d]) - ((c == d) ? (real)(2.0/3.0)*mu*div : (real)0.0);
+
+  const real uf = (real)0.5*(U[iL] + U[iR]);
+  const real vf = (real)0.5*(V[iL] + V[iR]);
+  const real wf = (real)0.5*(W[iL] + W[iR]);
+
+  Fv[0] = 0.0;
+  Fv[1] = tau[0];
+  Fv[2] = tau[1];
+  Fv[3] = tau[2];
+  Fv[4] = uf*tau[0] + vf*tau[1] + wf*tau[2] + kap*dTdn;   // -q_d = +kap dT/dx_d
 }
 
 __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
@@ -657,18 +721,12 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
   real *V   = grid.getField(F_RHOV);
   real *W   = grid.getField(F_RHOW);
   real *P   = grid.getField(F_RHOE);
-  real *Gx  = grid.getField(F_GX);   // RT0 slope DOFs (∂(ρu)/∂x, …); 0 in FV mode
-  real *Gy  = grid.getField(F_GY);
-  real *Gz  = grid.getField(F_GZ);
 
   real *RhsRho  = grid.getField(F_RHS + 0);
   real *RhsRhoU = grid.getField(F_RHS + 1);
   real *RhsRhoV = grid.getField(F_RHS + 2);
   real *RhsRhoW = grid.getField(F_RHS + 3);
   real *RhsRhoE = grid.getField(F_RHS + 4);
-  real *RhsGx   = grid.getField(F_RHS + 5);
-  real *RhsGy   = grid.getField(F_RHS + 6);
-  real *RhsGz   = grid.getField(F_RHS + 7);
 
   START_CELL_LOOP
     GET_CELL_INDICES
@@ -733,33 +791,23 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     qB[4] = grid.tvdRec(P[b2Idx], P[b1Idx], P[cIdx]);
     qF[4] = grid.tvdRec(P[f1Idx], P[cIdx],  P[b1Idx]);
 
-    // RT0/P0 DG: replace the limited face-normal velocity by the RT0 face state.
-    // ρ, pressure and the tangential velocities keep the reconstruction above.
-    // Modal slope mxs = (dx/2)·Gx, so a cell's right-face value is u + mxs/ρ and
-    // its left-face value is u − mxs/ρ.  rt0Face selects how the two sides meet:
-    //   0 = linear RT0 modal (each cell extrapolates its own slope), or
-    //   1 = c=1/6 biased parabola (both states average to the 4th-order c=1/6
-    //       face value; see parabolicFace).  Both are unlimited; HLLC upwinds.
-    if (grid.scheme == 1) {
-      real sxL = 0.5*dx*Gx[l1Idx]/Rho[l1Idx], sxR = 0.5*dx*Gx[cIdx]/Rho[cIdx];
-      real syL = 0.5*dy*Gy[d1Idx]/Rho[d1Idx], syR = 0.5*dy*Gy[cIdx]/Rho[cIdx];
-      real szL = 0.5*dz*Gz[b1Idx]/Rho[b1Idx], szR = 0.5*dz*Gz[cIdx]/Rho[cIdx];
-      if (grid.rt0Face == 1) {
-        qL[1] = parabolicFace(U[l1Idx], U[cIdx],  sxL);  qR[1] = parabolicFace(U[cIdx], U[l1Idx], -sxR);
-        qD[2] = parabolicFace(V[d1Idx], V[cIdx],  syL);  qU[2] = parabolicFace(V[cIdx], V[d1Idx], -syR);
-        qB[3] = parabolicFace(W[b1Idx], W[cIdx],  szL);  qF[3] = parabolicFace(W[cIdx], W[b1Idx], -szR);
-      } else {
-        qL[1] = U[l1Idx] + sxL;   qR[1] = U[cIdx] - sxR;   // x-face normal (u)
-        qD[2] = V[d1Idx] + syL;   qU[2] = V[cIdx] - syR;   // y-face normal (v)
-        qB[3] = W[b1Idx] + szL;   qF[3] = W[cIdx] - szR;   // z-face normal (w)
-      }
-    }
-
     Vec5 fluxL = grid.hllcFlux(grid.prim2cons(qL), grid.prim2cons(qR), Vec3(1,0,0));
     Vec5 fluxD = grid.hllcFlux(grid.prim2cons(qD), grid.prim2cons(qU), Vec3(0,1,0));
 
     real ax = dy*dz/vol;   // = 1/dx
     real ay = dx*dz/vol;   // = 1/dy
+
+    // Viscous face fluxes.  The conservative form is dU/dt + dFc/dx = dFv/dx,
+    // so the viscous flux enters the SAME face-scatter with the opposite sign;
+    // folding it into the convective flux keeps one accumulation per face and
+    // leaves the two sides of every face exactly equal and opposite.
+    if (grid.mu > 0) {
+      real Fv[5];
+      viscFaceFlux(grid, Rho, U, V, W, P, bIdx, i, j, k, 0, dx, dy, dz, Fv);
+      for (i32 n = 1; n < 5; n++) fluxL[n] -= Fv[n];
+      viscFaceFlux(grid, Rho, U, V, W, P, bIdx, i, j, k, 1, dx, dy, dz, Fv);
+      for (i32 n = 1; n < 5; n++) fluxD[n] -= Fv[n];
+    }
 
     real *Rhs[5] = {RhsRho, RhsRhoU, RhsRhoV, RhsRhoW, RhsRhoE};
     for (i32 n = 0; n < 5; n++) {
@@ -768,41 +816,18 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
       atomicAdd(&Rhs[n][d1Idx], - fluxD[n]*ay);
     }
 
-    // RT0 slope-DOF update: only the direction-normal faces feed a slope, and
-    // both neighbours of a face get the same-sign contribution.  Stored as the
-    // physical gradient, so d(Gx)/dt = (2/dx)·d(mxs)/dt.
-    //   face  : d(mxs)/dt −= 3·F_xmom/dx   →   RhsGx −= 6·fluxL[1]/dx²
-    //   volume: d(mxs)/dt += (6/dx)·[(mxa²+mxs²/3)/ρ + p] → RhsGx += 12/dx²·[…]
-    if (grid.scheme == 1) {
-      real rc = Rho[cIdx], pc = P[cIdx];
-      real gxF = -6.0*fluxL[1]/(dx*dx);
-      atomicAdd(&RhsGx[cIdx],  gxF);
-      atomicAdd(&RhsGx[l1Idx], gxF);
-      real mxa = rc*U[cIdx], mxs = 0.5*dx*Gx[cIdx];
-      atomicAdd(&RhsGx[cIdx], 12.0/(dx*dx)*((mxa*mxa + mxs*mxs/3.0)/rc + pc));
-
-      real gyF = -6.0*fluxD[2]/(dy*dy);
-      atomicAdd(&RhsGy[cIdx],  gyF);
-      atomicAdd(&RhsGy[d1Idx], gyF);
-      real mya = rc*V[cIdx], mys = 0.5*dy*Gy[cIdx];
-      atomicAdd(&RhsGy[cIdx], 12.0/(dy*dy)*((mya*mya + mys*mys/3.0)/rc + pc));
-    }
-
     // z-flux only in true 3D; pseudo2D never updates z-momentum (W stays 0)
     if (!grid.pseudo2D) {
       Vec5 fluxB = grid.hllcFlux(grid.prim2cons(qB), grid.prim2cons(qF), Vec3(0,0,1));
+      if (grid.mu > 0) {
+        real Fv[5];
+        viscFaceFlux(grid, Rho, U, V, W, P, bIdx, i, j, k, 2, dx, dy, dz, Fv);
+        for (i32 n = 1; n < 5; n++) fluxB[n] -= Fv[n];
+      }
       real az = dx*dy/vol;   // = 1/dz
       for (i32 n = 0; n < 5; n++) {
         atomicAdd(&Rhs[n][cIdx],    fluxB[n]*az);
         atomicAdd(&Rhs[n][b1Idx], - fluxB[n]*az);
-      }
-      if (grid.scheme == 1) {
-        real rc = Rho[cIdx], pc = P[cIdx];
-        real gzF = -6.0*fluxB[3]/(dz*dz);
-        atomicAdd(&RhsGz[cIdx],  gzF);
-        atomicAdd(&RhsGz[b1Idx], gzF);
-        real mza = rc*W[cIdx], mzs = 0.5*dz*Gz[cIdx];
-        atomicAdd(&RhsGz[cIdx], 12.0/(dz*dz)*((mza*mza + mzs*mzs/3.0)/rc + pc));
       }
     }
 
@@ -821,10 +846,7 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
 // update conservative by construction (Eq. 10).  The corner gradient is the
 // Green-Gauss formula (Eq. 20), exact for linear data on the 2x2 corner patch.
 // One-point quadrature at the corner-average state replaces the path integral
-// of |A_i| (first-order context).  FIRST-ORDER corner states: FV = P0 cell
-// averages; RT0 = P0 rho,E + the RT0 modal momentum evaluated AT the corner
-// (mxa +- mxs, mya +- mys) -- the continuous-normal-momentum DOF keeps the
-// acoustic |A| dissipation inactive for smooth low-Mach flow.
+// of |A_i| (first-order context).  FIRST-ORDER corner states: P0 cell averages.
 // Pseudo-2D only.
 //
 
@@ -913,11 +935,10 @@ __device__ inline real rec3(real a, real b, real c) {
   return (-a + 5.0*b + 2.0*c)/6.0;
 }
 
-// Raw ingredients (rho, u, v, p, RT0 normal trace) of cell (ii,jj)'s face value
+// Raw ingredients (rho, u, v, p) of cell (ii,jj)'s face value
 // in direction d at `side`, reconstructed along d by rec3 when recon==3.
 __device__ void mdFaceState1D(CompressibleSolver &grid,
                               real *Rho, real *U, real *V, real *P,
-                              real *Gx, real *Gy,
                               i32 bIdx, i32 ii, i32 jj, i32 kk,
                               i32 d, real side, real h, real out[5]) {
   i32 di = (d == 0), dj = (d == 1);
@@ -935,28 +956,8 @@ __device__ void mdFaceState1D(CompressibleSolver &grid,
     real nr = (d == 0) ? rec3(U[iu], u, U[idn]) : rec3(V[iu], v, V[idn]);
     if (rr > (real)1e-10 && pr > (real)1e-10) {   // positivity fallback
       r = rr; p = pr;
-      if (d == 0) { v = tr; if (grid.scheme != 1) u = nr; }
-      else        { u = tr; if (grid.scheme != 1) v = nr; }
-    }
-  }
-  if (grid.scheme == 1) {
-    // RT0 modal normal-velocity trace.  rt0Face==1: the c=1/6 biased parabola
-    // (5/6 self + 1/6 across-face neighbour + 2/3 modal slope), whose L/R face
-    // AVERAGE is the value whose flux difference is the 4th-order divergence
-    // operator -- the ingredient that lifts unlimited-rho/p (recon 3) runs
-    // from 2nd to 3rd order.  rt0Face==0: linear modal (c=1/4, 2nd-order).
-    real s;
-    if (d == 0) s = side*0.5*h*Gx[id]/Rho[id];
-    else        s = side*0.5*h*Gy[id]/Rho[id];
-    if (grid.rt0Face == 1) {
-      i32 di = (d == 0), dj = (d == 1);
-      i32 sgn = (side > 0) ? 1 : -1;
-      i32 idf = grid.getNbrIdx(bIdx, ii + sgn*di, jj + sgn*dj, kk);
-      if (d == 0) u = (5.0/6.0)*U[id] + (1.0/6.0)*U[idf] + (2.0/3.0)*s;
-      else        v = (5.0/6.0)*V[id] + (1.0/6.0)*V[idf] + (2.0/3.0)*s;
-    } else {
-      if (d == 0) u = U[id] + s;
-      else        v = V[id] + s;
+      if (d == 0) { v = tr; u = nr; }
+      else        { u = tr; v = nr; }
     }
   }
   out[0] = r; out[1] = u; out[2] = v; out[3] = 0.0; out[4] = p;
@@ -972,17 +973,16 @@ __device__ void mdFaceState1D(CompressibleSolver &grid,
 // form.  Positivity falls back to the 1D (or raw) value.
 __device__ void mdFaceState(CompressibleSolver &grid,
                             real *Rho, real *U, real *V, real *P,
-                            real *Gx, real *Gy,
                             i32 bIdx, i32 ii, i32 jj, i32 kk,
                             i32 d, real side, real tside, real h, real out[5]) {
-  mdFaceState1D(grid, Rho, U, V, P, Gx, Gy, bIdx, ii, jj, kk, d, side, h, out);
+  mdFaceState1D(grid, Rho, U, V, P, bIdx, ii, jj, kk, d, side, h, out);
   if (tside == 0.0 || grid.recon != 3) return;
 
   // face values of the two tangential neighbour rows
   i32 ti = (d == 0) ? 0 : 1, tj = 1 - ti;      // tangential unit offset
   real qm[5], qp[5];
-  mdFaceState1D(grid, Rho, U, V, P, Gx, Gy, bIdx, ii - ti, jj - tj, kk, d, side, h, qm);
-  mdFaceState1D(grid, Rho, U, V, P, Gx, Gy, bIdx, ii + ti, jj + tj, kk, d, side, h, qp);
+  mdFaceState1D(grid, Rho, U, V, P, bIdx, ii - ti, jj - tj, kk, d, side, h, qm);
+  mdFaceState1D(grid, Rho, U, V, P, bIdx, ii + ti, jj + tj, kk, d, side, h, qp);
 
   real c[5];
   for (i32 n = 0; n < 5; n++)
@@ -998,27 +998,22 @@ __device__ void mdFaceState(CompressibleSolver &grid,
 // deterministic: same inputs, same expression) which keeps assembly conservative.
 __device__ void mdCornerFlux(CompressibleSolver &grid,
                              real *Rho, real *U, real *V, real *W, real *P,
-                             real *Gx, real *Gy,
-                             i32 bIdx, i32 ic, i32 jc, i32 k,
+                              i32 bIdx, i32 ic, i32 jc, i32 k,
                              real dx, real dy, real Fx[5], real Fy[5]) {
     // the 4 cells sharing the vertex: (ic-1..ic) x (jc-1..jc)
     // sign of the corner relative to each cell's centre (sx, sy)
     const real csx[4] = { 1.0, -1.0,  1.0, -1.0};
     const real csy[4] = { 1.0,  1.0, -1.0, -1.0};
 
-    // Per-direction corner states, mirroring the face-based RT0 structure: the
-    // direction-i flux tensor sees the MODAL momentum only in its own normal
-    // component (u for F^x, v for F^y); the tangential momentum stays P0.  The
-    // fully-coupled variant (both components modal in both tensors) closes a
-    // Gx<->Gy cross-advection loop damped only by the near-zero shear
-    // eigenvalue and blows up on 2D shocks.
+    // Per-direction corner states: the direction-i flux tensor sees the
+    // momentum in its own normal component (u for F^x, v for F^y).
     real Qx[4][5], Qy[4][5];   // conservative corner states per flux direction
     real fx[4][5], fy[4][5];
     for (i32 m = 0; m < 4; m++) {
       i32 xi = ic - 1 + (m & 1), yj = jc - 1 + (m >> 1);   // quad cell coords
       real px[5], py[5];
-      mdFaceState(grid, Rho, U, V, P, Gx, Gy, bIdx, xi, yj, k, 0, csx[m], csy[m], dx, px);
-      mdFaceState(grid, Rho, U, V, P, Gx, Gy, bIdx, xi, yj, k, 1, csy[m], csx[m], dy, py);
+      mdFaceState(grid, Rho, U, V, P, bIdx, xi, yj, k, 0, csx[m], csy[m], dx, px);
+      mdFaceState(grid, Rho, U, V, P, bIdx, xi, yj, k, 1, csy[m], csx[m], dy, py);
       Qx[m][0] = px[0];  Qx[m][1] = px[0]*px[1];  Qx[m][2] = px[0]*px[2];  Qx[m][3] = 0.0;
       Qx[m][4] = px[4]/(gam - 1.0) + 0.5*px[0]*(px[1]*px[1] + px[2]*px[2]);
       Qy[m][0] = py[0];  Qy[m][1] = py[0]*py[1];  Qy[m][2] = py[0]*py[2];  Qy[m][3] = 0.0;
@@ -1053,8 +1048,7 @@ __device__ void mdCornerFlux(CompressibleSolver &grid,
     // dissipation coefficient 1/2 calibrated so the 1D (y-uniform) limit of the
     // assembled face flux is exactly the Roe/Osher flux 1/2(fL+fR) - 1/2|A|dQ
     // (h grad Q reduces to the 1D jump there); 1/4 (the naive 1/|C_p| carry-over
-    // from the paper's d+1-cell corners) is half-dissipative and unstable with
-    // the RT0 slope-DOF shock feedback.
+    // from the paper's d+1-cell corners) is half-dissipative and unstable.
     for (i32 n = 0; n < 5; n++) {
       real cx = 0.0, cy = 0.0;
       for (i32 m = 0; m < 4; m++) { cx += fx[m][n]; cy += fy[m][n]; }
@@ -1120,26 +1114,8 @@ __global__ void hancockPredictKernel(CompressibleSolver &grid) {
     grid.getField(F_OLD + F_RHOW)[cIdx] = 0.0;
     grid.getField(F_OLD + F_RHOE)[cIdx] = po;
 
-    // RT0 slope DOFs: half-step via their own DG update with central face
-    // momentum fluxes (a stale-g predictor leaves the dispersive g<->p coupling
-    // a full dt behind and blows up by CFL ~0.4)
-    real gx = grid.getField(F_GX)[cIdx], gy = grid.getField(F_GY)[cIdx];
-    if (grid.scheme == 1) {
-      real fc[5], gc[5];
-      mdPhysFlux(r0, u0, v0, 0.0, p0, 0, fc);
-      mdPhysFlux(r0, u0, v0, 0.0, p0, 1, gc);
-      real mxs = 0.5*dx*gx, mys = 0.5*dy*gy;
-      real Fbx = (r0*u0*r0*u0 + mxs*mxs/3.0)/r0 + p0;
-      real Fby = (r0*v0*r0*v0 + mys*mys/3.0)/r0 + p0;
-      // central face fluxes: FxL ~ (f(l1)+f(c))/2, FxR ~ (f(c)+f(r1))/2
-      real fxs = fc[1] + 0.5*(fm[1] + fp[1]);   // FxL[1] + FxR[1]
-      real fys = gc[2] + 0.5*(gm[2] + gp[2]);   // FyB[2] + FyT[2]
-      gx += 0.5*grid.deltaT*(6.0/(dx*dx))*(2.0*Fbx - fxs);
-      gy += 0.5*grid.deltaT*(6.0/(dy*dy))*(2.0*Fby - fys);
-    }
-    grid.getField(F_OLD + F_GX)[cIdx] = gx;
-    grid.getField(F_OLD + F_GY)[cIdx] = gy;
-    grid.getField(F_OLD + F_GZ)[cIdx] = 0.0;
+    grid.getField(F_OLD + F_RHOK  )[cIdx] = grid.getField(F_RHOK  )[cIdx];
+    grid.getField(F_OLD + F_RHOTAU)[cIdx] = grid.getField(F_RHOTAU)[cIdx];
 
   END_CELL_LOOP
 }
@@ -1147,8 +1123,7 @@ __global__ void hancockPredictKernel(CompressibleSolver &grid) {
 // MultiD corner-flux RHS: computes the cell's 4 vertex flux tensors on the fly,
 // the 4 face-midpoint 1D Osher fluxes, and assembles the faces by Simpson's
 // rule (Eq. 9 generalized).  Gather form -- no atomics; Rhs was zeroed by
-// updateFieldsKernel.  RT0 slope DOFs use the same Simpson face momentum
-// fluxes in the standard DG weak-form update.
+// updateFieldsKernel.
 __global__ void multiDRhsKernel(CompressibleSolver &grid) {
   // mdFlux==2 (CTU-Hancock): every state -- corners, midpoints, reconstruction
   // stencils -- comes from the HALF-STEP-PREDICTED primitives in the Old bank,
@@ -1160,8 +1135,6 @@ __global__ void multiDRhsKernel(CompressibleSolver &grid) {
   real *V   = grid.getField(fb + F_RHOV);
   real *W   = grid.getField(fb + F_RHOW);
   real *P   = grid.getField(fb + F_RHOE);
-  real *Gx  = grid.getField(fb + F_GX);
-  real *Gy  = grid.getField(fb + F_GY);
 
   START_CELL_LOOP
     GET_CELL_INDICES
@@ -1173,34 +1146,32 @@ __global__ void multiDRhsKernel(CompressibleSolver &grid) {
 
     // flux tensors at this cell's 4 vertices, computed in place
     real xLL[5], yLL[5], xLR[5], yLR[5], xUL[5], yUL[5], xUR[5], yUR[5];
-    mdCornerFlux(grid, Rho, U, V, W, P, Gx, Gy, bIdx, i,   j,   k, dx, dy, xLL, yLL);
-    mdCornerFlux(grid, Rho, U, V, W, P, Gx, Gy, bIdx, i+1, j,   k, dx, dy, xLR, yLR);
-    mdCornerFlux(grid, Rho, U, V, W, P, Gx, Gy, bIdx, i,   j+1, k, dx, dy, xUL, yUL);
-    mdCornerFlux(grid, Rho, U, V, W, P, Gx, Gy, bIdx, i+1, j+1, k, dx, dy, xUR, yUR);
+    mdCornerFlux(grid, Rho, U, V, W, P, bIdx, i,   j,   k, dx, dy, xLL, yLL);
+    mdCornerFlux(grid, Rho, U, V, W, P, bIdx, i+1, j,   k, dx, dy, xLR, yLR);
+    mdCornerFlux(grid, Rho, U, V, W, P, bIdx, i,   j+1, k, dx, dy, xUL, yUL);
+    mdCornerFlux(grid, Rho, U, V, W, P, bIdx, i+1, j+1, k, dx, dy, xUR, yUR);
 
     // Face-midpoint 1D Osher-Solomon fluxes (the 1D member of the same Osher
-    // family as the corner tensors; first-order states with the RT0 modal
-    // normal velocity -- the modal terms vanish in FV mode where G = 0).
-    // Each face is evaluated identically by its two sharing cells -> conservative.
-    real rc = Rho[cIdx], pc = P[cIdx];
+    // family as the corner tensors).  Each face is evaluated identically by its
+    // two sharing cells -> conservative.
 
     // Face-midpoint donor states via mdFaceState (raw P0, or recon==3
-    // unlimited parabolic; RT0 modal normal velocity in scheme 1), evaluated
+    // unlimited parabolic), evaluated
     // on the fb bank (predicted field under CTU-Hancock).
     real qA[5], qB[5];
     real FxLm[5], FxRm[5], FyBm[5], FyTm[5];
     {
-      mdFaceState(grid, Rho, U, V, P, Gx, Gy, bIdx, i-1, j, k, 0,  1.0, 0.0, dx, qA);
-      mdFaceState(grid, Rho, U, V, P, Gx, Gy, bIdx, i,   j, k, 0, -1.0, 0.0, dx, qB);
+      mdFaceState(grid, Rho, U, V, P, bIdx, i-1, j, k, 0,  1.0, 0.0, dx, qA);
+      mdFaceState(grid, Rho, U, V, P, bIdx, i,   j, k, 0, -1.0, 0.0, dx, qB);
       osher1dFlux(qA[0],qA[1],qA[2],qA[3],qA[4], qB[0],qB[1],qB[2],qB[3],qB[4], 0, FxLm);
-      mdFaceState(grid, Rho, U, V, P, Gx, Gy, bIdx, i,   j, k, 0,  1.0, 0.0, dx, qA);
-      mdFaceState(grid, Rho, U, V, P, Gx, Gy, bIdx, i+1, j, k, 0, -1.0, 0.0, dx, qB);
+      mdFaceState(grid, Rho, U, V, P, bIdx, i,   j, k, 0,  1.0, 0.0, dx, qA);
+      mdFaceState(grid, Rho, U, V, P, bIdx, i+1, j, k, 0, -1.0, 0.0, dx, qB);
       osher1dFlux(qA[0],qA[1],qA[2],qA[3],qA[4], qB[0],qB[1],qB[2],qB[3],qB[4], 0, FxRm);
-      mdFaceState(grid, Rho, U, V, P, Gx, Gy, bIdx, i, j-1, k, 1,  1.0, 0.0, dy, qA);
-      mdFaceState(grid, Rho, U, V, P, Gx, Gy, bIdx, i, j,   k, 1, -1.0, 0.0, dy, qB);
+      mdFaceState(grid, Rho, U, V, P, bIdx, i, j-1, k, 1,  1.0, 0.0, dy, qA);
+      mdFaceState(grid, Rho, U, V, P, bIdx, i, j,   k, 1, -1.0, 0.0, dy, qB);
       osher1dFlux(qA[0],qA[1],qA[2],qA[3],qA[4], qB[0],qB[1],qB[2],qB[3],qB[4], 1, FyBm);
-      mdFaceState(grid, Rho, U, V, P, Gx, Gy, bIdx, i, j,   k, 1,  1.0, 0.0, dy, qA);
-      mdFaceState(grid, Rho, U, V, P, Gx, Gy, bIdx, i, j+1, k, 1, -1.0, 0.0, dy, qB);
+      mdFaceState(grid, Rho, U, V, P, bIdx, i, j,   k, 1,  1.0, 0.0, dy, qA);
+      mdFaceState(grid, Rho, U, V, P, bIdx, i, j+1, k, 1, -1.0, 0.0, dy, qB);
       osher1dFlux(qA[0],qA[1],qA[2],qA[3],qA[4], qB[0],qB[1],qB[2],qB[3],qB[4], 1, FyTm);
     }
 
@@ -1208,10 +1179,8 @@ __global__ void multiDRhsKernel(CompressibleSolver &grid) {
     // 1/6 corner.  The row-local midpoint solver supplies the upwind coupling
     // and dissipation that the pure corner trapezoid lacks -- in particular it
     // damps the diagonal-checkerboard mode the corner tensors are exactly
-    // blind to, and it makes the same face flux a stable feed for the RT0
-    // slope DOFs.  1D limit stays exactly the Roe/Osher-scaled flux.
-    real FxL1 = 0, FxR1 = 0, FyB2 = 0, FyT2 = 0;   // momentum components for the slopes
-    real L[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    // blind to.  1D limit stays exactly the Roe/Osher-scaled flux.
+    real L[NEVOLVE] = {0};
     for (i32 n = 0; n < 5; n++) {
       const real w6 = 1.0/6.0, w23 = 2.0/3.0;
       real FxL = w6*(xLL[n] + xUL[n]) + w23*FxLm[n];   // left  face (i-1/2, j)
@@ -1219,20 +1188,6 @@ __global__ void multiDRhsKernel(CompressibleSolver &grid) {
       real FyB = w6*(yLL[n] + yLR[n]) + w23*FyBm[n];   // bottom face (i, j-1/2)
       real FyT = w6*(yUL[n] + yUR[n]) + w23*FyTm[n];   // top    face (i, j+1/2)
       L[n] = (FxL - FxR)/dx + (FyB - FyT)/dy;
-      if (n == 1) { FxL1 = FxL; FxR1 = FxR; }
-      if (n == 2) { FyB2 = FyB; FyT2 = FyT; }
-    }
-
-    if (grid.scheme == 1) {
-      // RT0 slope DOFs: DG weak form fed by the SAME Simpson face momentum
-      // fluxes as the conserved update (consistent; the 2/3 row-local midpoint
-      // weight keeps the slope's transverse modes damped).
-      //   d(mxs)/dt = (3/dx) [ 2 Fbar - (F_R + F_L) ],  Fbar = (mxa^2+mxs^2/3)/rho + p
-      // stored as the physical gradient: dG/dt = (2/dx) d(mxs)/dt.
-      real mxa = rc*U[cIdx], mxs = 0.5*dx*Gx[cIdx];
-      real mya = rc*V[cIdx], mys = 0.5*dy*Gy[cIdx];
-      L[5] = (6.0/(dx*dx))*(2.0*((mxa*mxa + mxs*mxs/3.0)/rc + pc) - (FxR1 + FxL1));
-      L[6] = (6.0/(dy*dy))*(2.0*((mya*mya + mys*mys/3.0)/rc + pc) - (FyT2 + FyB2));
     }
 
     if (grid.mdFlux == 2) {
@@ -1250,9 +1205,6 @@ __global__ void multiDRhsKernel(CompressibleSolver &grid) {
       grid.getField(F_RHOV)[cIdx] = rl*vl + dt*L[2];
       grid.getField(F_RHOW)[cIdx] = 0.0;
       grid.getField(F_RHOE)[cIdx] = pl/(gam - 1.0) + 0.5*rl*(ul*ul + vl*vl) + dt*L[4];
-      grid.getField(F_GX)[cIdx] += dt*L[5];
-      grid.getField(F_GY)[cIdx] += dt*L[6];
-      grid.getField(F_GZ)[cIdx]  = 0.0;
     } else {
       // LSRK: accumulate L onto the pre-scaled accumulator bank
       for (i32 n = 0; n < NEVOLVE; n++)
@@ -1291,10 +1243,9 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
         Q[cIdx] += Bw[stage] * dt * S[cIdx];
       }
 
-      // pseudo2D: z-momentum and its RT0 slope are never evolved
+      // pseudo2D: z-momentum is never evolved
       if (grid.pseudo2D) {
         grid.getField(F_RHOW)[cIdx] = 0;
-        grid.getField(F_GZ)[cIdx]   = 0;
       }
     }
 
@@ -1548,83 +1499,13 @@ __device__ real waveletPredict(MultiLevelSparseGrid &grid, real *Q, i32 prntIdx,
 }
 
 //
-// RT0 flux-preserving prolongation of the momentum DOFs.  The Deslauriers-Dubuc
-// prediction above is second-order accurate but does NOT reproduce a cell's RT0
-// face-normal-momentum DOF on refinement, so it leaks flux at coarse/fine faces.
-//
-// For a momentum component with normal direction d (x-mom -> d=x, ...) the child
-// cell-average is corrected so that the four fine faces tiling a parent face
-// average exactly to the parent's face DOF, and the interior fine faces stay
-// continuous.  The correction is: replace the DD normal-direction slope of the
-// average by the exact RT0 own-slope  s_d*(dx_child/2)*grad_p , and (for the
-// gradient DOF) drop its normal-direction variation entirely (RT0 momentum is
-// linear along its own axis, so its axis-derivative is constant there).  All the
-// transverse (y,z) and cross terms of DD are kept — they are zero-mean over the
-// four sub-faces, so they add tangential detail without breaking conservation.
-//
-// Normal-direction stencil offsets (which DD term to remove):
-//   d=0(x): s=xs, (nm,np)=(l,r)   d=1(y): s=ys,(d,u)   d=2(z): s=zs,(b,f)
-//
-__device__ real
-waveletPredictNormalSlope(MultiLevelSparseGrid &grid, real *Q, i32 prntIdx,
-                          i32 ip, i32 jp, i32 kp, real xs, real ys, real zs, i32 dir) {
-  real s; i32 nm, np;
-  if (dir == 0)      { s = xs; nm = grid.getNbrIdx(prntIdx, ip-1, jp, kp); np = grid.getNbrIdx(prntIdx, ip+1, jp, kp); }
-  else if (dir == 1) { s = ys; nm = grid.getNbrIdx(prntIdx, ip, jp-1, kp); np = grid.getNbrIdx(prntIdx, ip, jp+1, kp); }
-  else               { s = zs; nm = grid.getNbrIdx(prntIdx, ip, jp, kp-1); np = grid.getNbrIdx(prntIdx, ip, jp, kp+1); }
-  return s/8.0*(Q[np] - Q[nm]);
-}
-
-// prolongate the momentum cell-average (avg) paired with its gradient DOF (grad):
-//   DD prediction  -  DD normal-slope  +  RT0 own-slope [ = s*(dx_child/2)*grad_p ]
-__device__ real
-waveletPredictMomentum(MultiLevelSparseGrid &grid, real *avg, real *grad, i32 prntIdx,
-                       i32 ip, i32 jp, i32 kp, real xs, real ys, real zs,
-                       i32 dir, real dxChild) {
-  real base = waveletPredict(grid, avg, prntIdx, ip, jp, kp, xs, ys, zs);
-  base -= waveletPredictNormalSlope(grid, avg, prntIdx, ip, jp, kp, xs, ys, zs, dir);
-  real s  = (dir == 0) ? xs : (dir == 1 ? ys : zs);
-  i32  p  = grid.getNbrIdx(prntIdx, ip, jp, kp);
-  base += s * (0.5*dxChild) * grad[p];
-  return base;
-}
-
-// prolongate a momentum-gradient DOF: DD prediction minus its normal-direction
-// variation (kept constant along its own axis, per the RT0 linear-in-normal model)
-__device__ real
-waveletPredictGrad(MultiLevelSparseGrid &grid, real *grad, i32 prntIdx,
-                   i32 ip, i32 jp, i32 kp, real xs, real ys, real zs, i32 dir) {
-  real base = waveletPredict(grid, grad, prntIdx, ip, jp, kp, xs, ys, zs);
-  base -= waveletPredictNormalSlope(grid, grad, prntIdx, ip, jp, kp, xs, ys, zs, dir);
-  return base;
-}
-
-//
-// Predict evolved field f at a child cell from its parent block, dispatching to
-// the RT0 flux-preserving prolongation for the momentum DOFs and to plain DD for
-// the P0 scalars (ρ, E).  baseOff selects the field bank (0 = current, F_OLD =
-// the wavelet-transform reference snapshot).
+// Predict evolved field f at a child cell from its parent block by the
+// interpolating-wavelet (Deslauriers-Dubuc) stencil.  Every evolved field is a
+// P0 cell average, so one prolongation serves them all.
 //
 __device__ real
 predictEvolvedField(CompressibleSolver &grid, i32 baseOff, i32 f, i32 prntIdx,
                     i32 ip, i32 jp, i32 kp, real xs, real ys, real zs, i32 lvl) {
-  // finite-volume mode carries no RT0 slope DOFs -> plain DD for every field
-  if (grid.scheme != 1) {
-    real *Q = grid.getField(baseOff + f);
-    return waveletPredict(grid, Q, prntIdx, ip, jp, kp, xs, ys, zs);
-  }
-  if (f >= F_RHOU && f <= F_RHOW) {
-    i32 d = f - F_RHOU;
-    real *avg  = grid.getField(baseOff + F_RHOU + d);
-    real *grad = grid.getField(baseOff + F_GX   + d);
-    real dxd = (d == 0) ? grid.getDx(lvl) : (d == 1 ? grid.getDy(lvl) : grid.getDz(lvl));
-    return waveletPredictMomentum(grid, avg, grad, prntIdx, ip, jp, kp, xs, ys, zs, d, dxd);
-  }
-  else if (f >= F_GX && f <= F_GZ) {
-    i32 d = f - F_GX;
-    real *grad = grid.getField(baseOff + F_GX + d);
-    return waveletPredictGrad(grid, grad, prntIdx, ip, jp, kp, xs, ys, zs, d);
-  }
   real *Q = grid.getField(baseOff + f);
   return waveletPredict(grid, Q, prntIdx, ip, jp, kp, xs, ys, zs);
 }
@@ -1700,7 +1581,7 @@ __global__ void detailToScratchKernel(CompressibleSolver &grid, i32 mode) {
 
       real ind = 0.0;
       for (i32 f = 0; f < NEVOLVE; f++) {
-        if (f >= F_GX) continue;                       // match thresholding: primary fields only
+        if (f >= F_RHOK) continue;                     // match thresholding: primary fields only
         if (grid.pseudo2D && f == F_RHOW) continue;
         if (mode == 1 && f != F_RHO)  continue;
         if (mode == 2 && !(f >= F_RHOU && f <= F_RHOW)) continue;
@@ -1899,13 +1780,11 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
       else
       for (i32 f = 0; f < NEVOLVE; f++) {
         // Refine only on the PRIMARY conserved fields (rho, momentum, rhoE).
-        //  - The RT0 slope DOFs (Gx,Gy,Gz) are auxiliary sub-cell moments, not
-        //    primary fields: refining on them adds spurious grid (their detail
-        //    is noisy where G/rho is large, i.e. low-density regions) and is the
-        //    main source of the RT0-mode over-refinement.
+        //  - The k~/tau~ pair is a modelled quantity, not a primary field, and
+        //    is excluded so it cannot drive the grid on its own.
         //  - z-momentum is identically 0 in pseudo-2D, so it never fires anyway;
         //    skip it explicitly so a stray roundoff detail can never trigger.
-        if (f >= F_GX) continue;                               // skip Gx,Gy,Gz
+        if (f >= F_RHOK) continue;                             // skip the k~/tau~ pair
         if (grid.pseudo2D && f == F_RHOW) continue;            // z-mom is 0 in 2D
         real *Q = grid.getField(f);
         // normalize the detail by the domain max of this field's scale
@@ -1962,7 +1841,7 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
       }
       else {
         for (i32 f = 0; f < NEVOLVE; f++) {
-          if (f >= F_GX) continue;                         // primary fields only
+          if (f >= F_RHOK) continue;                       // primary fields only
           if (grid.pseudo2D && f == F_RHOW) continue;      // z-mom is 0 in 2D
           i32 sc = (f == F_RHO) ? 0 : (f <= F_RHOW ? 1 : 2);
           real mag = fmax(grid.globalScale[sc], (real)1e-32);

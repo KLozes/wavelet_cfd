@@ -11,9 +11,9 @@
 //
 //   testCase 0 : pseudo-2D / quasi-1D Sod shock tube (validated vs exact)
 //   testCase 1 : 2D circular Sod explosion with adaptive mesh refinement
-//   testCase 2 : isentropic vortex on [0,10]^2 (RT0/P0 DG validation, pseudo-2D)
+//   testCase 2 : isentropic vortex on [0,10]^2 (stationarity check, pseudo-2D)
 //   testCase 3 : true-3D spherical Sod explosion (exercises the z / Gz paths)
-//   testCase 4 : Gresho vortex on [0,1]^2, low-Mach (RT0 low-Mach preservation)
+//   testCase 4 : Gresho vortex on [0,1]^2, low-Mach preservation
 //   testCase 5 : Gresho vortex on a STATIC radial AMR grid (fine at centre,
 //                coarse outward) — tests flow crossing fixed coarse/fine faces
 //   testCase 6 : circular Sod explosion on a static radial AMR grid — measures
@@ -23,20 +23,15 @@
 //   --nlvls N    number of refinement levels           (per-case default)
 //   --nblocks N  base blocks in x                       (per-case default)
 //   --wthresh X  wavelet detail threshold               (per-case default)
-//   --scheme N   0 = finite volume (HLLC+TVD), 1 = RT0/P0 DG  (>=2 -> 1)
 //   --ma X       Gresho Mach / acConv amplitude / testCase-1 inner pressure
 //   --bc N       BC: 0 slip wall, 1 no-slip, 2 periodic, 3 transmissive
 //   --recon N    0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola
 //   --tend X     end time override                      (per-case default)
-//   --rt0face N  RT0 normal face (scheme 1): 0 = linear modal (default),
-//                1 = c=1/6 biased parabola (4th-order face average)
 //   --mdflux N   1 = genuinely multidimensional Osher-type corner flux
 //                (Gaburro-Ricchiuto-Dumbser, arXiv:2506.00207); 2 = CTU-Hancock:
 //                half-step predictor + single-Euler corrector, 2nd order in
-//                time, single flux sweep per step.  Stable CFL: FV ~1.2,
-//                RT0 ~0.35 (the slope DOFs are near-imaginary modes and the
-//                midpoint-class corrector leaks above that; RK3 for margin).
-//                pseudo-2D only; states follow --recon/--rt0face
+//                time, single flux sweep per step.  Stable CFL ~1.2.
+//                pseudo-2D only; states follow --recon
 //   --cfl X      CFL number (default 0.40; dt = cfl * min(dx/(|u|+c)))
 //
 // Back-compat: `./wave3d N` (bare first arg) still selects the test case.
@@ -73,16 +68,19 @@ static void runRank(int argc, char* argv[]) {
   i32 nLvls    = argI("--nlvls", (testCase == 1 ? 4 : (testCase == 5 ? 3 : (sodAmr ? 3 : (acoustic ? 3 : 1)))));
   i32 nBlocksX = argI("--nblocks", (testCase == 1 ? 16 : (testCase == 2 ? 40 : (testCase == 3 ? 8 : (testCase == 4 ? 40 : (testCase == 5 ? 10 : (sodAmr ? 16 : (acoustic ? 64 : (acConv ? 8 : 100)))))))));
   real wThresh = argF("--wthresh", (testCase == 1 ? 0.004 : 0.01));
-  i32 scheme   = argI("--scheme", (sodAmr ? 0 : (testCase >= 2 ? 1 : 0)));
   bool haveMa  = hasArg("--ma");
   real Ma      = haveMa ? argF("--ma", 0.1) : 0.1;   // Gresho Mach number / acConv amplitude
   i32 bcArg    = argI("--bc", -1);                   // bcType override (-1 = per-testCase default)
   i32 reconA   = argI("--recon", 1);                 // 0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola (smooth only)
   real tEndArg = argF("--tend", -1.0);               // tEnd override (-1 = per-testCase default)
-  i32 rt0FaceA = argI("--rt0face", 0);               // RT0 normal face (scheme==1): 0=linear modal (default), 1=c=1/6 parabola
   i32 mdFluxA  = argI("--mdflux", 0);                // 1 = multidimensional Osher-type corner flux (first-order states)
   real cflArg  = argF("--cfl", -1.0);                // CFL override (-1 = default 0.40; dt = cfl*min(dx/(|u|+c)))
   real advectA = argF("--advect", 0.0);              // isentropic-vortex (case 2) advection velocity u0=v0 (periodic seam-crossing test)
+  real muArg   = argF("--mu",  0.0);                 // dynamic viscosity (0 = inviscid)
+  real reArg   = argF("--re",  0.0);                 // Reynolds number -> mu = 1/Re
+  real prArg   = argF("--pr",  0.72);                // Prandtl number
+  real suthArg = argF("--suth", 0.0);                // Sutherland S/Tref (0 = constant mu)
+  real trefArg = argF("--tref", 1.0);                // Sutherland reference temperature
   i32 zcurveA  = argI("--zcurve", 1);                // partition: 1 = space-filling-curve (Hilbert) weight-balanced cut (default), 0 = box strips
   i32 rebalA   = argI("--rebalance", 0);             // dynamic rebalance period, adaptation cycles (0 = off; EXPERIMENTAL)
   i32 debugA   = argI("--debug", 0);                 // 1 = run topology/data integrity assert kernels each cycle
@@ -116,7 +114,6 @@ static void runRank(int argc, char* argv[]) {
   solver->pseudo2D        = (baseGridSize[2] == blockSize) ? 1 : 0;  // collapse z (pseudo-2D)
   solver->cfl             = cfl;
   solver->waveletThresh   = wThresh;
-  solver->scheme          = scheme;
   solver->icType          = (testCase == 1 || sodAmr) ? 1 : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : 0)))));
   solver->bcType          = (bcArg >= 0) ? bcArg : ((acConv || testCase == 1) ? 2 : 3);   // periodic for the acoustic wave and circular Sod; else transmissive
   solver->vortexAdvect    = acConv ? Ma : (testCase == 2 ? advectA : sodPin);  // acConv: wave amplitude A; case 2: vortex advection; testCase 1: Sod inner pressure
@@ -124,10 +121,13 @@ static void runRank(int argc, char* argv[]) {
   solver->staticGrid      = acoustic ? 3 : ((testCase == 5 || sodAmr) ? 1 : 0);   // 1=radial shells, 2=planar band, 3=centre step
   solver->refineRadius    = 0.4;                        // fine-region half-extent (unused for the step)
   solver->recon           = reconA;                     // face reconstruction (TVD / ROUND / LD-ROUND)
-  solver->rt0Face         = rt0FaceA;                    // RT0 normal face: 0=linear modal, 1=c=1/6 parabola
   solver->mdFlux          = mdFluxA;                     // multidimensional Osher-type corner flux
   solver->rebalanceEvery  = rebalA;                     // dynamic Z-curve rebalance period
   solver->dbgChecks       = debugA;                     // integrity assert kernels (--debug 1)
+  solver->mu              = (reArg > 0) ? (real)(1.0/reArg) : muArg;
+  solver->Pr              = prArg;
+  solver->sutherS         = suthArg;
+  solver->sutherTref      = trefArg;
   solver->immerserdBcType = 0;
   solver->initialize();
 
