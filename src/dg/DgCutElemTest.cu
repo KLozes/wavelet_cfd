@@ -74,6 +74,16 @@ int main(void) {
     if (!cutElemBuild(phi, N, E, ar, cfg, sc)) {
       printf("%-22s   BUILD FAILED\n", c.name); allok=false; continue;
     }
+    // E.snap != 0 means the cut machinery declined the cell as a cut element
+    // (a sub-resolution feature dropped geometrically).  No operators are
+    // built, so there is nothing to gate -- and since the degree ladder was
+    // removed, this is now the ONLY outcome for a cell that cannot carry its
+    // own degree.  Reporting it is the point; treating it as a failure is not.
+    if (E.snap) {
+      printf("%-22s %8.5f %9.5f   SNAPPED to %s (sub-resolution feature dropped)\n",
+             c.name, E.volume, E.wallArea, E.snap == 1 ? "FLUID" : "SOLID");
+      continue;
+    }
 
     // ---- GCL on the solution basis ---------------------------------------
     const i32 nb=E.B.nb;

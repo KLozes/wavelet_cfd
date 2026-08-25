@@ -84,9 +84,20 @@
 //  exists to reproduce, and it stops early with a residual the repair cannot
 //  remove (measured: free-stream 4.6e-07 vs 2.3e-09).  Default here is 1e-13.
 // ---------------------------------------------------------------------------
-// rules smaller than this are left alone: they cost nothing and Saye already
-// made them exact, so pruning them can only lose moments
-static constexpr i32 kPruneMin = 200;
+// Rules at or below this are left alone.  MEASURED, not guessed (P2, case 9,
+// sweeping the existing Potter/NNLS prune over gtol):
+//   a 1500-pt near-tangency FACE  -> 15 pts, moment error 1.1e-15  at the
+//     DEFAULT gtol 1e-9 -- the existing machinery is already exact here;
+//   a 200-pt face                 -> 15 pts, 1.4e-16;
+//   the 100-pt WALL rule          -> saturates at 2.4e-11 however tight the
+//     tolerance, keeping 96 of 100 points.  Not an NNLS failure: 100 points
+//     against a 105-function normal-weighted moment space is already minimal,
+//     exactly as CutQuadCompress.h's header says of surface rules.
+// So: prune faces (all of them), never the wall.  The wall's remaining cost is
+// z-over-resolution -- cfg.ng = 10 puts 10 Gauss points along a pseudo-2D
+// z-extrusion where degree 2N needs N+1 -- which is a rule-construction lever,
+// not a pruning one.
+static constexpr i32 kPruneMin = 32;
 
 struct CutPruneStat {
   i32    nIn = 0, nOut = 0;
@@ -255,7 +266,7 @@ inline bool cutEsBuild(const CutElemOps &E, CutEsOps &S,
     if (f < 6) fixedN[f/2] = (f%2) ? 1.0 : -1.0;
     const std::vector<SayeNode> *use = &raw;
     std::vector<SayeNode> pruned;
-    if (prune && (i32)raw.size() > kPruneMin) {
+    if (prune && f < 6 && (i32)raw.size() > kPruneMin) {
       CutPruneStat st = cutPruneRule(raw, Bm, /*vecMoments=*/(f == 6),
                                      (f < 6) ? fixedN : nullptr, pruned, gtol);
       // NEVER TRADE THE DIVERGENCE THEOREM FOR POINT COUNT.  A prune perturbs

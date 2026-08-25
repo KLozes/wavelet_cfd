@@ -149,7 +149,9 @@ int main(void) {
     {6, 6, "wedge   (6,6)"},      // vol 0.087, thickness 0.083 -- the tangency wedge
     {7, 6, "quarter (7,6)"},      // vol 0.685 -- the well-resolved cut
   };
-  const i32 degs[] = {1, 2};      // P1 and P2: the target degrees
+  i32 degsBuf[3] = {1,2,3};
+  const i32 nDegs = getenv("ES_DEG3") ? 3 : 2;
+  const i32 *degs = degsBuf;      // P1 and P2: the target degrees
 
   setenv("CUT_THINTOL", "0", 1);  // let the N argument set the degree, not the thin rule
 
@@ -194,7 +196,7 @@ int main(void) {
   bool allok = true;
 
   for (const Cell &c : cells) {
-    for (i32 N : degs) {
+    for (i32 di = 0; di < nDegs; di++) { const i32 N = degs[di];
       // ---- build the cut element exactly as the solver does --------------
       std::vector<real> v((size_t)n*n*n);
       for (i32 k=0;k<n;k++) for (i32 j=0;j<n;j++) for (i32 i=0;i<n;i++) {
@@ -219,6 +221,27 @@ int main(void) {
 
       const double sbp = cutEsSbpDefect(S);
       const double qh1 = cutEsQH1(S);
+      if (getenv("ES_COST")) {
+        // What does flux differencing ACTUALLY evaluate?  The volume rule is
+        // NNLS-compressed plus zero-weight padding to 2*nG+8 (CutElem.h:260),
+        // and Q_d[i][j] and E[a][i] are both proportional to w_i, so a
+        // zero-weight point contributes no pair at all.  Count the nonzeros.
+        i32 nqNZ = 0, nfNZ = 0;
+        for (i32 i = 0; i < S.nq; i++) if (S.wq[i] != 0.0) nqNZ++;
+        for (i32 a = 0; a < S.nf; a++)
+          if (S.B[0][a] != 0.0 || S.B[1][a] != 0.0 || S.B[2][a] != 0.0) nfNZ++;
+        long long pairsQ = 0, pairsE = 0;
+        for (i32 d = 0; d < 3; d++) {
+          for (i32 i = 0; i < S.nq; i++) for (i32 j = 0; j < S.nq; j++)
+            if (S.Q[d][(size_t)i*S.nq+j] - S.Q[d][(size_t)j*S.nq+i] != 0.0) pairsQ++;
+          for (i32 a = 0; a < S.nf; a++) for (i32 i = 0; i < S.nq; i++)
+            if (S.Emat[(size_t)a*S.nq+i]*S.B[d][a] != 0.0) pairsE++;
+        }
+        printf("   [cost] N=%d  nq %d (nz %d)  nf %d (nz %d)   EC pairs: volume %lld"
+               "  volume-face %lld  face %lld   TOTAL %lld\n",
+               N, S.nq, nqNZ, S.nf, nfNZ, pairsQ/2, pairsE, (long long)3*nfNZ,
+               pairsQ/2 + 2*pairsE + 3*nfNZ);
+      }
       if (getenv("ES_DBG")) {
         // split Eq 47 into its two blocks and show the correction's own residual:
         // the bottom block is automatic (Pq Vq = I), so anything there is a bug,
@@ -359,6 +382,99 @@ int main(void) {
         double er, sf;
         rhsOf(cmod, dudt, er, sf);
         for (size_t t = 0; t < (size_t)nb*5; t++) fsp = fmax(fsp, fabs(dudt[t]));
+      }
+
+      // ---- ES_EVOLVE: integrate the isolated element and watch the energy.
+      //      This is the question the Jacobian was a proxy for, asked directly:
+      //      seed the free stream with a small perturbation in every mode and
+      //      integrate dc/dt = R(c) with SSP-RK3 on the CLOSED element (f*_a is
+      //      the trace's own flux, no exterior).  The flux-differenced operator
+      //      is entropy CONSERVATIVE, so ||c - c_0|| must stay bounded; the
+      //      baseline cut RHS on the same element and the same seed grows (the
+      //      matching run is DgCutJacTest with CUT_EVOLVE=1).
+      if (getenv("ES_EVOLVE")) {
+        const double W0[5] = {1.0, 3.0, 0.0, 0.0, 1.0/GAM};   // the growth case
+        double U0[5]; p2c(W0, U0);
+        std::vector<double> c0((size_t)nb*5, 0.0);
+        for (i32 m = 0; m < nb; m++) {
+          double t = 0;
+          for (i32 i = 0; i < nq; i++) t += S.wq[i]*S.Vq[(size_t)i*nb+m];
+          for (i32 q = 0; q < 5; q++) c0[(size_t)m*5+q] = t*U0[q];
+        }
+        // deterministic seed: 1e-6 of the mean, alternating sign by mode
+        std::vector<double> cs(c0);
+        for (i32 m = 1; m < nb; m++)
+          for (i32 q = 0; q < 5; q++)
+            cs[(size_t)m*5+q] = 1e-6*fabs(c0[q])*((m%2) ? 1.0 : -1.0);
+        const double dt = getenv("ES_DT") ? atof(getenv("ES_DT")) : 2e-4;
+        const i32 nStep = getenv("ES_NSTEP") ? atoi(getenv("ES_NSTEP")) : 5000;
+        auto dev = [&](const std::vector<double> &x) {
+          double a = 0;
+          for (size_t t2 = 0; t2 < x.size(); t2++) a += (x[t2]-c0[t2])*(x[t2]-c0[t2]);
+          return sqrt(a);
+        };
+        std::vector<double> k1, k2, k3, tmp((size_t)nb*5);
+        double er, sf;
+        const double d0 = dev(cs);
+        printf("   [ES_EVOLVE] %s N=%d  dt=%.1e  nStep=%d  ||dc||_0 = %.3e\n",
+               c.name, N, dt, nStep, d0);
+        bool blew = false;
+        for (i32 it = 0; it < nStep && !blew; it++) {
+          rhsOf(cs, k1, er, sf);
+          for (size_t t2 = 0; t2 < tmp.size(); t2++) tmp[t2] = cs[t2] + dt*k1[t2];
+          rhsOf(tmp, k2, er, sf);
+          for (size_t t2 = 0; t2 < tmp.size(); t2++) tmp[t2] = cs[t2] + 0.25*dt*(k1[t2]+k2[t2]);
+          rhsOf(tmp, k3, er, sf);
+          for (size_t t2 = 0; t2 < tmp.size(); t2++)
+            cs[t2] += dt*(k1[t2] + k2[t2] + 4.0*k3[t2])/6.0;
+          for (size_t t2 = 0; t2 < cs.size(); t2++) if (!std::isfinite(cs[t2])) blew = true;
+          if (((it+1) % (nStep/5)) == 0 || blew) {
+            const double dd = dev(cs), T = (it+1)*dt;
+            printf("      t=%7.4f   ||dc|| = %.4e   ratio %.3e   rate %+7.2f/time%s\n",
+                   T, dd, dd/d0, (dd>0&&d0>0)?log(dd/d0)/T:0.0, blew?"   NON-FINITE":"");
+          }
+        }
+      }
+
+      // ---- ES_JAC: the same finite-difference Jacobian the baseline cut RHS
+      //      is measured with (DgCutJacTest.cu), so the two numbers compare
+      //      directly.  The flux-differenced operator is entropy CONSERVATIVE
+      //      (f*_a carries no jump), so linearised about a constant state it is
+      //      similar to a skew-symmetric matrix in the entropy metric: every
+      //      eigenvalue must sit on the imaginary axis, Re lambda = 0.  Any
+      //      positive real part here would mean the construction is broken.
+      if (getenv("ES_JAC")) {
+        const double W0[5] = {1.0, 3.0, 0.0, 0.0, 1.0/GAM};   // the growth case
+        double U0[5]; p2c(W0, U0);
+        std::vector<double> c0((size_t)nb*5, 0.0), dudt;
+        for (i32 m = 0; m < nb; m++) {
+          double t = 0;
+          for (i32 i = 0; i < nq; i++) t += S.wq[i]*S.Vq[(size_t)i*nb+m];
+          for (i32 q = 0; q < 5; q++) c0[(size_t)m*5+q] = t*U0[q];
+        }
+        const i32 nu = nb*5;
+        std::vector<double> A((size_t)nu*nu), cp(c0), Rp, Rm2;
+        double er, sf;
+        for (i32 j = 0; j < nu; j++) {
+          const double eps = 1e-6*fmax(fabs(c0[j]), 1.0);
+          cp = c0; cp[j] += eps; rhsOf(cp, Rp,  er, sf);
+          cp = c0; cp[j] -= eps; rhsOf(cp, Rm2, er, sf);
+          for (i32 i = 0; i < nu; i++) A[(size_t)i*nu+j] = (Rp[i]-Rm2[i])/(2.0*eps);
+        }
+        char fn[512];
+        snprintf(fn, sizeof fn, "%s/esjac_%s_N%d.csv",
+                 getenv("ES_JAC_DIR") ? getenv("ES_JAC_DIR") : ".", c.name[0]=='w'?"w66":"q76", N);
+        if (FILE *fp = fopen(fn, "w")) {
+          fprintf(fp, "# nb=%d nu=%d ES flux-differenced\n#deg:", nb, nu);
+          for (i32 m = 0; m < nb; m++) { i32 e[3]; E.B.expo(m, e); fprintf(fp, "%d ", e[0]+e[1]+e[2]); }
+          fprintf(fp, "\n#e2:");
+          for (i32 m = 0; m < nb; m++) { i32 e[3]; E.B.expo(m, e); fprintf(fp, "%d ", e[2]); }
+          fprintf(fp, "\n");
+          for (i32 i = 0; i < nu; i++)
+            for (i32 j = 0; j < nu; j++) fprintf(fp, "%.16e%c", A[(size_t)i*nu+j], j==nu-1?'\n':',');
+          fclose(fp);
+          printf("   [ES_JAC] %s  (%dx%d)\n", fn, nu, nu);
+        }
       }
 
       // ---- D: entropy conservation on a NON-uniform state ----------------

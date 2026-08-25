@@ -1097,7 +1097,14 @@ __global__ void dgAvNuKernel(DgSolver &grid) {
   for (i32 base = blockIdx.x*DG_EPB; base < grid.hashTable.nKeys; base += gridDim.x*DG_EPB) {
     const i32 bIdx = base + ell;
     u64 loc = (bIdx < grid.hashTable.nKeys) ? grid.bLocList[bIdx] : kEmpty;
-    const bool active = (loc != kEmpty);
+    // A MODAL cut block's slots hold coefficients, so every nodal sensor in
+    // this kernel (Ducros divergence, Persson modal decay) would be reading a
+    // coefficient vector as a field.  Cut elements run their own cut-aware
+    // sensors inside dgRhsCutKernel -- which is the whole reason those exist,
+    // since the tensor-node sensors were measured blind to sub-cell trouble.
+    const bool modalCut = (grid.cutOn && grid.cutModal && grid.blkCut
+                           && bIdx < grid.hashTable.nKeys && grid.blkCut[bIdx] >= 0);
+    const bool active = (loc != kEmpty) && !modalCut;
     i32 lvl = 0, ib = 0, jb = 0, kb = 0;
     if (active) grid.decode(loc, lvl, ib, jb, kb);
     real h[3] = {1,1,1};
@@ -3366,7 +3373,11 @@ __global__ void dgRk3StageKernel(DgSolver &grid, i32 stage, real dt) {
       else if (stage == 1) U[q] = (real)0.75*q0 + (real)0.25*(qc + dt*L);
       else                 U[q] = (real)(1.0/3.0)*q0 + (real)(2.0/3.0)*(qc + dt*L);
     }
-    dgSanitizeCons(U);
+    // dgSanitizeCons floors rho and p.  On a MODAL cut block these slots are
+    // coefficients, not a state -- clamping one would silently corrupt the
+    // element (and slot 0 aside, they are not even sign-definite).
+    if (!(grid.cutOn && grid.cutModal && grid.blkCut && grid.blkCut[bIdx] >= 0))
+      dgSanitizeCons(U);
     for (i32 q = 0; q < 5; q++) grid.getField(D_RHO+q)[cIdx] = U[q];
   }
 }
@@ -3678,6 +3689,86 @@ __global__ void dgEntropyLimitKernel(DgSolver &grid, real dt) {
   }
 }
 
+// ---- cut-element basis helpers ------------------------------------------
+// Hoisted above their first user: dgLamKernel needs to evaluate a MODAL cut
+// element's polynomial to get a meaningful wave speed.
+
+static constexpr i32 CUT_NBMAX = 20;    // total-degree P^3 in 3-D
+
+
+// Zhang-Shu-limit a cut element's trace state toward its fluid mean (sC[0] IS
+// the mean: psi_0 = 1).  A modal trace can overshoot near under-resolved
+// features; every consumer of a trace (faces, wall, mortar) limits first --
+// the same protection the FRIB wall path gives its traces.
+__device__ __forceinline__ void dgCutLimitTrace(const real *sC, real U[5],
+                                                real psi0t) {
+  real Ub[5];
+  for (i32 q = 0; q < 5; q++) Ub[q] = sC[q]*psi0t;  // mean = c~_0 psi~_0, psi~_0 = 1/L00
+  real rb = fmax(Ub[0], DG_EPSF), pb = dgPressureFromCons(Ub);
+  real th = (real)1.0, rf = (real)0.2*rb, pf = (real)0.2*fmax(pb, DG_EPSF);
+  real rhoM = fmax(U[0], DG_EPSF), pM = dgPressureFromCons(U);
+  if (rhoM < rf) th = fmin(th, (rb-rf)/fmax(rb-rhoM, DG_EPSF));
+  if (pM   < pf) th = fmin(th, (pb-pf)/fmax(pb-pM,   DG_EPSF));
+  th = fmax(th, (real)0.0);
+  for (i32 q = 0; q < 5; q++) U[q] = Ub[q] + th*(U[q]-Ub[q]);
+  dgSanitizeCons(U);
+}
+
+// modal basis value / gradient at a reference point, from the stored centroid
+// and scale.  Mirrors CutBasis so the device and the host builder agree.
+__device__ __forceinline__ void dgCutPsi(const real cen[4], const real xr[3],
+                                         i32 nb, real *psi, real *dpsi) {
+  real u[3];
+  for (i32 d = 0; d < 3; d++) u[d] = (xr[d] - cen[d])/cen[3];
+  i32 m = 0;
+  for (i32 deg = 0; deg <= dgOrder && m < nb; deg++)
+  for (i32 i = deg; i >= 0 && m < nb; i--)
+  for (i32 j = deg-i; j >= 0 && m < nb; j--) {
+    i32 e[3] = { i, j, deg-i-j };
+    real v = 1;
+    for (i32 d = 0; d < 3; d++) for (i32 a = 0; a < e[d]; a++) v *= u[d];
+    if (psi) psi[m] = v;
+    if (dpsi) for (i32 d = 0; d < 3; d++) {
+      if (e[d] == 0) { dpsi[3*m+d] = 0; continue; }
+      real t = (real)e[d]/cen[3];
+      for (i32 a = 0; a < 3; a++) {
+        i32 pw = (a == d) ? e[a]-1 : e[a];
+        for (i32 q = 0; q < pw; q++) t *= u[a];
+      }
+      dpsi[3*m+d] = t;
+    }
+    m++;
+  }
+}
+
+// ORTHONORMAL basis evaluation: monomials psi, then the forward solve
+// L psi~ = psi (and per gradient component).  In this frame the element mass
+// is exactly I -- no dense inverse anywhere, and the round trip
+// nodal -> modal -> nodal is an orthogonal projection.  The sliver conditioning
+// still exists, but it enters through ONE backward-stable triangular solve
+// instead of a stored explicit inverse.
+__device__ __forceinline__ void dgCutSolveL(const real *Lc, i32 nb, real *v) {
+  for (i32 i = 0; i < nb; i++) {
+    real t = v[i];
+    for (i32 j = 0; j < i; j++) t -= Lc[(size_t)i*CUT_NBMAX+j]*v[j];
+    v[i] = t/Lc[(size_t)i*CUT_NBMAX+i];
+  }
+}
+__device__ __forceinline__ void dgCutPsiO(const real cen[4], const real xr[3],
+                                          i32 nb, const real *Lc,
+                                          real *psi, real *dpsi) {
+  dgCutPsi(cen, xr, nb, psi, dpsi);
+  if (psi) dgCutSolveL(Lc, nb, psi);
+  if (dpsi) {
+    real col[CUT_NBMAX];
+    for (i32 d = 0; d < 3; d++) {
+      for (i32 m = 0; m < nb; m++) col[m] = dpsi[3*m+d];
+      dgCutSolveL(Lc, nb, col);
+      for (i32 m = 0; m < nb; m++) dpsi[3*m+d] = col[m];
+    }
+  }
+}
+
 __global__ void dgLamKernel(DgSolver &grid) {
   DG_CELL_LOOP(cIdx, bIdx) {
     u64 loc = grid.bLocList[bIdx];
@@ -3704,7 +3795,29 @@ __global__ void dgLamKernel(DgSolver &grid) {
     grid.decode(loc, lvl, ib, jb, kb);
     real h[3]; dgElemSize(grid, lvl, h);
     real U[5], W[5];
-    for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[cIdx];
+    const i32 cm = (grid.cutOn && grid.cutModal && grid.blkCut) ? grid.blkCut[bIdx] : -1;
+    if (cm >= 0) {
+      // MODAL cut block: these slots are COEFFICIENTS.  Reading them as a state
+      // gives a meaningless wave speed -- and since dt is a MINIMUM over cells,
+      // one nonsense value throttles the whole run (measured: dt 2.7e-05 instead
+      // of 7.8e-04, a 30x collapse that looks exactly like a stability problem
+      // and is not one).  Evaluate the element's polynomial at its OWN
+      // quadrature points instead: one point per thread, the rest bound nothing.
+      const i32 nd = (i32)(cIdx - (size_t)bIdx*blockSizeTot);
+      const i32 q0 = grid.cutVolOff[cm], nqE = grid.cutVolOff[cm+1] - q0;
+      if (nd >= nqE) { grid.getField(D_LAM)[cIdx] = 1e30; continue; }
+      const real *cen = grid.cutCen + 4*cm;
+      const real *Lc  = grid.cutLc + (size_t)cm*CUT_NBMAX*CUT_NBMAX;
+      const i32   nbE = grid.cutNbOf[cm];
+      real psi[CUT_NBMAX];
+      dgCutPsiO(cen, grid.cutVolP[q0 + nd].x, nbE, Lc, psi, nullptr);
+      for (i32 q = 0; q < 5; q++) { real v = 0;
+        for (i32 m = 0; m < nbE; m++)
+          v += grid.getField(D_RHO+q)[(size_t)bIdx*blockSizeTot + m]*psi[m];
+        U[q] = v; }
+    } else {
+      for (i32 q = 0; q < 5; q++) U[q] = grid.getField(D_RHO+q)[cIdx];
+    }
     dgConsToPrimSane(U, W);
     real lam = fabs(W[1]) + fabs(W[2]) + fabs(W[3]) + dgSoundSpeed(W[4], W[0]);
     real hmin = fmin(h[0], grid.pseudo2D ? h[0] : fmin(h[1], h[2]));
@@ -3780,6 +3893,19 @@ __device__ real dgIbLineBasisAt(i32 a, real x) {
 // piecewise-linear "hat" basis on the LGL nodes: paints monotone between
 // nodes.  The full Lagrange polynomial rings at shocks (Gibbs), and the
 // per-element overshoot pattern reads as blocky staircases in the image.
+// TRUE Lagrange basis at an arbitrary reference coordinate.  The paint used to
+// use the piecewise-linear hat below, which draws a p=3 element as a linear
+// ramp between its 4 nodes -- so the shape of the solution INSIDE an element
+// was never rendered, and at 4 pixels per element that reads as flat blocks.
+// Evaluating the actual polynomial gives each pixel the value the solution
+// really has there.  (dgLag1 is defined further down for the cut path; this is
+// the same formula, local to the paint so the file order is untouched.)
+__device__ __forceinline__ real dgLagAt(i32 a, real x) {
+  real t = 1;
+  for (i32 b = 0; b < NNODE; b++) if (b != a) t *= (x - c_xi[b])/(c_xi[a] - c_xi[b]);
+  return t;
+}
+
 __device__ __forceinline__ real dgHatAt(i32 a, real x) {
   if (x <= c_xi[a]) {
     if (a == 0) return 1.0;
@@ -3836,7 +3962,7 @@ __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
             real acc = (real)0.0;
             for (i32 aa = 0; aa < NNODE; aa++)
               for (i32 bb = 0; bb < NNODE; bb++)
-                acc += dgHatAt(aa, zx)*dgHatAt(bb, zy)
+                acc += dgLagAt(aa, zx)*dgLagAt(bb, zy)
                      * U[(u64)bIdx*blockSizeTot + aa + bb*NNODE];
             grid.imageDataX[(u64)jPxl*grid.imageSizeX[0] + iPxl] = acc;
             continue;
@@ -3859,7 +3985,7 @@ __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
               real acc = (real)0.0;
               for (i32 aa = 0; aa < NNODE; aa++)
                 for (i32 bb = 0; bb < NNODE; bb++)
-                  acc += dgHatAt(aa, zx)*dgHatAt(bb, zy)
+                  acc += dgLagAt(aa, zx)*dgLagAt(bb, zy)
                        * U[(u64)idx*blockSizeTot + aa + bb*NNODE];
               val = acc;
               break;
@@ -3914,7 +4040,7 @@ __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
     // contract the z-direction once: plane[a][b] = sum_c l_c(zeta) U[a,b,c]
     real Lz[NNODE], plane[NNODE][NNODE];
     if (f >= 0) {
-      for (i32 c = 0; c < NNODE; c++) Lz[c] = dgHatAt(c, zeta);
+      for (i32 c = 0; c < NNODE; c++) Lz[c] = dgLagAt(c, zeta);
       for (i32 b = 0; b < NNODE; b++)
         for (i32 a = 0; a < NNODE; a++) {
           real s = 0.0;
@@ -3927,7 +4053,7 @@ __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
     for (i32 py = 0; py < span; py++) {
       real eta = (real)2.0*(py + (real)0.5)/span - (real)1.0;
       real Ly[NNODE];
-      for (i32 b = 0; b < NNODE; b++) Ly[b] = dgHatAt(b, eta);
+      for (i32 b = 0; b < NNODE; b++) Ly[b] = dgLagAt(b, eta);
       i32 jPxl = jb*span + py;
       if (jPxl < 0 || jPxl >= grid.imageSizeX[1]) continue;
 
@@ -3937,7 +4063,9 @@ __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
         if (cutMask) {   // solid side of a cut element: not a solution value
           real xw = (ib + (px + (real)0.5)/span)*h[0];
           real yw = (jb + (py + (real)0.5)/span)*h[1];
-          if (dgIbPhi(grid, xw, yw) < (real)0.0) {
+          // the tangency guard shifts the level set by grid.cutEps (shrinking
+          // the body); test the SAME surface the cut rules were built on
+          if (dgIbPhi(grid, xw, yw) < -grid.cutEps) {
             grid.imageDataX[(u64)jPxl*grid.imageSizeX[0] + iPxl] = (real)kPaintVoid;
             continue;
           }
@@ -3947,7 +4075,7 @@ __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f) {
           real xi = (real)2.0*(px + (real)0.5)/span - (real)1.0;
           real acc = 0.0;
           for (i32 a = 0; a < NNODE; a++) {
-            real Lxa = dgHatAt(a, xi);
+            real Lxa = dgLagAt(a, xi);
             for (i32 b = 0; b < NNODE; b++) acc += Lxa*Ly[b]*plane[a][b];
           }
           val = acc;
@@ -5812,79 +5940,48 @@ __device__ __forceinline__ void dgLag3(const real xr[3], real *phi) {
     phi[i + NNODE*(j + NNODE*k)] = Lx[i]*Ly[j]*Lz[k];
 }
 
-static constexpr i32 CUT_NBMAX = 20;    // total-degree P^3 in 3-D
 
+// ---------------------------------------------------------------------------
+//  NODAL -> MODAL for every cut element, run once after the initial condition.
+//  Identical arithmetic to the projection dgRhsCutKernel used to do every
+//  evaluation; the difference is that the result now STAYS in the field.
+//  Slots [nb, blockSizeTot) are zeroed: RK sees zero state and zero RHS there,
+//  so they stay zero and cost nothing.
+// ---------------------------------------------------------------------------
+__global__ void dgCutToModalKernel(DgSolver &grid) {
+  extern __shared__ real sh[];
+  real *sU = sh;                          // [5][blockSizeTot] nodal state
+  real *sC = sU + 5*blockSizeTot;         // [nb][5] coefficients
 
-// Zhang-Shu-limit a cut element's trace state toward its fluid mean (sC[0] IS
-// the mean: psi_0 = 1).  A modal trace can overshoot near under-resolved
-// features; every consumer of a trace (faces, wall, mortar) limits first --
-// the same protection the FRIB wall path gives its traces.
-__device__ __forceinline__ void dgCutLimitTrace(const real *sC, real U[5],
-                                                real psi0t) {
-  real Ub[5];
-  for (i32 q = 0; q < 5; q++) Ub[q] = sC[q]*psi0t;  // mean = c~_0 psi~_0, psi~_0 = 1/L00
-  real rb = fmax(Ub[0], DG_EPSF), pb = dgPressureFromCons(Ub);
-  real th = (real)1.0, rf = (real)0.2*rb, pf = (real)0.2*fmax(pb, DG_EPSF);
-  real rhoM = fmax(U[0], DG_EPSF), pM = dgPressureFromCons(U);
-  if (rhoM < rf) th = fmin(th, (rb-rf)/fmax(rb-rhoM, DG_EPSF));
-  if (pM   < pf) th = fmin(th, (pb-pf)/fmax(pb-pM,   DG_EPSF));
-  th = fmax(th, (real)0.0);
-  for (i32 q = 0; q < 5; q++) U[q] = Ub[q] + th*(U[q]-Ub[q]);
-  dgSanitizeCons(U);
-}
+  for (i32 c = blockIdx.x; c < grid.nCutElem; c += gridDim.x) {
+    const i32 b = grid.cutBlk[c];
+    const real *cen = grid.cutCen + 4*c;
+    const real *Lc = grid.cutLc + (size_t)c*CUT_NBMAX*CUT_NBMAX;
+    const i32 nb = grid.cutNbOf[c];
 
-// modal basis value / gradient at a reference point, from the stored centroid
-// and scale.  Mirrors CutBasis so the device and the host builder agree.
-__device__ __forceinline__ void dgCutPsi(const real cen[4], const real xr[3],
-                                         i32 nb, real *psi, real *dpsi) {
-  real u[3];
-  for (i32 d = 0; d < 3; d++) u[d] = (xr[d] - cen[d])/cen[3];
-  i32 m = 0;
-  for (i32 deg = 0; deg <= dgOrder && m < nb; deg++)
-  for (i32 i = deg; i >= 0 && m < nb; i--)
-  for (i32 j = deg-i; j >= 0 && m < nb; j--) {
-    i32 e[3] = { i, j, deg-i-j };
-    real v = 1;
-    for (i32 d = 0; d < 3; d++) for (i32 a = 0; a < e[d]; a++) v *= u[d];
-    if (psi) psi[m] = v;
-    if (dpsi) for (i32 d = 0; d < 3; d++) {
-      if (e[d] == 0) { dpsi[3*m+d] = 0; continue; }
-      real t = (real)e[d]/cen[3];
-      for (i32 a = 0; a < 3; a++) {
-        i32 pw = (a == d) ? e[a]-1 : e[a];
-        for (i32 q = 0; q < pw; q++) t *= u[a];
+    for (i32 i = threadIdx.x; i < blockSizeTot; i += blockDim.x)
+      for (i32 q = 0; q < 5; q++)
+        sU[q*blockSizeTot + i] = grid.getField(D_RHO+q)[(size_t)b*blockSizeTot + i];
+    for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) sC[i] = 0;
+    __syncthreads();
+
+    for (i32 g = threadIdx.x; g < grid.cutVolOff[c+1]-grid.cutVolOff[c]; g += blockDim.x) {
+      const SayeNode &s = grid.cutVolP[grid.cutVolOff[c] + g];
+      real psi[CUT_NBMAX], phi[blockSizeTot];
+      dgCutPsiO(cen, s.x, nb, Lc, psi, nullptr);
+      dgLag3(s.x, phi);
+      for (i32 q = 0; q < 5; q++) {
+        real uq = 0;
+        for (i32 a = 0; a < blockSizeTot; a++) uq += sU[q*blockSizeTot+a]*phi[a];
+        for (i32 m = 0; m < nb; m++) atomicAdd(&sC[m*5+q], s.w*psi[m]*uq);
       }
-      dpsi[3*m+d] = t;
     }
-    m++;
-  }
-}
-
-// ORTHONORMAL basis evaluation: monomials psi, then the forward solve
-// L psi~ = psi (and per gradient component).  In this frame the element mass
-// is exactly I -- no dense inverse anywhere, and the round trip
-// nodal -> modal -> nodal is an orthogonal projection.  The sliver conditioning
-// still exists, but it enters through ONE backward-stable triangular solve
-// instead of a stored explicit inverse.
-__device__ __forceinline__ void dgCutSolveL(const real *Lc, i32 nb, real *v) {
-  for (i32 i = 0; i < nb; i++) {
-    real t = v[i];
-    for (i32 j = 0; j < i; j++) t -= Lc[(size_t)i*CUT_NBMAX+j]*v[j];
-    v[i] = t/Lc[(size_t)i*CUT_NBMAX+i];
-  }
-}
-__device__ __forceinline__ void dgCutPsiO(const real cen[4], const real xr[3],
-                                          i32 nb, const real *Lc,
-                                          real *psi, real *dpsi) {
-  dgCutPsi(cen, xr, nb, psi, dpsi);
-  if (psi) dgCutSolveL(Lc, nb, psi);
-  if (dpsi) {
-    real col[CUT_NBMAX];
-    for (i32 d = 0; d < 3; d++) {
-      for (i32 m = 0; m < nb; m++) col[m] = dpsi[3*m+d];
-      dgCutSolveL(Lc, nb, col);
-      for (i32 m = 0; m < nb; m++) dpsi[3*m+d] = col[m];
-    }
+    __syncthreads();
+    for (i32 i = threadIdx.x; i < blockSizeTot; i += blockDim.x)
+      for (i32 q = 0; q < 5; q++)
+        grid.getField(D_RHO+q)[(size_t)b*blockSizeTot + i] =
+            (i < nb) ? sC[i*5+q] : (real)0;
+    __syncthreads();
   }
 }
 
@@ -5893,7 +5990,8 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
   real *sU = sh;                       // [5][blockSizeTot] nodal state
   real *sR = sU + 5*blockSizeTot;      // [nb][5] modal residual
   real *sC = sR + 5*CUT_NBMAX;         // [nb][5] modal coefficients
-  real *sLam = sC + 5*CUT_NBMAX;       // [2] wave-speed reduce (AV) + -min(rho) reduce
+  real *sLam = sC + 5*CUT_NBMAX;       // [3] wave-speed reduce (AV), min(rho) reduce,
+                                       // and [2] the cut-aware modal-decay verdict
 
   for (i32 c = blockIdx.x; c < grid.nCutElem; c += gridDim.x) {
     const i32 b = grid.cutBlk[c];
@@ -5901,12 +5999,17 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     real h[3]; dgElemSize(grid, lvl, h);
     const real *cen = grid.cutCen + 4*c;
     const real *Lc = grid.cutLc + (size_t)c*CUT_NBMAX*CUT_NBMAX;
-    i32 nb = grid.cutNbOf[c];              // reduced on degenerate slivers
-    // CUT-MOOD: a troubled cut element evaluates THIS RHS at P0 -- first order
-    // through the trouble, P^N when clear; the state keeps its modes.  The
-    // trigger is decided AFTER the modal projection by the CUT-AWARE sensors
-    // below (the tensor-node Ducros/Persson sensors measured theta 0.001..0.02
-    // at every supersonic blowup -- they cannot see sub-cell wedge trouble).
+    i32 nb = grid.cutNbOf[c];              // == the full modal count: a cut
+                                           // element carries an UNCUT element's
+                                           // order (see CutElem.h)
+    // The CUT-MOOD order drop that used to live here -- a troubled cut element
+    // evaluating its RHS at P0 -- is gone with the rest of the degree-reduction
+    // machinery.  Dropping a cut element to first order whenever a sensor fires
+    // makes the wall first-order exactly where the flow is interesting, and it
+    // silently decides the order of accuracy per element per timestep, which no
+    // convergence study can survive.  The modal-decay sensor is KEPT and still
+    // published (it is a useful diagnostic and drives the limiter), but it no
+    // longer changes the order of the evaluation.
     const i32 nbFull = nb;
 
     for (i32 i = threadIdx.x; i < blockSizeTot; i += blockDim.x)
@@ -5914,12 +6017,23 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         sU[q*blockSizeTot + i] = grid.getField(D_RHO+q)[(size_t)b*blockSizeTot + i];
     for (i32 i = threadIdx.x; i < nbFull*5; i += blockDim.x) { sR[i] = 0; sC[i] = 0; }
     __syncthreads();
+    if (grid.cutModal) {
+      // MODAL RESIDENT: the coefficients ARE the state.  No projection, and --
+      // the point of the whole exercise -- no evaluation of psi~ at the tensor
+      // nodes, where it is 449x larger than anywhere in the element's support.
+      for (i32 i = threadIdx.x; i < nbFull*5; i += blockDim.x) {
+        const i32 m = i/5, q = i - 5*m;
+        sC[i] = sU[q*blockSizeTot + m];
+      }
+      __syncthreads();
+    }
 
     // ---- nodal -> modal, ORTHONORMAL: c~ = SUM_q w_q psi~(x_q) u(x_q) ------
     // The mass is exactly I in this frame, so the projection IS the weighted
     // sum -- no solve, no stored inverse, and the round trip is an orthogonal
     // projection.  FULL basis: the state keeps its modes even when the flux
     // evaluation below is order-dropped.
+    if (!grid.cutModal)
     for (i32 g = threadIdx.x; g < grid.cutVolOff[c+1]-grid.cutVolOff[c]; g += blockDim.x) {
       const SayeNode &s = grid.cutVolP[grid.cutVolOff[c] + g];
       real psi[CUT_NBMAX], phi[blockSizeTot];
@@ -5949,10 +6063,10 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
           if (eta > grid.cutEta) trouble = 1;
         }
       }
-      sLam[1] = trouble;                    // reused below; sLam[0] is the AV reduce
+      sLam[2] = trouble;                    // sLam[0] = AV reduce, sLam[1] = min(rho)
     }
     __syncthreads();
-    if (sLam[1] > (real)0.5) nb = 1;        // order-drop THIS evaluation
+    // (sLam[2] is the modal-decay verdict; it no longer drops the order)
     __syncthreads();
     for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) sR[i] = 0;
     if (threadIdx.x == 0) { sLam[0] = 0; }
@@ -5988,7 +6102,18 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         atomicMin((unsigned long long*)&sLam[1], (unsigned long long)__double_as_longlong(fmax(U[0], DG_EPSF)));
       }
       __syncthreads();
-      real theta = grid.getField(D_SCRATCH)[(u64)b*blockSizeTot + 1];
+      // THE SENSOR IS THIS ELEMENT'S OWN, not the Cartesian slot.  The comment
+      // above used to claim dgAvNuKernel publishes theta for cut blocks too --
+      // it does not: it sets `active = false` for a MODAL cut block
+      // (DgSolverKernels.cu:1105-1107) and EVERY D_SCRATCH write in that kernel
+      // is inside the `active` branch, so slots 0 and 1 were never written for
+      // a cut element and this read returned whatever the allocation held.
+      // Artificial viscosity has therefore never actually been active on a cut
+      // cell, in either direction: nuE was 0 here and the face penalty sigma
+      // read the same dead slot.  The correct sensor is already computed a few
+      // lines above -- the modal-decay verdict over the FLUID region, which is
+      // the whole reason the cut-aware sensors exist.
+      real theta = sLam[2];
       // CUT-AWARE TROUBLE SENSOR 2: positivity margin.  The decay sensor (and
       // the tensor-node theta) can miss imminent vacuum in the wedge; if the
       // modal solution's density anywhere in the FLUID region is below 10% of
@@ -5997,8 +6122,18 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
       if (__longlong_as_double(*(long long*)&sLam[1]) < (real)0.1*c0rho)
         theta = (real)1.0;
       real lenp  = h[0]/(real)(2*dgOrder+1);
-      nuE = grid.avCav * theta * lenp * __longlong_as_double(*(long long*)sLam);
+      const real lamE = __longlong_as_double(*(long long*)sLam);
+      nuE = grid.avCav * theta * lenp * lamE;
+      // publish for anyone reading THIS block's slots -- the neighbour side of
+      // the mortar face penalty, dgTroubledToScratchKernel, the refinement vote
+      if (threadIdx.x == 0) {
+        grid.getField(D_SCRATCH)[(u64)b*blockSizeTot]     = theta*lamE;
+        grid.getField(D_SCRATCH)[(u64)b*blockSizeTot + 1] = theta;
+        grid.getField(D_SCRATCH)[(u64)b*blockSizeTot + 5] = theta;
+        grid.getField(D_SCRATCH)[(u64)b*blockSizeTot + 6] = (real)0;   // no subcell FV here
+      }
     }
+    __syncthreads();
 
     // ---- volume:  + INT F_d(u) d(psi_m)/dx_d dV ----------------------------
     if (grid.cutDbgMask & 1)
@@ -6065,7 +6200,26 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         real Fx[5], Fy[5], Fz[5];           // the exact F.n of the trace state
         dgEulerFluxAxis(W, 0, Fx); dgEulerFluxAxis(W, 1, Fy); dgEulerFluxAxis(W, 2, Fz);
         for (i32 q = 0; q < 5; q++) Fw[q] = Fx[q]*np[0] + Fy[q]*np[1] + Fz[q]*np[2];
-      } else {                              // solid wall: pressure only
+      } else if (grid.cutWallRiem) {
+        // SOLID WALL AS A RIEMANN PROBLEM against the MIRROR state
+        //     u_m = u - 2 (u.n) n,   rho_m = rho,   p_m = p
+        // A Rusanov flux between the trace and its mirror collapses to
+        //     F* = [ 0, (p + rho un^2 + lambda rho un) n, 0 ]
+        // because the mass and energy fluxes cancel EXACTLY against the mirror
+        // and the dissipation only survives in the normal momentum.  So the
+        // wall is exactly conservative in mass and energy by construction, and
+        // -- the point -- un now carries a restoring term.
+        //
+        // The pressure-only flux below has none: it imposes p n whatever the
+        // normal velocity does, so no-penetration is never actually enforced,
+        // the wall leaks, and nothing pulls the wall pressure back.  Measured
+        // at M=0.3: Cp -15.9 at the stagnation point (theory +1.02) with wall
+        // pressure going NEGATIVE (-0.32 against p_inf = 0.714).
+        const real un  = W[1]*np[0] + W[2]*np[1] + W[3]*np[2];
+        const real lam = fabs(un) + dgSoundSpeed(W[4], W[0]);
+        const real pw  = W[4] + W[0]*un*un + lam*W[0]*un;
+        Fw[0] = 0; Fw[1] = pw*np[0]; Fw[2] = pw*np[1]; Fw[3] = pw*np[2]; Fw[4] = 0;
+      } else {                              // solid wall: pressure only (legacy)
         Fw[0] = 0; Fw[1] = W[4]*np[0]; Fw[2] = W[4]*np[1]; Fw[3] = W[4]*np[2]; Fw[4] = 0;
       }
       for (i32 m = 0; m < nb; m++) for (i32 q = 0; q < 5; q++)
@@ -6091,6 +6245,16 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         i32 nbM = grid.nbrIdxList[27*b + oM[0] + 3*oM[1] + 9*oM[2]];
         if (nbM == bEmpty) nbM = -1;
         const bool fullFace = fabs(grid.cutFacA[6*c+f] - (real)1.0) < (real)1e-6;
+        // STARVATION COUNTER: a NON-cut neighbour across a PARTIAL face gets
+        // nothing.  dgRhsKernel skips any face whose neighbour is cut, so that
+        // neighbour's only source for this face is the mortar deposit below --
+        // and the mortar requires the face to be fully fluid.  A face that is
+        // partial with a non-cut neighbour is therefore a HOLE in the coupling.
+        if (grid.cutDbg && threadIdx.x == 0 && nbM >= 0 && grid.blkCut[nbM] < 0
+            && !fullFace && grid.cutFacOff[6*c+f+1] > grid.cutFacOff[6*c+f])
+          atomicAdd(&grid.cutDbg[0], 1);
+        if (grid.cutDbg && threadIdx.x == 0 && nbM >= 0 && grid.blkCut[nbM] < 0 && fullFace)
+          atomicAdd(&grid.cutDbg[1], 1);
         if ((grid.cutDbgMask & 8) && fullFace && nbM >= 0 && grid.blkCut[nbM] < 0) {
           const real sgM  = sideM ? (real)1.0 : (real)-1.0;
           const real jacD = (real)2.0/h[dM];
@@ -6124,7 +6288,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
             real fs[5];
             if (sideM) dgRusanovAxis(Wm, Wo, dM, fs); else dgRusanovAxis(Wo, Wm, dM, fs);
             if (grid.avOn) {
-              real nuMe = grid.getField(D_SCRATCH)[(u64)b*blockSizeTot];
+              real nuMe = nuE;      // locally computed; the slot was never written
               real nuNb = grid.getField(D_SCRATCH)[(u64)nbM*blockSizeTot];
               real sig = sideM ? dgPenaltySigma(grid, nuMe, nuNb, Wm, Wo)
                                : dgPenaltySigma(grid, nuNb, nuMe, Wo, Wm);
@@ -6172,12 +6336,30 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         if (nbIdx >= 0) {
           real xn[3] = { s.x[0], s.x[1], s.x[2] };
           xn[d] = (real)1.0 - xn[d];
-          dgLag3(xn, phi);
           real Uo[5];
+          const i32 nbc = (grid.cutModal && grid.blkCut) ? grid.blkCut[nbIdx] : -1;
+          if (nbc >= 0) {
+            // MODAL cut neighbour: evaluate ITS polynomial in ITS OWN basis.
+            // The nodal path below would read its coefficients as if they were
+            // node values.  This is also the honest trace: the neighbour's
+            // tensor interpolant and its polynomial are different functions
+            // once the element is degree-reduced or the state leaves the space.
+            const real *cenN = grid.cutCen + 4*nbc;
+            const real *LcN  = grid.cutLc + (size_t)nbc*CUT_NBMAX*CUT_NBMAX;
+            const i32   nbN  = grid.cutNbOf[nbc];
+            real psiN[CUT_NBMAX];
+            dgCutPsiO(cenN, xn, nbN, LcN, psiN, nullptr);
+            for (i32 q = 0; q < 5; q++) { real v = 0;
+              for (i32 m = 0; m < nbN; m++)
+                v += grid.getField(D_RHO+q)[(size_t)nbIdx*blockSizeTot + m]*psiN[m];
+              Uo[q] = v; }
+          } else {
+          dgLag3(xn, phi);
           for (i32 q = 0; q < 5; q++) { real v = 0;
             for (i32 a = 0; a < blockSizeTot; a++)
               v += grid.getField(D_RHO+q)[(size_t)nbIdx*blockSizeTot + a]*phi[a];
             Uo[q] = v; }
+          }
           dgSanitizeCons(Uo);
           Wo[0]=fmax(Uo[0],DG_EPSF);
           Wo[1]=Uo[1]/Wo[0]; Wo[2]=Uo[2]/Wo[0]; Wo[3]=Uo[3]/Wo[0]; Wo[4]=dgPressureFromCons(Uo);
@@ -6190,7 +6372,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         // deposit is the only face flux these two elements exchange, so it must
         // carry the same dissipation the native path would.
         if (grid.avOn) {
-          real nuMe = grid.getField(D_SCRATCH)[(u64)b*blockSizeTot];
+          real nuMe = nuE;          // locally computed; the slot was never written
           real nuNb = (nbIdx >= 0) ? grid.getField(D_SCRATCH)[(u64)nbIdx*blockSizeTot] : nuMe;
           real sig = side ? dgPenaltySigma(grid, nuMe, nuNb, Wm, Wo)
                           : dgPenaltySigma(grid, nuNb, nuMe, Wo, Wm);
@@ -6205,9 +6387,60 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     }
     __syncthreads();
 
+    // ---- HIGH-ORDER MODAL HYPER-VISCOSITY (--cuthv tau) --------------------
+    // Every dissipation this solver has is SENSOR-GATED: the cut element's own
+    // LDG AV is nu = avCav * theta * (h/(2p+1)) * lambda with theta from the
+    // Ducros/Persson shock sensor, so on smooth data theta = 0 and a cut
+    // element receives NO dissipation at all.  The instability we are chasing
+    // lives on a UNIFORM state (measured growth rate 13.2/time, e-fold 0.076,
+    // independent of quadrature accuracy and of dt) -- precisely where every
+    // gated mechanism is switched off.
+    //
+    // This is the ungated, high-order complement: damp mode m by
+    //     sigma_m = tau * (lambda/h) * (deg(m)/N)^(2s)
+    // which is zero for the constant mode, negligible for the low modes, and
+    // O(tau*lambda/h) on the top mode -- the same shape as the dual-pairing
+    // SBP hyper-viscosity (Hew, Duru et al., JCP 523 (2025) 113624), written
+    // for a modal element whose mass matrix is the identity.  lambda/h is the
+    // natural rate here and is ~13 for M=3 on h=0.25, i.e. the same order as
+    // the growth rate it has to beat.
+    if (grid.cutHv != (real)0) {
+      real lamE = 0;
+      { real Wm[5], Um[5];
+        for (i32 q = 0; q < 5; q++) Um[q] = sC[0*5+q]*((real)1.0/Lc[0]);
+        Wm[0]=fmax(Um[0],DG_EPSF); Wm[1]=Um[1]/Wm[0]; Wm[2]=Um[2]/Wm[0];
+        Wm[3]=Um[3]/Wm[0]; Wm[4]=dgPressureFromCons(Um);
+        lamE = fabs(Wm[1])+fabs(Wm[2])+fabs(Wm[3])+dgSoundSpeed(Wm[4],Wm[0]); }
+      const real hmin = fmin(h[0], grid.pseudo2D ? h[0] : fmin(h[1],h[2]));
+      const real rate = fabs(grid.cutHv)*lamE/fmax(hmin,(real)1e-30);
+      for (i32 i = threadIdx.x; i < nb; i += blockDim.x) {
+        // total degree of mode i, degree-major ordering (matches dgCutPsi)
+        i32 dg = 0, m = 0;
+        for (i32 d = 0; d <= dgOrder && m <= i; d++) {
+          for (i32 a = d; a >= 0 && m <= i; a--)
+            for (i32 b = d-a; b >= 0 && m <= i; b--) { if (m == i) dg = d; m++; }
+        }
+        // DIAGNOSTIC (cutHvMean): damp the MEAN too.  Not conservative -- this
+        // exists to locate the unstable mode, not to be used.
+        if (dg == 0 && !grid.cutHvMean) continue;
+        real f;
+        if (grid.cutHv < (real)0) { f = (real)1.0; }  // DIAGNOSTIC: flat damping
+        else { f = (real)dg/(real)dgOrder; f = f*f; f = f*f; }   // (deg/N)^4
+        for (i32 q = 0; q < 5; q++) sR[i*5+q] -= rate*f*sC[i*5+q];
+      }
+      __syncthreads();
+    }
+
     // ---- dc~/dt = R~ (identity mass!), then evaluate at the nodes ----------
     for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) sC[i] = sR[i];
     __syncthreads();
+    if (grid.cutModal) {
+      // the RHS is a coefficient vector too -- store it as one
+      for (i32 i = threadIdx.x; i < blockSizeTot; i += blockDim.x)
+        for (i32 q = 0; q < 5; q++)
+          grid.getField(D_RHS+q)[(size_t)b*blockSizeTot + i] =
+              (i < nb) ? sC[i*5+q] : (real)0;
+    } else
     for (i32 i = threadIdx.x; i < blockSizeTot; i += blockDim.x) {
       i32 ii = i % NNODE, jj = (i/NNODE) % NNODE, kk = i/(NNODE*NNODE);
       real xr[3] = { (real)0.5*(c_xi[ii]+(real)1.0),
@@ -6221,4 +6454,314 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     }
     __syncthreads();
   }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  ENTROPY-STABLE CUT RHS  (--cutes)   Taylor & Chan, arXiv:2412.13002
+ *
+ *  The operators are built on the host by DgSolver::buildCutEs (DgCutEs.cu);
+ *  see that file's header for why the surface rule must BE the runtime
+ *  interface rule.  Everything below is in the REFERENCE cell, so each
+ *  direction-d contribution carries exactly one factor 1/h_d -- the same
+ *  convention dgRhsCutKernel uses, and the same one that makes the wall term
+ *  a Nanson transform without writing one: with n~_d = n_d/h_d,
+ *      SUM_d (1/h_d) w_f n_d f*_d  =  w_f |n~| (f*.n_phys).
+ * ════════════════════════════════════════════════════════════════════════ */
+
+// v = ( (gam-s)/(gam-1) - rho|u|^2/(2p), rho u/p, -rho/p ), eta = -rho s/(gam-1)
+__device__ __forceinline__ void dgEsEntVars(const real W[5], real v[5]) {
+  const real rho = fmax(W[0], DG_EPSF), p = fmax(W[4], DG_EPSF);
+  const real s  = log(p) - dgGam*log(rho);
+  const real q2 = W[1]*W[1] + W[2]*W[2] + W[3]*W[3];
+  v[0] = (dgGam - s)/(dgGam - (real)1.0) - rho*q2/((real)2.0*p);
+  v[1] = rho*W[1]/p; v[2] = rho*W[2]/p; v[3] = rho*W[3]/p;
+  v[4] = -rho/p;
+}
+// EXACT inverse of dgEsEntVars, transcribed from the validated host reference
+// (DgEsCutTest.cu:95-101).  Two errors lived here and both were invisible in the
+// CLOSED element -- the operator telescopes in whatever states it is handed, so a
+// consistently-wrong round trip still gave dM/M0 = 0 exactly.  They only showed
+// once a cut face was coupled to a Cartesian neighbour, whose RAW nodal state is
+// the true one: the spurious jump between the round-tripped trace and the true
+// neighbour state fed the Rusanov dissipation and broke free stream.
+//   1. v[4] is NEGATIVE.  The host forms v[0] - vv2/(2*v5) with v5 = v[4] < 0,
+//      i.e. it ADDS rho|u|^2/(2p) back; using vn = -v[4] and subtracting removed
+//      it twice.
+//   2. rho = (-v5 exp(s))^(-1/(gam-1)).  The expression that was here belongs to
+//      a different entropy normalisation and differs by (gam-1)^(1/(gam-1))/vn.
+__device__ __forceinline__ void dgEsEntVarsToPrim(const real v[5], real W[5]) {
+  const real g1  = dgGam - (real)1.0;
+  const real v5  = fmin(v[4], -DG_EPSF);            // strictly negative
+  const real vv2 = v[1]*v[1] + v[2]*v[2] + v[3]*v[3];
+  const real s   = dgGam - g1*(v[0] - vv2/((real)2.0*v5));
+  const real rho = pow(-v5*exp(s), -(real)1.0/g1);
+  W[0] = fmax(rho, DG_EPSF);
+  W[1] = v[1]/(-v5); W[2] = v[2]/(-v5); W[3] = v[3]/(-v5);
+  W[4] = fmax(-W[0]/v5, DG_EPSF);
+}
+// numerically-stable logarithmic mean (Ismail & Roe, Appendix B)
+__device__ __forceinline__ real dgEsLogMean(real a, real b) {
+  const real z = a/b, f = (z - (real)1.0)/(z + (real)1.0), u = f*f;
+  const real F = (u < (real)1e-2)
+      ? ((real)1.0 + u/(real)3.0 + u*u/(real)5.0 + u*u*u/(real)7.0)
+      : (log(z)/((real)2.0*f));
+  return (a + b)/((real)2.0*F);
+}
+// Chandrashekar entropy-conservative two-point flux along axis d
+__device__ __forceinline__ void dgEsEcFlux(const real WL[5], const real WR[5],
+                                           i32 d, real F[5]) {
+  const real bL = WL[0]/((real)2.0*WL[4]), bR = WR[0]/((real)2.0*WR[4]);
+  const real rl = dgEsLogMean(WL[0], WR[0]);
+  const real bl = dgEsLogMean(bL, bR);
+  const real ra = (real)0.5*(WL[0] + WR[0]);
+  const real ba = (real)0.5*(bL + bR);
+  const real ua = (real)0.5*(WL[1]+WR[1]), va = (real)0.5*(WL[2]+WR[2]),
+             wa = (real)0.5*(WL[3]+WR[3]);
+  const real pa = ra/((real)2.0*ba);
+  const real un = (d == 0) ? ua : ((d == 1) ? va : wa);
+  F[0] = rl*un;
+  F[1] = F[0]*ua; F[2] = F[0]*va; F[3] = F[0]*wa;
+  F[1+d] += pa;
+  const real h = (real)1.0/((real)2.0*bl*(dgGam - (real)1.0))
+               - (real)0.5*(WL[1]*WR[1] + WL[2]*WR[2] + WL[3]*WR[3])
+               + ua*ua + va*va + wa*wa;
+  F[4] = F[0]*h + pa*un;
+}
+
+// PASS 1: the entropy projection, published to global.
+//   vtil = Pq v(u_q),  Pq = Vq^T W   (the orthonormal mass is exactly I)
+// It has to be a separate pass because a cut element reading a CUT neighbour's
+// interface trace must see the neighbour's ENTROPY-PROJECTED state -- the same
+// one the neighbour uses on its own side of that face -- or the two sides
+// evaluate different fluxes and the face stops conserving.  A Cartesian
+// neighbour has no entropy projection and is read raw, which is the ordinary
+// treatment at an ES/non-ES interface and is still single-valued because this
+// kernel computes the flux and deposits the neighbour's share itself.
+__global__ void dgEsProjectKernel(DgSolver &grid) {
+  extern __shared__ real shp[];
+  const i32 c = blockIdx.x;
+  if (c >= grid.nCutElem) return;
+  const i32 b  = grid.cutBlk[c];
+  const i32 nb = grid.cutNbOf[c];
+  const i32 q0 = grid.esQOff[c], nq = grid.esQOff[c+1] - q0;
+  real *sC  = shp;
+  real *sVt = shp + (size_t)CUT_NBMAX*5;
+  for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) {
+    sC[i]  = grid.getField(D_RHO + (i%5))[(size_t)b*blockSizeTot + i/5];
+    sVt[i] = 0;
+  }
+  __syncthreads();
+  for (i32 i = threadIdx.x; i < nq; i += blockDim.x) {
+    const real *Vq = grid.esVq + (size_t)(q0+i)*CUT_NBMAX_H;
+    real U[5];
+    for (i32 q = 0; q < 5; q++) { real t = 0;
+      for (i32 m = 0; m < nb; m++) t += sC[m*5+q]*Vq[m]; U[q] = t; }
+    dgSanitizeCons(U);
+    real W[5]; W[0] = fmax(U[0], DG_EPSF);
+    W[1] = U[1]/W[0]; W[2] = U[2]/W[0]; W[3] = U[3]/W[0];
+    W[4] = dgPressureFromCons(U);
+    real v[5]; dgEsEntVars(W, v);
+    const real w = grid.esWq[q0+i];
+    for (i32 m = 0; m < nb; m++)
+      for (i32 q = 0; q < 5; q++) atomicAdd(&sVt[m*5+q], w*Vq[m]*v[q]);
+  }
+  __syncthreads();
+  for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x)
+    grid.esVtil[(size_t)c*CUT_NBMAX_H*5 + i] = sVt[i];
+}
+
+// ES_* bisection switches (DgMain reads the env into grid.esDbg):
+//   bit 0  ES_CLOSED     : f*_a = the trace's own flux at CUT FACES too, and no
+//                          neighbour deposit -- restores the configuration that
+//                          measured dM/M0 = 1.5e-16 before the coupling went in
+//   bit 1  ES_NODEPOSIT  : real interface flux, but do not deposit the
+//                          neighbour's share (breaks conservation on purpose)
+//   bit 2  ES_NOMETRIC   : drop every 1/h_d factor (pure reference measure, the
+//                          host operator's convention)
+__global__ void dgRhsCutEsKernel(DgSolver &grid) {
+  extern __shared__ real sh[];
+  const bool esClosed = (grid.esDbg & 1) != 0;
+  const bool esNoDep  = (grid.esDbg & 2) != 0;
+  const bool esNoMet  = (grid.esDbg & 4) != 0;
+  const i32 c = blockIdx.x;
+  if (c >= grid.nCutElem) return;
+  const i32 b  = grid.cutBlk[c];
+  const i32 nb = grid.cutNbOf[c];
+  const i32 q0 = grid.esQOff[c], nq = grid.esQOff[c+1] - q0;
+  const i32 f0 = grid.esFOff[c], nf = grid.esFOff[c+1] - f0;
+  const size_t tq2 = (size_t)grid.esQ2Off[grid.nCutElem];
+
+  i32 lvl, ib, jb, kb; grid.decode(grid.bLocList[b], lvl, ib, jb, kb);
+  real h[3]; dgElemSize(grid, lvl, h);
+
+  real *sWt  = sh;
+  real *sVt  = sWt + (size_t)(nq+nf)*5;
+  real *sMdu = sVt + (size_t)CUT_NBMAX*5;
+  real *sC   = sMdu + (size_t)CUT_NBMAX*5;
+
+  for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) {
+    sC[i]  = grid.getField(D_RHO + (i%5))[(size_t)b*blockSizeTot + i/5];
+    sVt[i] = grid.esVtil[(size_t)c*CUT_NBMAX_H*5 + i];   // published by pass 1
+    sMdu[i] = 0;
+  }
+  __syncthreads();
+
+  // ---- utilde at every hybridized point ------------------------------------
+  for (i32 i = threadIdx.x; i < nq+nf; i += blockDim.x) {
+    const real *V = (i < nq) ? (grid.esVq + (size_t)(q0+i)*CUT_NBMAX_H)
+                             : (grid.esVf + (size_t)(f0+i-nq)*CUT_NBMAX_H);
+    real v[5];
+    for (i32 q = 0; q < 5; q++) { real t = 0;
+      for (i32 m = 0; m < nb; m++) t += sVt[m*5+q]*V[m]; v[q] = t; }
+    dgEsEntVarsToPrim(v, &sWt[(size_t)i*5]);
+  }
+  __syncthreads();
+
+  const real *Qb = grid.esQ + grid.esQ2Off[c];
+  const real *Eb = grid.esEmat + grid.esEOff[c];
+
+  // ---- volume ---------------------------------------------------------------
+  for (i32 i = threadIdx.x; i < nq; i += blockDim.x) {
+    real r[5] = {0,0,0,0,0}, F[5];
+    for (i32 d = 0; d < 3; d++) {
+      const real *Qd = Qb + (size_t)d*tq2;
+      const real jac = esNoMet ? (real)1.0 : (real)1.0/h[d];
+      for (i32 j = 0; j < nq; j++) {
+        const real a = Qd[(size_t)i*nq+j] - Qd[(size_t)j*nq+i];
+        if (a == (real)0) continue;
+        dgEsEcFlux(&sWt[(size_t)i*5], &sWt[(size_t)j*5], d, F);
+        for (i32 q = 0; q < 5; q++) r[q] += jac*a*F[q];
+      }
+      for (i32 a2 = 0; a2 < nf; a2++) {
+        const real Bd = grid.esWf[f0+a2]*grid.esNrm[3*(size_t)(f0+a2)+d];
+        if (Bd == (real)0) continue;
+        const real a = Eb[(size_t)a2*nq+i]*Bd;
+        if (a == (real)0) continue;
+        dgEsEcFlux(&sWt[(size_t)i*5], &sWt[(size_t)(nq+a2)*5], d, F);
+        for (i32 q = 0; q < 5; q++) r[q] += jac*a*F[q];
+      }
+    }
+    const real *Vq = grid.esVq + (size_t)(q0+i)*CUT_NBMAX_H;
+    for (i32 m = 0; m < nb; m++)
+      for (i32 q = 0; q < 5; q++) atomicAdd(&sMdu[m*5+q], -Vq[m]*r[q]);
+  }
+
+  // ---- surface: the interface flux, and the neighbour's share ---------------
+  for (i32 a2 = threadIdx.x; a2 < nf; a2 += blockDim.x) {
+    real r[5] = {0,0,0,0,0}, F[5];
+    const real *Wa = &sWt[(size_t)(nq+a2)*5];
+    const i32 own = grid.esOwner[f0+a2];
+
+    // ---- the OTHER state, and the flux f*_d ---------------------------------
+    real Fst[3][5];
+    for (i32 d = 0; d < 3; d++) for (i32 q = 0; q < 5; q++) Fst[d][q] = 0;
+    i32 nbIdx = -1, nbNode = -1;
+    real Wo[5];
+    if (own == 6) {
+      // SOLID WALL as a Riemann problem against the mirror state.  Expressed in
+      // the hybridized form the wall flux must be the f*_d whose normal
+      // contraction is [0, p_w n, 0], i.e. f*_d = [0, p_w e_d, 0].
+      real nt[3] = { grid.esNrm[3*(size_t)(f0+a2)+0]/h[0],
+                     grid.esNrm[3*(size_t)(f0+a2)+1]/h[1],
+                     grid.esNrm[3*(size_t)(f0+a2)+2]/h[2] };
+      real nm = sqrt(nt[0]*nt[0] + nt[1]*nt[1] + nt[2]*nt[2]);
+      if (nm > (real)0) {
+        const real np[3] = { nt[0]/nm, nt[1]/nm, nt[2]/nm };
+        const real un = Wa[1]*np[0] + Wa[2]*np[1] + Wa[3]*np[2];
+        real pw;
+        if (grid.cutFsp) {                        // transparent (free-stream gate)
+          for (i32 d = 0; d < 3; d++) dgEulerFluxAxis(Wa, d, Fst[d]);
+          pw = (real)0;
+        } else {
+          pw = grid.cutWallRiem
+             ? Wa[4] + Wa[0]*un*un + (fabs(un) + dgSoundSpeed(Wa[4], Wa[0]))*Wa[0]*un
+             : Wa[4];
+          for (i32 d = 0; d < 3; d++) { for (i32 q = 0; q < 5; q++) Fst[d][q] = 0;
+                                        Fst[d][1+d] = pw; }
+        }
+      }
+    } else if (esClosed) {
+      const i32 d = own/2;
+      dgEulerFluxAxis(Wa, d, Fst[d]);          // ES_CLOSED: own flux, no exterior
+    } else {
+      const i32 d = own/2, side = own%2;
+      i32 o[3] = {1,1,1}; o[d] = side ? 2 : 0;
+      nbIdx = grid.nbrIdxList[27*b + o[0] + 3*o[1] + 9*o[2]];
+      if (nbIdx == bEmpty) nbIdx = -1;
+      nbNode = grid.esNode[f0+a2];
+      bool have = false;
+      if (nbIdx >= 0 && nbNode >= 0 && grid.blkCut[nbIdx] < 0) {
+        real Uo[5];
+        for (i32 q = 0; q < 5; q++)
+          Uo[q] = grid.getField(D_RHO+q)[(size_t)nbIdx*blockSizeTot + nbNode];
+        dgSanitizeCons(Uo);
+        Wo[0] = fmax(Uo[0], DG_EPSF);
+        Wo[1] = Uo[1]/Wo[0]; Wo[2] = Uo[2]/Wo[0]; Wo[3] = Uo[3]/Wo[0];
+        Wo[4] = dgPressureFromCons(Uo);
+        have = true;
+      } else if (nbIdx >= 0 && grid.blkCut[nbIdx] >= 0) {
+        // cut neighbour: evaluate ITS polynomial at the mirrored reference point
+        const i32 cn = grid.blkCut[nbIdx];
+        const i32 nbn = grid.cutNbOf[cn];
+        const real *cenN = grid.cutCen + 4*cn;
+        const real *LcN  = grid.cutLc  + (size_t)cn*CUT_NBMAX*CUT_NBMAX;
+        real xr[3] = { grid.esXf[3*(size_t)(f0+a2)+0],
+                       grid.esXf[3*(size_t)(f0+a2)+1],
+                       grid.esXf[3*(size_t)(f0+a2)+2] };
+        xr[d] = (real)1.0 - xr[d];
+        real psiN[CUT_NBMAX];
+        dgCutPsiO(cenN, xr, nbn, LcN, psiN, nullptr);
+        // its ENTROPY-PROJECTED trace, so both sides of this face see the same
+        // pair and the single-valued flux really is single-valued
+        real vo[5];
+        for (i32 q = 0; q < 5; q++) { real t = 0;
+          for (i32 m = 0; m < nbn; m++)
+            t += grid.esVtil[(size_t)cn*CUT_NBMAX_H*5 + m*5 + q]*psiN[m];
+          vo[q] = t; }
+        dgEsEntVarsToPrim(vo, Wo);
+        have = true;
+      }
+      if (!have) for (i32 q = 0; q < 5; q++) Wo[q] = Wa[q];   // outflow
+      real fs[5];
+      if (side) dgRusanovAxis(Wa, Wo, d, fs); else dgRusanovAxis(Wo, Wa, d, fs);
+      for (i32 q = 0; q < 5; q++) Fst[d][q] = fs[q];
+
+      // the NEIGHBOUR's share of the SAME single-valued flux, lifted with ITS
+      // native operator -- this is what keeps the face conservative
+      if (!esNoDep && nbIdx >= 0 && nbNode >= 0 && grid.blkCut[nbIdx] < 0) {
+        const real sgnN = side ? (real)1.0 : (real)-1.0;
+        const i32  nrmN = side ? 0 : (NNODE-1);
+        real fOwn[5]; dgEulerFluxAxis(Wo, d, fOwn);
+        const real lift = sgnN*((real)2.0/h[d])*c_winv[nrmN];
+        for (i32 q = 0; q < 5; q++)
+          atomicAdd(&grid.getField(D_RHS+q)[(size_t)nbIdx*blockSizeTot + nbNode],
+                    lift*(fs[q] - fOwn[q]));
+      }
+    }
+
+    // ---- r_a = SUM_d B_d ( f*_d - SUM_i E[a][i] fEC(a,i) ) / h_d ------------
+    for (i32 d = 0; d < 3; d++) {
+      const real Bd = grid.esWf[f0+a2]*grid.esNrm[3*(size_t)(f0+a2)+d];
+      if (Bd == (real)0) continue;
+      real acc[5] = {0,0,0,0,0};
+      for (i32 i = 0; i < nq; i++) {
+        const real e = Eb[(size_t)a2*nq+i];
+        if (e == (real)0) continue;
+        dgEsEcFlux(Wa, &sWt[(size_t)i*5], d, F);
+        for (i32 q = 0; q < 5; q++) acc[q] += e*F[q];
+      }
+      const real jacS = esNoMet ? (real)1.0 : (real)1.0/h[d];
+      for (i32 q = 0; q < 5; q++) r[q] += (Bd*jacS)*(Fst[d][q] - acc[q]);
+    }
+    const real *Vf = grid.esVf + (size_t)(f0+a2)*CUT_NBMAX_H;
+    for (i32 m = 0; m < nb; m++)
+      for (i32 q = 0; q < 5; q++) atomicAdd(&sMdu[m*5+q], -Vf[m]*r[q]);
+  }
+  __syncthreads();
+
+  // ---- dc~/dt = M^-1 (M du/dt) with M = I ---------------------------------
+  for (i32 i = threadIdx.x; i < blockSizeTot; i += blockDim.x)
+    for (i32 q = 0; q < 5; q++)
+      grid.getField(D_RHS+q)[(size_t)b*blockSizeTot + i] =
+          (i < nb) ? sMdu[i*5+q] : (real)0;
 }

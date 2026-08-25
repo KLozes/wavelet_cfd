@@ -51,7 +51,7 @@ static inline void legShift(double x,int K,double*P){ double t=2*x-1; P[0]=1; if
 struct NnlsStat { long long reformCalls=0, reformFlops=0, scanFlops=0, outer=0; };
 extern NnlsStat g_nnlsStat;
 #pragma omp threadprivate(g_nnlsStat)
-NnlsStat g_nnlsStat;
+inline NnlsStat g_nnlsStat;
 // PF holds the FACTORED candidate matrix: 3*n1 Legendre factors per node
 // (Px,Py,Pz), from which column q of A is the tensor product
 // A_q[(i0*n1+i1)*n1+i2] = (Px[i0]*Py[i1])*Pz[i2].
@@ -117,7 +117,19 @@ static void nnlsCore(const Acc&acc,const std::vector<double>&b,int m,int n,
     int jm=-1; double gm=gtol;
     g_nnlsStat.outer++; g_nnlsStat.scanFlops += (long long)n*m;
     for(int j=0;j<n;j++) if(!P[j]){ double g=dotAv(j,r.data()); if(g>gm){gm=g;jm=j;} }
-    if(jm<0) break; P[jm]=1; addcol(jm);
+    if(jm<0) break;
+    // THE PASSIVE SET is what must stay within the m x m scratch -- not the
+    // iteration count.  Each outer pass adds ONE column and the inner
+    // active-set loop can remove SEVERAL, so capping outer at m stops the
+    // solve early with columns still to find: measured on a case-9 cut cell,
+    // 21 columns admitted for a 35-dimensional moment space, terminating on
+    // the cap with 2.0e-05 (wedge) / 3.2e-04 (quarter) of moment residual --
+    // landing on moments that are EXACTLY ZERO in the true geometry (every
+    // odd power of z, which a z-invariant cylinder cannot have).  The raw
+    // Saye rule gives those as 1e-15, so an exact non-negative solution
+    // provably exists and NNLS was simply stopped before finding it.
+    if(k>=m) break;
+    P[jm]=1; addcol(jm);
     for(int inner=0;inner<3*n;inner++){
       solveLS(); std::fill(z.begin(),z.end(),0.0); double zmin=1e300;
       for(int a=0;a<k;a++){ z[idx[a]]=zk[a]; if(zk[a]<zmin)zmin=zk[a]; }
@@ -160,7 +172,11 @@ struct NnlsFactAcc {
 // (src/common/CutElem.h) are untouched.
 static void nnls(const std::vector<double>&A,const std::vector<double>&b,int m,int n,
                  std::vector<double>&w, double gtol=1e-9, int nOuter=-1){
-  if (nOuter<0 || nOuter>m) nOuter=m;
+  // nOuter<0 keeps the historical default (= m) so the FEM/IGA path is
+  // bit-identical; a caller that needs the solve to CONVERGE passes more.
+  // The passive set is bounded inside nnlsCore (k >= m breaks), so a larger
+  // iteration budget cannot overflow the scratch.
+  if (nOuter<0) nOuter=m;
   NnlsDenseAcc acc{A.data(),m};
   nnlsCore(acc,b,m,n,w,gtol,nOuter);
 }

@@ -163,6 +163,19 @@ struct CutElemOps {
   }
 };
 
+// CUT_TRACEFACE=1: print each face rule as it is built.  This exists because a
+// TANGENCY cell's accepted geometry is the output of a SEARCH: if the raw build
+// leaves bndIncons > qualTol, cutElemBuild below retries over a ladder of
+// level-set perturbations and keeps the best.  Anything that changes the raw
+// build -- including a shared-face override -- can therefore change which
+// perturbation wins, and with it the cell's volume.  MEASURED on the case-9
+// wedge (6,6): a NO-OP override (handing face 2 back its own Saye rule) moved
+// the accepted volume 8.688436e-02 -> 8.684247e-02, because the unperturbed
+// build drops face 0's 4.0e-05 tangency sliver and the perturbed one keeps it.
+// That is the search being sensitive, not the override being wrong -- with the
+// retry disabled (qualTol = inf) the two builds agree exactly.
+static const bool cutTraceFace = (getenv("CUT_TRACEFACE") != nullptr);
+
 // ---------------------------------------------------------------------------
 //  Build the operators for one cut element from its level-set fit.
 //  `phi < 0` is the ACTIVE region (negate at the caller if your fluid is phi>0).
@@ -180,8 +193,28 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
   { SayeSet w=mkset(scratch); sayeSurface(phi,&w,&ar,cfg);
     E.wall.assign(w.p, w.p+w.n); }
   for (i32 d=0; d<3; d++) for (i32 side=0; side<2; side++) {
+    const i32 fi = 2*d+side;
+    // SHARED-FACE RULE.  If an already-built cut neighbour owns this face, take
+    // ITS rule (flipped into our frame by the caller) instead of building our
+    // own.  The two fits restrict IDENTICALLY to the shared face in exact
+    // arithmetic, but in floating point each side evaluates its restriction
+    // from different 3-D coefficients and at a tangency the ulp differences
+    // flip Saye recursion branches.  MEASURED on case 9 before this line
+    // existed: 6 of 8 shared cut<->cut faces disagreed on their OWN AREA by
+    // 4.6e-05 (1.7e-04 relative), so the two elements integrated the same
+    // physical face over different quadrature -- each self-consistent with its
+    // own GCL (free stream still passed at 1e-12) but NOT CONSERVATIVE across
+    // the face: what one side says leaves is not what the other says enters.
+    // The mismatches come in mirrored pairs of opposite sign, which is why a
+    // symmetric gate cancels it and a wake does not.
+    // e6c25c2 introduced the override, threaded it through two call levels, and
+    // never read it here; this is the line that was missing.
+    if (faceOverride && faceOverride[fi]) { E.face[fi] = *faceOverride[fi];
+      if (cutTraceFace) printf("   [face] fi=%d OVERRIDE n=%zu\n", fi, E.face[fi].size());
+      continue; }
     SayeSet f=mkset(scratch); sayeFace(phi,d,side,&f,&ar,cfg);
-    E.face[2*d+side].assign(f.p, f.p+f.n);
+    E.face[fi].assign(f.p, f.p+f.n);
+    if (cutTraceFace) printf("   [face] fi=%d saye n=%d ovf=%d\n", fi, f.n, (i32)f.ovf);
   }
   E.wallArea=0; for (const SayeNode &s : E.wall) E.wallArea += (double)s.w;
 
@@ -191,28 +224,47 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
     cand.assign(v.p, v.p+v.n); }
   if (cand.empty()) return false;
 
-  // ---- basis, scaled over the WHOLE reference cell -------------------------
-  // NOT over the cut region.  A region-adapted centroid/scale looks better
-  // conditioned, but a DG cut element's polynomial must also be EVALUATED at
-  // the solution nodes outside the cut region -- and there u=(X-c)/s grows like
-  // (cell size)/(sliver size), so psi ~ u^N explodes.  In the solver that
-  // amplification fed back through the nodal->modal round trip and blew a
-  // uniform state to 1e24 in one RK step.  With the cell-wide scale psi = O(1)
-  // at every node; the sliver's mass-matrix conditioning is then worse, but
-  // that is the small-cell problem state redistribution exists to fix.
-  double cc[3]={0.5,0.5,0.5};
+  // ---- basis, adapted to the CUT REGION ----------------------------------
+  // This used to be scaled over the WHOLE reference cell, for a reason that no
+  // longer holds and is worth recording because it inverted the trade-off:
+  // a region-adapted MONOMIAL basis has u = (X-c)/s growing like
+  // (cell size)/(sliver size), so psi ~ u^N explodes at the tensor solution
+  // nodes -- which a nodally-stored element must evaluate -- and that blew a
+  // uniform state to 1e24 in one RK step.  But the basis is ORTHONORMALISED
+  // against this element's own rule (psi~ = L^-1 psi, added later), and
+  // orthonormalisation normalises that scale away: MEASURED on the case-9
+  // tangency wedge, cell-wide and region-adapted give the SAME max|psi~|,
+  // 54.3 over the fluid rule and 2.44e+04 at the tensor nodes, to the digit.
+  // The 54.3 is intrinsic -- it is the Christoffel function of a 0.083-cell-
+  // thick region and no basis choice removes it.  What the region scale DOES
+  // buy is the conditioning of the mass matrix itself:
+  //     kappa(M)   wedge 1.22e+07 -> 5.53e+04 (220x)
+  //                quarter 5.82e+03 -> 1.54e+02 (38x)
+  // which is what decides whether the element can carry its own degree at all,
+  // and that now matters because there is no degree ladder to fall back on.
+  double cc[3];
   double wsum=0; for (const SayeNode &s : cand) wsum+=(double)s.w;
   if (wsum<=0) return false;
-  double sc=0.75;                          // (half-diagonal)^2 of the unit cell
+  E.volume = wsum;      // raw geometric volume, published EARLY so that a
+                        // caller can still judge the snap criteria if the
+                        // element turns out not to support its degree
+  { double m1[3]={0,0,0};
+    for (const SayeNode &s : cand)
+      for (i32 d=0;d<3;d++) m1[d]+=(double)s.w*(double)s.x[d];
+    for (i32 d=0;d<3;d++) cc[d]=m1[d]/wsum; }
+  double sc=0;          // rms radius of the fluid region about its centroid
+  for (const SayeNode &s : cand) { double r2=0;
+    for (i32 d=0;d<3;d++){ double t=(double)s.x[d]-cc[d]; r2+=t*t; }
+    sc += (double)s.w*r2; }
+  sc /= wsum;
+  // a degenerate rule (all points coincident) would give s = 0; fall back to
+  // the old cell-wide scale rather than dividing by it
+  if (!(sc > 1e-30)) { cc[0]=cc[1]=cc[2]=0.5; sc=0.75; }
   E.B.init(2*N, cc, sqrt(sc));            // moments to total degree 2N
   const i32 nm = E.B.nb;                  // number of moment constraints
 
-  // Solution basis.  Degree starts at N and DROPS if the element cannot carry
-  // it: a tiny sliver's quadrature cannot make a full-degree cell-scaled mass
-  // matrix positive definite (measured: fluid volume 3e-5 with 21 points fails
-  // to factor 20 modes).  Reducing the degree is the honest response -- the
-  // element represents what its fluid region can support, down to a piecewise
-  // constant -- and state redistribution merges exactly these cells anyway.
+  // Solution basis, SAME centre and scale -- the kernel reads both from
+  // cutCen, so they must not diverge.
   CutBasis Bs; Bs.init(N, cc, sqrt(sc));
   i32 nb=Bs.nb, nG=3*nb;
 
@@ -244,7 +296,11 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
       E.B.eval(X, chi.data());
       for (i32 m=0;m<nm;m++){ A[(size_t)q*nm+m]=chi[m]; b[m]+=(double)cand[q].w*chi[m]; }
     }
-    nnls(A, b, nm, nc, wfit);
+    // nOuter = 8*nm, not the default nm: one column is admitted per outer pass
+    // and the active-set loop removes several, so the default stops the solve
+    // early and leaves ~1e-4 of moment error on a rule whose whole job is to
+    // reproduce those moments.  See the note in nnlsCore.
+    nnls(A, b, nm, nc, wfit, 1e-9, 8*nm);
     E.vol.clear();
     for (i32 q=0;q<nc;q++) if (wfit[q]>1e-15){ SayeNode s=cand[q]; s.w=(real)wfit[q]; E.vol.push_back(s); }
   }
@@ -270,33 +326,30 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
     }
   }
 
-  // ---- step 2+3, per candidate degree: GCL correction, then the mass -------
+  // ---- step 2+3: GCL correction, then the mass ---------------------------
+  // A CUT ELEMENT CARRIES THE SAME DEGREE AS AN UNCUT ONE.  There is no degree
+  // ladder here any more, and that is a deliberate reversal.  Three separate
+  // mechanisms used to drop the order -- a thin-cell rule (mean thickness
+  // < CUT_THINTOL => P0), a conditioning cap (CUT_KAPMAX), and a CUT_DEGMAX
+  // override -- and each was a workaround for an instability rather than a
+  // property of the geometry.  They are gone because:
+  //   * the small-cell problem is STATE REDISTRIBUTION's job (Berger &
+  //     Giuliani; Taylor, Wilcox & Chan), and dgsrd_test verifies ours is
+  //     conservative, polynomial-exact to degree N and contractive.  Reducing
+  //     the degree solves the same problem twice, and the second solution
+  //     costs the order the scheme exists to deliver;
+  //   * the conditioning cap was measured to be unjustified: on case 9 every
+  //     one of the 12 cut elements -- INCLUDING the 0.087-volume tangency
+  //     wedges -- factors a full P3 mass matrix with bndIncons ~ 1e-11.  The
+  //     cap at 1e2 was collapsing all of them to P0/P1 for nothing;
+  //   * a mixed-order mesh is its own problem: a P0 cut element against a P3
+  //     Cartesian neighbour is a first-order wall no matter how good the
+  //     interior is, and it makes every convergence study meaningless.
+  // If the mass matrix will not factor at degree N, that is now a BUILD
+  // FAILURE reported to the caller, not a silent order drop.
   std::vector<SayeNode> volKeep(E.vol);      // pre-correction weights
-  i32 degTop = N;
-  { const char *de = getenv("CUT_DEGMAX");
-    if (de) { i32 v = atoi(de); if (v >= 0 && v < degTop) degTop = v; } }
-  // THIN-CELL DEGREE RULE.  Mean thickness = fluid volume / wall area.  A
-  // tangency WEDGE (wall grazing a cell face) has thickness ~0.08 cells; its
-  // P^N trace on the far face is extrapolation garbage that no face-coupling
-  // structure can repair -- measured as the persistent supersonic blowup at
-  // exactly the four tangency cells after the mortar fixed everything else.
-  // A cell thinner than CUT_THINTOL (default 0.25) of a cell carries P0 only:
-  // the geometric form of the sub-half-cell resolution limit, applied to the
-  // DEGREE instead of to existence.
   {
-    // NOTE: E.volume is not assigned yet at this point -- an earlier version
-    // read it here and silently collapsed EVERY element to degree 0 (the
-    // "P2 all-Mach pass" it produced was P0 in disguise).  The raw Saye
-    // candidate volume wsum is what exists now, and is the right measure.
-    double aw = E.wallArea;
-    if (aw > 1e-12) {
-      double thick = wsum / aw;
-      const char *tt = getenv("CUT_THINTOL");
-      double tol = tt ? atof(tt) : 0.25;
-      if (thick < tol) degTop = 0;
-    }
-  }
-  for (i32 deg = degTop; deg >= 0; deg--) {
+    const i32 deg = N;
   Bs.init(deg, cc, sqrt(sc)); nb = Bs.nb; nG = 3*nb;
   E.vol = volKeep;                           // reset weights for this attempt
   // ---- LEAST-NORM CORRECTION so the GCL holds EXACTLY ---------------------
@@ -455,28 +508,12 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
       for (i32 q=0;q<j;q++) t-=M[(size_t)i*nb+q]*M[(size_t)j*nb+q];
       M[(size_t)i*nb+j]=t/d;
     } }
-  if (!spd) continue;                      // this degree does not fit: try lower
-  // KAPPA CAP.  Factorability is not enough: a small cut cell can factor a
-  // full-degree mass matrix whose inverse still amplifies by 1e6, and the RHS
-  // then produces intermediates the sanitizer mangles before state
-  // redistribution can act (measured: 7.8e6 modal RHS on a physical wall load
-  // of ~1.5e2, blowing up in three stages).  A cell whose quadrature cannot
-  // SUPPORT a mode must not own it -- the neighbourhood polynomial SRD builds
-  // carries the accuracy there instead.  Estimate kappa from the Cholesky
-  // diagonal and drop the degree until it is tame.
-  {
-    double dmin=1e300, dmax=0;
-    for (i32 i=0;i<nb;i++){ double d=M[(size_t)i*nb+i]; dmin=fmin(dmin,d); dmax=fmax(dmax,d); }
-    double kap=(dmax/dmin)*(dmax/dmin);
-    const char *ke = getenv("CUT_KAPMAX");
-    double kapMax = ke ? atof(ke) : 1e4;
-    if (kap > kapMax && deg > 0) continue;   // too ill-conditioned: try lower
-  }
+  if (!spd) return false;                  // cannot support its own degree: build failure
   E.Mchol.swap(M);
   E.B = Bs;                                // keep the SOLUTION basis actually used
   E.ok = true;
   return true;
-  }                                        // end of the degree loop
+  }                                        // end of the (single-degree) block
   return false;
 }
 
@@ -501,7 +538,24 @@ inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
                          std::vector<SayeNode> &scratch,
                          double qualTol = 1e-6,
                          const std::vector<SayeNode> * const *faceOverride = nullptr) {
-  if (!cutElemBuildRaw(phi, N, E, ar, cfg, scratch, faceOverride)) return false;
+  if (!cutElemBuildRaw(phi, N, E, ar, cfg, scratch, faceOverride)) {
+    // The element cannot carry degree N -- and with the degree ladder gone
+    // there is no lower order to fall back to.  That is deliberate, but it is
+    // not a reason to lose the cell: a SUB-RESOLUTION feature should be dropped
+    // geometrically, which is what the snap rules already do and is the honest
+    // answer anyway (a 3e-05 fluid sliver is below the mesh's resolution, so
+    // representing it at ANY order is a fiction).  Anything else is a genuine
+    // failure: the element needs more QUADRATURE, not less accuracy -- the
+    // limit there is the rule's point count against the mode count, so the fix
+    // is a denser Saye rule (cfg.ng) on that cell, never a lower degree.
+    // NOTE the contract: these return true with E.ok == false and NO operators
+    // built.  E.snap != 0 means "this is not a cut element" -- the caller must
+    // reclassify the block (IB_FLUID / IB_DEAD) and never touch E.B, E.vol or
+    // E.Mchol.  DgCutBuild.cu does exactly that.
+    if (E.volume > 0.97 && E.wallArea < 0.2) { E.snap = 1; return true; }
+    if (E.volume < 0.03 && E.wallArea < 0.2) { E.snap = 2; return true; }
+    return false;
+  }
   if (E.bndIncons > qualTol) {
     const double epsL[6] = {1e-9,-1e-9,1e-7,-1e-7,1e-5,-1e-5};
     CutElemOps best = E;
@@ -520,7 +574,12 @@ inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
   // makes bndIncons exactly 0 on such cells, which silently un-snapped them and
   // left live P2 cells with needle walls paired against P0 wedges across the
   // tangency face (the surviving supersonic blowup pair).
-  if (E.volume > 0.97 && E.wallArea < 0.05) { E.snap = 1; return true; }
+  // CUT_NOSNAP=1: keep a grazing cell as a genuine cut element.  Snapping it to
+  // FLUID deletes its wall, which puts a HOLE in the body at exactly the four
+  // points where the surface is tangent to the grid -- and the flow goes
+  // through it.  Snapping to SOLID at least keeps the body closed.
+  const bool noSnapF = getenv("CUT_NOSNAP") != nullptr;
+  if (!noSnapF && E.volume > 0.97 && E.wallArea < 0.05) { E.snap = 1; return true; }
   if (E.volume < 0.03 && E.wallArea < 0.05) { E.snap = 2; return true; }
   if (E.bndIncons > qualTol) {
     // still inconsistent: if the cut is marginal, drop the feature entirely

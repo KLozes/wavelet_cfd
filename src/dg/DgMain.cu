@@ -195,7 +195,15 @@ int main(int argc, char* argv[]) {
   solver->ibHO        = argI("--ibho", 1);   // 0 = first-order wall reconstruction
   solver->ibSbm       = argI("--ibsbm", 0);   // 1 = shifted boundary wall (no ghosts)
   solver->cutOn       = argI("--cutcell", 0);   // cut-cell DG (replaces the IB family)
+  solver->cutModal    = argI("--cutmodal", 0); // cut elements store modal coeffs
+  solver->cutHvMean   = argI("--cuthvmean", 0);
+  solver->cutHv       = argF("--cuthv", 0.0);  // modal hyper-viscosity on cut elems
+  solver->cutWallRiem = argI("--cutwall", 0);  // 1 = mirror-state Riemann wall
   solver->cutFsp      = argI("--cutfsp", 0);    // transparent-wall free-stream gate
+  solver->cutEs       = argI("--cutes", 0);     // entropy-stable cut RHS (arXiv:2412.13002)
+  solver->esDbg       = (getenv("ES_CLOSED")    ? 1 : 0)
+                      | (getenv("ES_NODEPOSIT") ? 2 : 0)
+                      | (getenv("ES_NOMETRIC")  ? 4 : 0);
   solver->cutDbgMask  = argI("--cutmask", 15);  // term mask (debug bisection)
   solver->cutEta      = argF("--cuteta", 0.05); // modal-decay trouble threshold
   i32 cutProbe        = argI("--cutprobe", 0);  // isolate cut RHS terms and exit
@@ -376,6 +384,14 @@ int main(int argc, char* argv[]) {
       fflush(stdout);
       exit(2);
     }
+    { // steady-state residual: ||dU/dt||/||U|| over the fluid.  A converged
+      // steady solve flattens this; a slowly-growing one is not converging.
+      static double rPrev = -1.0;
+      double rn = solver->dgResidualNorm();
+      printf("[resid] t=%.3f  ||dU/dt||/||U|| = %.6e%s\n", (double)t, rn,
+             (rPrev > 0) ? (rn < rPrev ? "   (falling)" : "   (RISING)") : "");
+      rPrev = rn;
+    }
     { // boundary mass-flux balance: inflow (x-lo), outflow (x-hi), y walls,
       // and the net vs the actual d/dt(mass) -- the gap is IB non-conservation
       double bnd[4]; solver->boundaryMassFlux(bnd);
@@ -432,6 +448,10 @@ int main(int argc, char* argv[]) {
 
   cudaDeviceSynchronize();
   // nodal field dump for external plotting (x, y, rho, u, v, p per node)
+  if (solver->cutOn && solver->cutDbg)
+    printf("[cutfaces] cut<->NONcut faces: %d took the conforming mortar, "
+           "%d were PARTIAL and got NO deposit at all\n",
+           solver->cutDbg[1], solver->cutDbg[0]);
   if (solver->cutOn) solver->writeCutFields("output/cut");
 
   if (argI("--cutdump", 0)) {
@@ -484,6 +504,12 @@ int main(int argc, char* argv[]) {
     i32 isCut = (devB>=0 && solver->blkCut) ? solver->blkCut[devB] : -1;
     printf("[cutcheck] max relative drift from uniform IC = %.6e  (q=%d, %s element)\n",
            dev, devQ, isCut>=0?"CUT":"cartesian");
+    // The loop above walks TENSOR NODES, which on a cut element include points
+    // inside the solid (an extension, not a solution) and -- under --cutmodal --
+    // are coefficients, not values at all.  Measure the cut elements properly:
+    // their own polynomial, on their own volume rule.
+    printf("[cutcheck] cut elements, on their own fluid rule = %.6e\n",
+           solver->cutMaxDeviation(U0));
   }
 
   delete solver;

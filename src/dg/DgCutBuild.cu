@@ -42,9 +42,137 @@ static void hostElemSizeLocal(const DgSolver &g, i32 lvl, double h[3]) {
                     : (double)g.domainSize[2] / ((double)(g.baseGridSize[2]/blockSize) * powi(2, lvl));
 }
 
+// ---------------------------------------------------------------------------
+//  TANGENCY GUARD.  A body tangent to a grid line is a DEGENERATE input, and it
+//  is not exotic -- case 9 ships with R = 0.5 and h = domx/nblocks = 0.25, i.e.
+//  R/h = 2.0000 exactly, so the cylinder touches four cell edges by
+//  construction.  Measured cost of that one coincidence:
+//    * the node-sign classifier flags 20 blocks as cut when only 12 are (the
+//      8 extras touch the body at a single point and come back wallArea == 0);
+//    * Saye subdivides the tangent faces 15x, 1500 points on a unit face;
+//    * the face rules lose polynomial exactness: 8.4e-03 against closed-form
+//      integrals, versus 8.0e-10 as soon as the tangency is broken;
+//    * the cut volume fraction collapses to 0.087 (wedges) from 0.45;
+//    * the volume rule's moment error goes 1.8e-10 -> 4.1e-04.
+//  Every one of those recovers the moment the geometry is non-degenerate, and
+//  the perturbation needed is tiny: 2e-6 of the radius is not enough, 2e-5 is
+//  (measured, both directions).  So: detect it and step off it.
+//
+//  The perturbation is GLOBAL and applied to the sampled level set, not per
+//  cell -- neighbours must agree about where the interface is, or the shared
+//  face rules stop matching.
+// ---------------------------------------------------------------------------
 void DgSolver::buildCutElems(void) {
   if (!cutOn) return;
   cudaDeviceSynchronize();
+  if (cutEps == (real)0 && !getenv("CUT_NOGEOMGUARD")) {
+    // --- DEGENERACY AUDIT + ESCALATING SHIFT ------------------------------
+    // Probe the geometry at a candidate shift and score how degenerate it is.
+    // Four signatures, each measured on this exact case and each with a
+    // documented downstream cost:
+    //   T  tangency      node-flagged block with ZERO wall area.  The
+    //                    classifier calls it cut, the surface inside has no
+    //                    measure.  Costs: 8 false cuts, all snapped away.
+    //   S  sliver        fluid fraction within kSliver of 0 or 1.  A cell that
+    //                    is essentially all one phase but carries cut
+    //                    machinery, mass-matrix conditioning and a wall.
+    //   N  needle face   a face with a nonzero but negligible fluid area.
+    //                    100 quadrature points on 4e-05 of a face.
+    // and one COST signal that is deliberately NOT part of the verdict:
+    //   X  subdivision   Saye exploding the point count on a near-tangent face
+    //                    (1500 points on a unit face).  This is expensive but
+    //                    NOT wrong: at R/h = 1.65 eight faces still trip it and
+    //                    those same rules are polynomially exact to 8.0e-10
+    //                    (verified against closed-form integrals).  Counting it
+    //                    as degeneracy made the guard cry wolf on a geometry
+    //                    that is fine, so it is reported and not acted on.
+    // Shifts are tried in increasing size and the FIRST clean one wins; the
+    // measured threshold on case 9 is between 2e-6 and 2e-5 of the radius, so
+    // the ladder starts below it and steps past.  Positive shrinks the body --
+    // growing it instead manufactures sub-resolution solid slivers (measured:
+    // bndIncons 1.7e-10 -> 2.1e-04).  The shift is GLOBAL: neighbours must
+    // agree on where the interface is or the shared face rules stop matching.
+    const double kSliver = 1e-3, kNeedle = 1e-3;
+    double hMin = 1e30;
+    for (i32 b = 0; b < hashTable.nKeys; b++) {
+      if (bLocList[b] == kEmpty) continue;
+      i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
+      double hh[3]; hostElemSizeLocal(*this, lvl, hh);
+      hMin = fmin(hMin, fmin(hh[0], hh[1]));
+    }
+    double w0[NNODE], xi0[NNODE];
+    dgGetHostOps(w0, xi0, gauss);
+    std::vector<SayeNode> arena0(1<<21), scratch0(1<<18);
+    SayeArena ar0; ar0.buf=arena0.data(); ar0.cap=1<<21; ar0.top=0;
+    SayeCfg cfg0 = SayeCfg::def(); cfg0.ng = 10;
+
+    auto audit = [&](double eps, i32 cnt[4]) {
+      cnt[0]=cnt[1]=cnt[2]=cnt[3]=0;
+      for (i32 b = 0; b < hashTable.nKeys; b++) {
+        u64 loc = bLocList[b];
+        if (loc == kEmpty) continue;
+        i32 lvl, ib, jb, kb; decode(loc, lvl, ib, jb, kb);
+        double hh[3]; hostElemSizeLocal(*this, lvl, hh);
+        std::vector<real> v0((size_t)NNODE*NNODE*NNODE);
+        bool anyF=false, anyS=false;
+        for (i32 k = 0; k < NNODE; k++)
+        for (i32 j = 0; j < NNODE; j++)
+        for (i32 i = 0; i < NNODE; i++) {
+          double X = (ib + 0.5*(xi0[i]+1.0))*hh[0];
+          double Y = (jb + 0.5*(xi0[j]+1.0))*hh[1];
+          double f = -dgHostIbPhi(*this, X, Y) - eps;
+          v0[i + NNODE*(j + NNODE*k)] = (real)f;
+          if (f < 0) anyF = true; else anyS = true;
+        }
+        if (!anyF || !anyS) continue;
+        PolyND phi0 = fitPoly3(dgOrder, v0.data());
+        SayeSet ws; ws.p=scratch0.data(); ws.n=0; ws.cap=1<<18; ws.ovf=false;
+        sayeSurface(phi0, &ws, &ar0, cfg0);
+        double wa=0; for (i32 q=0;q<ws.n;q++) wa += (double)ws.p[q].w;
+        if (wa <= 1e-12) { cnt[0]++; continue; }            // T
+        SayeSet vs; vs.p=scratch0.data(); vs.n=0; vs.cap=1<<18; vs.ovf=false;
+        sayeVolume(phi0, &vs, &ar0, cfg0);
+        double vol=0; for (i32 q=0;q<vs.n;q++) vol += (double)vs.p[q].w;
+        if (vol < kSliver || vol > 1.0-kSliver) cnt[1]++;   // S
+        for (i32 d=0; d<3; d++) for (i32 sd=0; sd<2; sd++) {
+          SayeSet fs; fs.p=scratch0.data(); fs.n=0; fs.cap=1<<18; fs.ovf=false;
+          sayeFace(phi0, d, sd, &fs, &ar0, cfg0);
+          double fa=0; for (i32 q=0;q<fs.n;q++) fa += (double)fs.p[q].w;
+          if (fa > 1e-14 && fa < kNeedle) cnt[2]++;         // N
+          if (fs.n > 400) cnt[3]++;                         // X
+        }
+      }
+    };
+
+    i32 c0[4]; audit(0.0, c0);
+    const i32 bad0 = c0[0]+c0[1]+c0[2];      // X is COST, not correctness
+    if (bad0 > 0) {
+      printf("cut    : DEGENERATE GEOMETRY -- %d tangency, %d sliver, "
+             "%d needle-face  (+%d face(s) heavily subdivided: cost, not error)\n",
+             c0[0], c0[1], c0[2], c0[3]);
+      const double ladder[] = {1e-5, 1e-4, 1e-3, 1e-2};
+      double bestEps = 0; i32 bestBad = bad0;
+      for (double f : ladder) {
+        i32 c[4]; const double eps = f*hMin;
+        audit(eps, c);
+        const i32 bad = c[0]+c[1]+c[2];
+        printf("       : shift %.2e (%.0e of a cell) -> "
+               "%d tangency, %d sliver, %d needle\n", eps, f, c[0], c[1], c[2]);
+        if (bad < bestBad) { bestBad = bad; bestEps = eps; }
+        if (bad == 0) break;
+      }
+      cutEps = (real)bestEps;
+      if (bestBad == 0)
+        printf("       : adopting shift %.3e -- geometry is now non-degenerate\n",
+               (double)cutEps);
+      else
+        printf("       : WARNING no shift cleared it; best is %.3e with %d "
+               "signature(s) left.\n"
+               "       : that is under-resolution, not degeneracy -- REFINE the "
+               "wall band.\n", (double)cutEps, bestBad);
+      printf("       : CUT_NOGEOMGUARD=1 reproduces the unshifted build\n");
+    }
+  }
 
   const i32 N = dgOrder, nb = CutBasis::count(N);
   cutNb = nb;
@@ -56,7 +184,7 @@ void DgSolver::buildCutElems(void) {
   std::vector<SayeNode> arena(1<<21), scratch(1<<18);
   SayeArena ar; ar.buf = arena.data(); ar.cap = 1<<21; ar.top = 0;
   SayeCfg cfg = SayeCfg::def();
-  cfg.ng = 10;                           // 5 is NOT enough for the GCL -- measured
+  cfg.ng = getenv("CUT_NG") ? atoi(getenv("CUT_NG")) : 10;   // 5 is NOT enough -- measured
 
   std::vector<i32>       blkOf;
   std::vector<CutElemOps> ops;
@@ -78,7 +206,8 @@ void DgSolver::buildCutElems(void) {
     for (i32 i = 0; i < NNODE; i++) {
       double X = (ib + 0.5*(xi[i]+1.0))*h[0];
       double Y = (jb + 0.5*(xi[j]+1.0))*h[1];
-      double f = -dgHostIbPhi(*this, X, Y);   // Saye active = phi<0 = FLUID
+      double f = -dgHostIbPhi(*this, X, Y) - cutEps;   // Saye active = phi<0 = FLUID
+                                              // cutEps: see the tangency guard
       v[i + NNODE*(j + NNODE*k)] = (real)f;
       if (f < 0) anyF = true; else anyS = true;
     }
@@ -110,7 +239,7 @@ void DgSolver::buildCutElems(void) {
         const i32 d2 = fc/2, myS = fc%2, nbF = 2*d2 + (1-myS);   // their matching face
         ovStore[fc] = ops[cnb].face[nbF];
         for (SayeNode &sn : ovStore[fc]) sn.x[d2] = (real)1.0 - sn.x[d2];
-        ovPtr[fc] = &ovStore[fc];
+        if (!getenv("CUT_NOFACEOVR")) ovPtr[fc] = &ovStore[fc];
       }
     }
     CutElemOps E;
@@ -155,6 +284,8 @@ void DgSolver::buildCutElems(void) {
   devS(walOff[nCutElem], &cutWalP);
   devS(facOff[6*nCutElem], &cutFacP);
   cudaMallocManaged(&cutFacA, (size_t)6*nCutElem*sizeof(real));
+  cudaMallocManaged(&cutDbg, 2*sizeof(i32));
+  cutDbg[0] = cutDbg[1] = 0;
   cudaMallocManaged(&cutBlk,  nCutElem*sizeof(i32));
   cudaMallocManaged(&cutNbOf, nCutElem*sizeof(i32));
   cudaMallocManaged(&cutNbLo, nCutElem*sizeof(i32));
@@ -199,6 +330,9 @@ void DgSolver::buildCutElems(void) {
         cutLc[(size_t)c*CUT_NBMAX_H*CUT_NBMAX_H + (size_t)i*CUT_NBMAX_H + j] =
           (real)E.Mchol[(size_t)i*nbE + j];
   }
+
+  // ---- entropy-stable operators, if asked for ----------------------------
+  buildCutEs(&ops);
 
   // ---- the cut path REPLACES the IB machinery ----------------------------
   // Cut elements integrate as ordinary fluid (the wall lives in their flux
@@ -289,6 +423,14 @@ struct DgSrd {
 void DgSolver::buildSrd(void) {
   if (!cutOn || nCutElem == 0) return;
   srd = new DgSrd();
+  // srdApply reads element states through THIS basis; the quadrature pool and
+  // the modal conversion use dgGetHostOps(..., gauss).  Under --gauss the
+  // solution points are Gauss-Legendre, so a GLL basis here would read the
+  // right numbers through the wrong polynomials -- silently.
+  if (gauss) {
+    printf("srd    : WARNING --gauss with SRD: the SRD nodal basis is GLL while "
+           "the solution points are Gauss-Legendre; results are not trustworthy\n");
+  }
   srd->B.init(dgOrder);
 
   // ---- collect the element set: cut blocks + two rings of fluid neighbours --
@@ -364,29 +506,269 @@ void DgSolver::buildSrd(void) {
   // states, positivity-preserving by construction.  Raising this together
   // with the cut elements' own degree needs a trouble detector (cut-MOOD);
   // that is the accuracy roadmap, not the stability baseline.
-  { const char *se = getenv("CUT_SRDDEG");
-    srd->S.factor(srd->elems, srd->qpool.data(), se ? atoi(se) : 0); }
+  {
+    // SRD PROJECTION DEGREE.  Taylor, Wilcox & Chan project onto P_N over the
+    // merge neighbourhood -- N being the SOLUTION degree -- and degree 0 appears
+    // NOWHERE in the paper: their Def 2.2, Eq 26 and the contractivity lemma are
+    // all stated for P_N, and their runs are N = 1,2,3,4.  "Preserves polynomial
+    // order", which is the property that makes SRD free, is definitionally
+    // impossible at degree 0.
+    //
+    // MEASURED CONSEQUENCE of doing it properly: at degree 0 this scheme is
+    // stable, at 1 the solution corrupts (wall Cp min -20), at 2 and 3 it blows
+    // up (t=0.56, t=0.28).  The reason is
+    // that SRD is a CONTRACTIVE FILTER and the theorem is conditional -- it says
+    // an ENERGY-STABLE scheme survives one.  Our cut RHS is a standard weak form
+    // with Rusanov/HLLC faces and is not energy stable, so the theorem does not
+    // cover it and the filter has nothing to protect.  Degree 0 is then acting
+    // as a low-pass stabiliser rather than as state redistribution.
+    //
+    // THE COST IS NOT SUBTLE: a degree-0 projection replaces every merged cut
+    // element by a CONSTANT, three times per step (once per RK stage), so the
+    // wall trace is piecewise constant per element and the cut band is
+    // first-order no matter what degree the elements carry.  Measured: wall Cp
+    // is a staircase with one plateau per cut element.
+    // DEFAULT IS THE SOLUTION DEGREE, per the paper.  A degree-0 projection
+    // replaces every merged cut element by a CONSTANT three times per step and
+    // makes the cut band first-order however high the element degree -- it is
+    // not state redistribution, it is a low-pass filter wearing its name.
+    const char *se = getenv("CUT_SRDDEG");
+    i32 sdeg = se ? atoi(se) : dgOrder;
+    if (sdeg > dgOrder) {
+      // above the solution degree the nodal write-back truncates the projection
+      // at the (p+1)^3 tensor nodes and CONSERVATION IS LOST
+      printf("srd    : CUT_SRDDEG=%d exceeds the solution degree %d -- clamped "
+             "(the write-back would truncate it and break conservation)\n",
+             sdeg, dgOrder);
+      sdeg = dgOrder;
+    }
+    if (sdeg < 0) sdeg = 0;
+    srd->S.factor(srd->elems, srd->qpool.data(), sdeg);
+    if (sdeg < dgOrder)
+      printf("srd    : projection degree %d < solution degree %d -- the cut band "
+             "is FIRST-ORDER (see the note in DgCutBuild.cu; CUT_SRDDEG=%d is "
+             "the faithful setting and needs an energy-stable RHS)\n",
+             sdeg, dgOrder, dgOrder);
+  }
   for (i32 k = 0; k < srd->S.nElem; k++) if (!srd->S.trivial[k]) srd->nMerged++;
   const size_t nd = (size_t)srd->elems.size()*blockSizeTot*5;
   srd->u.resize(nd); srd->su.resize(nd);
   double vmin = 1e300;
   for (const SrdElem &E : srd->elems) if (E.vol < vmin) vmin = E.vol;
-  printf("srd    : %zu elements (%d merged), smallest vol %.3e of full %.3e\n",
+  double vnb = 1e300;
+  for (i32 k = 0; k < srd->S.nElem; k++) {
+    if (srd->S.trivial[k]) continue;
+    double vv = 0; for (i32 m : srd->S.M[k]) vv += srd->elems[m].vol;
+    vnb = fmin(vnb, vv);
+  }
+  printf("srd    : %zu elements (%d merged), smallest vol %.3e of full %.3e, "
+         "smallest MERGED neighbourhood %.3e\n",
          srd->elems.size(), srd->nMerged, vmin,
-         srd->elems.empty() ? 0.0 : srd->elems[0].hv());
+         srd->elems.empty() ? 0.0 : srd->elems[0].hv(),
+         (vnb < 1e299) ? vnb : 0.0);
+  if (srd->S.nShort > 0)
+    printf("srd    : WARNING %d neighbourhood(s) never reached the volume "
+           "target and are used anyway -- SRD did not buy the CFL relief there\n",
+           srd->S.nShort);
 }
+
+// ---------------------------------------------------------------------------
+//  HOST-SIDE ACCESS TO A CUT ELEMENT'S ACTUAL SOLUTION.
+//  Re-runs dgRhsCutKernel's own nodal->modal projection (DgSolverKernels.cu:5920)
+//  and evaluates the resulting polynomial.  Shared by the field writer and by
+//  the image path: both need the cut element's REAL representation, and the
+//  coefficients live only in the kernel's shared memory.
+// ---------------------------------------------------------------------------
+struct CutHostEval {
+  DgSolver *g = nullptr;
+  i32 c = -1, nb = 0;
+  std::vector<double> cmod;
+  double xiN[NNODE], wN[NNODE];
+
+  void begin(DgSolver &G, i32 cIdx) {
+    g = &G; c = cIdx; nb = G.cutNbOf[cIdx];
+    dgGetHostOps(wN, xiN, G.gauss);
+    cmod.assign((size_t)nb*5, 0.0);
+    const i32 b = G.cutBlk[cIdx];
+    if (G.cutModal) {                 // the coefficients ARE the state
+      for (i32 m = 0; m < nb; m++)
+        for (i32 q = 0; q < 5; q++)
+          cmod[(size_t)m*5+q] = (double)G.getField(D_RHO+q)[(size_t)b*blockSizeTot + m];
+      return;
+    }
+    std::vector<double> psi(CUT_NBMAX_H), Lx(NNODE), Ly(NNODE), Lz(NNODE);
+    for (i32 q = G.cutVolOff[cIdx]; q < G.cutVolOff[cIdx+1]; q++) {
+      const SayeNode &s = G.cutVolP[q];
+      const double xr[3] = {(double)s.x[0], (double)s.x[1], (double)s.x[2]};
+      basis(xr, psi.data());
+      lag(2.0*xr[0]-1.0, Lx.data()); lag(2.0*xr[1]-1.0, Ly.data()); lag(2.0*xr[2]-1.0, Lz.data());
+      for (i32 fq = 0; fq < 5; fq++) {
+        double uq = 0.0;
+        for (i32 k = 0; k < NNODE; k++) for (i32 j = 0; j < NNODE; j++) for (i32 i = 0; i < NNODE; i++)
+          uq += Lx[i]*Ly[j]*Lz[k]
+              * (double)G.getField(D_RHO+fq)[(size_t)b*blockSizeTot + i + NNODE*(j + NNODE*k)];
+        for (i32 m = 0; m < nb; m++) cmod[(size_t)m*5+fq] += (double)s.w*psi[m]*uq;
+      }
+    }
+  }
+  void lag(double x, double *L) const {
+    for (i32 a = 0; a < NNODE; a++) { double v = 1.0;
+      for (i32 m = 0; m < NNODE; m++) if (m != a) v *= (x - xiN[m])/(xiN[a] - xiN[m]);
+      L[a] = v; }
+  }
+  // orthonormal cut basis, host twin of dgCutPsiO (DgSolverKernels.cu:5841)
+  void basis(const double xr[3], double *psi) const {
+    const real *cen = g->cutCen + 4*c;
+    double u[3];
+    for (i32 d = 0; d < 3; d++) u[d] = (xr[d] - (double)cen[d])/(double)cen[3];
+    i32 m = 0;
+    for (i32 deg = 0; deg <= dgOrder && m < nb; deg++)
+    for (i32 i = deg; i >= 0 && m < nb; i--)
+    for (i32 j = deg-i; j >= 0 && m < nb; j--) {
+      const i32 e[3] = { i, j, deg-i-j };
+      double v = 1.0;
+      for (i32 d = 0; d < 3; d++) for (i32 a = 0; a < e[d]; a++) v *= u[d];
+      psi[m++] = v;
+    }
+    const real *Lc = g->cutLc + (size_t)c*CUT_NBMAX_H*CUT_NBMAX_H;
+    for (i32 i = 0; i < nb; i++) { double t = psi[i];
+      for (i32 j = 0; j < i; j++) t -= (double)Lc[(size_t)i*CUT_NBMAX_H+j]*psi[j];
+      psi[i] = t/(double)Lc[(size_t)i*CUT_NBMAX_H+i]; }
+  }
+  // conserved variables of the element's own polynomial at a reference point
+  void consAt(const double xr[3], double U[5]) const {
+    std::vector<double> psi(nb);
+    basis(xr, psi.data());
+    for (i32 q = 0; q < 5; q++) { double t = 0;
+      for (i32 m = 0; m < nb; m++) t += cmod[(size_t)m*5+q]*psi[m];
+      U[q] = t; }
+  }
+};
 
 void DgSolver::applySrd(void) {
   if (!srd || srd->nMerged == 0) return;
   if (getenv("CUT_NOSRD")) return;
   cudaDeviceSynchronize();
   const i32 nE = (i32)srd->elems.size();
+  // ---- TEMP conservation probe (SRD_CONS=1 / FRD_CONS=1) -------------------
+  // Totals over the SRD ELEMENT SET measured with the SOLVER'S OWN functional:
+  // cut elements over their Saye volume rule (same as dgCutConserved), uncut
+  // over the tensor GLL rule (same as dgTotalConserved).  base = D_RHO gives
+  // the state total, base = D_RHS gives the total RATE.
+  auto srdSetTot = [&](i32 base, double T[3]) {
+    T[0]=T[1]=T[2]=0;
+    double wq[NNODE], xq[NNODE]; dgGetHostOps(wq, xq, gauss);
+    std::vector<double> psi(CUT_NBMAX_H);
+    for (i32 e2 = 0; e2 < nE; e2++) {
+      const i32 b2 = srd->blk[e2];
+      i32 lvl,ib2,jb2,kb2; decode(bLocList[b2], lvl, ib2, jb2, kb2);
+      double hh[3]; hostElemSizeLocal(*this, lvl, hh);
+      const i32 c2 = (cutModal && blkCut) ? blkCut[b2] : -1;
+      if (c2 >= 0) {
+        const double jac = hh[0]*hh[1]*hh[2];
+        CutHostEval ev2; ev2.begin(*this, c2);          // basis()/nb only
+        const i32 nb2 = cutNbOf[c2];
+        for (i32 g2 = cutVolOff[c2]; g2 < cutVolOff[c2+1]; g2++) {
+          const SayeNode &sn = cutVolP[g2];
+          const double xr[3] = {(double)sn.x[0],(double)sn.x[1],(double)sn.x[2]};
+          ev2.basis(xr, psi.data());
+          const double wv = (double)sn.w*jac;
+          for (i32 f2 = 0; f2 < 3; f2++) {
+            const i32 fq = (f2==0)?0:((f2==1)?1:4);
+            double v = 0;
+            for (i32 m = 0; m < nb2; m++)
+              v += (double)getField(base+fq)[(size_t)b2*blockSizeTot+m]*psi[m];
+            T[f2] += wv*v;
+          }
+        }
+      } else {
+        for (i32 nd = 0; nd < blockSizeTot; nd++) {
+          i32 i2=nd%NNODE, j2=(nd/NNODE)%NNODE, k2=nd/(NNODE*NNODE);
+          double wv = (0.5*hh[0]*wq[i2])*(0.5*hh[1]*wq[j2])*(0.5*hh[2]*wq[k2]);
+          T[0]+=wv*(double)getField(base+0)[(size_t)b2*blockSizeTot+nd];
+          T[1]+=wv*(double)getField(base+1)[(size_t)b2*blockSizeTot+nd];
+          T[2]+=wv*(double)getField(base+4)[(size_t)b2*blockSizeTot+nd];
+        }
+      }
+    }
+  };
+  const bool consProbe = getenv("SRD_CONS") != nullptr;
+  double T0[3] = {0,0,0};
+  if (consProbe) srdSetTot(D_RHO, T0);
+  // MODAL cut blocks hold coefficients, and srdApply consumes NODAL values on
+  // the tensor grid (it evaluates them with the tensor Lagrange basis at each
+  // element's quadrature points).  Convert at the BOUNDARY rather than teaching
+  // the operator about cut bases -- and the conversion is EXACT, not an
+  // approximation: a total-degree-N polynomial with N <= p lies in the tensor
+  // Q^p space, so interpolation at the (p+1)^3 Lobatto nodes reproduces it
+  // identically.  The round trip therefore costs round-off, not accuracy.
+  double wN[NNODE], xiN[NNODE];
+  dgGetHostOps(wN, xiN, gauss);
   for (i32 e = 0; e < nE; e++) {
     i32 b = srd->blk[e];
+    const i32 c = (cutModal && blkCut) ? blkCut[b] : -1;
+    if (c >= 0) {
+      CutHostEval ev; ev.begin(*this, c);
+      for (i32 nd = 0; nd < blockSizeTot; nd++) {
+        const i32 i2 = nd%NNODE, j2 = (nd/NNODE)%NNODE, k2 = nd/(NNODE*NNODE);
+        const double xr[3] = { 0.5*(xiN[i2]+1.0), 0.5*(xiN[j2]+1.0), 0.5*(xiN[k2]+1.0) };
+        double U[5]; ev.consAt(xr, U);
+        for (i32 q = 0; q < 5; q++) srd->u[((size_t)e*blockSizeTot+nd)*5+q] = U[q];
+      }
+      continue;
+    }
     for (i32 nd = 0; nd < blockSizeTot; nd++)
       for (i32 q = 0; q < 5; q++)
         srd->u[((size_t)e*blockSizeTot+nd)*5+q] =
           (double)getField(D_RHO+q)[(size_t)b*blockSizeTot+nd];
+  }
+  // SRD_RTCHECK=1: the boundary conversion's IDENTITY test.  Gathering a cut
+  // element to the tensor grid and projecting straight back over the fluid rule
+  // is algebraically the identity (a total-degree-N polynomial with N <= p lies
+  // in Q^p, so tensor interpolation reproduces it).  In floating point it is
+  // not: the tensor nodes sit INSIDE THE SOLID, where the element's own basis
+  // is an extrapolation -- CutElem.h records max|psi~| = 54.3 over the fluid
+  // rule against 2.44e+04 at the tensor nodes on the case-9 wedge.  The round
+  // trip is therefore a ~450x cancellation, run three times per step.  This
+  // measures what it actually costs, with NO redistribution in between.
+  if (getenv("SRD_RTCHECK")) {
+    static i32 nRt = 0;
+    double worst = 0, worstIn = 0; i32 worstE = -1;
+    for (i32 e = 0; e < nE; e++) {
+      const i32 b = srd->blk[e];
+      const i32 c = (cutModal && blkCut) ? blkCut[b] : -1;
+      if (c < 0) continue;
+      const i32 nb = cutNbOf[c];
+      CutHostEval ev; ev.begin(*this, c);
+      std::vector<double> cm((size_t)nb*5, 0.0), psi(nb), Lx(NNODE), Ly(NNODE), Lz(NNODE);
+      for (i32 g = cutVolOff[c]; g < cutVolOff[c+1]; g++) {
+        const SayeNode &sn = cutVolP[g];
+        const double xr[3] = {(double)sn.x[0], (double)sn.x[1], (double)sn.x[2]};
+        ev.basis(xr, psi.data());
+        ev.lag(2.0*xr[0]-1.0, Lx.data());
+        ev.lag(2.0*xr[1]-1.0, Ly.data());
+        ev.lag(2.0*xr[2]-1.0, Lz.data());
+        for (i32 q = 0; q < 5; q++) {
+          double uq = 0;
+          for (i32 k2 = 0; k2 < NNODE; k2++) for (i32 j2 = 0; j2 < NNODE; j2++)
+          for (i32 i2 = 0; i2 < NNODE; i2++)
+            uq += Lx[i2]*Ly[j2]*Lz[k2]
+                * srd->u[((size_t)e*blockSizeTot + i2 + NNODE*(j2 + NNODE*k2))*5+q];
+          for (i32 m = 0; m < nb; m++) cm[(size_t)m*5+q] += (double)sn.w*psi[m]*uq;
+        }
+      }
+      double d = 0, r = 0;
+      for (i32 m = 0; m < nb; m++) for (i32 q = 0; q < 5; q++) {
+        const double o = ev.cmod[(size_t)m*5+q];
+        d = fmax(d, fabs(cm[(size_t)m*5+q] - o));
+        r = fmax(r, fabs(o));
+      }
+      if (d/fmax(r,1e-300) > worst) { worst = d/fmax(r,1e-300); worstIn = r; worstE = c; }
+    }
+    if (nRt < 8 || (nRt % 200) == 0)
+      printf("[srdrt] call %d  worst round-trip rel drift %.3e on cut elem %d (|c|max %.3e)\n",
+             nRt, worst, worstE, worstIn);
+    nRt++;
   }
   srdApply(srd->S, srd->elems, srd->qpool.data(), srd->B,
            srd->u.data(), srd->su.data(), 5);
@@ -409,10 +791,49 @@ void DgSolver::applySrd(void) {
   }
   for (i32 e = 0; e < nE; e++) {
     i32 b = srd->blk[e];
+    const i32 c = (cutModal && blkCut) ? blkCut[b] : -1;
+    if (c >= 0) {
+      // project the redistributed state back onto the element's own basis --
+      // the same weighted sum dgRhsCutKernel used to do, over the fluid rule
+      const i32 nb = cutNbOf[c];
+      CutHostEval ev; ev.begin(*this, c);          // for lag()/basis() only
+      std::vector<double> cm((size_t)nb*5, 0.0), psi(nb), Lx(NNODE), Ly(NNODE), Lz(NNODE);
+      for (i32 g = cutVolOff[c]; g < cutVolOff[c+1]; g++) {
+        const SayeNode &sn = cutVolP[g];
+        const double xr[3] = {(double)sn.x[0], (double)sn.x[1], (double)sn.x[2]};
+        ev.basis(xr, psi.data());
+        ev.lag(2.0*xr[0]-1.0, Lx.data());
+        ev.lag(2.0*xr[1]-1.0, Ly.data());
+        ev.lag(2.0*xr[2]-1.0, Lz.data());
+        for (i32 q = 0; q < 5; q++) {
+          double uq = 0;
+          for (i32 k2 = 0; k2 < NNODE; k2++) for (i32 j2 = 0; j2 < NNODE; j2++)
+          for (i32 i2 = 0; i2 < NNODE; i2++)
+            uq += Lx[i2]*Ly[j2]*Lz[k2]
+                * srd->su[((size_t)e*blockSizeTot + i2 + NNODE*(j2 + NNODE*k2))*5+q];
+          for (i32 m = 0; m < nb; m++) cm[(size_t)m*5+q] += (double)sn.w*psi[m]*uq;
+        }
+      }
+      for (i32 nd = 0; nd < blockSizeTot; nd++)
+        for (i32 q = 0; q < 5; q++)
+          getField(D_RHO+q)[(size_t)b*blockSizeTot+nd] =
+              (nd < nb) ? (real)cm[(size_t)nd*5+q] : (real)0;
+      continue;
+    }
     for (i32 nd = 0; nd < blockSizeTot; nd++)
       for (i32 q = 0; q < 5; q++)
         getField(D_RHO+q)[(size_t)b*blockSizeTot+nd] =
           (real)srd->su[((size_t)e*blockSizeTot+nd)*5+q];
+  }
+  if (consProbe) {
+    double T1[3]; srdSetTot(D_RHO, T1);
+    static i32 nC = 0; static double acc[3] = {0,0,0};
+    for (i32 i2 = 0; i2 < 3; i2++) acc[i2] += T1[i2]-T0[i2];
+    if (nC < 40 || (nC%30)==0)
+      printf("[srdcons] call %4d  setMass %.15e  dMass %+.4e (cum %+.4e)  "
+             "dMomx %+.4e  dE %+.4e\n", nC, T0[0], T1[0]-T0[0], acc[0],
+             T1[1]-T0[1], T1[2]-T0[2]);
+    nC++;
   }
 }
 
@@ -434,6 +855,48 @@ void DgSolver::redistributeFlux(void) {
   if (!srd || srd->nMerged == 0) return;
   if (getenv("CUT_NOFRD")) return;
   cudaDeviceSynchronize();
+  // ---- TEMP probe (FRD_CONS=1): total mass RATE over the SRD element set ---
+  const i32 nEf = (i32)srd->elems.size();
+  auto frdSetRate = [&](double T[3]) {
+    T[0]=T[1]=T[2]=0;
+    double wq[NNODE], xq[NNODE]; dgGetHostOps(wq, xq, gauss);
+    std::vector<double> psi(CUT_NBMAX_H);
+    for (i32 e2 = 0; e2 < nEf; e2++) {
+      const i32 b2 = srd->blk[e2];
+      i32 lvl,ib2,jb2,kb2; decode(bLocList[b2], lvl, ib2, jb2, kb2);
+      double hh[3]; hostElemSizeLocal(*this, lvl, hh);
+      const i32 c2 = (cutModal && blkCut) ? blkCut[b2] : -1;
+      if (c2 >= 0) {
+        const double jac = hh[0]*hh[1]*hh[2];
+        CutHostEval ev2; ev2.begin(*this, c2);
+        const i32 nb2 = cutNbOf[c2];
+        for (i32 g2 = cutVolOff[c2]; g2 < cutVolOff[c2+1]; g2++) {
+          const SayeNode &sn = cutVolP[g2];
+          const double xr[3] = {(double)sn.x[0],(double)sn.x[1],(double)sn.x[2]};
+          ev2.basis(xr, psi.data());
+          const double wv = (double)sn.w*jac;
+          for (i32 f2 = 0; f2 < 3; f2++) {
+            const i32 fq = (f2==0)?0:((f2==1)?1:4);
+            double v = 0;
+            for (i32 m = 0; m < nb2; m++)
+              v += (double)getField(D_RHS+fq)[(size_t)b2*blockSizeTot+m]*psi[m];
+            T[f2] += wv*v;
+          }
+        }
+      } else {
+        for (i32 nd = 0; nd < blockSizeTot; nd++) {
+          i32 i2=nd%NNODE, j2=(nd/NNODE)%NNODE, k2=nd/(NNODE*NNODE);
+          double wv = (0.5*hh[0]*wq[i2])*(0.5*hh[1]*wq[j2])*(0.5*hh[2]*wq[k2]);
+          T[0]+=wv*(double)getField(D_RHS+0)[(size_t)b2*blockSizeTot+nd];
+          T[1]+=wv*(double)getField(D_RHS+1)[(size_t)b2*blockSizeTot+nd];
+          T[2]+=wv*(double)getField(D_RHS+4)[(size_t)b2*blockSizeTot+nd];
+        }
+      }
+    }
+  };
+  const bool frdProbe = getenv("FRD_CONS") != nullptr;
+  double R0[3] = {0,0,0};
+  if (frdProbe) frdSetRate(R0);
   const double vFull = srd->elems.empty() ? 1.0 : srd->elems[0].hv();
   for (i32 k = 0; k < srd->S.nElem; k++) {
     if (srd->S.trivial[k]) continue;
@@ -441,10 +904,32 @@ void DgSolver::redistributeFlux(void) {
     const i32 bS = srd->blk[k];
     if (blkCut[bS] < 0) continue;              // only small CUT members
     if (srd->elems[k].vol >= srd->S.volFrac*vFull) continue;
-    // rates: small member = its (P0) nodal constant; partners = GLL-mean RHS
+    // MODAL-AWARE MEAN AND SHIFT.  Under --cutmodal a cut block's D_RHS slots
+    // hold the RHS's MODAL COEFFICIENTS in the element's own orthonormal basis,
+    // not nodal values.  The previous code read slot 0 as "the P0 nodal
+    // constant" -- it is c~_0, which is the mean scaled by 1/psi~_0 = L00 -- and
+    // then wrote the merged rate into ALL blockSizeTot slots, setting every mode
+    // c~_m to the same number and filling the m >= nb slots the RHS kernel had
+    // zeroed.  That does not damp the small element's rate; it REPLACES its
+    // whole residual polynomial with a spurious one, three times per step, on
+    // exactly the 0.088-volume wedges.  MEASURED on case 9, single level, M=0.3,
+    // solid wall, SRD degree 3: with this path disabled (CUT_NOFRD=1) the run
+    // completes to t=1.0 and the interior mass source at t=0.2 falls 1.15e-02
+    // -> 2.43e-04; with it enabled the run dies at t=0.247.
+    //
+    // psi~_0 is the constant 1/L00, so
+    //     mean(R) = c~_0 * psi~_0 = c~_0 / L00,      c~_0 = mean(R) * L00
+    // and shifting the mean by `add` while PRESERVING the higher modes is
+    //     c~_0 += add * L00
+    // -- which is the order-preserving statement of "the small member takes the
+    // merged rate".  Flattening to a constant would be a P0 cut cell.
+    auto cutL00 = [&](i32 c) {
+      return (double)cutLc[(size_t)c*CUT_NBMAX_H*CUT_NBMAX_H];
+    };
+    const double L00S = cutL00(blkCut[bS]);
     double rS[5], rM[5] = {0,0,0,0,0};
     for (i32 q = 0; q < 5; q++)
-      rS[q] = (double)getField(D_RHS+q)[(size_t)bS*blockSizeTot];
+      rS[q] = (double)getField(D_RHS+q)[(size_t)bS*blockSizeTot]/L00S;
     double volK = 0, volP = 0;
     double w[NNODE], xi[NNODE]; dgGetHostOps(w, xi, gauss);
     for (i32 j : srd->S.M[k]) {
@@ -452,6 +937,13 @@ void DgSolver::redistributeFlux(void) {
       if (j != k) volP += vj;
       const i32 bj = srd->blk[j];
       if (j == k) { for (i32 q = 0; q < 5; q++) rM[q] += vj*rS[q]; continue; }
+      const i32 cj = (cutModal && blkCut) ? blkCut[bj] : -1;
+      if (cj >= 0) {                      // a CUT partner is modal too
+        const double L00j = cutL00(cj);
+        for (i32 q = 0; q < 5; q++)
+          rM[q] += vj*(double)getField(D_RHS+q)[(size_t)bj*blockSizeTot]/L00j;
+        continue;
+      }
       for (i32 q = 0; q < 5; q++) {
         double m = 0, ws = 0;
         for (i32 nd = 0; nd < blockSizeTot; nd++) {
@@ -464,21 +956,35 @@ void DgSolver::redistributeFlux(void) {
     }
     if (volK <= 0 || volP <= 0) continue;
     for (i32 q = 0; q < 5; q++) rM[q] /= volK;
-    // small member -> merged rate; excess -> partners, volume-weighted
+    // small member -> merged rate; excess -> partners, volume-weighted.
+    // Conservation: the small member's mass rate moves by vol_k*(rM - rS) and
+    // the partners take sum_j vol_j*(dlt/volP) = dlt = vol_k*(rS - rM).
     double dlt[5];
     for (i32 q = 0; q < 5; q++) dlt[q] = srd->elems[k].vol*(rS[q]-rM[q]);
-    for (i32 q = 0; q < 5; q++)
-      for (i32 nd = 0; nd < blockSizeTot; nd++)
-        getField(D_RHS+q)[(size_t)bS*blockSizeTot+nd] = (real)rM[q];
+    for (i32 q = 0; q < 5; q++)                       // shift the MEAN only
+      getField(D_RHS+q)[(size_t)bS*blockSizeTot] = (real)(rM[q]*L00S);
     for (i32 j : srd->S.M[k]) {
       if (j == k) continue;
       const i32 bj = srd->blk[j];
+      const i32 cj = (cutModal && blkCut) ? blkCut[bj] : -1;
       for (i32 q = 0; q < 5; q++) {
-        real add = (real)(dlt[q]/volP);
-        for (i32 nd = 0; nd < blockSizeTot; nd++)
-          getField(D_RHS+q)[(size_t)bj*blockSizeTot+nd] += add;
+        const double add = dlt[q]/volP;
+        if (cj >= 0) {                    // modal: shift the mean coefficient
+          getField(D_RHS+q)[(size_t)bj*blockSizeTot] += (real)(add*cutL00(cj));
+        } else {
+          for (i32 nd = 0; nd < blockSizeTot; nd++)
+            getField(D_RHS+q)[(size_t)bj*blockSizeTot+nd] += (real)add;
+        }
       }
     }
+  }
+  if (frdProbe) {
+    double R1[3]; frdSetRate(R1);
+    static i32 nF = 0;
+    if (nF < 40 || (nF%30)==0)
+      printf("[frdcons] call %4d  rate0 %+.6e -> %+.6e   dRate %+.6e\n",
+             nF, R0[0], R1[0], R1[0]-R0[0]);
+    nF++;
   }
 }
 
@@ -533,6 +1039,8 @@ static void dgEulerEigH(const double W[5], const double n[2],
 }
 
 void DgSolver::applyCutLimiter(void) {
+  // same reason as applySrd: this reads the cell mean off the tensor nodes
+  if (cutModal) return;
   if (!srd || !cutOn || nCutElem == 0) return;
   if (getenv("CUT_NOBJ")) return;
   cudaDeviceSynchronize();
@@ -635,6 +1143,88 @@ void DgSolver::applyCutLimiter(void) {
 }
 
 // ---------------------------------------------------------------------------
+//  IMAGE PATCH.  dgComputeImageDataKernel voids the solid side of a cut element,
+//  but its FLUID pixels were still hat-interpolated from the block's tensor
+//  Lobatto nodes -- and those nodes include the solid-side ones, so the
+//  interpolation drags the polynomial's unconstrained extension back into the
+//  fluid pixels it was supposed to keep out.  Repaint them from the element's
+//  OWN polynomial.  Conserved fields only (f = 0..4): a SCRATCH-backed paint
+//  (pressure, troubled) is not a modal coefficient of anything.
+//
+//  MEASURED, and worth recording because it refutes the motivation above: the
+//  difference is 2.3e-15.  A cut element's nodal state STARTS as the IC sampled
+//  at the nodes and is only ever incremented by the modal RHS sampled at the
+//  nodes, so it stays inside the element's own polynomial space and the tensor
+//  interpolant reproduces the modal polynomial exactly.  This patch is
+//  therefore INSURANCE, not a fix -- it earns its keep only where something
+//  writes nodal values from outside that space (a non-representable IC, the
+//  positivity clip, a MOOD redo).  The real defect was painting the solid side
+//  at all, which the kernel mask fixes.  CUT_NOIMGPATCH=1 disables it.
+// ---------------------------------------------------------------------------
+void DgSolver::patchCutImage(i32 f) {
+  if (!cutOn || nCutElem == 0 || f < 0 || f > 4) return;
+  if (getenv("CUT_NOIMGPATCH")) return;     // A/B: paint from the tensor nodes instead
+  cudaDeviceSynchronize();
+  CutHostEval ev;
+  i64 nPatch = 0; double dMax = 0;
+  for (i32 c = 0; c < nCutElem; c++) {
+    const i32 b = cutBlk[c];
+    i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
+    if (!isInteriorBlock(lvl, ib, jb, kb)) continue;
+    double h[3]; hostElemSizeLocal(*this, lvl, h);
+    ev.begin(*this, c);
+    const i32 span = blockSize*powi(2, nLvls-1-lvl);
+    for (i32 py = 0; py < span; py++) {
+      const i32 jP = jb*span + py;
+      if (jP < 0 || jP >= imageSizeX[1]) continue;
+      for (i32 px = 0; px < span; px++) {
+        const i32 iP = ib*span + px;
+        if (iP < 0 || iP >= imageSizeX[0]) continue;
+        const double xr[3] = { (px + 0.5)/span, (py + 0.5)/span, 0.5 };
+        const double X = (ib + xr[0])*h[0], Y = (jb + xr[1])*h[1];
+        const double dx = X - (double)ibX, dy = Y - (double)ibY;
+        // same shifted surface as the build (see the degeneracy guard)
+        if (sqrt(dx*dx + dy*dy) - (double)ibR < -(double)cutEps) continue;   // solid
+        double U[5]; ev.consAt(xr, U);
+        if (getenv("CUT_IMGDBG")) {
+          const double was = (double)imageDataX[(u64)jP*imageSizeX[0] + iP];
+          nPatch++; dMax = fmax(dMax, fabs(was - U[f]));
+        }
+        imageDataX[(u64)jP*imageSizeX[0] + iP] = (real)U[f];
+      }
+    }
+  }
+  if (getenv("CUT_IMGDBG"))
+    printf("[imgpatch] f=%d  repainted %lld px  max |nodal - modal| = %.6e\n",
+           f, (long long)nPatch, dMax);
+}
+
+// ---------------------------------------------------------------------------
+//  Max relative deviation of the cut elements from a uniform state, measured
+//  where the polynomial actually lives (its own volume rule) rather than at the
+//  tensor nodes -- half of which are inside the solid, where the value is an
+//  extension and deviating from the free stream means nothing.
+// ---------------------------------------------------------------------------
+double DgSolver::cutMaxDeviation(const double U0[5]) {
+  if (!cutOn || nCutElem == 0) return 0.0;
+  cudaDeviceSynchronize();
+  double dev = 0;
+  CutHostEval ev;
+  for (i32 c = 0; c < nCutElem; c++) {
+    ev.begin(*this, c);
+    for (i32 q = cutVolOff[c]; q < cutVolOff[c+1]; q++) {
+      const SayeNode &s = cutVolP[q];
+      if ((double)s.w <= 0.0) continue;
+      const double xr[3] = {(double)s.x[0], (double)s.x[1], (double)s.x[2]};
+      double U[5]; ev.consAt(xr, U);
+      for (i32 f = 0; f < 5; f++)
+        dev = fmax(dev, fabs(U[f] - U0[f])/fmax(fabs(U0[f]), 1.0));
+    }
+  }
+  return dev;
+}
+
+// ---------------------------------------------------------------------------
 //  CUT-CELL OUTPUT.  The first writer in this solver that samples a cut
 //  element's ACTUAL solution.
 //
@@ -655,44 +1245,114 @@ void DgSolver::applyCutLimiter(void) {
 //  computeIbGates/writeIbSurface are gated on ibOn, which buildCutElems sets to
 //  0, so cut runs emitted no Cp, no wall pressure and no drag at all.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  Domain totals over the CUT BAND, integrated over the FLUID region.
+//
+//  dgTotalConserved sums the tensor GLL grid with full-cell weights, which is
+//  wrong for a cut element twice over: under --cutmodal the field slots hold
+//  modal coefficients rather than nodal values, and the full-cell weights
+//  integrate the solid side as well.  Both errors vanish on a uniform state --
+//  a constant polynomial has c~_m = 0 for m > 0 and the offset is fixed -- so
+//  the free-stream gate never saw them, while dM/M0 on any DEVELOPING flow was
+//  measuring the coefficients drifting, not mass moving.
+//
+//  Here the element's own fitted volume rule is used, which is the same rule
+//  the RHS integrates over, so what this reports is exactly the quantity the
+//  scheme conserves.  Reference measure x h0 h1 h2 = physical volume.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  STEADY-STATE MONITOR:  ||dU/dt||_L2(fluid) / ||U||_L2(fluid).
+//
+//  Integrated with the SAME functional the conservation monitor uses -- cut
+//  elements over their own Saye volume rule with their modal coefficients,
+//  uncut elements over the tensor GLL rule -- so a cut block contributes what
+//  it actually holds rather than coefficients read as nodal values.  Solid
+//  (IB_DEAD) blocks are excluded.
+//
+//  D_RHS holds the last RK stage's residual after dgStep returns, which is the
+//  conventional steady-state residual.  A converged run drives this to the
+//  level at which the spatial discretisation's own inconsistency lives; it will
+//  NOT reach round-off on a cut mesh.
+// ---------------------------------------------------------------------------
+double DgSolver::dgResidualNorm(void) {
+  cudaDeviceSynchronize();
+  double num = 0, den = 0;
+  double wq[NNODE], xq[NNODE]; dgGetHostOps(wq, xq, gauss);
+  std::vector<double> psi(CUT_NBMAX_H);
+  for (i32 b = 0; b < hashTable.nKeys; b++) {
+    if (bLocList[b] == kEmpty) continue;
+    if (ibClassList && ibClassList[b] == IB_DEAD) continue;
+    if (ibOn && ibClassList && ibClassList[b] != IB_FLUID) continue;
+    i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
+    double h[3]; hostElemSizeLocal(*this, lvl, h);
+    const i32 c = (cutOn && blkCut) ? blkCut[b] : -1;
+    if (c >= 0) {
+      const double jac = h[0]*h[1]*h[2];
+      const i32 nb = cutNbOf[c];
+      CutHostEval ev; ev.begin(*this, c);              // basis() only
+      for (i32 g = cutVolOff[c]; g < cutVolOff[c+1]; g++) {
+        const SayeNode &sn = cutVolP[g];
+        const double xr[3] = {(double)sn.x[0], (double)sn.x[1], (double)sn.x[2]};
+        ev.basis(xr, psi.data());
+        const double wv = (double)sn.w*jac;
+        for (i32 q = 0; q < 5; q++) {
+          double r = 0, u = 0;
+          for (i32 m = 0; m < nb; m++) {
+            r += (double)getField(D_RHS+q)[(size_t)b*blockSizeTot+m]*psi[m];
+            u += (double)getField(D_RHO+q)[(size_t)b*blockSizeTot+m]*psi[m];
+          }
+          num += wv*r*r; den += wv*u*u;
+        }
+      }
+      continue;
+    }
+    for (i32 nd = 0; nd < blockSizeTot; nd++) {
+      const i32 i2 = nd%NNODE, j2 = (nd/NNODE)%NNODE, k2 = nd/(NNODE*NNODE);
+      const double wv = (0.5*h[0]*wq[i2])*(0.5*h[1]*wq[j2])*(0.5*h[2]*wq[k2]);
+      for (i32 q = 0; q < 5; q++) {
+        const double r = (double)getField(D_RHS+q)[(size_t)b*blockSizeTot+nd];
+        const double u = (double)getField(D_RHO+q)[(size_t)b*blockSizeTot+nd];
+        num += wv*r*r; den += wv*u*u;
+      }
+    }
+  }
+  return (den > 0) ? sqrt(num/den) : 0.0;
+}
+
+void DgSolver::dgCutConserved(double &mass, double &momx, double &energy) {
+  cudaDeviceSynchronize();
+  mass = momx = energy = 0;
+  if (!cutOn || nCutElem <= 0) return;
+  CutHostEval ev;
+  std::vector<double> psi(CUT_NBMAX_H);
+  for (i32 c = 0; c < nCutElem; c++) {
+    const i32 b = cutBlk[c];
+    if (b < 0 || bLocList[b] == kEmpty) continue;
+    i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
+    double h[3]; hostElemSizeLocal(*this, lvl, h);
+    const double jac = h[0]*h[1]*h[2];
+    ev.begin(*this, c);
+    for (i32 q = cutVolOff[c]; q < cutVolOff[c+1]; q++) {
+      const SayeNode &s = cutVolP[q];
+      const double xr[3] = {(double)s.x[0], (double)s.x[1], (double)s.x[2]};
+      ev.basis(xr, psi.data());
+      double U[5] = {0,0,0,0,0};
+      for (i32 m = 0; m < ev.nb; m++)
+        for (i32 fq = 0; fq < 5; fq++) U[fq] += ev.cmod[(size_t)m*5+fq]*psi[m];
+      const double wv = (double)s.w*jac;
+      mass   += wv*U[0];
+      momx   += wv*U[1];
+      energy += wv*U[4];
+    }
+  }
+}
+
 void DgSolver::writeCutFields(const char *stem) {
   if (!cutOn || nCutElem == 0) return;
   cudaDeviceSynchronize();
 
   double wq[NNODE], xi[NNODE];
   dgGetHostOps(wq, xi, gauss);
-
-  // 1-D Lagrange at the LGL nodes, argument on [-1,1]
-  auto lag1 = [&](double x, double *L) {
-    for (i32 a = 0; a < NNODE; a++) {
-      double v = 1.0;
-      for (i32 m = 0; m < NNODE; m++) if (m != a) v *= (x - xi[m])/(xi[a] - xi[m]);
-      L[a] = v;
-    }
-  };
-  // orthonormal cut basis at a reference point of [0,1]^3 -- the host twin of
-  // dgCutPsiO (DgSolverKernels.cu:5841); ordering and stride must match or the
-  // coefficients mean nothing
-  auto psiO = [&](i32 c, const double xr[3], i32 nb, double *psi) {
-    const real *cen = cutCen + 4*c;
-    double u[3];
-    for (i32 d = 0; d < 3; d++) u[d] = (xr[d] - (double)cen[d])/(double)cen[3];
-    i32 m = 0;
-    for (i32 deg = 0; deg <= dgOrder && m < nb; deg++)
-    for (i32 i = deg; i >= 0 && m < nb; i--)
-    for (i32 j = deg-i; j >= 0 && m < nb; j--) {
-      const i32 e[3] = { i, j, deg-i-j };
-      double v = 1.0;
-      for (i32 d = 0; d < 3; d++) for (i32 a = 0; a < e[d]; a++) v *= u[d];
-      psi[m++] = v;
-    }
-    const real *Lc = cutLc + (size_t)c*CUT_NBMAX_H*CUT_NBMAX_H;
-    for (i32 i = 0; i < nb; i++) {                 // forward solve L z = psi
-      double t = psi[i];
-      for (i32 j = 0; j < i; j++) t -= (double)Lc[(size_t)i*CUT_NBMAX_H+j]*psi[j];
-      psi[i] = t/(double)Lc[(size_t)i*CUT_NBMAX_H+i];
-    }
-  };
 
   char fn[256];
   snprintf(fn, sizeof fn, "%s_geom.csv", stem);
@@ -707,37 +1367,25 @@ void DgSolver::writeCutFields(const char *stem) {
   fprintf(fv, "elem,x,y,w,rho,u,v,p\n");
 
   const double pInf = 1.0/(double)dgGam, qInf = 0.5*(double)machInf*(double)machInf;
-  std::vector<double> psi(CUT_NBMAX_H), cmod((size_t)CUT_NBMAX_H*5), Lx(NNODE), Ly(NNODE), Lz(NNODE);
 
   for (i32 c = 0; c < nCutElem; c++) {
     const i32 b = cutBlk[c], nb = cutNbOf[c];
     i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
     double h[3]; hostElemSizeLocal(*this, lvl, h);
 
-    // ---- nodal -> modal, exactly as the kernel does it -------------------
-    for (size_t t = 0; t < (size_t)nb*5; t++) cmod[t] = 0.0;
+    // ONE evaluator for every sample (CutHostEval): it knows whether the block
+    // holds nodal values or coefficients.  This function used to carry its own
+    // copy of the projection, written before that existed, and under
+    // --cutmodal it re-projected coefficients as if they were node values --
+    // which is where a wall Cp of -16 and NEGATIVE wall pressures came from,
+    // while cut_fine.csv (which already used the shared evaluator) reported the
+    // same solution as entirely sensible.  Duplicated state logic, one copy
+    // updated.
+    CutHostEval ev; ev.begin(*this, c);
     double volFrac = 0.0;
-    for (i32 g = cutVolOff[c]; g < cutVolOff[c+1]; g++) {
-      const SayeNode &s = cutVolP[g];
-      const double xr[3] = {(double)s.x[0], (double)s.x[1], (double)s.x[2]};
-      volFrac += (double)s.w;
-      psiO(c, xr, nb, psi.data());
-      lag1(2.0*xr[0]-1.0, Lx.data());
-      lag1(2.0*xr[1]-1.0, Ly.data());
-      lag1(2.0*xr[2]-1.0, Lz.data());
-      for (i32 q = 0; q < 5; q++) {
-        double uq = 0.0;
-        for (i32 k = 0; k < NNODE; k++) for (i32 j = 0; j < NNODE; j++) for (i32 i = 0; i < NNODE; i++)
-          uq += Lx[i]*Ly[j]*Lz[k]
-              * (double)getField(D_RHO+q)[(size_t)b*blockSizeTot + i + NNODE*(j + NNODE*k)];
-        for (i32 m = 0; m < nb; m++) cmod[(size_t)m*5+q] += (double)s.w*psi[m]*uq;
-      }
-    }
+    for (i32 g = cutVolOff[c]; g < cutVolOff[c+1]; g++) volFrac += (double)cutVolP[g].w;
     auto sampleAt = [&](const double xr[3], double W[5]) {
-      psiO(c, xr, nb, psi.data());
-      double U[5] = {0,0,0,0,0};
-      for (i32 q = 0; q < 5; q++)
-        for (i32 m = 0; m < nb; m++) U[q] += cmod[(size_t)m*5+q]*psi[m];
+      double U[5]; ev.consAt(xr, U);
       W[0] = U[0];
       W[1] = U[1]/U[0]; W[2] = U[2]/U[0]; W[3] = U[3]/U[0];
       W[4] = ((double)dgGam-1.0)*(U[4] - 0.5*(U[1]*U[1]+U[2]*U[2]+U[3]*U[3])/U[0]);
@@ -770,6 +1418,35 @@ void DgSolver::writeCutFields(const char *stem) {
               W[0], W[1], W[2], W[4]);
     }
   }
+  // ---- FINE SAMPLE: the raster gives a cut element only blockSize pixels per
+  // axis, which is why the cut band reads as blocks whatever the degree.  Here
+  // the element's own polynomial is evaluated on a dense reference grid,
+  // FLUID SIDE ONLY, so the band can be drawn at whatever resolution the
+  // picture wants without inventing data in the solid.
+  const i32 nfine = getenv("CUT_NFINE") ? atoi(getenv("CUT_NFINE")) : 16;
+  snprintf(fn, sizeof fn, "%s_fine.csv", stem);
+  if (FILE *ff = fopen(fn, "w")) {
+    fprintf(ff, "elem,x,y,rho,u,v,p\n");
+    for (i32 c = 0; c < nCutElem; c++) {
+      const i32 b = cutBlk[c];
+      i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
+      double h[3]; hostElemSizeLocal(*this, lvl, h);
+      CutHostEval ev; ev.begin(*this, c);
+      for (i32 jy = 0; jy < nfine; jy++)
+      for (i32 ix = 0; ix < nfine; ix++) {
+        const double xr[3] = {(ix+0.5)/nfine, (jy+0.5)/nfine, 0.5};
+        const double X = (ib + xr[0])*h[0], Y = (jb + xr[1])*h[1];
+        const double dx = X - (double)ibX, dy = Y - (double)ibY;
+        if (sqrt(dx*dx + dy*dy) - (double)ibR < -(double)cutEps) continue;   // solid
+        double U[5]; ev.consAt(xr, U);
+        const double rho = U[0];
+        const double pr = ((double)dgGam-1.0)*(U[4] - 0.5*(U[1]*U[1]+U[2]*U[2]+U[3]*U[3])/rho);
+        fprintf(ff, "%d,%.8f,%.8f,%.8e,%.8e,%.8e,%.8e\n",
+                c, X, Y, rho, U[1]/rho, U[2]/rho, pr);
+      }
+    }
+    fclose(ff);
+  }
   fclose(fg); fclose(fw); fclose(fv);
-  printf("[cutfields] wrote %s_{geom,wall,vol}.csv  (%d cut elements)\n", stem, nCutElem);
+  printf("[cutfields] wrote %s_{geom,wall,vol,fine}.csv  (%d cut elements)\n", stem, nCutElem);
 }

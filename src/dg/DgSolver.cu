@@ -97,7 +97,16 @@ void DgSolver::buildInitialGrid(bool doPaint) {
     // nothing re-fills.
     setInitialConditions();
     cudaDeviceSynchronize();
+    cutToModal();          // cut blocks now hold coefficients, not node values
   }
+}
+
+// nodal -> modal for every cut element (no-op unless --cutmodal 1)
+void DgSolver::cutToModal(void) {
+  if (!cutOn || !cutModal || nCutElem == 0) return;
+  size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 3)*sizeof(real);
+  dgCutToModalKernel<<<nCutElem, blockSizeTot, shm>>>(*this);
+  cudaDeviceSynchronize();
 }
 
 void DgSolver::setInitialConditions(void) {
@@ -112,6 +121,7 @@ void DgSolver::sortFieldData(void) {
 
 void DgSolver::computeImageData(i32 f) {
   dgComputeImageDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this, f);
+  patchCutImage(f);   // cut elements: repaint from the modal solution, not the nodes
 }
 
 //
@@ -362,7 +372,17 @@ real DgSolver::step(real tStep) {
       if (gauss) dgRhsGaussKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (T)); \
       else dgRhsKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (T)); \
       if (cutOn) { \
-        size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 2)*sizeof(real); \
+        size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 3)*sizeof(real); \
+        if (cutEs) { \
+          const i32 nqM = esQOff[nCutElem], nfM = esFOff[nCutElem]; (void)nqM; (void)nfM; \
+          i32 mq = 0, mf = 0; \
+          for (i32 c = 0; c < nCutElem; c++) { \
+            mq = max(mq, esQOff[c+1]-esQOff[c]); mf = max(mf, esFOff[c+1]-esFOff[c]); } \
+          size_t shmEs = ((size_t)(mq+mf)*5 + 3*(size_t)CUT_NBMAX_H*5)*sizeof(real); \
+          size_t shmPj = ((size_t)2*CUT_NBMAX_H*5)*sizeof(real); \
+          dgEsProjectKernel<<<nCutElem, 256, shmPj>>>(*this); \
+          dgRhsCutEsKernel<<<nCutElem, 256, shmEs>>>(*this); \
+        } else \
         dgRhsCutKernel<<<nCutElem, blockSizeTot, shm>>>(*this, (T)); } } while (0)
     for (i32 stage = 0; stage < 3; stage++) {
       // SSP-RK3 stage abscissae: t, t+dt, t+dt/2
@@ -482,6 +502,20 @@ void DgSolver::dgTotalConserved(double &mass, double &momx, double &energy) {
     u64 loc = bLocList[b];
     if (loc == kEmpty) continue;
     if (ibOn && ibClassList[b] != IB_FLUID) continue;   // fluid-only totals
+    // A CUT block cannot be summed on the tensor GLL grid, for two independent
+    // reasons, and BOTH of them silently corrupt the conservation monitor:
+    //   1. under --cutmodal its field slots hold MODAL COEFFICIENTS, so this
+    //      loop would weight c~_m as if it were u at node m;
+    //   2. even nodally, the full-cell weights (h/2 w_i)^3 integrate the WHOLE
+    //      cell -- solid side included -- not the fluid region.
+    // Neither shows up on a uniform state (the coefficients are then constant
+    // and the error is a constant offset), which is exactly why the free-stream
+    // gate looked clean while dM/M0 on a DEVELOPING flow was meaningless.
+    // dgCutConserved below integrates the cut band over its own Saye rule.
+    if (cutOn && blkCut && blkCut[b] >= 0) continue;
+    // a SOLID block is not evolved and is not fluid; the cut path sets ibOn = 0
+    // so the guard above does not catch it
+    if (ibClassList && ibClassList[b] == IB_DEAD) continue;
     i32 lvl, ib, jb, kb; decode(loc, lvl, ib, jb, kb);
     double h[3]; hostElemSize(*this, lvl, h);
     for (i32 nd = 0; nd < blockSizeTot; nd++) {
@@ -492,6 +526,11 @@ void DgSolver::dgTotalConserved(double &mass, double &momx, double &energy) {
       momx   += wv*(double)getField(D_RHOU)[c];
       energy += wv*(double)getField(D_RHOE)[c];
     }
+  }
+  if (cutOn && nCutElem > 0) {
+    double cm = 0, cp = 0, ce = 0;
+    dgCutConserved(cm, cp, ce);
+    mass += cm; momx += cp; energy += ce;
   }
 }
 

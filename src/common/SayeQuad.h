@@ -66,76 +66,56 @@ struct SayeArena {
   }
 };
 
-// -------- Gauss-Legendre on [0,1], up to 10 points -------------------------
-// 6..10 were added for the cut-cell DG gate: the discrete divergence theorem
-// needs the base-direction rule to integrate the height-function composition,
-// and with only 5 points cfg.ng was SILENTLY CLAMPED, so convergence studies in
-// ng measured nothing.  Default cfg.ng is still 5 (unchanged for every existing
-// caller); raising it is now actually possible.
+// -------- Gauss-Legendre on [0,1] ------------------------------------------
+// Computed by Newton iteration on the Legendre three-term recurrence, in
+// DOUBLE regardless of `real`, so the rule is accurate to machine precision.
+//
+// WHAT THIS REPLACED, and why it mattered: the previous version was a set of
+// literal tables truncated to TEN significant digits --
+//     W[10] = {0.0333356722, 0.0747256746, ...}
+// whose weights sum to 1 + 4.0e-10 instead of 1.  A tensor FACE rule squares
+// that: a fully-fluid cut face measured its own area as 1 + 8.0e-10, which is
+// EXACTLY the defect measured on the case-9 cylinder (dgcutjac_test).  Every
+// cut-cell geometric quantity inherited it: face areas, the fitted volume
+// rule, the discrete divergence theorem the volume weights are corrected
+// against (GCL residual floored at 4e-10), and hence free-stream preservation
+// (|R~|_inf floored at 1e-8).  Raising cfg.ng could not help -- the floor is
+// the table, not the order -- which is why ng = 10 and ng = 16 gave
+// bit-identical answers.
+//
+// The 10-point cap is unchanged (GaussRule is a by-value struct that appears
+// in host-side recursion; growing it grows every frame).  n > GAUSS_MAX still
+// clamps -- that is an order limit, no longer an accuracy one.
 static constexpr i32 GAUSS_MAX = 10;
 struct GaussRule { i32 n; real x[GAUSS_MAX]; real w[GAUSS_MAX]; };
 __host__ __device__ inline GaussRule gaussLegendre(i32 n) {
-  GaussRule g; g.n = n;
-  if (n > GAUSS_MAX) { n = GAUSS_MAX; g.n = n; }
-  if (n == 6) {
-    const real X[6]={(real)0.0337652429,(real)0.1693953068,(real)0.3806904070,
-                     (real)0.6193095930,(real)0.8306046932,(real)0.9662347571};
-    const real W[6]={(real)0.0856622462,(real)0.1803807865,(real)0.2339569673,
-                     (real)0.2339569673,(real)0.1803807865,(real)0.0856622462};
-    for (i32 i=0;i<6;i++){ g.x[i]=X[i]; g.w[i]=W[i]; } return g;
+  GaussRule g;
+  if (n < 1) n = 1;
+  if (n > GAUSS_MAX) n = GAUSS_MAX;
+  g.n = n;
+  const double PI_G = 3.14159265358979323846;
+  for (i32 i = 0; i < n; i++) {
+    // Chebyshev/Tricomi start, then Newton on P_n
+    double t = cos(PI_G*((double)i + 0.75)/((double)n + 0.5));
+    double p0 = 1.0, p1 = 0.0, dp = 1.0;
+    for (i32 it = 0; it < 100; it++) {
+      p0 = 1.0; p1 = 0.0;
+      for (i32 k = 0; k < n; k++) {            // p0 -> P_n(t), p1 -> P_{n-1}(t)
+        const double p2 = p1; p1 = p0;
+        p0 = ((2.0*(double)k + 1.0)*t*p1 - (double)k*p2)/((double)k + 1.0);
+      }
+      dp = (double)n*(t*p0 - p1)/(t*t - 1.0);
+      const double dt = -p0/dp;
+      t += dt;
+      if (fabs(dt) <= 1e-16*(fabs(t) + 1.0)) break;
+    }
+    const double wt = 2.0/((1.0 - t*t)*dp*dp);
+    // [-1,1] -> [0,1]; the Newton roots come out DESCENDING in t, so fill from
+    // the far end to keep x ascending (callers assume an ordered rule)
+    g.x[n-1-i] = (real)(0.5*(1.0 + t));
+    g.w[n-1-i] = (real)(0.5*wt);
   }
-  if (n == 7) {
-    const real X[7]={(real)0.0254460438,(real)0.1292344072,(real)0.2970774243,(real)0.5,
-                     (real)0.7029225757,(real)0.8707655928,(real)0.9745539562};
-    const real W[7]={(real)0.0647424831,(real)0.1398526957,(real)0.1909150253,(real)0.2089795918,
-                     (real)0.1909150253,(real)0.1398526957,(real)0.0647424831};
-    for (i32 i=0;i<7;i++){ g.x[i]=X[i]; g.w[i]=W[i]; } return g;
-  }
-  if (n == 8) {
-    const real X[8]={(real)0.0198550718,(real)0.1016667613,(real)0.2372337950,(real)0.4082826788,
-                     (real)0.5917173212,(real)0.7627662050,(real)0.8983332387,(real)0.9801449282};
-    const real W[8]={(real)0.0506142681,(real)0.1111905172,(real)0.1568533229,(real)0.1813418917,
-                     (real)0.1813418917,(real)0.1568533229,(real)0.1111905172,(real)0.0506142681};
-    for (i32 i=0;i<8;i++){ g.x[i]=X[i]; g.w[i]=W[i]; } return g;
-  }
-  if (n == 9) {
-    const real X[9]={(real)0.0159198802,(real)0.0819844464,(real)0.1933142836,(real)0.3378732883,
-                     (real)0.5,(real)0.6621267117,(real)0.8066857164,(real)0.9180155536,(real)0.9840801198};
-    const real W[9]={(real)0.0406371942,(real)0.0903240804,(real)0.1303053482,(real)0.1561735385,
-                     (real)0.1651196775,(real)0.1561735385,(real)0.1303053482,(real)0.0903240804,
-                     (real)0.0406371942};
-    for (i32 i=0;i<9;i++){ g.x[i]=X[i]; g.w[i]=W[i]; } return g;
-  }
-  if (n >= 10) {
-    const real X[10]={(real)0.0130467357,(real)0.0674683167,(real)0.1602952159,(real)0.2833023029,
-                      (real)0.4255628305,(real)0.5744371695,(real)0.7166976971,(real)0.8397047841,
-                      (real)0.9325316833,(real)0.9869532643};
-    const real W[10]={(real)0.0333356722,(real)0.0747256746,(real)0.1095431813,(real)0.1346333597,
-                      (real)0.1477621124,(real)0.1477621124,(real)0.1346333597,(real)0.1095431813,
-                      (real)0.0747256746,(real)0.0333356722};
-    g.n=10; for (i32 i=0;i<10;i++){ g.x[i]=X[i]; g.w[i]=W[i]; } return g;
-  }
-  if (n <= 1) { g.n=1; g.x[0]=(real)0.5; g.w[0]=1; return g; }
-  if (n == 2) {
-    g.x[0]=(real)0.2113248654; g.x[1]=(real)0.7886751346;
-    g.w[0]=(real)0.5;          g.w[1]=(real)0.5; return g;
-  }
-  if (n == 3) {
-    g.x[0]=(real)0.1127016654; g.x[1]=(real)0.5; g.x[2]=(real)0.8872983346;
-    g.w[0]=(real)0.2777777778; g.w[1]=(real)0.4444444444; g.w[2]=(real)0.2777777778;
-    return g;
-  }
-  if (n == 4) {
-    g.x[0]=(real)0.0694318442; g.x[1]=(real)0.3300094782;
-    g.x[2]=(real)0.6699905218; g.x[3]=(real)0.9305681558;
-    g.w[0]=(real)0.1739274226; g.w[1]=(real)0.3260725774;
-    g.w[2]=(real)0.3260725774; g.w[3]=(real)0.1739274226; return g;
-  }
-  g.n=5;
-  g.x[0]=(real)0.0469100771; g.x[1]=(real)0.2307653449; g.x[2]=(real)0.5;
-  g.x[3]=(real)0.7692346551; g.x[4]=(real)0.9530899229;
-  g.w[0]=(real)0.1184634425; g.w[1]=(real)0.2393143352; g.w[2]=(real)0.2844444444;
-  g.w[3]=(real)0.2393143352; g.w[4]=(real)0.1184634425; return g;
+  return g;
 }
 
 // -------- configuration ----------------------------------------------------

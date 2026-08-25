@@ -106,6 +106,9 @@ int main(void) {
     PolyND phi=fitPoly3(p,v.data());
     CutElemOps E;
     if (!cutElemBuild(phi,N,E,ar,cfg,sc)) { printf("%-34s BUILD FAILED\n",c.name); allok=false; continue; }
+    // snapped == not a cut element; no operators exist to test (see CutElem.h)
+    if (E.snap) { printf("%-34s SNAPPED to %s (sub-resolution)\n",
+                         c.name, E.snap==1?"FLUID":"SOLID"); continue; }
     const i32 nb=E.B.nb;
 
     // modal coefficients of a UNIFORM conservative state: only the constant

@@ -258,11 +258,36 @@ public:
   // the exchange conservative by construction and leaves dgRhsKernel almost
   // untouched.
   i32  cutOn = 0;          // 1 = cut-cell path active
+  i32  cutHvMean = 0;      // DIAGNOSTIC: let the hyper-viscosity touch mode 0
+  real cutHv = 0;          // --cuthv: UNGATED high-order modal hyper-viscosity
+                           // on cut elements (see dgRhsCutKernel).  Every other
+                           // dissipation here is shock-sensor gated and is
+                           // therefore absent exactly where the smooth
+                           // instability lives.
+  real cutEps = 0;         // global level-set shift applied at sampling time to
+                           // step off an exactly-tangent body (see the tangency
+                           // guard in DgCutBuild.cu).  0 = geometry is generic.
+  i32  cutModal = 0;       // 1 = a cut element's field slots hold MODAL
+                           // COEFFICIENTS, not nodal values.  A cut element's
+                           // polynomial is supported on {phi>0} only, but the
+                           // tensor Lobatto nodes include points buried in the
+                           // solid, and evaluating an orthonormal basis there
+                           // costs a factor of 449 (measured: max|psi~| 54 over
+                           // the fluid rule vs 2.4e+04 at the nodes).  Storing
+                           // coefficients means the basis is never evaluated
+                           // outside its own support -- the same invariant
+                           // Taylor & Chan get by putting their Fekete nodes
+                           // inside the cut region.
   i32  cutDbgMask = 15;    // DEBUG term mask: 1 volume, 2 faces, 4 wall, 8 deposit
+  i32  cutWallRiem = 0;    // 1 = solid wall as a Riemann problem against the
+                           // mirror state (enforces u.n = 0 weakly); 0 = the
+                           // legacy pressure-only flux, which does not
   i32  cutFsp = 0;         // DEBUG: transparent wall (exact F.n of the trace)
                            // for the in-solver free-stream gate; free stream is
                            // NOT a solid-wall solution, so gating it against the
                            // reflective wall would test the wrong thing
+  i32 *cutDbg = nullptr;   // [2] {starved faces, mortar faces} -- see the
+                           // starvation counter in dgRhsCutKernel
   i32  nCutElem = 0;       // number of cut elements
   i32  cutNb = 0;          // modal basis size (total degree N)
   i32  *blkCut = nullptr;  // [nBlocksMax] cut index of a block, or -1
@@ -290,6 +315,40 @@ public:
   SayeNode *cutFacP = nullptr;  i32 *cutFacOff = nullptr;   // [6*nCutElem+1]
   real *cutFacA = nullptr;      // [6*nCutElem] fluid area of each cut face --
                                 // ~1 selects the conforming GLL mortar path
+
+  // ---- ENTROPY-STABLE cut operators (--cutes), Taylor & Chan arXiv:2412.13002 -
+  // Built once on the host from the same CutElemOps the baseline path uses, then
+  // uploaded.  The surface rule IS the runtime interface rule -- the tensor GLL
+  // nodes on any fully-fluid face, the Saye rule on a partial one, the Saye wall
+  // rule -- because the flux-differenced surface term only telescopes against the
+  // volume term if the two use the same rule, and because a shared face must be
+  // integrated identically by both sides or the coupling stops conserving.
+  i32   cutEs   = 0;            // --cutes: 1 = entropy-stable cut RHS
+  i32   esDbg   = 0;            // ES_CLOSED|ES_NODEPOSIT|ES_NOMETRIC bisection
+  i32  *esQOff  = nullptr;      // [nCutElem+1] volume-point CSR offsets
+  i32  *esFOff  = nullptr;      // [nCutElem+1] surface-point CSR offsets
+  real *esVq    = nullptr;      // [esQOff[n]*CUT_NBMAX] psi~ at volume points
+  real *esDVq   = nullptr;      // [3*esQOff[n]*CUT_NBMAX] d psi~/dx_d there
+  real *esVf    = nullptr;      // [esFOff[n]*CUT_NBMAX] psi~ at surface points
+  real *esWq    = nullptr;      // [esQOff[n]] volume weights (reference measure)
+  real *esWf    = nullptr;      // [esFOff[n]] surface weights
+  real *esNrm   = nullptr;      // [3*esFOff[n]] outward normal at surface points
+  real *esQ     = nullptr;      // [3*sum(nq^2)] Q_d = W dVq_d Pq  (dense, per elem)
+  i32  *esQ2Off = nullptr;      // [nCutElem+1] offsets into esQ (units of nq^2)
+  real *esEmat  = nullptr;      // [sum(nf*nq)] E = Vf Pq
+  i32  *esEOff  = nullptr;      // [nCutElem+1] offsets into esEmat
+  i32  *esOwner = nullptr;      // [esFOff[n]] 0..5 = cut face, 6 = wall
+  i32  *esNode  = nullptr;      // [esFOff[n]] neighbour tensor-node index on a
+                                // full-face GLL point, else -1
+  real *esXf    = nullptr;      // [3*esFOff[n]] surface point reference coords
+  real *esVtil  = nullptr;      // [nCutElem*CUT_NBMAX*5] entropy-variable modal
+                                // coefficients, PUBLISHED so that a cut element
+                                // reading a cut neighbour's trace sees the same
+                                // entropy-projected state that neighbour uses.
+                                // Both sides of a shared face must evaluate the
+                                // SAME pair or the single-valued-flux property
+                                // -- and with it conservation -- is lost.
+  double esGcl  = 0;            // worst Eq-47 residual over the elements
 
   i32  ibOn;           // 1 = ghost-element immersed boundary active (cylinder SDF)
   real ibX, ibY;       // cylinder center
@@ -592,6 +651,17 @@ public:
   void ibClassify(void);                         // geometry classes (2 kernels), post-sort
   void ibFill(void);                             // Hermite ghost reconstruction
   void computeIbGates(void);                     // standoff + stagnation pressure + Cd
+  void cutToModal(void);                         // nodal -> modal for cut blocks
+  double cutMaxDeviation(const double U0[5]);    // uniform-state check ON the
+                                                 // fluid region, not the nodes
+  void patchCutImage(i32 f);                     // repaint cut elements from their
+                                                 // own polynomial (see DgCutBuild.cu)
+  double dgResidualNorm(void);                   // ||dU/dt||_2 / ||U||_2 over the
+                                                 // fluid, the steady-state monitor
+  void buildCutEs(const void *opsVec);            // ES operators from CutElemOps
+  void dgCutConserved(double &mass, double &momx, double &energy);
+                                                 // totals over the CUT band only,
+                                                 // integrated over the FLUID region
   void writeCutFields(const char *stem);         // cut geometry + the modal solution
                                                  // sampled at Saye volume/wall points
   void writeIbSurface(const char *fileName);     // Cp(theta) around the cylinder

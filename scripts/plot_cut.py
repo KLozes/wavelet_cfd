@@ -84,7 +84,7 @@ def load_cut(stem):
         with open(p) as fh:
             rows = list(csv.DictReader(fh))
         return {k: np.array([float(r[k]) for r in rows]) for k in rows[0]} if rows else None
-    return rd("geom"), rd("wall"), rd("vol")
+    return rd("geom"), rd("wall"), rd("vol"), rd("fine")
 
 
 def main():
@@ -109,7 +109,7 @@ def main():
     domx = (meta or {}).get("domx") or float(nx)
     domy = (meta or {}).get("domy") or float(ny)
 
-    geom, wall, vol = load_cut(os.path.join(args.dir, "cut"))
+    geom, wall, vol, fine = load_cut(os.path.join(args.dir, "cut"))
     have_cut = wall is not None and len(wall.get("x", [])) > 0
 
     fig = plt.figure(figsize=(13.5, 4.6), constrained_layout=True)
@@ -163,21 +163,28 @@ def main():
                  ha="center", va="center")
         ax2.set_axis_off()
 
-    # ---- panel 3: the cut elements' own solution, where it lives -----------
+    # ---- panel 3: the cut band at its OWN resolution -----------------------
+    # The raster gives a cut element only blockSize pixels per axis, so the band
+    # reads as blocks no matter what the polynomial does.  cut_fine.csv is the
+    # element's own polynomial on a dense grid, fluid side only.
     ax3 = fig.add_subplot(gs[0, 2])
-    if vol is not None and len(vol.get("x", [])) > 0:
-        sc = ax3.scatter(vol["x"], vol["y"], c=vol["rho"], s=7, cmap="viridis")
+    src = fine if (fine is not None and len(fine.get("x", [])) > 0) else vol
+    if src is not None and len(src.get("x", [])) > 0:
+        sc = ax3.scatter(src["x"], src["y"], c=src["rho"], s=(3 if src is fine else 7),
+                         marker="s", cmap="viridis", vmin=vmin, vmax=vmax,
+                         linewidths=0)
         fig.colorbar(sc, ax=ax3, fraction=0.04, pad=0.01)
         if have_cut:
             # scatter, NOT a line: the wall points are ordered by element, so a
             # connected line draws chords across the body between elements
-            ax3.plot(wall["x"], wall["y"], ".", ms=1.2, color="k", alpha=0.6)
+            ax3.plot(wall["x"], wall["y"], ".", ms=1.0, color="k", alpha=0.7)
         ax3.set_aspect("equal")
-        ax3.set_title("rho at the Saye VOLUME points\n(inside the fluid by construction)",
-                      fontsize=9)
+        ax3.set_title(("rho on the cut band, from each element's OWN\npolynomial "
+                       "(fluid side only)") if src is fine else
+                      "rho at the Saye VOLUME points", fontsize=9)
         ax3.set_xlabel("x"); ax3.set_ylabel("y")
     else:
-        ax3.text(0.5, 0.5, "no cut_vol.csv", ha="center", va="center")
+        ax3.text(0.5, 0.5, "no cut_fine.csv / cut_vol.csv", ha="center", va="center")
         ax3.set_axis_off()
 
     out = args.out or os.path.join(args.dir, f"cut_{args.field}_"

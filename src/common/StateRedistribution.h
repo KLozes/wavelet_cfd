@@ -117,16 +117,25 @@ struct SrdOperator {
   // the face neighbour that adds the most volume, until the neighbourhood
   // clears the threshold.  On a Cartesian background this naturally prefers
   // whole uncut cells, which is what a normal-based rule would pick anyway.
+  i32 nShort = 0;          // neighbourhoods that never reached the volume
+                           // target: they are used ANYWAY, so the CFL relief
+                           // SRD is supposed to buy was not actually bought
   void buildNeighborhoods(const std::vector<SrdElem> &e) {
     nElem = (i32)e.size();
+    nShort = 0;
     M.assign(nElem, {}); trivial.assign(nElem, 1);
-    const double vFull = e.empty() ? 1.0 : e[0].hv();
-    const double vTarget = volFrac * vFull;
+    // THRESHOLD IS PER ELEMENT.  This used to be volFrac * e[0].hv() -- element
+    // ZERO's background volume, used as if it were global.  SrdElem carries its
+    // own h[3], so that is a latent wrong answer the moment the wall band spans
+    // more than one refinement level.
+    const double vFull0 = e.empty() ? 1.0 : e[0].hv();
     for (i32 k=0;k<nElem;k++) {
       M[k].push_back(k);
+      const double vTarget = volFrac * e[k].hv();
       if (e[k].vol >= vTarget) continue;       // healthy: M_k = {k}
       double v = e[k].vol;
       std::vector<char> in(nElem, 0); in[k]=1;
+      bool reached = true;
       while (v < vTarget) {
         i32 best=-1; double bestV=0;
         for (i32 m : M[k])
@@ -135,9 +144,10 @@ struct SrdOperator {
             if (nn<0 || in[nn]) continue;
             if (e[nn].vol > bestV) { bestV=e[nn].vol; best=nn; }
           }
-        if (best<0) break;                     // no more neighbours to absorb
+        if (best<0) { reached = false; break; }   // ran out of neighbours                     // no more neighbours to absorb
         in[best]=1; M[k].push_back(best); v += e[best].vol;
       }
+      if (!reached) nShort++;
       trivial[k] = (M[k].size()==1);
     }
     // |C_k| = how many neighbourhoods element k belongs to (>= 1, itself)
