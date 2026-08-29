@@ -124,11 +124,32 @@ struct SayeCfg {
   i32  maxDepth;   // subdivision cap before low-order fallback
   real gradTol;    // |grad_k| below this -> axis not usable as height dir
   __host__ __device__ static SayeCfg def() {
-    // maxDepth 6: a well-resolved cut cell needs 0-2 subdivisions; a deeper spiral
-    // means the cell is under-resolved (feature ~ cell size) -> bounded low-order
-    // fallback instead of a 2^depth node explosion.  The solver h-refines such
-    // cells (crease detector), so this bound is never the accuracy-limiting factor.
-    SayeCfg c; c.ng = 5; c.maxDepth = 6; c.gradTol = (real)1e-9; return c;
+    // maxDepth 10.  It WAS 6, on the reasoning that a well-resolved cut cell
+    // needs 0-2 subdivisions and anything deeper is an under-resolved cell the
+    // solver would h-refine anyway -- so the bound "is never the accuracy-
+    // limiting factor".  That was wrong, and measurably so, because the two
+    // recursions do DIFFERENT things when they hit the cap and neither is a
+    // graceful degradation:
+    //   * arrangementRule (volume and face rules) calls fallbackTensor, which
+    //     tensors the WHOLE box and ignores the interface -- it over-counts;
+    //   * sayeSurfaceRec (the wall rule) just returns, dropping the piece --
+    //     it under-counts.
+    // So the cap does not lower the order, it breaks the closed-surface
+    // identity CLOSED INT n dS = 0 that free-stream preservation rests on, in
+    // opposite directions on the two sides of the same identity.  No volume-
+    // weight correction can repair that (it is exactly what CutElemOps calls
+    // bndIncons), and raising the Gauss order cannot either -- which is the
+    // signature that had been read as a structural defect of the scheme.
+    // MEASURED on the dgcutelem_test cells at N=3, depth 6 -> 10:
+    //   interior bubble   wall area 0.580 -> 1.131, i.e. 4 pi (0.3)^2 EXACTLY:
+    //                     at depth 6 HALF THE SPHERE was missing.  GCL 3.4e-03
+    //                     -> 1.1e-11.
+    //   near-face tangency  volume 0.40704 -> 0.41489, GCL 1.7e-03 -> 3.4e-10.
+    //   worst GCL over all cells 3.4e-03 -> 3.9e-10, 2 geometry-limited -> 0.
+    // Deeper is NOT better: at 14 the interior bubble fails to build outright
+    // (the recursion outruns the arena), so 10 is the measured setting, not an
+    // "as deep as possible" one.  CUT_MAXDEPTH overrides it in the DG build.
+    SayeCfg c; c.ng = 5; c.maxDepth = 10; c.gradTol = (real)1e-9; return c;
   }
 };
 
@@ -464,6 +485,62 @@ __host__ __device__ inline void sayeFace(const PolyND &phi, i32 d, i32 side,
   for (i32 i = 0; i < all.n; i++)
     if (phi.eval(all.p[i].x) < 0) out->add(all.p[i]);
   ar->release(m0);
+}
+
+// ---------------------------------------------------------------------------
+//  PSEUDO-2D (EXTRUDED) RULES.
+//
+//  When the geometry is z-invariant -- a cylinder, an extruded profile -- the
+//  cut region is (2-D shape) x (full z), and the right rule is the tensor
+//  product of a 2-D/1-D rule in the slice with a Gauss rule in z.  Building it
+//  that way is not just cheaper than the 3-D recursion; it is the only way to
+//  get the rule EXACTLY symmetric in z, which the 3-D fit does not give:
+//  measured on a cylinder, the fitted 3-D volume rule is moment-symmetric
+//  (sum w (z-1/2) ~ 4e-16) but its individual weights differ from their
+//  z-mirrors by up to 4.2e-03, and the Euler flux -- rational in the modal
+//  coefficients, so outside the moment space -- aliases that asymmetry into
+//  spurious z-odd modes.
+//
+//  These three deactivate axes through the same act[] mask the recursion
+//  already carries, so no new machinery is involved.
+// ---------------------------------------------------------------------------
+
+// region {phi < 0} in the plane z = z0; weights are the 2-D area measure
+__host__ __device__ inline void sayeSlice2D(const PolyND &phi, real z0, SayeSet *out,
+                                            SayeArena *ar, const SayeCfg &cfg = SayeCfg::def()) {
+  real lo[3] = {0,0,z0}, hi[3] = {1,1,z0}; bool act[3] = {true,true,false};
+  i32 m0 = ar->mark();
+  i32 half = (ar->cap - ar->top) / 2;
+  SayeSet all = ar->span(half);
+  arrangementRule(&phi, 1, lo, hi, act, &all, ar, cfg, 0);
+  if (all.ovf) out->ovf = true;
+  for (i32 i = 0; i < all.n; i++)
+    if (phi.eval(all.p[i].x) < 0) out->add(all.p[i]);
+  ar->release(m0);
+}
+
+// interval {phi < 0} on the line {x_d = v, z = z0}, d in {0,1}; 1-D length measure
+__host__ __device__ inline void sayeEdge1D(const PolyND &phi, i32 d, real v, real z0,
+                                           SayeSet *out, SayeArena *ar,
+                                           const SayeCfg &cfg = SayeCfg::def()) {
+  real lo[3] = {0,0,z0}, hi[3] = {1,1,z0}; bool act[3] = {true,true,false};
+  lo[d] = hi[d] = v; act[d] = false;
+  i32 m0 = ar->mark();
+  i32 half = (ar->cap - ar->top) / 2;
+  SayeSet all = ar->span(half);
+  arrangementRule(&phi, 1, lo, hi, act, &all, ar, cfg, 0);
+  if (all.ovf) out->ovf = true;
+  for (i32 i = 0; i < all.n; i++)
+    if (phi.eval(all.p[i].x) < 0) out->add(all.p[i]);
+  ar->release(m0);
+}
+
+// curve {phi = 0} in the plane z = z0, with in-plane normals (n_z = 0 for a
+// z-invariant phi, since the normal comes from the 3-D gradient)
+__host__ __device__ inline void sayeCurve2D(const PolyND &phi, real z0, SayeSet *out,
+                                            SayeArena *ar, const SayeCfg &cfg = SayeCfg::def()) {
+  real lo[3] = {0,0,z0}, hi[3] = {1,1,z0}; bool act[3] = {true,true,false};
+  sayeSurfaceRec(phi, lo, hi, act, out, ar, cfg, 0);
 }
 
 // ---------------------------------------------------------------------------

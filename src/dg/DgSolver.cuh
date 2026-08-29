@@ -286,7 +286,7 @@ public:
                            // for the in-solver free-stream gate; free stream is
                            // NOT a solid-wall solution, so gating it against the
                            // reflective wall would test the wrong thing
-  i32 *cutDbg = nullptr;   // [2] {starved faces, mortar faces} -- see the
+  i32 *cutDbg = nullptr;   // [2] {starved faces, conforming faces} -- see the
                            // starvation counter in dgRhsCutKernel
   i32  nCutElem = 0;       // number of cut elements
   i32  cutNb = 0;          // modal basis size (total degree N)
@@ -314,7 +314,7 @@ public:
   SayeNode *cutWalP = nullptr;  i32 *cutWalOff = nullptr;   // [nCutElem+1]
   SayeNode *cutFacP = nullptr;  i32 *cutFacOff = nullptr;   // [6*nCutElem+1]
   real *cutFacA = nullptr;      // [6*nCutElem] fluid area of each cut face --
-                                // ~1 selects the conforming GLL mortar path
+                                // ~1 selects the conforming full-face path
 
   // ---- ENTROPY-STABLE cut operators (--cutes), Taylor & Chan arXiv:2412.13002 -
   // Built once on the host from the same CutElemOps the baseline path uses, then
@@ -350,6 +350,17 @@ public:
                                 // -- and with it conservation -- is lost.
   double esGcl  = 0;            // worst Eq-47 residual over the elements
 
+  i32  cutZ2d = 0;     // --cutz2d: zero z-dependent cut modes in a pseudo-2D run
+  i32  cutPos = 1;     // --cutpos: Zhang-Shu positivity limiter on cut elements
+                       // (modal form -- see dgCutPositivityKernel)
+  i32  cutHvGate = 0;  // --cuthvgate 1: gate the cut modal filter on the Persson
+                       // modal-decay ramp instead of applying it everywhere
+  i32  cutFlux = 0;    // --cutflux 1: cut faces use dgIfaceFlux (HLLC), matching
+                       // the Cartesian mesh; 0 = the legacy hardcoded Rusanov
+  real srdVolFrac = 0; // --srdvol: SRD small-cell threshold as a fraction of a
+                       // background volume (0 = keep StateRedistribution's 0.5)
+  i32  subBc = 0;      // --subbc: experimental subsonic characteristic BCs for
+                       // bcType 5 (NOT validated -- see the note in dgBcState)
   i32  ibOn;           // 1 = ghost-element immersed boundary active (cylinder SDF)
   real ibX, ibY;       // cylinder center
   real ibR;            // cylinder radius
@@ -621,9 +632,37 @@ public:
   void applyCutLimiter(void);   // characteristic Barth-Jespersen on cut elements
                                 // (Giuliani SISC 2022) -- wall-tangent eigenframe,
                                 // range condition vs neighbour means, post-SRD
+  void buildSrdDevice(void);    // flatten + upload the SRD operator (once)
+  void applySrdDevice(void);    // the three-kernel device apply (no host sync)
   void applySrd(void);          // stage-wise state redistribution on the HOST via
                                 // managed memory -- microseconds at wall-band size;
                                 // port to a kernel only if a profile says so
+  // ---- SRD ON THE DEVICE --------------------------------------------------
+  // The host apply (applySrd) costs a full device sync plus a serial gather /
+  // project / scatter three times per step.  MEASURED on case 9 at only 12 cut
+  // elements, M=0.2, t=2: 11.40 s with SRD+FRD, 10.34 s SRD-only, 7.48 s with
+  // neither -- i.e. SRD alone was 28% of the run, and the SRD element set grows
+  // with the wall band (52 cut elements at h=0.0625, plus two neighbour rings).
+  // Everything the operator needs is built ONCE and is small, so it uploads and
+  // the apply becomes three kernels with no host round trip.
+  // Flat arrays rather than the SrdElem/SrdBasis structs so this header does not
+  // have to include StateRedistribution.h.
+  i32  srdNE = 0, srdNb = 0, srdDeg = 0;   // elements, modes/neighbourhood, degree
+  i32  *srdBlk  = nullptr;   // [nE]      block index of each SRD element
+  double *srdX0 = nullptr;   // [3*nE]    element lower corner (physical)
+  double *srdH  = nullptr;   // [3*nE]    element size per axis
+  i32  *srdQOff = nullptr;   // [nE+1]    slice of the quadrature pool
+  SayeNode *srdQ = nullptr;  // [qTot]    quadrature pool (reference coords)
+  i32  *srdMOff = nullptr, *srdM = nullptr;   // merge neighbourhoods, CSR
+  i32  *srdCOff = nullptr, *srdC = nullptr;   // reverse map (who projects onto i)
+  i32  *srdCcnt = nullptr;   // [nE]      |C_k|
+  char *srdTriv = nullptr;   // [nE]      neighbourhood is {k}: identity
+  double *srdBas  = nullptr; // [4*nE]    neighbourhood centroid (3) + scale
+  double *srdChol = nullptr; // [nE*nb*nb] factored neighbourhood mass
+  double *srdCoef = nullptr; // [nE*nb*5]  scratch: Pi_k u coefficients
+  double *srdU    = nullptr; // [nE*blockSizeTot*5] gathered nodal state
+  i32  srdOnDev = 0;         // 1 = device arrays built; CUT_SRDHOST=1 forces host
+
   struct DgSrd *srd = nullptr;  // opaque SRD state (DgCutBuild.cu); block indices
                                 // captured at build time, so the band must stay
                                 // STATIC and unsorted (same constraint as the cut

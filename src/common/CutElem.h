@@ -180,16 +180,60 @@ static const bool cutTraceFace = (getenv("CUT_TRACEFACE") != nullptr);
 //  Build the operators for one cut element from its level-set fit.
 //  `phi < 0` is the ACTIVE region (negate at the caller if your fluid is phi>0).
 // ---------------------------------------------------------------------------
+// z exponent of mode m in the degree-major total-degree ordering CutBasis uses
+inline i32 cutModeKz(i32 m, i32 deg) {
+  i32 idx = 0;
+  for (i32 d = 0; d <= deg; d++)
+    for (i32 i = d; i >= 0; i--)
+      for (i32 j = d-i; j >= 0; j--) { if (idx == m) return d-i-j; idx++; }
+  return 0;
+}
+
 inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
                          SayeArena &ar, const SayeCfg &cfg,
                          std::vector<SayeNode> &scratch,
-                         const std::vector<SayeNode> * const *faceOverride = nullptr) {
+                         const std::vector<SayeNode> * const *faceOverride = nullptr,
+                         const double *ffXi = nullptr, const double *ffW = nullptr,
+                         i32 ffN = 0, i32 p2dNz = 0) {
   E.ok=false;
   auto mkset=[&](std::vector<SayeNode> &b){
     SayeSet s; s.p=b.data(); s.n=0; s.cap=(i32)b.size(); s.ovf=false; return s; };
 
   // ---- boundary rules first: they define the geometry the volume rule must
   //      be consistent with, not the other way round ------------------------
+  // ---- PSEUDO-2D: build every rule as (slice) x (Gauss in z) --------------
+  //  Symmetric in z BY CONSTRUCTION, because the Gauss rule is, and every
+  //  point carries the same in-plane position.  See the note on sayeSlice2D.
+  const GaussRule gz = gaussLegendre(p2dNz > 0 ? p2dNz : 1);
+  const real z0 = (real)0.5;
+  auto extrude = [&](const SayeSet &src, std::vector<SayeNode> &dst) {
+    dst.clear(); dst.reserve((size_t)src.n*gz.n);
+    for (i32 i = 0; i < src.n; i++)
+      for (i32 k = 0; k < gz.n; k++) {
+        SayeNode s = src.p[i]; s.x[2] = gz.x[k]; s.w = src.p[i].w*gz.w[k];
+        dst.push_back(s);
+      }
+  };
+  if (p2dNz > 0) {
+    { SayeSet w=mkset(scratch); sayeCurve2D(phi,z0,&w,&ar,cfg); extrude(w, E.wall); }
+    for (i32 d=0; d<2; d++) for (i32 side=0; side<2; side++) {
+      const i32 fi = 2*d+side;
+      if (faceOverride && faceOverride[fi]) { E.face[fi] = *faceOverride[fi];
+        if (cutTraceFace) printf("   [face] fi=%d OVERRIDE n=%zu\n", fi, E.face[fi].size());
+        continue; }
+      SayeSet f=mkset(scratch); sayeEdge1D(phi,d,(real)(side?1:0),z0,&f,&ar,cfg);
+      extrude(f, E.face[fi]);
+      if (cutTraceFace) printf("   [face] fi=%d edge1D n=%d -> %zu\n", fi, f.n, E.face[fi].size());
+    }
+    // the z faces ARE the slice, placed at z = 0 and z = 1
+    { SayeSet f=mkset(scratch); sayeSlice2D(phi,z0,&f,&ar,cfg);
+      for (i32 side=0; side<2; side++) {
+        const i32 fi = 4+side;
+        if (faceOverride && faceOverride[fi]) { E.face[fi] = *faceOverride[fi]; continue; }
+        E.face[fi].clear();
+        for (i32 i=0;i<f.n;i++){ SayeNode s=f.p[i]; s.x[2]=(real)side; E.face[fi].push_back(s); }
+      } }
+  } else {
   { SayeSet w=mkset(scratch); sayeSurface(phi,&w,&ar,cfg);
     E.wall.assign(w.p, w.p+w.n); }
   for (i32 d=0; d<3; d++) for (i32 side=0; side<2; side++) {
@@ -216,13 +260,152 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
     E.face[fi].assign(f.p, f.p+f.n);
     if (cutTraceFace) printf("   [face] fi=%d saye n=%d ovf=%d\n", fi, f.n, (i32)f.ovf);
   }
+  }
+  // ---- FULLY FLUID FACES TAKE THE SOLVER'S OWN TENSOR RULE ----------------
+  //  A face whose fluid area is the whole face is not cut, so there is nothing
+  //  for Saye to resolve on it -- and asking Saye anyway is both wasteful and
+  //  WRONG IN THE ONE WAY THAT MATTERS.  Wasteful: the recursion subdivides for
+  //  a near-tangency that does not touch this face, and it is measured, not
+  //  hypothetical -- CUT_TRACEFACE on case 9 shows a single fully-fluid face
+  //  carrying 6300 points, and the ordinary ones carrying 100 (a 10x10 Gauss
+  //  tensor rule with extra steps).  Wrong: the GCL correction below fits the
+  //  volume weights against THESE face integrals, while the DG kernel, on
+  //  exactly these faces, substitutes the tensor rule its Cartesian neighbour
+  //  lifts over and skips the Saye rule entirely.  The identity is then fitted
+  //  against one rule and evaluated against another -- the D1/D2 hypothesis
+  //  dgcutjac_test was written to test, which measured the two agreeing to only
+  //  5.7e-10 where they should be identical.
+  //
+  //  So take the caller's rule (ffXi/ffW, a 1-D rule on [-1,1] with weights
+  //  summing to 2 -- the DG solution points) and tensor it onto the face.  This
+  //  loses NO accuracy: face integrals here carry psi_m of the SOLUTION degree
+  //  N only, and a (N+1)-point GLL rule is exact through degree 2N-1 >= N.
+  //  Both sides of a shared face get the same point set, because the node set
+  //  is symmetric about the face centre and the mirror map only reverses the
+  //  tangential indices.  ffN == 0 keeps the Saye rule (the FEM callers, which
+  //  have no such neighbour rule to match).
+  if (ffN > 0) {
+    for (i32 fi = 0; fi < 6; fi++) {
+      double a = 0; for (const SayeNode &s : E.face[fi]) a += (double)s.w;
+      if (fabs(a - 1.0) > 1e-6) continue;                 // cut, or empty
+      const i32 d = fi/2, side = fi%2;
+      const i32 t1 = (d == 0) ? 1 : 0, t2 = (d == 2) ? 1 : 2;
+      std::vector<SayeNode> g; g.reserve((size_t)ffN*ffN);
+      for (i32 b2 = 0; b2 < ffN; b2++)
+        for (i32 a2 = 0; a2 < ffN; a2++) {
+          SayeNode s{};
+          s.x[d]  = (real)(side ? 1.0 : 0.0);
+          s.x[t1] = (real)(0.5*(ffXi[a2] + 1.0));
+          s.x[t2] = (real)(0.5*(ffXi[b2] + 1.0));
+          s.w     = (real)(0.25*ffW[a2]*ffW[b2]);
+          s.n[0]=s.n[1]=s.n[2]=(real)0; s.n[d] = (real)(side ? 1.0 : -1.0);
+          g.push_back(s);
+        }
+      if (cutTraceFace)
+        printf("   [face] fi=%d FULL -> tensor n=%zu (was %zu)\n",
+               fi, g.size(), E.face[fi].size());
+      E.face[fi].swap(g);
+    }
+  }
+
   E.wallArea=0; for (const SayeNode &s : E.wall) E.wallArea += (double)s.w;
 
-  // ---- candidate volume nodes: the raw Saye points ------------------------
+  // ---- candidate volume nodes ---------------------------------------------
+  //  Potter, "Fast Construction of Efficient Cut Cell Quadratures" (Sec 4.1,
+  //  docs/PotterCutCellQuadrature.pdf): EVERY method in that paper begins from
+  //  the same discretisation, and it is NOT the raw Saye points --
+  //      Alg 4.2  1) fit a TIGHT BOUNDING BOX to the cut region Omega;
+  //               2) map that box to [-1,1]^d  (call it F);
+  //               3) grid [-1,1]^d uniformly with spacing h;
+  //               4) candidates = grid nodes lying inside F(Omega),
+  //  with the moments carried through by the change of variables (his 4.1).
+  //  His reason for step 2 is stated plainly in Sec 4.1: rescaling "allows a
+  //  more even distribution of grid nodes over Omega which avoids some issues
+  //  caused by tiny sliver cut cells".
+  //
+  //  We had only ever used the Saye nodes.  Those are feasible BY CONSTRUCTION
+  //  -- they reproduce the moments they were built from, which a grid need not
+  //  -- but their positions are dictated by the height-function recursion, so
+  //  on a thin cell they bunch into the subdivision pattern instead of covering
+  //  the region.  The candidate set is what the NNLS fit and the GCL correction
+  //  below get to choose from, so a bunched set is a bad basis for both.
+  //
+  //  So: take the UNION.  The Saye nodes keep feasibility unconditional, the
+  //  bounding-box grid supplies the even cover Potter asks for, and NNLS picks.
+  //  The grid nodes enter with ZERO WEIGHT, which is what keeps the moment
+  //  target b exact -- b is accumulated as sum_q w_q chi(x_q) below, so only the
+  //  Saye nodes contribute to it and the change of variables is never needed:
+  //  we sample in the box but integrate in the cell's own frame.
+  //
+  //  CUT_CANDGRID sets the grid resolution per axis; it is OFF by default, and
+  //  that is a MEASURED choice, not an untested one.  On case 9 (cylinder,
+  //  nlvls 1, p3) switching it on changes nothing worth paying for:
+  //      worst bndIncons   4.08e-04 -> 4.08e-04 (fp32),  1.97e-10 -> 1.97e-10 (fp64)
+  //      free-stream |RHS| 3.384e-07 -> 3.385e-07 (fp64)
+  //      time-marched free-stream growth: the ||dU/dt||/||U|| curve at
+  //      gN = 0 / 12 / 20 agrees to 3-4 significant figures at EVERY output
+  //      time (5.58e-09 -> 7.13e-06 over t = 0.05..0.5 in all three).
+  //  The reason is structural and worth stating so nobody re-runs this: the
+  //  quantity that limits these cells is bndIncons, which is a property of the
+  //  BOUNDARY rules alone -- the volume candidate set cannot move it by
+  //  construction -- and the GCL correction was already closing to that floor.
+  //  Potter's rescaling earns its keep where the candidate set is genuinely
+  //  degenerate (a sliver whose Saye nodes cannot span the moment space); case
+  //  9's thinnest cut cell is 8.8% of a cell and is nowhere near that.  Kept,
+  //  documented and one env var away for the geometry that does hit it.
   std::vector<SayeNode> cand;
-  { SayeSet v=mkset(scratch); sayeVolume(phi,&v,&ar,cfg);
-    cand.assign(v.p, v.p+v.n); }
+  // PSEUDO-2D: the candidates are the 2-D SLICE, not an extrusion of it.  The
+  // whole fit -- NNLS moments and the GCL correction -- is done in the slice
+  // and the result is swept into z at the end.  That is what makes the 3-D rule
+  // exactly z-symmetric AND exactly GCL-consistent: with w_{q,k} = w2_q wg_k the
+  // d = x,y rows factor as (2-D GCL row) x (Gauss z-moment), and the d = z rows
+  // reduce to (2-D moment) x [z^k] which the two z-faces reproduce identically.
+  // Fitting in 3-D and symmetrising afterwards does NOT work (see the note by
+  // the mass build): the correction has already pinned G w = g, so perturbing w
+  // re-opens the residual.
+  if (p2dNz > 0) { SayeSet v=mkset(scratch); sayeSlice2D(phi,z0,&v,&ar,cfg);
+                   cand.assign(v.p, v.p+v.n); }
+  else { SayeSet v=mkset(scratch); sayeVolume(phi,&v,&ar,cfg);
+         cand.assign(v.p, v.p+v.n); }
   if (cand.empty()) return false;
+  {
+    static const i32 gN = getenv("CUT_CANDGRID") ? atoi(getenv("CUT_CANDGRID")) : 0;
+    if (gN > 1) {
+      // Step 1, the tight bounding box.  Potter's Alg 4.1 refines one out of the
+      // inside-outside test alone; we do not need it -- the boundary rules ARE a
+      // sample of dOmega, so vol U wall U face already brackets Omega tightly and
+      // costs nothing.
+      double lo[3] = {1e300,1e300,1e300}, hi[3] = {-1e300,-1e300,-1e300};
+      auto grow = [&](const std::vector<SayeNode> &v2) {
+        for (const SayeNode &s : v2) for (i32 d=0; d<3; d++) {
+          lo[d] = fmin(lo[d], (double)s.x[d]); hi[d] = fmax(hi[d], (double)s.x[d]); } };
+      grow(cand); grow(E.wall);
+      for (i32 f=0; f<6; f++) grow(E.face[f]);
+      // one grid cell of margin, clamped to the reference cell: the box must
+      // CONTAIN Omega, and the sampled extent is an inner estimate of it
+      bool ok = true;
+      for (i32 d=0; d<3; d++) {
+        if (!(lo[d] <= hi[d])) { ok = false; break; }
+        const double m2 = (hi[d]-lo[d])/(double)gN;
+        lo[d] = fmax(0.0, lo[d]-m2); hi[d] = fmin(1.0, hi[d]+m2);
+      }
+      if (ok) {
+        // Steps 2-4.  Sampling uniformly in the BOX is the same set of points as
+        // gridding [-1,1]^3 uniformly and mapping back, so F stays implicit.
+        for (i32 a=0; a<gN; a++)
+        for (i32 b2=0; b2<gN; b2++)
+        for (i32 c2=0; c2<gN; c2++) {
+          double X[3] = { lo[0] + (a +0.5)*(hi[0]-lo[0])/gN,
+                          lo[1] + (b2+0.5)*(hi[1]-lo[1])/gN,
+                          lo[2] + (c2+0.5)*(hi[2]-lo[2])/gN };
+          real xr[3] = {(real)X[0], (real)X[1], (real)X[2]};
+          if (phi.eval(xr) >= 0) continue;             // outside Omega
+          SayeNode s{}; s.x[0]=xr[0]; s.x[1]=xr[1]; s.x[2]=xr[2]; s.w=(real)0;
+          cand.push_back(s);
+        }
+      }
+    }
+  }
 
   // ---- basis, adapted to the CUT REGION ----------------------------------
   // This used to be scaled over the WHOLE reference cell, for a reason that no
@@ -290,17 +473,26 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
   // 2N moments.  Positive weights, ~nm points, and accurate by construction.
   const i32 nc=(i32)cand.size();
   {
-    std::vector<double> A((size_t)nc*nm), b(nm,0.0), chi(nm), wfit;
+    // PSEUDO-2D: only the kz == 0 moments are independent constraints.  With the
+    // tensor form the 3-D moment of x^i y^j z^k is (2-D moment) x (Gauss z-moment)
+    // and the z factor is exact and cancels against the target, so every k for a
+    // given (i,j) is the SAME condition -- fitting them all would just repeat it.
+    std::vector<i32> mrow;                      // moment rows actually used
+    for (i32 m=0;m<nm;m++)
+      if (p2dNz<=0 || cutModeKz(m, 2*N)==0) mrow.push_back(m);
+    const i32 nmU=(i32)mrow.size();
+    std::vector<double> A((size_t)nc*nmU), b(nmU,0.0), chi(nm), wfit;
     for (i32 q=0;q<nc;q++){
       double X[3]={(double)cand[q].x[0],(double)cand[q].x[1],(double)cand[q].x[2]};
       E.B.eval(X, chi.data());
-      for (i32 m=0;m<nm;m++){ A[(size_t)q*nm+m]=chi[m]; b[m]+=(double)cand[q].w*chi[m]; }
+      for (i32 t=0;t<nmU;t++){ A[(size_t)q*nmU+t]=chi[mrow[t]];
+                               b[t]+=(double)cand[q].w*chi[mrow[t]]; }
     }
     // nOuter = 8*nm, not the default nm: one column is admitted per outer pass
     // and the active-set loop removes several, so the default stops the solve
     // early and leaves ~1e-4 of moment error on a rule whose whole job is to
     // reproduce those moments.  See the note in nnlsCore.
-    nnls(A, b, nm, nc, wfit, 1e-9, 8*nm);
+    nnls(A, b, nmU, nc, wfit, 1e-9, 8*nmU);
     E.vol.clear();
     for (i32 q=0;q<nc;q++) if (wfit[q]>1e-15){ SayeNode s=cand[q]; s.w=(real)wfit[q]; E.vol.push_back(s); }
   }
@@ -324,6 +516,22 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
       for (i32 q=0; q<nc && (i32)E.vol.size()<want; q+=stride)
         if (!used[q]) { SayeNode s=cand[q]; s.w=(real)0; E.vol.push_back(s); used[q]=1; }
     }
+  }
+
+  // ---- PSEUDO-2D: SWEEP the fitted slice rule into z ----------------------
+  //  From here on E.vol is the 3-D tensor rule w_{q,k} = w2_q wg_k.  nSlice
+  //  records the slice size so the GCL correction below can keep the tensor
+  //  form (one unknown per SLICE point, not per 3-D point).
+  i32 nSlice = 0;
+  if (p2dNz > 0) {
+    nSlice = (i32)E.vol.size();
+    std::vector<SayeNode> sw; sw.reserve((size_t)nSlice*gz.n);
+    for (i32 q = 0; q < nSlice; q++)
+      for (i32 k = 0; k < gz.n; k++) {
+        SayeNode t = E.vol[q]; t.x[2] = gz.x[k]; t.w = E.vol[q].w*gz.w[k];
+        sw.push_back(t);
+      }
+    E.vol.swap(sw);
   }
 
   // ---- step 2+3: GCL correction, then the mass ---------------------------
@@ -367,12 +575,24 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
   // right trade: consistency with a slightly-wrong boundary preserves
   // free-stream, inconsistency does not.
   {
-    const i32 np=(i32)E.vol.size();
-    std::vector<double> G((size_t)nG*np), g(nG,0.0), psi(nb), dpsi((size_t)nb*3);
+    const i32 npFull=(i32)E.vol.size();
+    // PSEUDO-2D: solve for a TENSOR correction dw_{q,k} = dw2_q wg_k, i.e. one
+    // unknown per slice point.  The constraint row then contracts against the
+    // Gauss weights, and the correction cannot break z-symmetry because dw2 is
+    // z-independent by construction.
+    const bool p2d = (p2dNz > 0 && nSlice > 0);
+    const i32 np = p2d ? nSlice : npFull;
+    const i32 nz = p2d ? gz.n : 1;
+    std::vector<double> G((size_t)nG*np, 0.0), g(nG,0.0), psi(nb), dpsi((size_t)nb*3);
     for (i32 q=0;q<np;q++){
-      double X[3]={(double)E.vol[q].x[0],(double)E.vol[q].x[1],(double)E.vol[q].x[2]};
-      Bs.grad(X,dpsi.data());
-      for (i32 m=0;m<nb;m++) for (i32 d=0;d<3;d++) G[(size_t)(3*m+d)*np+q]=dpsi[3*m+d];
+      for (i32 k=0;k<nz;k++){
+        const i32 idx = p2d ? (q*nz+k) : q;
+        const double zw = p2d ? (double)gz.w[k] : 1.0;
+        double X[3]={(double)E.vol[idx].x[0],(double)E.vol[idx].x[1],(double)E.vol[idx].x[2]};
+        Bs.grad(X,dpsi.data());
+        for (i32 m=0;m<nb;m++) for (i32 d=0;d<3;d++)
+          G[(size_t)(3*m+d)*np+q] += zw*dpsi[3*m+d];
+      }
     }
     auto accumG=[&](const double X[3], double w, const double nrm[3]){
       Bs.eval(X, psi.data());
@@ -430,10 +650,18 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
       // and never even ran at degree 0.
       for (i32 d=0; d<3; d++) E.bndIncons = fmax(E.bndIncons, fabs(g[3*0+d]));
     }
-    // residual r = g - G w
+    // residual r = g - G w.  In the pseudo-2D tensor form the unknown is the
+    // SLICE weight w2_q (the 3-D weight is w2_q wg_k), and G has already been
+    // contracted against wg, so the product must use w2 -- not the first nSlice
+    // entries of the swept array, which are (q=0, k=0..nz-1) and would be
+    // nonsense.  Recover w2_q from the swept rule: w_{q,0} = w2_q wg_0.
+    std::vector<double> wUse(np);
+    for (i32 q=0;q<np;q++)
+      wUse[q] = p2d ? (double)E.vol[(size_t)q*nz].w/(double)gz.w[0]
+                    : (double)E.vol[q].w;
     std::vector<double> r(nG,0.0);
     for (i32 i=0;i<nG;i++){ double s=g[i];
-      for (i32 q=0;q<np;q++) s-=G[(size_t)i*np+q]*(double)E.vol[q].w; r[i]=s; }
+      for (i32 q=0;q<np;q++) s-=G[(size_t)i*np+q]*wUse[q]; r[i]=s; }
     E.momResid=0; for (double t : r) E.momResid=fmax(E.momResid,fabs(t));
     // (G G^T) y = r, with a small Tikhonov term for the rank-deficient rows
     // (the m=0 GCL rows are 0 == CLOSED INT n_d, which G cannot see)
@@ -469,19 +697,35 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
           if (!freeQ[q]) continue;
           double d=0; for (i32 i=0;i<nG;i++) d+=G[(size_t)i*np+q]*yy[i];
           dw[q]=d;
-          if ((double)E.vol[q].w + d < 0) {
+          if (wUse[q] + d < 0) {          // wUse = the SLICE weight (see above)
             // pin at zero: dw = -w0 exactly, and its constraint contribution
             // moves to the right-hand side for the next round
-            viol=true; freeQ[q]=0; dw[q]=-(double)E.vol[q].w;
+            viol=true; freeQ[q]=0; dw[q]=-wUse[q];
             for (i32 i=0;i<nG;i++) rr[i]-=G[(size_t)i*np+q]*dw[q];
           }
         }
         if (!viol) break;
       }
       for (i32 q=0;q<np;q++)
-        E.vol[q].w = (real)fmax((double)E.vol[q].w + dw[q], 0.0);
+        for (i32 k=0;k<nz;k++){
+          const i32 idx = p2d ? (q*nz+k) : q;
+          const double zw = p2d ? (double)gz.w[k] : 1.0;
+          E.vol[idx].w = (real)fmax((double)E.vol[idx].w + zw*dw[q], 0.0);
+        }
     }
   }
+  // NOTE, measured: symmetrising the FITTED weights here (averaging each point
+  //  with its z-mirror, which exists by construction in the extruded candidate
+  //  set) does NOT work, and the reason is worth keeping.  The least-norm
+  //  correction immediately above solves G w = g so the GCL holds EXACTLY;
+  //  perturbing w afterwards re-opens a residual at the size of the asymmetry
+  //  (~1e-3 relative) and the run then blows up, even though bndIncons -- a
+  //  BOUNDARY metric -- still reads 1.22e-12 and looks fine.
+  //  Doing it properly means solving the correction IN THE SYMMETRIC SUBSPACE:
+  //  one unknown per mirror pair, so the correction is symmetric by
+  //  construction and the GCL is satisfied by the symmetric weights directly.
+  //  Until then, --cutz2d projects the spurious z modes out of the residual,
+  //  which is exact for a pseudo-2D run and costs nothing.
   { i32 neg=0; for (const SayeNode &s : E.vol) if ((double)s.w<0) neg++;
     E.nNegW=neg; }
   if (E.vol.empty()) return false;
@@ -511,6 +755,21 @@ inline bool cutElemBuildRaw(const PolyND &phi, i32 N, CutElemOps &E,
   if (!spd) return false;                  // cannot support its own degree: build failure
   E.Mchol.swap(M);
   E.B = Bs;                                // keep the SOLUTION basis actually used
+  // LOW-DEGREE MODE COUNT for the modal-decay (Persson) sensor.  The basis is
+  // degree-major and the Cholesky NESTS, so the first count(N-1) orthonormal
+  // functions span the degree-(N-1) space exactly and
+  //     eta = 1 - sum_{m < nbLo} c~_m^2 / sum_m c~_m^2
+  // is the top-degree energy fraction -- Persson & Peraire's indicator, exact
+  // in this frame with no mass matvec.
+  // THIS WAS NEVER ASSIGNED.  nbLo defaulted to 0, its own declaration reads
+  // "0 => no sensor", and the consumer guards on `k > 0` -- so the cut-cell
+  // modal-decay sensor has been DEAD since the degree ladder was removed (nbLo
+  // used to be set as part of that machinery).  Everything keyed on it was
+  // therefore silently off: the cut-element artificial viscosity reads that
+  // verdict as its theta, so AV on cut cells was identically zero, which is
+  // exactly the reported symptom "at every blowup the element sensor read
+  // theta = 0.001..0.018 -- IT NEVER FIRED".
+  E.nbLo = (N >= 1) ? CutBasis::count(N-1) : 0;
   E.ok = true;
   return true;
   }                                        // end of the (single-degree) block
@@ -537,8 +796,10 @@ inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
                          SayeArena &ar, const SayeCfg &cfg,
                          std::vector<SayeNode> &scratch,
                          double qualTol = 1e-6,
-                         const std::vector<SayeNode> * const *faceOverride = nullptr) {
-  if (!cutElemBuildRaw(phi, N, E, ar, cfg, scratch, faceOverride)) {
+                         const std::vector<SayeNode> * const *faceOverride = nullptr,
+                         const double *ffXi = nullptr, const double *ffW = nullptr,
+                         i32 ffN = 0, i32 p2dNz = 0) {
+  if (!cutElemBuildRaw(phi, N, E, ar, cfg, scratch, faceOverride, ffXi, ffW, ffN, p2dNz)) {
     // The element cannot carry degree N -- and with the degree ladder gone
     // there is no lower order to fall back to.  That is deliberate, but it is
     // not a reason to lose the cell: a SUB-RESOLUTION feature should be dropped
@@ -562,7 +823,7 @@ inline bool cutElemBuild(const PolyND &phi, i32 N, CutElemOps &E,
     for (double eps : epsL) {
       PolyND ps = phi; ps.at(0,0,0) = (real)((double)ps.at(0,0,0) + eps);
       CutElemOps T;
-      if (!cutElemBuildRaw(ps, N, T, ar, cfg, scratch, faceOverride)) continue;
+      if (!cutElemBuildRaw(ps, N, T, ar, cfg, scratch, faceOverride, ffXi, ffW, ffN, p2dNz)) continue;
       if (T.bndIncons < best.bndIncons) best = T;
       if (best.bndIncons <= qualTol) break;
     }

@@ -88,6 +88,7 @@ void DgSolver::buildInitialGrid(bool doPaint) {
   if (cutOn) {
     buildCutElems();
     buildSrd();
+    buildSrdDevice();     // flatten + upload; applySrd then runs on the device
     // The FRIB machinery ran during the build above (ibOn was still 1) and
     // FILLED ghost/dead blocks with wall-mirrored states -- including the
     // solid-side nodes of what are now cut elements.  The cut path reads those
@@ -104,7 +105,7 @@ void DgSolver::buildInitialGrid(bool doPaint) {
 // nodal -> modal for every cut element (no-op unless --cutmodal 1)
 void DgSolver::cutToModal(void) {
   if (!cutOn || !cutModal || nCutElem == 0) return;
-  size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 3)*sizeof(real);
+  size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 4)*sizeof(real);
   dgCutToModalKernel<<<nCutElem, blockSizeTot, shm>>>(*this);
   cudaDeviceSynchronize();
 }
@@ -242,7 +243,8 @@ void DgSolver::adaptLeaves(void) {
   cudaDeviceSynchronize();
 
   nBlocks = hashTable.nKeys;
-  deleteDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  dgDeleteDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // NOT the common
+  // kernel: its cell loop is k==0-guarded under pseudo2D (see the kernel's note)
   long t3 = nowUs(); tSpawnUs += t3 - t2;
   sortBlocks();
 
@@ -372,7 +374,7 @@ real DgSolver::step(real tStep) {
       if (gauss) dgRhsGaussKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (T)); \
       else dgRhsKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (T)); \
       if (cutOn) { \
-        size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 3)*sizeof(real); \
+        size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 4)*sizeof(real); \
         if (cutEs) { \
           const i32 nqM = esQOff[nCutElem], nfM = esFOff[nCutElem]; (void)nqM; (void)nfM; \
           i32 mq = 0, mf = 0; \
@@ -417,6 +419,10 @@ real DgSolver::step(real tStep) {
       // Giuliani's ordering: update -> SRD (postprocess) -> characteristic limit
       if (cutOn) { applySrd(); applyCutLimiter(); }
       dgPositivityKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+      if (cutOn && cutModal && cutPos && nCutElem > 0) {   // cut cells: modal Zhang-Shu
+        size_t shmP = ((size_t)CUT_NBMAX_H*5 + 2)*sizeof(real);
+        dgCutPositivityKernel<<<nCutElem, 128, shmP>>>(*this);
+      }
       if (esLim)   // ES limiter: bound the cell entropy by the RHS's slots 3/4
         dgEntropyLimitKernel<<<cudaGridSize, cudaBlockSize>>>(*this, deltaT);
       if (ibOn && (ibFillEvery == 0 || stage == 2))   // refill ghosts from the

@@ -969,6 +969,25 @@ __device__ void dgEvalIC(DgSolver &grid, real x, real y, real z, i32 lvl, real W
   }
 }
 
+// Free the blocks adaptLeaves flagged DELETE: release the slot and zero every
+// node of every field.  This is the common deleteDataKernel minus its
+// START_CELL_LOOP, whose pseudo2D guard (added for the FV solver's collapsed-z
+// mode) visits only the k == 0 plane -- a DG element carries live data on all
+// NNODE z-layers, so that guard would leave stale nodes in a freed slot.
+
+__global__ void dgDeleteDataKernel(DgSolver &grid) {
+  DG_CELL_LOOP(cIdx, bIdx) {
+    if (grid.bFlagsList[bIdx] != DELETE) continue;
+    if (cIdx % blockSizeTot == 0) {
+      grid.bLocList[bIdx] = kEmpty;
+      grid.bIdxList[bIdx] = bEmpty;
+      atomicAdd(&(grid.nBlocks), -1);
+    }
+    grid.cFlagsList[cIdx] = 0;
+    for (i32 f = 0; f < grid.nFields; f++) grid.getField(f)[cIdx] = 0;
+  }
+}
+
 __global__ void dgSetICKernel(DgSolver &grid) {
   DG_CELL_LOOP(cIdx, bIdx) {
     GET_CELL_INDICES
@@ -1054,14 +1073,69 @@ __device__ __forceinline__ void dgBcState(DgSolver &grid, const real Win[5],
       }
       else { for (i32 q=0;q<5;q++) Wg[q]=Win[q]; }                        // z: transmissive
       break;
-    case 5:   // freestream tunnel: x-lo Dirichlet inflow (all characteristics
-              // incoming at supersonic M), y-lo/hi SLIP WALLS (a wind-tunnel;
-              // the transmissive y/corner treatment is the measured M=0
-              // domain-corner mode and misbehaves subsonically), x-hi (and z)
-              // transmissive
+    case 5:   // freestream tunnel: y-lo/hi SLIP WALLS (a wind-tunnel; the
+              // transmissive y/corner treatment is the measured M=0
+              // domain-corner mode and misbehaves subsonically), x-lo inflow,
+              // x-hi outflow, z transmissive.
+              //
+              // THE x BOUNDARIES ARE CHARACTERISTIC-COUNTED, and they have to
+              // be: this case was written for the Mach-3 blunt body, where all
+              // five characteristics enter at x-lo and all five leave at x-hi,
+              // so "impose everything / extrapolate everything" is correct.
+              // SUBSONICALLY BOTH ENDS ARE THEN WRONG, by exactly one
+              // characteristic each -- u-c runs upstream, so it LEAVES at the
+              // inflow (5 conditions imposed where 4 are admissible: the
+              // boundary reflects) and ENTERS at the outflow (0 imposed where 1
+              // is needed: nothing pins the pressure level, and the whole field
+              // is free to drift off p_inf).
+              // MEASURED at M=0.2 on the cylinder, before this branch existed:
+              // a near-UNIFORM Cp offset of about -0.68 -- front stagnation
+              // +0.30 against the exact +1.01, shoulder -3.64 against -3.00 --
+              // identical at h = 0.25 / 0.125 / 0.0625 (grid-independent, so no
+              // refinement could touch it) and unchanged by the wall treatment.
+              // The free-stream gate stayed clean at 9.2e-09 throughout, which
+              // is the tell: a uniform state is the exact solution the Dirichlet
+              // inflow imposes, so it is the one state these BCs get right.
+              //
+              // --subbc 1 SELECTS AN EXPERIMENTAL SUBSONIC TREATMENT, and it is
+              // OFF BY DEFAULT because it is NOT VALIDATED.  It imposes the free
+              // stream's rho and velocity at inflow (extrapolating p) and a back
+              // pressure at outflow.  The characteristic COUNT is then right, and
+              // it fixes the front stagnation point -- Cp +0.297 -> +1.059 against
+              // the exact +1.010 at h = 0.25.  But it is worse where it matters
+              // more: the mid-wake far field goes Cp +0.035 -> +1.578, mass
+              // accumulates (dM/dt +7.2e-03) because a rigidly imposed inflow
+              // mass flux against a pinned back pressure leaves nothing to
+              // balance it during the transient, and the run DIES at t = 28.
+              // A correct version imposes STAGNATION conditions at inflow (h0, s,
+              // flow angle -- letting u adjust) and relaxes the back pressure
+              // rather than pinning it.  Kept, gated and documented so the
+              // diagnosis is not lost; the default reproduces the original
+              // supersonic-tunnel behaviour exactly.
       if (dir == 0 && side == 0) {
         Wg[0] = (real)1.0; Wg[1] = grid.machInf; Wg[2] = (real)0.0;
-        Wg[3] = (real)0.0; Wg[4] = (real)1.0/dgGam;   // a_inf = 1, u = M
+        Wg[3] = (real)0.0;
+        Wg[4] = (grid.subBc && grid.machInf < (real)1.0)
+                  ? Win[4]                    // subsonic: p is the outgoing one
+                  : (real)1.0/dgGam;            // a_inf = 1, u = M
+      } else if (dir == 0 && side == 1 && grid.subBc && grid.machInf < (real)1.0) {
+        // SUBSONIC OUTFLOW, characteristic form.  Imposing p = p_inf while
+        // extrapolating rho and u is NOT the same thing and is badly
+        // reflecting: that state violates the two invariants that are leaving
+        // (entropy, and J+ = u + 2c/(gam-1)), so the mismatch radiates back in.
+        // MEASURED: rear stagnation Cp +2.13 against the exact +1.01, i.e. an
+        // over-pressure larger than stagnation, and the residual ROSE.
+        // Carry the outgoing invariants and let only p be set:
+        //     p_g   = p_inf
+        //     rho_g = rho + (p_g - p)/c^2        (entropy)
+        //     u_g   = u   + (p - p_g)/(rho c)    (J+, linearised)
+        const real pB  = (real)1.0/dgGam;
+        const real c   = dgSoundSpeed(Win[4], Win[0]);
+        const real rc  = Win[0]*c;
+        Wg[0] = fmax(Win[0] + (pB - Win[4])/(c*c), DG_EPSF);
+        Wg[1] = Win[1] + (Win[4] - pB)/fmax(rc, DG_EPSF);
+        Wg[2] = Win[2]; Wg[3] = Win[3];
+        Wg[4] = pB;
       } else if (dir == 1) {
         for (i32 q = 0; q < 5; q++) Wg[q] = Win[q];
         Wg[2] = -Win[2];                               // slip wall
@@ -4108,6 +4182,21 @@ __device__ __forceinline__ void dgAtomicMaxPos(real *addr, real v) {
 #endif
 }
 
+// ... and the min.  Same trick, same precondition: NONNEGATIVE reals only,
+// whose IEEE bit patterns are monotone in the value.  Both helpers write the
+// SAME width as `real`, so the slot stays a plain real and an ordinary typed
+// read gets the answer back -- which is the bug this replaced: the cut kernel
+// used the fp64 form unconditionally, so an fp32 build issued an 8-byte atomic
+// on a 4-byte-aligned float slot (memcheck: "Invalid __shared__ read of size 8
+// bytes ... misaligned"), killing every non-ES cut run at the first RHS.
+__device__ __forceinline__ void dgAtomicMinPos(real *addr, real v) {
+#ifdef USE_DOUBLE
+  atomicMin((unsigned long long*)addr, (unsigned long long)__double_as_longlong(v));
+#else
+  atomicMin((int*)addr, __float_as_int(v));
+#endif
+}
+
 __global__ void dgScalesKernel(DgSolver &grid) {
   // register accumulation + block tree-reduction: 6 atomics per CUDA block.
   // (The naive per-node version issued ~1.5M atomicAdds onto SIX addresses per
@@ -5948,6 +6037,326 @@ __device__ __forceinline__ void dgLag3(const real xr[3], real *phi) {
 //  Slots [nb, blockSizeTot) are zeroed: RK sees zero state and zero RHS there,
 //  so they stay zero and cost nothing.
 // ---------------------------------------------------------------------------
+/* ════════════════════════════════════════════════════════════════════════
+ *  STATE REDISTRIBUTION ON THE DEVICE
+ *
+ *  A faithful port of srdApply (common/StateRedistribution.h) + the gather /
+ *  write-back that applySrd wrapped around it.  Same algebra, same order of
+ *  operations, in double throughout -- so an fp32 solver still redistributes
+ *  in double, exactly as the host path did.
+ *
+ *    kernel 1  gather : nodal state of every SRD element -> grid.srdU.  A
+ *                       MODAL cut block is evaluated through its own basis at
+ *                       the tensor nodes (its slots hold coefficients).
+ *    kernel 2  project: one block per NON-TRIVIAL neighbourhood k.  Builds
+ *                       rhs_m = SUM_j SUM_q w_j w_q hv_j psi_m(X_q) u_j(x_q)
+ *                       and Cholesky-solves it -> grid.srdCoef[k].
+ *    kernel 3  scatter: one block per element i.  Averages every projection
+ *                       that touched i over its own tensor nodes, then writes
+ *                       back -- projecting onto the cut basis over the fluid
+ *                       rule for a modal cut block.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+// total-degree monomials about a neighbourhood centroid (SrdBasis::eval)
+__device__ __forceinline__ void dgSrdPsi(const double *bas, i32 N,
+                                         const double X[3], double *psi) {
+  const double sc = bas[3];
+  const double u = (X[0]-bas[0])/sc, v = (X[1]-bas[1])/sc, w = (X[2]-bas[2])/sc;
+  i32 m = 0;
+  for (i32 d = 0; d <= N; d++)
+    for (i32 i = d; i >= 0; i--)
+      for (i32 j = d-i; j >= 0; j--) {
+        const i32 k = d-i-j;
+        double t = 1;
+        for (i32 a = 0; a < i; a++) t *= u;
+        for (i32 a = 0; a < j; a++) t *= v;
+        for (i32 a = 0; a < k; a++) t *= w;
+        psi[m++] = t;
+      }
+}
+
+// tensor Lagrange values at a reference point in [0,1]^3 (double; dgLag3 is real)
+__device__ __forceinline__ void dgSrdLag1(double x, double *L) {
+  for (i32 a = 0; a < NNODE; a++) {
+    double t = 1;
+    const double xa = (double)c_xi[a];
+    for (i32 b = 0; b < NNODE; b++)
+      if (b != a) t *= (x - (double)c_xi[b])/(xa - (double)c_xi[b]);
+    L[a] = t;
+  }
+}
+
+__global__ void dgSrdGatherKernel(DgSolver &grid) {
+  const i32 e = blockIdx.x;
+  if (e >= grid.srdNE) return;
+  const i32 b = grid.srdBlk[e];
+  const i32 c = (grid.cutModal && grid.blkCut) ? grid.blkCut[b] : -1;
+  double *ue = grid.srdU + (size_t)e*blockSizeTot*5;
+  if (c < 0) {
+    for (i32 nd = threadIdx.x; nd < blockSizeTot; nd += blockDim.x)
+      for (i32 q = 0; q < 5; q++)
+        ue[(size_t)nd*5+q] = (double)grid.getField(D_RHO+q)[(size_t)b*blockSizeTot+nd];
+    return;
+  }
+  const i32 nb = grid.cutNbOf[c];
+  const real *cen = grid.cutCen + 4*c;
+  const real *Lc  = grid.cutLc  + (size_t)c*CUT_NBMAX*CUT_NBMAX;
+  for (i32 nd = threadIdx.x; nd < blockSizeTot; nd += blockDim.x) {
+    const i32 i2 = nd%NNODE, j2 = (nd/NNODE)%NNODE, k2 = nd/(NNODE*NNODE);
+    real xr[3] = { (real)(0.5*((double)c_xi[i2]+1.0)),
+                   (real)(0.5*((double)c_xi[j2]+1.0)),
+                   (real)(0.5*((double)c_xi[k2]+1.0)) };
+    real psi[CUT_NBMAX];
+    dgCutPsiO(cen, xr, nb, Lc, psi, nullptr);
+    for (i32 q = 0; q < 5; q++) {
+      double v = 0;
+      for (i32 m = 0; m < nb; m++)
+        v += (double)grid.getField(D_RHO+q)[(size_t)b*blockSizeTot+m]*(double)psi[m];
+      ue[(size_t)nd*5+q] = v;
+    }
+  }
+}
+
+__global__ void dgSrdProjectKernel(DgSolver &grid) {
+  extern __shared__ double sh[];
+  const i32 k = blockIdx.x;
+  if (k >= grid.srdNE || grid.srdTriv[k]) return;
+  const i32 nb = grid.srdNb;
+  double *rhs = sh;                       // [nb*5]
+  for (i32 t = threadIdx.x; t < nb*5; t += blockDim.x) rhs[t] = 0.0;
+  __syncthreads();
+
+  const double *bas = grid.srdBas + 4*k;
+  for (i32 mi = grid.srdMOff[k]; mi < grid.srdMOff[k+1]; mi++) {
+    const i32 j = grid.srdM[mi];
+    const double wj = 1.0/(double)grid.srdCcnt[j];
+    const double hv = grid.srdH[3*j]*grid.srdH[3*j+1]*grid.srdH[3*j+2];
+    const double *uj = grid.srdU + (size_t)j*blockSizeTot*5;
+    const i32 q0 = grid.srdQOff[j], q1 = grid.srdQOff[j+1];
+    for (i32 q = q0 + threadIdx.x; q < q1; q += blockDim.x) {
+      const SayeNode &sn = grid.srdQ[q];
+      const double xr[3] = { (double)sn.x[0], (double)sn.x[1], (double)sn.x[2] };
+      double X[3], Lx[NNODE], Ly[NNODE], Lz[NNODE], psi[64];
+      for (i32 d = 0; d < 3; d++) X[d] = grid.srdX0[3*j+d] + grid.srdH[3*j+d]*xr[d];
+      dgSrdLag1(2.0*xr[0]-1.0, Lx); dgSrdLag1(2.0*xr[1]-1.0, Ly); dgSrdLag1(2.0*xr[2]-1.0, Lz);
+      dgSrdPsi(bas, grid.srdDeg, X, psi);
+      const double wq = wj*(double)sn.w*hv;
+      for (i32 cc = 0; cc < 5; cc++) {
+        double uq = 0;
+        for (i32 kk = 0; kk < NNODE; kk++)
+          for (i32 jj = 0; jj < NNODE; jj++) {
+            const double lyz = Ly[jj]*Lz[kk];
+            for (i32 ii = 0; ii < NNODE; ii++)
+              uq += Lx[ii]*lyz*uj[(size_t)(ii + NNODE*(jj + NNODE*kk))*5+cc];
+          }
+        const double wu = wq*uq;
+        for (i32 m = 0; m < nb; m++) atomicAdd(&rhs[m*5+cc], wu*psi[m]);
+      }
+    }
+  }
+  __syncthreads();
+
+  // one Cholesky solve per component against the stored factor
+  if (threadIdx.x < 5) {
+    const i32 cc = threadIdx.x;
+    const double *L = grid.srdChol + (size_t)k*nb*nb;
+    double *out = grid.srdCoef + (size_t)k*nb*5;
+    double y[64];
+    for (i32 i = 0; i < nb; i++) {
+      double t = rhs[i*5+cc];
+      for (i32 q = 0; q < i; q++) t -= L[(size_t)i*nb+q]*y[q];
+      y[i] = t/L[(size_t)i*nb+i];
+    }
+    for (i32 i = nb-1; i >= 0; i--) {
+      double t = y[i];
+      for (i32 q = i+1; q < nb; q++) t -= L[(size_t)q*nb+i]*out[q*5+cc];
+      out[i*5+cc] = t/L[(size_t)i*nb+i];
+    }
+  }
+}
+
+__global__ void dgSrdScatterKernel(DgSolver &grid) {
+  extern __shared__ double sh2[];
+  const i32 i = blockIdx.x;
+  if (i >= grid.srdNE) return;
+  const i32 nb = grid.srdNb;
+  double *su = sh2;                          // [blockSizeTot*5]
+  const double inv = 1.0/(double)grid.srdCcnt[i];
+  const double *ui = grid.srdU + (size_t)i*blockSizeTot*5;
+
+  for (i32 t = threadIdx.x; t < blockSizeTot*5; t += blockDim.x) su[t] = 0.0;
+  __syncthreads();
+  for (i32 nd = threadIdx.x; nd < blockSizeTot; nd += blockDim.x) {
+    const i32 i2 = nd%NNODE, j2 = (nd/NNODE)%NNODE, k2 = nd/(NNODE*NNODE);
+    const double X[3] = { grid.srdX0[3*i+0] + grid.srdH[3*i+0]*0.5*((double)c_xi[i2]+1.0),
+                          grid.srdX0[3*i+1] + grid.srdH[3*i+1]*0.5*((double)c_xi[j2]+1.0),
+                          grid.srdX0[3*i+2] + grid.srdH[3*i+2]*0.5*((double)c_xi[k2]+1.0) };
+    double acc[5] = {0,0,0,0,0};
+    for (i32 ci = grid.srdCOff[i]; ci < grid.srdCOff[i+1]; ci++) {
+      const i32 j = grid.srdC[ci];
+      if (grid.srdTriv[j]) {
+        for (i32 q = 0; q < 5; q++) acc[q] += inv*ui[(size_t)nd*5+q];
+        continue;
+      }
+      double psi[64];
+      dgSrdPsi(grid.srdBas + 4*j, grid.srdDeg, X, psi);
+      const double *cf = grid.srdCoef + (size_t)j*nb*5;
+      for (i32 q = 0; q < 5; q++) {
+        double t = 0;
+        for (i32 m = 0; m < nb; m++) t += cf[m*5+q]*psi[m];
+        acc[q] += inv*t;
+      }
+    }
+    for (i32 q = 0; q < 5; q++) su[(size_t)nd*5+q] = acc[q];
+  }
+  __syncthreads();
+
+  // ---- write back ---------------------------------------------------------
+  const i32 b = grid.srdBlk[i];
+  const i32 c = (grid.cutModal && grid.blkCut) ? grid.blkCut[b] : -1;
+  if (c < 0) {
+    for (i32 nd = threadIdx.x; nd < blockSizeTot; nd += blockDim.x)
+      for (i32 q = 0; q < 5; q++)
+        grid.getField(D_RHO+q)[(size_t)b*blockSizeTot+nd] = (real)su[(size_t)nd*5+q];
+    return;
+  }
+  // MODAL cut block: project the redistributed nodal state back onto the
+  // element's own basis over its fluid rule (the host path's final step).
+  double *cm = sh2 + (size_t)blockSizeTot*5;          // [CUT_NBMAX*5]
+  const i32 nbc = grid.cutNbOf[c];
+  for (i32 t = threadIdx.x; t < nbc*5; t += blockDim.x) cm[t] = 0.0;
+  __syncthreads();
+  const real *cen = grid.cutCen + 4*c;
+  const real *Lc  = grid.cutLc  + (size_t)c*CUT_NBMAX*CUT_NBMAX;
+  for (i32 g = grid.cutVolOff[c] + threadIdx.x; g < grid.cutVolOff[c+1]; g += blockDim.x) {
+    const SayeNode &sn = grid.cutVolP[g];
+    real psir[CUT_NBMAX];
+    dgCutPsiO(cen, sn.x, nbc, Lc, psir, nullptr);
+    double Lx[NNODE], Ly[NNODE], Lz[NNODE];
+    dgSrdLag1(2.0*(double)sn.x[0]-1.0, Lx);
+    dgSrdLag1(2.0*(double)sn.x[1]-1.0, Ly);
+    dgSrdLag1(2.0*(double)sn.x[2]-1.0, Lz);
+    for (i32 q = 0; q < 5; q++) {
+      double uq = 0;
+      for (i32 kk = 0; kk < NNODE; kk++)
+        for (i32 jj = 0; jj < NNODE; jj++) {
+          const double lyz = Ly[jj]*Lz[kk];
+          for (i32 ii = 0; ii < NNODE; ii++)
+            uq += Lx[ii]*lyz*su[(size_t)(ii + NNODE*(jj + NNODE*kk))*5+q];
+        }
+      const double wu = (double)sn.w*uq;
+      for (i32 m = 0; m < nbc; m++) atomicAdd(&cm[m*5+q], wu*(double)psir[m]);
+    }
+  }
+  __syncthreads();
+  for (i32 nd = threadIdx.x; nd < blockSizeTot; nd += blockDim.x)
+    for (i32 q = 0; q < 5; q++)
+      grid.getField(D_RHO+q)[(size_t)b*blockSizeTot+nd] =
+          (nd < nbc) ? (real)cm[nd*5+q] : (real)0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  ZHANG-SHU POSITIVITY LIMITER ON CUT ELEMENTS
+ *
+ *  dgPositivityKernel SKIPS cut elements, and the reason recorded for that is
+ *  sound as far as it goes: "its cell mean is the full-tensor GLL mean, which
+ *  mixes solid-side extension values, and rescaling toward a garbage mean
+ *  INFLATES good nodes (measured 1e33)".  That objection is specific to the
+ *  NODAL representation.  Under --cutmodal the obstacle is gone:
+ *
+ *    * the mean over the FLUID REGION is exactly c~_0 * psi~_0 = c~_0 / L00,
+ *      because psi~_0 is the constant 1/L00 -- no solid-side values enter it;
+ *    * the admissible set is evaluated on the element's OWN quadrature (volume,
+ *      wall and cut faces), i.e. only where the polynomial is a solution;
+ *    * and the deviation scaling U := Ubar + theta (U - Ubar) is, in this
+ *      basis, simply "multiply modes 1.. by theta and leave c~_0 alone" -- so
+ *      it is EXACTLY conservative by construction and costs no nodal round trip.
+ *
+ *  Two stages, as Zhang & Shu: density first, then pressure by bisection along
+ *  the segment from the mean to the state (p is not linear in theta).
+ * ════════════════════════════════════════════════════════════════════════ */
+__global__ void dgCutPositivityKernel(DgSolver &grid) {
+  extern __shared__ real shp2[];
+  const i32 c = blockIdx.x;
+  if (c >= grid.nCutElem) return;
+  const i32 b  = grid.cutBlk[c];
+  const i32 nb = grid.cutNbOf[c];
+  if (nb <= 1) return;                       // P0: the mean IS the solution
+  const real *cen = grid.cutCen + 4*c;
+  const real *Lc  = grid.cutLc  + (size_t)c*CUT_NBMAX*CUT_NBMAX;
+
+  real *sC = shp2;                           // [nb*5] coefficients
+  real *sR = sC + (size_t)CUT_NBMAX*5;       // [2] reduction slots
+  for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x)
+    sC[i] = grid.getField(D_RHO + (i%5))[(size_t)b*blockSizeTot + i/5];
+  if (threadIdx.x == 0) { sR[0] = (real)1.0; sR[1] = (real)1.0; }
+  __syncthreads();
+
+  // fluid-region mean (psi~_0 = 1/L00 is constant over the element)
+  real Ub[5];
+  for (i32 q = 0; q < 5; q++) Ub[q] = sC[0*5+q]*((real)1.0/Lc[0]);
+  const real rhoB = Ub[0];
+  const real pB   = dgPressureFromCons(Ub);
+  if (!(rhoB > (real)0) || !(pB > (real)0)) return;   // mean inadmissible: nothing to scale toward
+  const real epsR = fmin((real)1e-13, rhoB);
+  const real epsP = fmin((real)1e-13, pB);
+
+  // the element's own admissible-set points: volume rule + wall + cut faces
+  const i32 v0 = grid.cutVolOff[c],  v1 = grid.cutVolOff[c+1];
+  const i32 w0 = grid.cutWalOff[c],  w1 = grid.cutWalOff[c+1];
+  const i32 f0 = grid.cutFacOff[6*c], f1 = grid.cutFacOff[6*c+6];
+  const i32 nTot = (v1-v0) + (w1-w0) + (f1-f0);
+
+  // ---- stage 1: density ---------------------------------------------------
+  for (i32 t = threadIdx.x; t < nTot; t += blockDim.x) {
+    const SayeNode *sn = (t < v1-v0) ? &grid.cutVolP[v0+t]
+                       : (t < (v1-v0)+(w1-w0)) ? &grid.cutWalP[w0+t-(v1-v0)]
+                       : &grid.cutFacP[f0+t-(v1-v0)-(w1-w0)];
+    real psi[CUT_NBMAX];
+    dgCutPsiO(cen, sn->x, nb, Lc, psi, nullptr);
+    real r = 0;
+    for (i32 m = 0; m < nb; m++) r += sC[m*5+0]*psi[m];
+    if (r < epsR) {
+      const real th = (rhoB - r > (real)0) ? (rhoB - epsR)/(rhoB - r) : (real)0;
+      dgAtomicMinPos(&sR[0], fmax(fmin(th, (real)1.0), (real)0.0));
+    }
+  }
+  __syncthreads();
+  const real th1 = sR[0];
+  if (th1 < (real)1.0)
+    for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x)
+      if (i/5 > 0) sC[i] *= th1;              // modes 1.. only: the mean is kept
+  __syncthreads();
+
+  // ---- stage 2: pressure, bisection in theta ------------------------------
+  for (i32 t = threadIdx.x; t < nTot; t += blockDim.x) {
+    const SayeNode *sn = (t < v1-v0) ? &grid.cutVolP[v0+t]
+                       : (t < (v1-v0)+(w1-w0)) ? &grid.cutWalP[w0+t-(v1-v0)]
+                       : &grid.cutFacP[f0+t-(v1-v0)-(w1-w0)];
+    real psi[CUT_NBMAX];
+    dgCutPsiO(cen, sn->x, nb, Lc, psi, nullptr);
+    real U[5];
+    for (i32 q = 0; q < 5; q++) { real v = 0;
+      for (i32 m = 0; m < nb; m++) v += sC[m*5+q]*psi[m]; U[q] = v; }
+    if (dgPressureFromCons(U) >= epsP) continue;
+    real lo = (real)0, hi = (real)1;          // p(lo) >= epsP by the mean check
+    for (i32 it = 0; it < 24; it++) {
+      const real mid = (real)0.5*(lo+hi);
+      real Um[5];
+      for (i32 q = 0; q < 5; q++) Um[q] = Ub[q] + mid*(U[q]-Ub[q]);
+      if (dgPressureFromCons(Um) >= epsP && Um[0] >= epsR) lo = mid; else hi = mid;
+    }
+    dgAtomicMinPos(&sR[1], lo);
+  }
+  __syncthreads();
+  const real th2 = sR[1];
+  for (i32 i = threadIdx.x; i < nb*5; i += blockDim.x) {
+    real v = sC[i];
+    if (i/5 > 0 && th2 < (real)1.0) v *= th2;
+    grid.getField(D_RHO + (i%5))[(size_t)b*blockSizeTot + i/5] = v;
+  }
+}
+
 __global__ void dgCutToModalKernel(DgSolver &grid) {
   extern __shared__ real sh[];
   real *sU = sh;                          // [5][blockSizeTot] nodal state
@@ -6052,7 +6461,7 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     // low-degree space exactly.  eta = 1 - sum_{m<k} c~^2 / sum c~^2.
     // Sensed on DENSITY (Persson's choice).
     if (threadIdx.x == 0) {
-      real trouble = 0;
+      real trouble = 0, thP = 0;
       const i32 k = grid.cutNbLo[c];
       if (nbFull > 1 && k > 0) {
         real num = 0, low = 0;
@@ -6061,9 +6470,21 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         if (num > (real)1e-30) {
           real eta = (real)1.0 - low/num;
           if (eta > grid.cutEta) trouble = 1;
+          // PERSSON & PERAIRE's RAMP on the same quantity.  eta is the top-mode
+          // energy FRACTION; his indicator is its log10, and his sensor is a
+          // raised-sine ramp over [s0-kappa, s0+kappa] rather than a step -- a
+          // binary gate chatters on and off between stages and puts a
+          // discontinuity into the dissipation.  Same s0/kappa the Cartesian
+          // elements use (--pps0 / --ppkappa), so the wall band and the mesh
+          // around it are gated by one sensor with one calibration.
+          const real sP = log10(fmax(eta, (real)1e-30));
+          const real s0 = grid.ppS0, kap = grid.ppKappa;
+          thP = (sP < s0-kap) ? (real)0.0 : (sP > s0+kap) ? (real)1.0
+              : (real)0.5*((real)1.0 + sin((real)0.5*(real)PI*(sP - s0)/kap));
         }
       }
       sLam[2] = trouble;                    // sLam[0] = AV reduce, sLam[1] = min(rho)
+      sLam[3] = thP;                        // continuous Persson ramp (filter gate)
     }
     __syncthreads();
     // (sLam[2] is the modal-decay verdict; it no longer drops the order)
@@ -6083,7 +6504,8 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     //      present via the Rusanov jump term.
     real nuE = 0;
     if (grid.avOn) {
-      if (threadIdx.x == 0) sLam[1] = (real)1e300;    // min(rho) reduce
+      if (threadIdx.x == 0) sLam[1] = (real)INFINITY;  // min(rho) reduce identity
+      // (was 1e300, which an fp32 build silently overflows to the same +inf)
       __syncthreads();
       for (i32 g = threadIdx.x; g < grid.cutVolOff[c+1]-grid.cutVolOff[c]; g += blockDim.x) {
         const SayeNode &s = grid.cutVolP[grid.cutVolOff[c] + g];
@@ -6096,10 +6518,10 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         real rho = fmax(U[0], DG_EPSF);
         real p = dgPressureFromCons(U);
         real lam = (fabs(U[1])+fabs(U[2])+fabs(U[3]))/rho + dgSoundSpeed(p, rho);
-        atomicMax((unsigned long long*)sLam, (unsigned long long)__double_as_longlong(lam));
-        // min(rho): atomicMin on the raw bits -- POSITIVE doubles order like
-        // unsigned integers, so this is exact (rho is sanitize-floored > 0).
-        atomicMin((unsigned long long*)&sLam[1], (unsigned long long)__double_as_longlong(fmax(U[0], DG_EPSF)));
+        dgAtomicMaxPos(&sLam[0], lam);
+        // min(rho): atomicMin on the raw bits -- POSITIVE reals order like
+        // integers, so this is exact (rho is sanitize-floored > 0).
+        dgAtomicMinPos(&sLam[1], fmax(U[0], DG_EPSF));
       }
       __syncthreads();
       // THE SENSOR IS THIS ELEMENT'S OWN, not the Cartesian slot.  The comment
@@ -6119,13 +6541,13 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
       // modal solution's density anywhere in the FLUID region is below 10% of
       // the mean, run this evaluation with the sensor forced full on.
       real c0rho = fmax(sC[0]/Lc[0], DG_EPSF);   // mean rho = c~_0 psi~_0
-      if (__longlong_as_double(*(long long*)&sLam[1]) < (real)0.1*c0rho)
+      if (sLam[1] < (real)0.1*c0rho)
         theta = (real)1.0;
       real lenp  = h[0]/(real)(2*dgOrder+1);
-      const real lamE = __longlong_as_double(*(long long*)sLam);
+      const real lamE = sLam[0];
       nuE = grid.avCav * theta * lenp * lamE;
       // publish for anyone reading THIS block's slots -- the neighbour side of
-      // the mortar face penalty, dgTroubledToScratchKernel, the refinement vote
+      // the conforming-face penalty, dgTroubledToScratchKernel, the refine vote
       if (threadIdx.x == 0) {
         grid.getField(D_SCRATCH)[(u64)b*blockSizeTot]     = theta*lamE;
         grid.getField(D_SCRATCH)[(u64)b*blockSizeTot + 1] = theta;
@@ -6231,7 +6653,15 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
     // cut, so nothing is double counted.
     if (grid.cutDbgMask & 2)
     for (i32 f = 0; f < 6; f++) {
-      // ---- CONFORMING GLL MORTAR (cut <-> Cartesian, full fluid face) ------
+      // ---- CONFORMING FACE (cut <-> Cartesian, full fluid face) ------------
+      // NOT a mortar, and the distinction is not pedantic: a mortar exists to
+      // couple NONCONFORMING faces, where the two sides carry different face
+      // node sets and the flux must be L2-projected between them (dgFaceLift's
+      // coarse/fine branch, ~line 1757 -- that is the only mortar in this
+      // solver, and it belongs to AMR).  A cut element and its Cartesian
+      // neighbour are ALWAYS the same level and share the whole face, so the
+      // two sides have the IDENTICAL tensor face nodes.  One flux per shared
+      // node, lifted natively on both sides.  There is nothing to project.
       // ONE flux per shared GLL face node, used by BOTH sides: my modal weak
       // integral over the tensor GLL face rule, and their native pointwise
       // sgn*jacDir*winv lift.  That is exactly the conforming-DG coupling, so
@@ -6247,8 +6677,8 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         const bool fullFace = fabs(grid.cutFacA[6*c+f] - (real)1.0) < (real)1e-6;
         // STARVATION COUNTER: a NON-cut neighbour across a PARTIAL face gets
         // nothing.  dgRhsKernel skips any face whose neighbour is cut, so that
-        // neighbour's only source for this face is the mortar deposit below --
-        // and the mortar requires the face to be fully fluid.  A face that is
+        // neighbour's only source for this face is the deposit below -- and
+        // that path requires the face to be fully fluid.  A face that is
         // partial with a non-cut neighbour is therefore a HOLE in the coupling.
         if (grid.cutDbg && threadIdx.x == 0 && nbM >= 0 && grid.blkCut[nbM] < 0
             && !fullFace && grid.cutFacOff[6*c+f+1] > grid.cutFacOff[6*c+f])
@@ -6286,7 +6716,18 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
             Wo[1]=Uo[1]/Wo[0]; Wo[2]=Uo[2]/Wo[0]; Wo[3]=Uo[3]/Wo[0];
             Wo[4]=dgPressureFromCons(Uo);
             real fs[5];
-            if (sideM) dgRusanovAxis(Wm, Wo, dM, fs); else dgRusanovAxis(Wo, Wm, dM, fs);
+            // SAME FLUX AS THE REST OF THE MESH.  This was hardcoded Rusanov while
+            // every Cartesian face runs dgIfaceFlux (HLLC by default), so the wall
+            // band carried a dissipation JUMP: Rusanov damps with lambda = |u.n| + c,
+            // which at M = 0.2 is ~5x the convective scale (10x at M = 0.1, 20x at
+            // M = 0.05), and it smears the contact and shear waves HLLC resolves --
+            // right where the wall pressure is sampled.  --cutflux 0 restores it.
+            if (grid.cutFlux) {
+              if (sideM) dgIfaceFlux(grid, Wm, Wo, dM, (real)0, fs);
+              else       dgIfaceFlux(grid, Wo, Wm, dM, (real)0, fs);
+            } else {
+              if (sideM) dgRusanovAxis(Wm, Wo, dM, fs); else dgRusanovAxis(Wo, Wm, dM, fs);
+            }
             if (grid.avOn) {
               real nuMe = nuE;      // locally computed; the slot was never written
               real nuNb = grid.getField(D_SCRATCH)[(u64)nbM*blockSizeTot];
@@ -6367,7 +6808,12 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
           for (i32 q = 0; q < 5; q++) Wo[q] = Wm[q];      // outflow / copy
         }
         real Fs[5];
-        if (side) dgRusanovAxis(Wm, Wo, d, Fs); else dgRusanovAxis(Wo, Wm, d, Fs);
+        if (grid.cutFlux) {                    // see the note at the deposit above
+          if (side) dgIfaceFlux(grid, Wm, Wo, d, (real)0, Fs);
+          else      dgIfaceFlux(grid, Wo, Wm, d, (real)0, Fs);
+        } else {
+          if (side) dgRusanovAxis(Wm, Wo, d, Fs); else dgRusanovAxis(Wo, Wm, d, Fs);
+        }
         // AV jump penalty, exactly as the Cartesian face path applies it: the
         // deposit is the only face flux these two elements exchange, so it must
         // carry the same dissipation the native path would.
@@ -6412,7 +6858,13 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         Wm[3]=Um[3]/Wm[0]; Wm[4]=dgPressureFromCons(Um);
         lamE = fabs(Wm[1])+fabs(Wm[2])+fabs(Wm[3])+dgSoundSpeed(Wm[4],Wm[0]); }
       const real hmin = fmin(h[0], grid.pseudo2D ? h[0] : fmin(h[1],h[2]));
-      const real rate = fabs(grid.cutHv)*lamE/fmax(hmin,(real)1e-30);
+      // --cuthvgate 1: scale the filter by the Persson ramp, so it is strong
+      // where the element's modal decay says it is troubled and OFF where the
+      // solution is smooth.  Ungated (0) it damps the top modes everywhere,
+      // which is what the original comment meant by "UNGATED".
+      const real gate = grid.cutHvGate ? sLam[3] : (real)1.0;
+      const real rate = gate*fabs(grid.cutHv)*lamE/fmax(hmin,(real)1e-30);
+      if (rate > (real)0)
       for (i32 i = threadIdx.x; i < nb; i += blockDim.x) {
         // total degree of mode i, degree-major ordering (matches dgCutPsi)
         i32 dg = 0, m = 0;
@@ -6427,6 +6879,31 @@ __global__ void dgRhsCutKernel(DgSolver &grid, real t) {
         if (grid.cutHv < (real)0) { f = (real)1.0; }  // DIAGNOSTIC: flat damping
         else { f = (real)dg/(real)dgOrder; f = f*f; f = f*f; }   // (deg/N)^4
         for (i32 q = 0; q < 5; q++) sR[i*5+q] -= rate*f*sC[i*5+q];
+      }
+      __syncthreads();
+    }
+
+    // ---- PSEUDO-2D: kill the z-dependent modes of the residual --------------
+    //  In a pseudo-2D run the geometry is a cylinder and the exact solution is
+    //  EXACTLY z-invariant, so every mode with a z exponent > 0 is error.  It is
+    //  nonetheless generated, and the mechanism is worth recording: the fitted
+    //  volume rule is MOMENT-symmetric in z (measured: sum w (z-1/2) ~ 4e-16)
+    //  but NOT POINTWISE symmetric -- individual weights differ from their
+    //  z-mirrors by up to 4.2e-03, ~1% of the total.  That is invisible to a
+    //  polynomial integrand of degree <= 2N, which only sees the moments, but
+    //  the Euler flux is rational in the coefficients, so psi_m F(u) is not in
+    //  that space and the asymmetry ALIASES into z-odd modes.  Measured wall Cp
+    //  z-spread: 7e-09 on a uniform state (exact, F constant), 1.5e-03 at
+    //  t = 0.1 with flow, 6.7e-02 by t = 5 at M = 0.5.
+    //  Projecting them out is exact for this configuration, and conservative:
+    //  mode 0 has z-exponent 0 and is untouched.
+    if (grid.cutZ2d && grid.pseudo2D) {
+      for (i32 i = threadIdx.x; i < nb; i += blockDim.x) {
+        i32 kz = 0, m = 0;                       // z exponent of mode i
+        for (i32 d = 0; d <= dgOrder && m <= i; d++)
+          for (i32 a = d; a >= 0 && m <= i; a--)
+            for (i32 b2 = d-a; b2 >= 0 && m <= i; b2--) { if (m == i) kz = d-a-b2; m++; }
+        if (kz > 0) for (i32 q = 0; q < 5; q++) sR[i*5+q] = (real)0;
       }
       __syncthreads();
     }

@@ -1,6 +1,7 @@
 # Build for the solvers, which share the MultiLevelSparseGrid wavelet AMR core:
 #   wave3d   - the compressible flow solver              (15 fields/block)
 #   wavesdf  - the narrowband signed distance field gen   (2 fields/block)
+#   wavedg3d - the multi-resolution cut-cell DGSEM Euler solver
 #   wavefem  - CutFEM linear elasticity on a cut/immersed STL body
 # archived (still builds via `make wavewsdf`, not part of `all`):
 #   wavewsdf - the wavelet / BVH-oracle SDF + dual contour
@@ -12,7 +13,7 @@
 #                     Stl/Features/Bvh/BvhQuery
 #   src/fv          - CompressibleSolver + Main/MainMgpu       (wave3d*)
 #   src/sdf         - SignedDistanceSolver + MainSdf           (wavesdf)
-#   src/dg          - standalone cut-cell DG gates (dg*_test only)
+#   src/dg          - DgSolver + DgMain + cut-cell DG gates  (wavedg3d*, dg*_test)
 #   src/fem         - CutFemSolver + FemMain                   (wavefem*)
 #   src/archive     - retired solvers, kept buildable but out of `all`
 #     archive/waveletsdf - WaveletSdfSolver, DualContour, NodalOctree (wavewsdf)
@@ -29,8 +30,11 @@ NVCC = nvcc
 SRC_DIR = src
 OBJ_DIR = obj
 
-# CUDA 13 / Thrust need >= c++17; sm_89 = RTX 4080 SUPER (was sm_75 = GTX 1650)
-ARCH      = sm_89
+# CUDA 13 / Thrust need >= c++17.  ARCH follows the GPU that is actually
+# present (sm_89 = RTX 4080 SUPER, sm_75 = GTX 1650); override with
+# `make ARCH=sm_XX` when cross-building.  Falls back to sm_89 without a GPU.
+GPU_CC   := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
+ARCH     ?= $(if $(GPU_CC),sm_$(GPU_CC),sm_89)
 STD       = c++17
 NVCCFLAGS = -O2 -std=$(STD) -arch=$(ARCH)
 LDFLAGS   = -lpng -lz -lcusolver -lcusparse
@@ -40,6 +44,7 @@ INC_COMMON    = -I./$(SRC_DIR)/common
 WAVE3D_INC    = $(INC_COMMON) -I./$(SRC_DIR)/fv
 WAVESDF_INC   = $(INC_COMMON) -I./$(SRC_DIR)/sdf
 WAVEWSDF_INC  = $(INC_COMMON) -I./$(SRC_DIR)/archive/waveletsdf
+WAVEDG_INC    = $(INC_COMMON) -I./$(SRC_DIR)/dg -I./$(SRC_DIR)/fem
 WAVEFEM_INC   = $(INC_COMMON) -I./$(SRC_DIR)/fem
 
 # per-executable cell cap (blocks = NCELLS_MAX/blockSizeTot).  wave3d gets 64M
@@ -97,6 +102,29 @@ WAVE3D_2D_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_2d/%.cu.o,$(WAVE3D_SRCS))
 WAVE3D_2D_SP_DEFS = -DCOLLAPSE_2D
 WAVE3D_2D_SP_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_2d_sp/%.cu.o,$(WAVE3D_SRCS))
 
+# multi-resolution DGSEM solver (leaf-only AMR, one block = one p=3 element of
+# 4^3 LGL nodes).  16M nodes = 250k elements; 17 node-fields ~ 1.1 GB fp32.
+# wavedg3d_dp: fp64 for conservation/convergence studies (halved node cap).
+#   THE CUT-CELL PATH WANTS THE fp64 BUILD.  SayeNode stores quadrature points,
+#   weights and normals in `real`, so an fp32 build carries the whole cut
+#   geometry pipeline in float and free-stream preservation floors out:
+#   measured on case 9, worst bndIncons 7.9e-05 vs 1.3e-12 and cut-element
+#   free-stream |RHS| 7.0e-02 vs 3.0e-09, against a 1.5e-05 background.
+# wavedg3d_p2: p=2 variant (3^3 LGL nodes; blockSize must equal p+1).
+# The cut-cell path (--cutcell 1) needs the fem include for LagrangeBasis.h.
+WAVEDG_DEFS    = -DNCELLS_MAX=32000000 -DDG_ORDER=3
+WAVEDG_DP_DEFS = -DNCELLS_MAX=8000000 -DDG_ORDER=3 -DUSE_DOUBLE
+WAVEDG_P2_DEFS = -DNCELLS_MAX=32000000 -DDG_ORDER=2 -DBLOCK_SIZE=3
+# p=1 (2^3 LGL nodes per element), fp64 -- the order at which the published
+# cut-cell DG shock results live (Giuliani's SISC 2022 runs are p=1).
+WAVEDG_P1_DEFS = -DNCELLS_MAX=32000000 -DDG_ORDER=1 -DBLOCK_SIZE=2 -DUSE_DOUBLE
+WAVEDG_SRCS = $(COMMON_SRCS) \
+              dg/DgSolver dg/DgSolverKernels dg/DgCutBuild dg/DgCutEs dg/DgMain
+WAVEDG_OBJS    = $(patsubst %,$(OBJ_DIR)/wavedg3d/%.cu.o,$(WAVEDG_SRCS))
+WAVEDG_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_dp/%.cu.o,$(WAVEDG_SRCS))
+WAVEDG_P2_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_p2/%.cu.o,$(WAVEDG_SRCS))
+WAVEDG_P1_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_p1/%.cu.o,$(WAVEDG_SRCS))
+
 # CutFEM linear elasticity (steady, matrix-free CG -- the only implicit solver
 # here).  wavefem_dp is the fp64 build: the convergence study needs errors well
 # below the ~1e-5 relative floor fp32 CG leaves.
@@ -130,7 +158,7 @@ ifeq ($(USE_MPI),1)
   WAVE3D_MGPU_LDFLAGS = -L$(MPI_HOME)/lib -lmpi -Xlinker -rpath -Xlinker $(MPI_HOME)/lib
 endif
 
-all: wave3d wavesdf wavefem
+all: wave3d wavesdf wavedg3d wavefem
 
 wave3d: $(WAVE3D_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
@@ -148,6 +176,18 @@ wave3d_2d: $(WAVE3D_2D_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
 wave3d_2d_sp: $(WAVE3D_2D_SP_OBJS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
+
+wavedg3d: $(WAVEDG_OBJS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
+
+wavedg3d_dp: $(WAVEDG_DP_OBJS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
+
+wavedg3d_p2: $(WAVEDG_P2_OBJS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
+
+wavedg3d_p1: $(WAVEDG_P1_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
 wavefem: $(WAVEFEM_OBJS)
@@ -184,6 +224,22 @@ $(OBJ_DIR)/wave3d_2d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
 $(OBJ_DIR)/wave3d_2d_sp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) $(WAVE3D_2D_SP_DEFS) $(WAVE3D_INC) -dc $< -o $@
+
+$(OBJ_DIR)/wavedg3d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVEDG_DEFS) $(WAVEDG_INC) -dc $< -o $@
+
+$(OBJ_DIR)/wavedg3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVEDG_DP_DEFS) $(WAVEDG_INC) -dc $< -o $@
+
+$(OBJ_DIR)/wavedg3d_p2/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVEDG_P2_DEFS) $(WAVEDG_INC) -dc $< -o $@
+
+$(OBJ_DIR)/wavedg3d_p1/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVEDG_P1_DEFS) $(WAVEDG_INC) -dc $< -o $@
 
 # -Xcompiler -fopenmp: the Qp path (CutFemIga.cu) parallelizes its host assembly /
 # CG over cores.  The p=1 sources have no OpenMP pragmas, so their generated code
@@ -262,7 +318,7 @@ iga_euler2d: $(SRC_DIR)/fem/IgaEuler2dTest.cu $(HDRS)
 femtests: saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
 clean:
-	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf wave3d_dp wave3d_2d wave3d_mgpu \
+	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf wave3d_dp wave3d_2d wave3d_mgpu wavedg3d wavedg3d_dp wavedg3d_p2 wavedg3d_p1 \
 	       wavefem wavefem_dp ktau_test ktau_test_sp saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
 .PHONY: all clean femtests

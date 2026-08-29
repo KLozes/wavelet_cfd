@@ -27,9 +27,23 @@
 // host mirror of the solver's level-set: fluid is phi > 0 (OUTSIDE the body),
 // while Saye's convention is that the ACTIVE region is phi < 0, so the sign is
 // flipped at the sampling step and nowhere else.
+// CUT_PHIDIST=1 restores the DISTANCE form below; the default is the QUADRATIC
+// one.  Every cut rule is built from fitPoly3's degree-p interpolant of this
+// function at the element's own solution nodes, so the geometry the rules
+// integrate is the FIT, not this function.  r - R is not a polynomial, so its
+// cubic interpolant has O(h^4) error and a zero set that wobbles relative to the
+// true circle, differently on a face than in the interior.  r^2 - R^2 has the
+// SAME ZERO SET and is a quadratic, which a cubic fit reproduces EXACTLY, so the
+// volume, face and wall rules all integrate one consistent algebraic surface.
+// MEASURED on case 9, p3, --cutmodal: fp32 free-stream |RHS| 8.245 -> 1.866 and
+// worst bndIncons 7.72e-04 -> 4.08e-04.  In fp64 the two forms are equivalent
+// (1.7e-09 vs 3.0e-09) -- the fit error only dominates once float rounding does
+// not, so this is an fp32 robustness fix, not an accuracy one.
 static double dgHostIbPhi(const DgSolver &g, double x, double y) {
   double dx = x - (double)g.ibX, dy = y - (double)g.ibY;
-  return sqrt(dx*dx + dy*dy) - (double)g.ibR;
+  static const bool useDist = (getenv("CUT_PHIDIST") != nullptr);
+  if (useDist) return sqrt(dx*dx + dy*dy) - (double)g.ibR;
+  return dx*dx + dy*dy - (double)g.ibR*(double)g.ibR;
 }
 
 // ONE BLOCK == ONE DG ELEMENT and a block holds blockSize cells, so the element
@@ -105,6 +119,7 @@ void DgSolver::buildCutElems(void) {
     std::vector<SayeNode> arena0(1<<21), scratch0(1<<18);
     SayeArena ar0; ar0.buf=arena0.data(); ar0.cap=1<<21; ar0.top=0;
     SayeCfg cfg0 = SayeCfg::def(); cfg0.ng = 10;
+    if (getenv("CUT_MAXDEPTH")) cfg0.maxDepth = atoi(getenv("CUT_MAXDEPTH"));
 
     auto audit = [&](double eps, i32 cnt[4]) {
       cnt[0]=cnt[1]=cnt[2]=cnt[3]=0;
@@ -185,6 +200,10 @@ void DgSolver::buildCutElems(void) {
   SayeArena ar; ar.buf = arena.data(); ar.cap = 1<<21; ar.top = 0;
   SayeCfg cfg = SayeCfg::def();
   cfg.ng = getenv("CUT_NG") ? atoi(getenv("CUT_NG")) : 10;   // 5 is NOT enough -- measured
+  // subdivision cap: see the long note on SayeCfg::def().  The default (10) is
+  // what makes the discrete divergence theorem close at P3; this override is
+  // for reproducing the old geometry, not for tuning.
+  if (getenv("CUT_MAXDEPTH")) cfg.maxDepth = atoi(getenv("CUT_MAXDEPTH"));
 
   std::vector<i32>       blkOf;
   std::vector<CutElemOps> ops;
@@ -243,7 +262,14 @@ void DgSolver::buildCutElems(void) {
       }
     }
     CutElemOps E;
-    if (!cutElemBuild(phi, N, E, ar, cfg, scratch, 1e-6, ovPtr)) continue;
+    // ffXi/ffW: the DG solution rule.  A fully-fluid face then carries exactly
+    // the rule dgRhsCutKernel integrates it with (the neighbour's tensor face
+    // nodes), so the GCL is fitted against the runtime rule -- see the note in
+    // CutElem.h.
+    // pseudo2D: build the rules as (2-D slice) x (Gauss in z) -- exactly
+    // z-symmetric, and cheaper than the 3-D recursion (see SayeQuad.h)
+    const i32 p2dNz = (pseudo2D && !getenv("CUT_NO2DRULE")) ? NNODE+1 : 0;
+    if (!cutElemBuild(phi, N, E, ar, cfg, scratch, 1e-6, ovPtr, xi, w, NNODE, p2dNz)) continue;
     // SNAPPED elements: the cut machinery half-saw a sub-resolution feature and
     // its rules were irreparably inconsistent.  Dropping the feature keeps the
     // GCL exact; the cost is the pocket volume, which is below resolution.
@@ -370,7 +396,7 @@ void DgSolver::probeCutRhs(void) {
   for (i32 q = 0; q < 5; q++)
     cudaMemset(getField(D_RHS+q), 0, (size_t)nBlocksMax*blockSizeTot*sizeof(real));
   dgRhsKernel<<<cudaGridSize, DG_EPB*blockSizeTot>>>(*this, (real)0);
-  size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 2)*sizeof(real);
+  size_t shm = (5*blockSizeTot + 10*CUT_NBMAX_H + 4)*sizeof(real);
   dgRhsCutKernel<<<nCutElem, blockSizeTot, shm>>>(*this, (real)0);
   cudaDeviceSynchronize();
   double mCut=0, mNbr=0, mFar=0; i32 bCut=-1,bNbr=-1;
@@ -432,6 +458,17 @@ void DgSolver::buildSrd(void) {
            "the solution points are Gauss-Legendre; results are not trustworthy\n");
   }
   srd->B.init(dgOrder);
+  // SMALL-CELL THRESHOLD.  SRD is a filter: it replaces a flagged element's
+  // state by a neighbourhood projection, so applying it to a HEALTHY cell costs
+  // accuracy and time for a problem that cell does not have.  The default 0.5
+  // flags everything under half a background volume, which on case 9 at h=0.25
+  // is every cut element in the band (min fluid fraction 0.45).  --srdvol sets
+  // it; 0.1 restricts SRD to genuinely small cells.
+  { const char *sv = getenv("CUT_SRDVOL");
+    if (srdVolFrac > 0) srd->S.volFrac = srdVolFrac;
+    else if (sv) srd->S.volFrac = atof(sv); }
+  printf("srd    : small-cell threshold volFrac = %.3f of a background cell\n",
+         srd->S.volFrac);
 
   // ---- collect the element set: cut blocks + two rings of fluid neighbours --
   std::vector<i32> mark(nBlocksMax, 0);
@@ -645,9 +682,77 @@ struct CutHostEval {
   }
 };
 
+// ---------------------------------------------------------------------------
+//  Flatten the SRD operator into device arrays.  Called once, after buildSrd.
+//  Everything here is static for the life of the run (the wall band is frozen
+//  and the block sort is pinned), so this is pure setup.
+// ---------------------------------------------------------------------------
+void DgSolver::buildSrdDevice(void) {
+  if (!srd || srd->nMerged == 0) return;
+  if (getenv("CUT_SRDHOST")) { srdOnDev = 0; return; }
+  const i32 nE = (i32)srd->elems.size();
+  const i32 nb = srd->S.nb;
+  srdNE = nE; srdNb = nb; srdDeg = srd->S.N;
+
+  auto allocI = [&](i32 **p2, size_t n) { cudaMallocManaged(p2, n*sizeof(i32)); };
+  auto allocD = [&](double **p2, size_t n) { cudaMallocManaged(p2, n*sizeof(double)); };
+  allocI(&srdBlk, nE);  allocI(&srdQOff, nE+1); allocI(&srdCcnt, nE);
+  allocI(&srdMOff, nE+1); allocI(&srdCOff, nE+1);
+  allocD(&srdX0, 3*nE); allocD(&srdH, 3*nE); allocD(&srdBas, 4*nE);
+  allocD(&srdChol, (size_t)nE*nb*nb);
+  allocD(&srdCoef, (size_t)nE*nb*5);
+  allocD(&srdU,   (size_t)nE*blockSizeTot*5);
+  cudaMallocManaged(&srdTriv, nE*sizeof(char));
+  cudaMallocManaged(&srdQ, (srd->qpool.size()?srd->qpool.size():1)*sizeof(SayeNode));
+  memcpy(srdQ, srd->qpool.data(), srd->qpool.size()*sizeof(SayeNode));
+
+  size_t mTot = 0, cTot = 0;
+  for (i32 k = 0; k < nE; k++) { mTot += srd->S.M[k].size(); cTot += srd->S.C[k].size(); }
+  allocI(&srdM, mTot?mTot:1); allocI(&srdC, cTot?cTot:1);
+
+  srdMOff[0] = srdCOff[0] = srdQOff[0] = 0;
+  i32 mAt = 0, cAt = 0;
+  for (i32 k = 0; k < nE; k++) {
+    const SrdElem &E = srd->elems[k];
+    srdBlk[k] = srd->blk[k];
+    for (i32 d = 0; d < 3; d++) { srdX0[3*k+d] = E.x0[d]; srdH[3*k+d] = E.h[d]; }
+    srdQOff[k+1] = srdQOff[k] + E.qN;
+    srdCcnt[k] = srd->S.Ccnt[k];
+    srdTriv[k] = srd->S.trivial[k];
+    const SrdBasis &B = srd->S.basis[k];
+    srdBas[4*k+0]=B.c[0]; srdBas[4*k+1]=B.c[1]; srdBas[4*k+2]=B.c[2]; srdBas[4*k+3]=B.s;
+    if (!srd->S.trivial[k] && (i32)srd->S.chol[k].size() >= nb*nb)
+      memcpy(srdChol + (size_t)k*nb*nb, srd->S.chol[k].data(), (size_t)nb*nb*sizeof(double));
+    for (i32 j : srd->S.M[k]) srdM[mAt++] = j;
+    for (i32 j : srd->S.C[k]) srdC[cAt++] = j;
+    srdMOff[k+1] = mAt; srdCOff[k+1] = cAt;
+  }
+  // qOff in the flattened pool must match the elements' own slices
+  for (i32 k = 0; k < nE; k++)
+    if (srdQOff[k] != srd->elems[k].qOff) {
+      printf("srd    : device qOff mismatch at %d (%d vs %d) -- staying on the host\n",
+             k, srdQOff[k], srd->elems[k].qOff);
+      srdOnDev = 0; return;
+    }
+  srdOnDev = 1;
+  printf("srd    : DEVICE apply ON -- %d elements, %d modes, pools M %zu / C %zu, %.2f MB\n",
+         nE, nb, mTot, cTot,
+         ((double)nE*nb*nb + (double)nE*nb*5 + (double)nE*blockSizeTot*5)*sizeof(double)/1048576.0);
+}
+
+// three kernels, no host round trip (see the note in DgSolver.cuh)
+void DgSolver::applySrdDevice(void) {
+  const size_t shProj = (size_t)srdNb*5*sizeof(double);
+  const size_t shScat = ((size_t)blockSizeTot*5 + (size_t)CUT_NBMAX_H*5)*sizeof(double);
+  dgSrdGatherKernel <<<srdNE, 64>>>(*this);
+  dgSrdProjectKernel<<<srdNE, 128, shProj>>>(*this);
+  dgSrdScatterKernel<<<srdNE, 64,  shScat>>>(*this);
+}
+
 void DgSolver::applySrd(void) {
   if (!srd || srd->nMerged == 0) return;
   if (getenv("CUT_NOSRD")) return;
+  if (srdOnDev) { applySrdDevice(); return; }
   cudaDeviceSynchronize();
   const i32 nE = (i32)srd->elems.size();
   // ---- TEMP conservation probe (SRD_CONS=1 / FRD_CONS=1) -------------------

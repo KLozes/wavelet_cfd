@@ -10,6 +10,7 @@ bool dgOperatorSelfTest(i32 gauss, i32 frType);
 void dgGetHostOps(double *w, double *xi, i32 gauss);
 __global__ void dgRhsCutKernel(DgSolver &grid, real t);
 __global__ void dgCutToModalKernel(DgSolver &grid);
+__global__ void dgCutPositivityKernel(DgSolver &grid);  // Zhang-Shu on cut elements
 
 // RHS kernel launch geometry: EPB elements of blockSizeTot nodes per CUDA
 // block.  The in-kernel working set is sW[EPB][5][64] + the AV gradient banks
@@ -32,6 +33,11 @@ static constexpr i32 DG_EPB = 4;
        cIdx += gridDim.x*blockDim.x, bIdx = cIdx/blockSizeTot)
 
 __global__ void dgSetICKernel(DgSolver &grid);
+__global__ void dgDeleteDataKernel(DgSolver &grid);   // free DELETE-flagged blocks (all z-nodes)
+// state redistribution on the device (see the note in DgSolver.cuh)
+__global__ void dgSrdGatherKernel(DgSolver &grid);
+__global__ void dgSrdProjectKernel(DgSolver &grid);
+__global__ void dgSrdScatterKernel(DgSolver &grid);
 __global__ void dgRhsKernel(DgSolver &grid, real t);
 __global__ void dgRhsGaussKernel(DgSolver &grid, real t);   // Gauss-Legendre flux reconstruction (--gauss)
 __global__ void dgAvNuKernel(DgSolver &grid);   // per-element AV nu -> D_SCRATCH (face jump penalty)

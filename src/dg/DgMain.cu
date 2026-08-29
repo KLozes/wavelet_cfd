@@ -194,6 +194,12 @@ int main(int argc, char* argv[]) {
   solver->ibLimit     = argI("--iblimit", 1);
   solver->ibHO        = argI("--ibho", 1);   // 0 = first-order wall reconstruction
   solver->ibSbm       = argI("--ibsbm", 0);   // 1 = shifted boundary wall (no ghosts)
+  solver->cutZ2d      = argI("--cutz2d", 0);    // pseudo-2D: drop cut z-modes
+  solver->cutPos      = argI("--cutpos", 1);    // Zhang-Shu on cut elements
+  solver->cutHvGate   = argI("--cuthvgate", 0);  // Persson-gate the cut filter
+  solver->cutFlux     = argI("--cutflux", 0);   // 1 = HLLC at cut faces
+  solver->srdVolFrac  = argF("--srdvol", 0.0);  // SRD small-cell threshold
+  solver->subBc       = argI("--subbc", 0);     // experimental subsonic BCs (bcType 5)
   solver->cutOn       = argI("--cutcell", 0);   // cut-cell DG (replaces the IB family)
   solver->cutModal    = argI("--cutmodal", 0); // cut elements store modal coeffs
   solver->cutHvMean   = argI("--cuthvmean", 0);
@@ -449,7 +455,7 @@ int main(int argc, char* argv[]) {
   cudaDeviceSynchronize();
   // nodal field dump for external plotting (x, y, rho, u, v, p per node)
   if (solver->cutOn && solver->cutDbg)
-    printf("[cutfaces] cut<->NONcut faces: %d took the conforming mortar, "
+    printf("[cutfaces] cut<->NONcut faces: %d were conforming (full), "
            "%d were PARTIAL and got NO deposit at all\n",
            solver->cutDbg[1], solver->cutDbg[0]);
   if (solver->cutOn) solver->writeCutFields("output/cut");
