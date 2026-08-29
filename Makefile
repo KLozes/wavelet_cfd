@@ -29,8 +29,8 @@ NVCC = nvcc
 SRC_DIR = src
 OBJ_DIR = obj
 
-# CUDA 13 / Thrust need >= c++17; sm_75 = GTX 1650
-ARCH      = sm_75
+# CUDA 13 / Thrust need >= c++17; sm_89 = RTX 4080 SUPER (was sm_75 = GTX 1650)
+ARCH      = sm_89
 STD       = c++17
 NVCCFLAGS = -O2 -std=$(STD) -arch=$(ARCH)
 LDFLAGS   = -lpng -lz -lcusolver -lcusparse
@@ -86,6 +86,16 @@ WAVEWSDF_OBJS = $(patsubst %,$(OBJ_DIR)/wavewsdf/%.cu.o,$(WAVEWSDF_SRCS))
 # long-time acoustic errors around 1e-5 relative)
 WAVE3D_DP_DEFS = -DUSE_DOUBLE
 WAVE3D_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_dp/%.cu.o,$(WAVE3D_SRCS))
+# collapsed 2-D build: blocks are blockSize x blockSize x 1 instead of cubic, so
+# a pseudo-2D run allocates and integrates 1/blockSize of the cells.  Separate
+# object dir -- blockSizeTot is constexpr, so every object differs from the 3-D
+# build.  Only valid for genuinely 2-D cases (nBlocksZ == 1).
+WAVE3D_2D_DEFS = -DUSE_DOUBLE -DCOLLAPSE_2D
+WAVE3D_2D_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_2d/%.cu.o,$(WAVE3D_SRCS))
+
+# single-precision pseudo-2D build: the fp32 gate/validation twin of wave3d_2d
+WAVE3D_2D_SP_DEFS = -DCOLLAPSE_2D
+WAVE3D_2D_SP_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_2d_sp/%.cu.o,$(WAVE3D_SRCS))
 
 # CutFEM linear elasticity (steady, matrix-free CG -- the only implicit solver
 # here).  wavefem_dp is the fp64 build: the convergence study needs errors well
@@ -134,6 +144,12 @@ wavewsdf: $(WAVEWSDF_OBJS)
 wave3d_dp: $(WAVE3D_DP_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 
+wave3d_2d: $(WAVE3D_2D_OBJS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
+
+wave3d_2d_sp: $(WAVE3D_2D_SP_OBJS)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
+
 wavefem: $(WAVEFEM_OBJS)
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -fopenmp $^ -o $@ $(LDFLAGS)
 
@@ -160,6 +176,14 @@ $(OBJ_DIR)/wavewsdf/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
 $(OBJ_DIR)/wave3d_dp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) $(WAVE3D_DP_DEFS) $(WAVE3D_INC) -dc $< -o $@
+
+$(OBJ_DIR)/wave3d_2d/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVE3D_2D_DEFS) $(WAVE3D_INC) -dc $< -o $@
+
+$(OBJ_DIR)/wave3d_2d_sp/%.cu.o: $(SRC_DIR)/%.cu $(HDRS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(WAVE3D_2D_SP_DEFS) $(WAVE3D_INC) -dc $< -o $@
 
 # -Xcompiler -fopenmp: the Qp path (CutFemIga.cu) parallelizes its host assembly /
 # CG over cores.  The p=1 sources have no OpenMP pragmas, so their generated code
@@ -238,10 +262,20 @@ iga_euler2d: $(SRC_DIR)/fem/IgaEuler2dTest.cu $(HDRS)
 femtests: saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
 clean:
-	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf wave3d_dp wave3d_mgpu \
-	       wavefem wavefem_dp saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
+	rm -rf $(OBJ_DIR) wave3d wavesdf wavewsdf wave3d_dp wave3d_2d wave3d_mgpu \
+	       wavefem wavefem_dp ktau_test ktau_test_sp saye_test qp_test qpe_test qp_mms sbm_shift_test sbm_mms
 
 .PHONY: all clean femtests
+
+# k~-tau~ SST closure gates: the wall function is the integral of Eq. (34), the
+# Theta identity, the constant mu_t below the image point, and the Eq. (24)
+# near-wall balance with the Appendix-A non-conservative tau~ diffusion fluxes.
+ktau_test: $(SRC_DIR)/fv/KtauTest.cu $(HDRS) $(SRC_DIR)/fv/KtauSst.h
+	$(NVCC) -O2 -std=$(STD) -arch=$(ARCH) -DUSE_DOUBLE $(WAVE3D_INC) $< -o $@
+
+# ... and the SAME gates in single precision, which is what wave3d actually builds
+ktau_test_sp: $(SRC_DIR)/fv/KtauTest.cu $(HDRS) $(SRC_DIR)/fv/KtauSst.h
+	$(NVCC) -O2 -std=$(STD) -arch=$(ARCH) $(WAVE3D_INC) $< -o $@
 
 # Tier-0 cut-element Jacobian + runtime-rule-mismatch probe (no solver needed)
 dgcutjac_test: $(SRC_DIR)/dg/DgCutJacTest.cu $(HDRS)

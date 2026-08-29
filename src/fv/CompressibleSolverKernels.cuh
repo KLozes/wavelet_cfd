@@ -4,10 +4,12 @@
 #include "CompressibleSolver.cuh"
 
 __global__ void sortFieldDataKernel(CompressibleSolver &grid);
+__global__ void copyFieldKernel(CompressibleSolver &grid, i32 fSrc, i32 fDst);
+__global__ void gatherSortedFieldKernel(CompressibleSolver &grid, i32 fSrc, i32 fDst);
 
 __global__ void setInitialConditionsKernel(CompressibleSolver &grid);
 
-__global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff);
+__global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, i32 prim);
 
 
 __global__ void conservativeToPrimitiveKernel(CompressibleSolver &grid);
@@ -18,9 +20,13 @@ __global__ void computeGlobalScalesKernel(CompressibleSolver &grid);
 
 __global__ void computePressureKernel(CompressibleSolver &grid);
 
+__global__ void envCheckKernel(CompressibleSolver &grid);
 __global__ void computeDeltaTKernel(CompressibleSolver &grid);
 
 __global__ void computeRightHandSideKernel(CompressibleSolver &grid);
+__global__ void gatherFaceFluxKernel(CompressibleSolver &grid);
+__global__ void stateHashKernel(CompressibleSolver &grid);
+__global__ void ibForceKernel(CompressibleSolver &grid);
 
 // multiD Osher-type RHS: on-the-fly corner flux tensors + 1D Osher midpoints,
 // Simpson face assembly
@@ -52,13 +58,54 @@ __global__ void fillOldSnapshotKernel(CompressibleSolver &grid, i32 level);
 __global__ void consumeNeedKernel(CompressibleSolver &grid);
 __global__ void dbgVacKernel(CompressibleSolver &grid);
 extern __device__ unsigned long long g_vacOwned;
+extern __device__ unsigned long long g_ipTaint;
+extern __device__ unsigned long long g_ibDetect;
+extern __device__ double g_ibFx, g_ibFy;
+extern __device__ unsigned long long g_ibFailDip;
+extern __device__ unsigned long long g_ibFailSlip;
+extern __device__ unsigned long long g_ibFailIp;
+extern __device__ unsigned long long g_ibNup;
+extern __device__ unsigned long long g_wmGhost;
+extern __device__ unsigned long long g_wmCand;
+extern __device__ double g_ibMaxDfc;
+extern __device__ double g_ibMaxLvl;
+extern __device__ unsigned long long g_ibFlux;
 extern __device__ unsigned long long g_vacGhost;
 __global__ void inverseWaveletTransformKernel(CompressibleSolver &grid);
 
 __global__ void waveletThresholdingKernel(CompressibleSolver &grid);
 
-__global__ void interpolateFieldsKernel(CompressibleSolver &grid);
+__global__ void interpolateFieldsKernel(CompressibleSolver &grid, i32 lvlOnly);
 
-__global__ void restrictFieldsKernel(CompressibleSolver &grid);
+__global__ void restrictFieldsKernel(CompressibleSolver &grid, i32 lvlOnly);
+
+__global__ void turbClosureKernel(CompressibleSolver &grid);
+
+__global__ void wallUtauKernel(CompressibleSolver &grid);
+
+__global__ void jfnkAxpyKernel(const real *x, const real *y, real a, real *out, i32 n);
+__global__ void jfnkScaleKernel(const real *x, real a, real *out, i32 n);
+__global__ void jfnkCombKernel(const real *x, const real *y, real a, real b, real *out, i32 n);
+__global__ void jfnkGatherKernel(CompressibleSolver &grid, real *q, i32 N);
+__global__ void jfnkScatterKernel(CompressibleSolver &grid, const real *q, i32 N);
+__global__ void jfnkResidualKernel(CompressibleSolver &grid, real *r, i32 N);
+__global__ void jfnkDiagKernel(CompressibleSolver &grid, const real *v, real *Jv, real cflMul, i32 N);
+__global__ void ransFieldProbeKernel(CompressibleSolver &grid, i32 which);
+
+__global__ void wallGhostKernel(CompressibleSolver &grid);
+
+__global__ void ibGhostKernel(CompressibleSolver &grid);
+__global__ void zeroTrashBlockKernel(CompressibleSolver &grid, i32 f);
+__global__ void zeroScalesKernel(CompressibleSolver &grid);
+__global__ void zeroFlagsKernel(CompressibleSolver &grid);
+__global__ void zeroAccumulatorKernel(CompressibleSolver &grid);
+__global__ void ibStampGeometryKernel(CompressibleSolver &grid);
+__global__ void stampLocalDtKernel(CompressibleSolver &grid, real dtGlobal, real dtCap);
+
+__global__ void ransShearProbeKernel(CompressibleSolver &grid, real u0, real ky);
+
+__global__ void ransWallProbeKernel(CompressibleSolver &grid, real uTau, real ypMin, i32 comp);
+
+__global__ void ransDecayErrorKernel(CompressibleSolver &grid, real kEx, real tEx, i32 mode);
 
 #endif
