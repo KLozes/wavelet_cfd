@@ -119,7 +119,7 @@ WAVEDG_P2_DEFS = -DNCELLS_MAX=32000000 -DDG_ORDER=2 -DBLOCK_SIZE=3
 # cut-cell DG shock results live (Giuliani's SISC 2022 runs are p=1).
 WAVEDG_P1_DEFS = -DNCELLS_MAX=32000000 -DDG_ORDER=1 -DBLOCK_SIZE=2 -DUSE_DOUBLE
 WAVEDG_SRCS = $(COMMON_SRCS) \
-              dg/DgSolver dg/DgSolverKernels dg/DgCutBuild dg/DgCutEs dg/DgMain
+              dg/DgSolver dg/DgSolverKernels dg/DgCutBuild dg/DgMain
 WAVEDG_OBJS    = $(patsubst %,$(OBJ_DIR)/wavedg3d/%.cu.o,$(WAVEDG_SRCS))
 WAVEDG_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_dp/%.cu.o,$(WAVEDG_SRCS))
 WAVEDG_P2_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_p2/%.cu.o,$(WAVEDG_SRCS))
@@ -299,12 +299,6 @@ dgcutrhs_test: $(SRC_DIR)/dg/DgCutRhsTest.cu $(HDRS)
 
 # state redistribution gate: conservation, polynomial exactness, contractivity
 dgsrd_test: $(SRC_DIR)/dg/DgSrdTest.cu $(HDRS)
-	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
-
-# ES1 gate: entropy-stable (skew-hybridized SBP) cut-element operators -- the
-# hybridized SBP property, Taylor & Chan's Eq 47, free stream, and discrete
-# entropy conservation of the flux-differenced RHS at P1/P2
-dges_test: $(SRC_DIR)/dg/DgEsCutTest.cu $(HDRS)
 	$(NVCC) $(FEMTEST_FLAGS) -DDG_ORDER=3 $< -o $@
 
 # IGA compressible flow, step 1: 1-D Euler + classic FEM shock capturing (Sod gate)

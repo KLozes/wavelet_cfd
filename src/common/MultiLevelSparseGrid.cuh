@@ -119,7 +119,7 @@ public:
   i32 *bFlagsList;      // block Flags
   i32 *cFlagsList;      // cell Flags
   i32 *snapValidList;   // 1 if this block held a valid F_OLD snapshot at copyToOld, else 0 (new/imported)
-  i32 *ibClassList;     // immersed-boundary class per block (IB_FLUID=0/IB_GHOST=1/IB_DEAD=2);
+  i32 *ibClassList;     // immersed-body class per block (IB_FLUID=0 / IB_DEAD=2, solid);
                         // pure geometry -- recomputed after every sort, never permuted
   i32  dbgChecks = 0;   // runtime debug: topology/data-integrity assert kernels (--debug)
   i32 *dbgCnt = nullptr;      // [1] managed violation counter for the check kernels
