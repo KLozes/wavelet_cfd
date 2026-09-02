@@ -46,8 +46,27 @@
 //   --nblocks N  base blocks in x                       (per-case default)
 //   --wthresh X  wavelet detail threshold               (per-case default)
 //   --ma X       Gresho Mach / acConv amplitude / testCase-1 inner pressure
-//   --bc N       BC: 0 slip wall, 1 no-slip, 2 periodic, 3 transmissive
+//   --bc N       BC: 0 slip wall, 1 no-slip, 2 periodic, 3 transmissive,
+//                6 exact-solution Dirichlet (verification cases 16/17)
 //   --recon N    0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola
+//   ---- case 18, canal with a 10% bump (Ni 1982; Ndiaye et al. Sect. 4.2) ----
+//   --canaloff f  floor fluid fraction of its cut row (default 0.3)
+//   --canalma X   inlet Mach number (default 0.675); p0 = rho0 = 1
+//   ---- case 16, supersonic vortex (Ndiaye et al. IJHFF 114 (2025) Sect. 4.4) --
+//   --svquarter N 1 = the paper's QUARTER annulus: centre at the domain corner,
+//                exact Dirichlet in/outflow through x = 0 and y = 0 (bc 6);
+//                0 = closed full annulus (default)
+//   --svlen X    quarter-annulus box side (default 1.5, the paper's Fig. 16)
+//   --svmach X   inner-wall Mach number (default 2.25)
+//   --ibdir N    1 = the arcs carry the EXACT state as a Dirichlet datum (the
+//                paper's boundary condition); 0 = slip walls (default)
+//   --gradlim N  recon 6 limiter: -1 first order, 0 none, 1 Barth-Jespersen,
+//                2 Venkatakrishnan (--gradlimk K)
+//   ---- Brinkman volume penalization (pressure-tight; docs/pressureTIghtBrinkman.pdf)
+//   --ibbrink N  1 = smeared-porosity IB instead of the sharp/cut-cell one
+//   --brinkdelta X  tanh band half-width in FINEST cells (default 0.125)
+//   --brinkeps X    volume fraction deep inside the body (default 1e-6)
+//   --brinkseg N    sub-segments per face in the porosity quadrature (default 4)
 //   --tend X     end time override                      (per-case default)
 //   --mdflux N   1 = genuinely multidimensional Osher-type corner flux
 //                (Gaburro-Ricchiuto-Dumbser, arXiv:2506.00207); 2 = CTU-Hancock:
@@ -165,25 +184,27 @@ int main(int argc, char* argv[]) {
   bool ibPlate = (testCase == 14);                         // SAME plate, but immersed (IB gate)
   bool afoil   = (testCase == 15);                         // RAE 2822 airfoil (immersed, level set)
   bool svort   = (testCase == 16);                         // supersonic vortex in an annulus (EXACT, curved wall)
+  bool ringleb = (testCase == 17);                         // Ringleb flow (EXACT, curved streamline walls)
+  bool canal   = (testCase == 18);                         // transonic canal with a 10% bump (Ni 1982; RCCM paper Sect. 4.2)
   i32 nLvls    = argI("--nlvls", (testCase == 1 ? 4 : (testCase == 5 ? 3 : (sodAmr ? 3 : (acoustic ? 3 : (fptbl ? 3 : (afoil ? 6 : (svort ? 1 : 1))))))));
-  i32 nBlocksX = argI("--nblocks", (testCase == 1 ? 16 : (testCase == 2 ? 40 : (testCase == 3 ? 8 : (testCase == 4 ? 40 : (testCase == 5 ? 10 : (sodAmr ? 16 : (acoustic ? 64 : (acConv ? 8 : (shear ? 8 : ((ransBox||ransShr||ransWal) ? 4 : (afoil ? 24 : (svort ? 32 : ((fptbl||ibPlate) ? 64 : 100))))))))))))));
+  i32 nBlocksX = argI("--nblocks", (testCase == 1 ? 16 : (testCase == 2 ? 40 : (testCase == 3 ? 8 : (testCase == 4 ? 40 : (testCase == 5 ? 10 : (sodAmr ? 16 : (acoustic ? 64 : (acConv ? 8 : (shear ? 8 : ((ransBox||ransShr||ransWal) ? 4 : (afoil ? 24 : (svort ? 32 : (ringleb ? 32 : (canal ? 38 : ((fptbl||ibPlate) ? 64 : 100))))))))))))))));
   real wThresh = argF("--wthresh", (testCase == 1 ? 0.004 : 0.01));
   bool haveMa  = hasArg("--ma");
   real Ma      = haveMa ? argF("--ma", 0.1) : 0.1;   // Gresho Mach number / acConv amplitude
   i32 bcArg    = argI("--bc", -1);                   // bcType override (-1 = per-testCase default)
-  // Reconstruction default is SPLIT by physics, because the two regimes want
-  // opposite things and both were measured:
-  //   EULER  -> van Leer (4).  Strictly TVD, which is what shock capturing on a
-  //             smeared/immersed wall wants.
-  //   RANS   -> ROUND (1).  A TVD limiter clips the SMOOTH near-wall velocity
-  //             gradient, and that gradient is exactly what the image point
-  //             feeds to the u_tau solve: van Leer on the mean flow cost the
-  //             aligned FPTBL gate +14.6% (0.003093 vs 0.002653), CFL-independent.
-  //             The paper agrees -- it leaves mass/momentum/energy UNLIMITED and
-  //             limits only the turbulence convection (tvdRecVanLeer, always on).
+  // van Leer (4) is the default for BOTH regimes (user's call, 2026-08-30).
+  // Strictly TVD, which is what shock capturing on a smeared/immersed wall wants.
+  //
+  // KNOWN COST, kept on the record: a TVD limiter clips the SMOOTH near-wall
+  // velocity gradient, and that gradient is exactly what the image point feeds
+  // to the u_tau solve.  Measured, van Leer on the mean flow cost the aligned
+  // FPTBL gate +14.6% in C_f (0.003093 vs 0.002653), CFL-independent, which is
+  // why RANS previously defaulted to ROUND (1).  The WallModeledRans paper
+  // leaves mass/momentum/energy UNLIMITED and limits only the turbulence
+  // convection (tvdRecVanLeer, always on).  Pass --recon 1 to get ROUND back.
   // NOTE: van Leer needs CFL <~ 0.6; it is unstable at 1.2 even for the sharp IB.
-  i32 reconA   = argI("--recon", argI("--rans", 0) ? 1 : 4);
-  i32 jfnkVerifyOnce = argI("--jfnkverify", 0);
+  //   0 = smooth TVD, 1 = ROUND, 2 = LD-ROUND, 3 = unlimited parabola, 4 = van Leer
+  i32 reconA   = argI("--recon", 4);
   i32 debugA   = argI("--debug", 0);                 // 1 = per-cycle integrity/census diagnostics                 // 0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola (smooth only)
   real tEndArg = argF("--tend", -1.0);               // tEnd override (-1 = per-testCase default)
   i32 mdFluxA  = argI("--mdflux", 0);                // 1 = multidimensional Osher-type corner flux (first-order states)
@@ -227,13 +248,29 @@ int main(int argc, char* argv[]) {
   // annulus: everything outside r_o is solid, so the domain BCs are shielded
   // by the outer wall and never enter the answer.
   real svRi = argF("--svri", 1.0), svRo = argF("--svro", 1.384);
-  real domainLenX = svort ? 2.0*svRo*1.06 : (testCase == 2) ? 10.0
+  // --svquarter 1: the paper's quarter annulus (their Fig. 16) -- the vortex
+  // centre sits at the domain corner and the box side is 1.5 by default, so
+  // the two arcs are cut by the grid and the straight inflow/outflow planes
+  // x = 0, y = 0 are DOMAIN boundaries carrying the exact state (bcType 6).
+  i32  svQuarterA = argI("--svquarter", 0);
+  real svLen      = argF("--svlen", 1.5);
+  // Canal (case 18): length 3, height 1, bump chord 1 on x in [1,2] with
+  // t/c = 10% (circular arc, R = 1.3).  Floor, bump and ceiling are IMMERSED;
+  // --canaloff f puts the floor inside row 1 with fluid fraction f, so the
+  // whole floor is a row of small cut cells (the paper offsets its canal from
+  // the grid for the same reason, Table 4).  The ceiling then lands wherever
+  // 1/dx puts it; its fraction is printed.  Inlet M = --canalma (0.675).
+  real canalOff = argF("--canaloff", 0.3);
+  real domainLenX = ringleb ? 5.8 : svort ? (svQuarterA ? svLen : 2.0*svRo*1.06) : canal ? 3.0 : (testCase == 2) ? 10.0
                   : (afoil ? (domLenXA > 0 ? domLenXA : 24.0)
                   : ((fptbl||ibPlate) ? (domLenXA > 0 ? domLenXA : 1.5) : 1.0));
 
   bool cube   = (testCase == 3);
-  bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv || shear || ransBox || ransShr || ransWal || afoil || svort);
-  i32 nBlocksY = (square || cube) ? nBlocksX : ((fptbl||ibPlate) ? max(1, (i32)lround((domLenYA > 0 ? domLenYA : 0.1)/domainLenX*nBlocksX)) : (nBlocksX + 9) / 10);
+  bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv || shear || ransBox || ransShr || ransWal || afoil || svort || ringleb);
+  real canalDx = domainLenX/(nBlocksX*blockSize);
+  real canalY0 = (2.0 - canalOff)*canalDx, canalY1 = canalY0 + 1.0;   // floor / ceiling
+  i32 nBlocksY = (square || cube) ? nBlocksX : ((fptbl||ibPlate) ? max(1, (i32)lround((domLenYA > 0 ? domLenYA : 0.1)/domainLenX*nBlocksX))
+               : canal ? (i32)ceil((canalY1 + 1.0*canalDx)/(blockSize*canalDx)) : (nBlocksX + 9) / 10);
   i32 nBlocksZ = cube ? nBlocksX : 1;
 
   // cubic cells; domain length in x is 10 for the isentropic vortex, 1 otherwise
@@ -250,17 +287,17 @@ int main(int argc, char* argv[]) {
   // shorter tEnd to stay inside the domain.
   real sodPin = (testCase == 1) ? (haveMa ? argF("--ma", 1.0) : 1.0) : 0.0;
   real acPeriod = domainLenX / sqrt(gam);   // sound-crossing time (c0=sqrt(gam), p0=rho0=1)
-  real tEnd  = (testCase == 1 && sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin) : ((testCase == 2) ? 1.0 : (testCase == 3 ? 0.15 : (gresho ? 1.0 : (sodAmr ? 0.15 : (acoustic ? 0.35 : (acConv ? 2.0*acPeriod : (shear ? 0.5 : ((ransBox||ransShr||ransWal) ? 1.0 : (afoil ? 40.0 : (svort ? 2.0 : ((fptbl||ibPlate) ? 5.0 : 0.20)))))))))));
+  real tEnd  = (testCase == 1 && sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin) : ((testCase == 2) ? 1.0 : (testCase == 3 ? 0.15 : (gresho ? 1.0 : (sodAmr ? 0.15 : (acoustic ? 0.35 : (acConv ? 2.0*acPeriod : (shear ? 0.5 : ((ransBox||ransShr||ransWal) ? 1.0 : (afoil ? 40.0 : (svort ? 2.0 : (ringleb ? 2.0 : (canal ? 60.0 : ((fptbl||ibPlate) ? 5.0 : 0.20)))))))))))));
   if (tEndArg > 0) tEnd = tEndArg;                   // CLI override (arg 10)
-  real tStep = (testCase == 1) ? ((tEndArg > 0) ? tEnd/50.0 : ((sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin)/10.0 : 0.008)) : (testCase == 2 ? 0.1 : (testCase == 3 ? 0.03 : (gresho ? 0.1 : (sodAmr ? 0.02 : (acoustic ? 0.02 : (acConv ? tEnd : (shear ? tEnd : ((ransBox||ransShr||ransWal) ? tEnd : ((fptbl||ibPlate||afoil||svort) ? tEnd/20.0 : 0.01)))))))));
+  real tStep = (testCase == 1) ? ((tEndArg > 0) ? tEnd/50.0 : ((sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin)/10.0 : 0.008)) : (testCase == 2 ? 0.1 : (testCase == 3 ? 0.03 : (gresho ? 0.1 : (sodAmr ? 0.02 : (acoustic ? 0.02 : (acConv ? tEnd : (shear ? tEnd : ((ransBox||ransShr||ransWal) ? tEnd : ((fptbl||ibPlate||afoil||svort||ringleb||canal) ? tEnd/20.0 : 0.01)))))))));
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls);
   solver->pseudo2D        = (baseGridSize[2] == blockSizeZ) ? 1 : 0;  // collapse z (pseudo-2D)
   solver->cfl             = cfl;
   solver->waveletThresh   = wThresh;
-  solver->icType          = (testCase == 1 || sodAmr) ? (argI("--dgblast", 0) ? 7 : 1) : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : (shear ? 8 : (ransBox ? 9 : (ransShr ? 10 : (ransWal ? 11 : (svort ? 13 : ((fptbl||ibPlate||afoil) ? 12 : 0)))))))))));
+  solver->icType          = (testCase == 1 || sodAmr) ? (argI("--dgblast", 0) ? 7 : 1) : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : (shear ? 8 : (ransBox ? 9 : (ransShr ? 10 : (ransWal ? 11 : (svort ? 13 : (ringleb ? 14 : (canal ? 15 : ((fptbl||ibPlate||afoil) ? 12 : 0)))))))))))));
   // --dgblast 1: DG-matched blast IC (icType 7) for wavedg3d comparison runs
-  solver->bcType          = (bcArg >= 0) ? bcArg : (afoil ? 5 : ((fptbl||ibPlate) ? 4 : ((acConv || shear || ransBox || ransShr || testCase == 1) ? 2 : 3)));   // periodic for the acoustic/shear waves and circular Sod; else transmissive
+  solver->bcType          = (bcArg >= 0) ? bcArg : ((svort && svQuarterA) ? 6 : (canal ? 7 : (afoil ? 5 : ((fptbl||ibPlate) ? 4 : ((acConv || shear || ransBox || ransShr || testCase == 1) ? 2 : 3)))));   // periodic for the acoustic/shear waves and circular Sod; else transmissive
   solver->vortexAdvect    = (acConv || shear || ransBox || ransShr || ransWal) ? Ma : (testCase == 2 ? advectA : sodPin);  // acConv/shear: wave amplitude; case 2: vortex advection; testCase 1: Sod inner pressure
   // shear: fix the background pressure (c ~ 11.8) so --ma sets ONLY the shear
   // amplitude; the flow Mach number is then ~ma/11.8, low enough that the
@@ -282,13 +319,120 @@ int main(int argc, char* argv[]) {
   // length, and the wall model is applied only for x >= plateX0 with slip
   // upstream, the geometry AND the boundary treatment match case 13 exactly --
   // same problem, two independent wall implementations.
-  solver->immerserdBcType = svort ? 7 : (ibPlate ? argI("--ibtype", 2) : 0);
+  solver->immerserdBcType = svort ? 7 : (canal ? 10 : (ibPlate ? argI("--ibtype", 2) : 0));
+  if (canal) {
+    solver->canalY0 = canalY0;  solver->canalY1 = canalY1;
+    solver->ibCenter[0] = 1.5;  solver->ibCenter[1] = canalY0 - 1.2;  solver->ibCenter[2] = 0.5;
+    solver->ibRadius = 1.3;
+    const real M = argF("--canalma", 0.675);
+    const real tr = 1.0/(1.0 + 0.5*(gam - 1.0)*M*M);   // T/T0 of the inlet stream
+    solver->canalMa    = M;
+    solver->canalPin   = pow(tr, gam/(gam - 1.0));      // p0 = 1
+    solver->canalRhoIn = pow(tr, 1.0/(gam - 1.0));      // rho0 = 1
+    solver->canalUin   = M*sqrt(gam*solver->canalPin/solver->canalRhoIn);
+    solver->canalPout  = solver->canalPin;              // the paper's P_out = P0 (1 + (gam-1)/2 M^2)^(-gam/(gam-1))
+    const real ceilFrac = canalY1/canalDx - floor(canalY1/canalDx);
+    printf("[canal] %d x %d cells, dx = %.5f, floor y0 = %.5f (row 1 fluid fraction %.3f), "
+           "ceiling y1 = %.5f (row %d fluid fraction %.3f), bump R = 1.3 centre (1.5, %.4f)\n"
+           "[canal] inlet M = %.4f: rho = %.6f  u = %.6f  p = %.6f  (p0 = rho0 = 1), p_out = %.6f\n",
+           nBlocksX*blockSize, nBlocksY*blockSize, (double)canalDx, (double)canalY0, (double)canalOff,
+           (double)canalY1, (i32)floor(canalY1/canalDx), (double)ceilFrac, (double)solver->ibCenter[1],
+           (double)M, (double)solver->canalRhoIn, (double)solver->canalUin, (double)solver->canalPin,
+           (double)solver->canalPout);
+  }
   // ibtype 8 (planar slab) takes its upper wall from --ibplane2
   if (solver->immerserdBcType == 8) solver->ibRadius2 = argF("--ibplane2", 0.4);
   if (svort) {
-    solver->ibCenter[0] = 0.5*domainLenX; solver->ibCenter[1] = 0.5*domainLenX;
+    solver->svQuarter = svQuarterA;
+    const real cc = svQuarterA ? 0.0 : 0.5*domainLenX;
+    solver->ibCenter[0] = cc; solver->ibCenter[1] = cc;
     solver->ibCenter[2] = 0.5; solver->ibRadius = svRi; solver->ibRadius2 = svRo;
     solver->svMach = argF("--svmach", 2.25);
+  }
+  if (ringleb) {
+    // ---- Ringleb DUCT as a tagged segment loop ----------------------------
+    // The region is q in [qin,qout], k in [kmin,kmax] -- a genuine duct with
+    // FOUR faces: two streamline WALLS (k = kmin, kmax) and two iso-velocity
+    // arcs that are the INLET and OUTLET (q = qin, qout).  The earlier version
+    // bounded q from below only, so both "arcs" were short caps at the extremes
+    // and the flow had no way through -- no steady solution could exist.
+    // All four curves are evaluated FORWARD through the hodograph map; nothing
+    // here inverts anything.  Subsonic throughout (qout < q_sonic = 0.9129).
+    const i32 nSeg = argI("--rgseg", 2000);
+    const real kmn = argF("--rgkmin", 0.7), kmx = argF("--rgkmax", 1.2);
+    const real qin = argF("--rgqin", 0.40), qout = argF("--rgqout", 0.85);
+    // duct spans x[-2.23,1.38], y[0,3.18]; offsets centre it in the box
+    const real rx0 = argF("--rgx0", -3.13), ry0 = argF("--rgy0", -0.80);
+    std::vector<real> rxy, rst; std::vector<i32> rbc;
+    auto hodo = [&](double q, double k, double &X, double &Y, double &R, double &P) {
+      const double b = sqrt(fmax(1.0 - 0.5*(gam-1.0)*q*q, 1e-12));
+      R = pow(b, 2.0/(gam-1.0));
+      P = pow(b, 2.0*gam/(gam-1.0))/gam;
+      const double L = 1.0/b + 1.0/(3*b*b*b) + 1.0/(5*b*b*b*b*b)
+                     - 0.5*log((1.0+b)/fmax(1.0-b,1e-12));
+      X = (1.0/(2*R))*(2.0/(k*k) - 1.0/(q*q)) - 0.5*L;
+      Y = sqrt(fmax(1.0 - (q*q)/(k*k), 0.0))/(k*R*q);
+    };
+    // boundary state, with the direction taken the SAME way the solver takes it
+    auto push = [&](double q, double k, double sgnY, i32 tag) {
+      double X,Y,R,P; hodo(q,k,X,Y,R,P);
+      const double hq=1e-6; double xa,ya,xb,yb,ra,pa2,rb,pb;
+      hodo(q-hq,k,xa,ya,ra,pa2); hodo(q+hq,k,xb,yb,rb,pb);
+      double tx=xb-xa, ty=yb-ya; const double tn=sqrt(fmax(tx*tx+ty*ty,1e-30));
+      tx/=tn; ty/=tn; if (sgnY<0) ty=-ty;
+      rxy.push_back((real)(X-rx0)); rxy.push_back((real)(sgnY*Y-ry0));
+      rbc.push_back(tag);
+      rst.push_back((real)R); rst.push_back((real)(q*tx));
+      rst.push_back((real)(q*ty)); rst.push_back((real)P);
+    };
+    // Sample each edge UNIFORMLY IN ARC LENGTH, not in the parameter.  Uniform
+    // steps in q and k are wildly non-uniform in space -- the hodograph map
+    // stretches near the apex and sonic line -- and produced gaps of 0.099
+    // against a median segment of 0.004, i.e. holes 2.2 CELLS wide that the
+    // winding test leaks through.  The sagitta sizing assumed arc length, so
+    // sampling in the parameter quietly invalidated it.
+    const i32 nS = nSeg/4;
+    auto edge = [&](double p0, double p1, bool alongQ, double fixed, i32 tag) {
+      // walk the edge finely, accumulate arc length, then place nS points evenly
+      const i32 M = 40*nS;
+      std::vector<double> ss(M+1, 0.0), pp(M+1, 0.0);
+      double xp = 0, yp = 0, R, P;
+      for (i32 m = 0; m <= M; m++) {
+        const double par = p0 + (p1 - p0)*double(m)/M;
+        pp[m] = par;
+        double X, Y;
+        if (alongQ) hodo(par, fixed, X, Y, R, P); else hodo(fixed, par, X, Y, R, P);
+        if (m) ss[m] = ss[m-1] + hypot(X-xp, Y-yp);
+        xp = X; yp = Y;
+      }
+      const double total = ss[M];
+      i32 j = 0;
+      for (i32 t = 0; t < nS; t++) {
+        const double target = total*double(t)/nS;
+        while (j < M && ss[j+1] < target) j++;
+        const double w = (ss[j+1] > ss[j]) ? (target - ss[j])/(ss[j+1]-ss[j]) : 0.0;
+        const double par = pp[j] + w*(pp[j+1] - pp[j]);
+        if (alongQ) push(par, fixed, +1, tag); else push(fixed, par, +1, tag);
+      }
+    };
+    edge(qin,  qout, true,  kmn, 0);   // wall  k = kmin
+    edge(kmn,  kmx,  false, qout, 1);  // OUTLET arc  q = qout
+    edge(qout, qin,  true,  kmx, 0);   // wall  k = kmax
+    edge(kmx,  kmn,  false, qin, 1);   // INLET  arc  q = qin
+    solver->setPolyline(rxy.data(), rbc.data(), rst.data(), (i32)rbc.size());
+    solver->immerserdBcType = 6;              // ONE geometry path: segments
+    solver->ibPolyFluidInside = 1;            // the loop bounds the FLUID here
+    solver->ibPolyBcTol = argF("--rgbctol", 0.02);   // corner bias toward inflow/outflow
+
+    // The two curved walls are the streamlines k = kmin and k = kmax; the fluid
+    // is the band between them.  Defaults are the usual verification band.
+    // ONE source of truth: the exact solution must use the SAME frame as the
+    // geometry.  A second, stale parameter block here silently gave ringlebExact
+    // a different origin from the segment loop, so the IC was evaluated in the
+    // wrong coordinates entirely.
+    solver->ringlebKmin = kmn;  solver->ringlebKmax = kmx;
+    solver->ringlebQmin = qin;  solver->ringlebScale = (real)1;
+    solver->ringlebX0   = rx0;  solver->ringlebY0   = ry0;
   }
   solver->ibDfcMode       = argI("--ibdfc", 0);   // diagnostic: freeze one d_FC term
   solver->dIpFac          = argF("--dipfac", 3.0);  // image-point distance in cells
@@ -326,11 +470,44 @@ int main(int argc, char* argv[]) {
   solver->paintOn         = paintOn;   // gates the uniform-fine image everywhere
   solver->ibIpQuad        = argI("--ipquad", 0);
   solver->ibThermoRec     = argI("--ibthermo", 0); // close the wall trace on (s, H) not (p, rho)
+  solver->ibGMirror       = argI("--ibgmirror", 0);  // natural mirror image point + ghosts in stencil
+  solver->ibGIter         = argI("--ibgiter", 1);
+  solver->ibGFloor        = argF("--ibgfloor", 0.25);  // mirror-distance floor, cells
+  solver->ibGSlip         = argI("--ibgslip", 0);      // Ali et al. wall-point slip BC
+  // ---- Brinkman volume penalization (pressure-tight) ----------------------
+  // One configuration, the one that works (2026-09-02): a NARROW band
+  // (delta = h/8 -- at 1.5h the RAE 2822 is still 7% open at its thickest point
+  // and produces no shock at all), face porosities from the segmented
+  // closed-form average stamped once per adaptation, a p grad(phi) source built
+  // from those same face values, and the porosity stiffness taken
+  // point-implicitly.  The alternatives that lost -- analytic grad(phi),
+  // point-value face phi, momentum-only or absent point-implicit stamp, and the
+  // Darcy interior damping -- are deleted rather than left as flags.
+  solver->ibBrink         = argI("--ibbrink", 0);        // 1 = volume penalization instead of the sharp/cut IB
+  solver->ibBrinkEps      = argF("--brinkeps", 1e-6);    // volume fraction deep inside the body
+  solver->ibBrinkDelta    = argF("--brinkdelta", 0.125); // tanh band half-width, in FINEST cells
+  solver->brinkNSeg       = argI("--brinkseg", 4);       // sub-segments per face (stamped once, so free)
+  solver->ibRccm          = argI("--ibrccm", 0);       // RCCM cut-cell + reconstructed small cells
+  solver->ibDirichlet     = argI("--ibdir", 0);        // immersed boundary carries the exact state (paper Sect. 4.4)
+  solver->ibRccmIter      = argI("--rccmiter", 3);
+  solver->ibRccmRelax     = argF("--rccmrelax", 0.7); // damped Jacobi on the R-Cell system
+  solver->ibRccmPw        = argI("--rccmpw", 1);
+  solver->ibRccmNeu       = argF("--rccmneu", 1.0);  // Neumann rows in the R-Cell fit (0 = off)
+  solver->gradLim         = argI("--gradlim", 1);      // recon 6: 0 none, 1 Barth-Jespersen, 2 Venkatakrishnan
+  solver->gradLimK        = argF("--gradlimk", 5.0);   //   Venkatakrishnan eps^2 = (K h)^3       // gradient-extrapolated wall pressure     // R-Cell reconstruction sweeps
+  solver->ibIface         = argI("--ibiface", 0);      // Ali et al. interface-cell mode (1=bilinear, 2=triquadratic)
+  solver->kSensor         = argF("--ksensor", 0.05);   // recon 5 Ducros-like sensor gain (DG --avk)
+  if (solver->recon == 5 && ransA) {                   // sensor lives in F_RHOK
+    printf("recon 5 is not available with RANS (the sensor uses the k~ bank); using recon 4\n");
+    solver->recon = 4;
+  }
   solver->ibWls           = argI("--ibwls", 0);    // constrained quadratic WLS wall trace   // 2 image points + biquadratic wall reconstruction
   solver->ransA7Tol       = argF("--a7tol", 1e-6); // (A.7) switch: caps the (A.6) tau ratio
-  solver->jfnkOn          = argI("--jfnk", 0);     // implicit k~/tau~ (Newton-Krylov)
-  solver->jfnkM           = argI("--jfnkm", 15);   // GMRES restart length
-  solver->jfnkCfl         = argF("--jfnkcfl", 50.0); // pseudo-time dtau = jfnkCfl*dt
+  // Point/block-diagonal preconditioning DEFAULTS OFF: measured in fp64 with a
+  // correct FD step it makes the Krylov solve WORSE (mean rrel 0.336 bare vs
+  // 0.423 preconditioned, both pinned at the 15-vector restart limit).  The
+  // ill-conditioning here is the cell-to-cell acoustic coupling, which is
+  // non-local -- no diagonal scaling can reach it.  Kept for experimentation.
   solver->ibInfinite      = argI("--ibinf", 0);    // ibtype 5: infinite plane (no tip)
   solver->ibWallMode      = argI("--ibwm", 0);     // 1 = ghost-cell architecture (Processes 2024); 2 = log-law ghost (diagnostic)
   solver->turbModel       = argI("--sa", 0);       // 1 = Spalart-Allmaras
@@ -338,37 +515,24 @@ int main(int argc, char* argv[]) {
   solver->nutInf          = argF("--nutinf", 3.0*(double)solver->mu);
   solver->wmX0            = argF("--wmx0", -1.0);  // wall-model start x; <0 = use plateX0
   solver->wmRamp          = argF("--wmramp", 0.0);  // wall-model blend-in fetch past wmx0 (immersed path)
-  solver->brinkPI         = argI("--brinkpi", 2);  // 1 = p grad(phi) only, 2 = full porosity stiffness
-  solver->brinkFaceLS     = argI("--brinkface", 3); // 1 pt value, 2 endpoint avg, 3 segmented
-  solver->brinkNSeg       = argI("--brinkseg", 4);  // segments for brinkface 3
-  solver->brinkDtW        = argI("--brinkdtw", solver->brinkPI >= 2 ? 0 : 1); // phi-ratio dt limit: unneeded once brinkpi 2 absorbs it
-  solver->ibNoSlip        = argI("--ibnoslip", 0);   // volume-penalized no-slip (viscous Brinkman)
-  solver->ibNoSlipRate    = argF("--noslipRate", 4.0); // penalization rate / (U_ref/h)
-  solver->ibSlipModel     = argI("--ibslip", 0);    // 1 = slip-length wall model
-  solver->slipA1          = argF("--slipa1", 0.30); // lambda_x = 1 + a1 (delta_f+)^n1
-  solver->slipN1          = argF("--slipn1", 0.53);
-  solver->slipMatchH      = argF("--wmmatch", 0.0);
-  solver->ibTurbShift     = argF("--turbretreat", 2.5);  // wall-modelled band retreat (u AND k~/tau~ masks), cells inside: 2.5 keeps the plate slip tail (-1..-2% Cf) AND damps curved-body interiors (RAE nose blowup at 4) // matching height / h_fine (0 = delta_f)
-  solver->ibMassRepair    = argF("--massrepair", 1.0);  // deep-body rho relaxation toward rho_inf (0 = off)
-  solver->ibPureSource    = argI("--ibpure", 0);      // 1 = pure-source IB (no porosity flux machinery)
-  solver->ibTangOnly      = argI("--ibtang", 0);      // wall model = tangential traction ONLY (pressure-tight normal, Darcy interior)
-  solver->wmOrder         = argI("--wmorder", 2);   // ibslip 4: series truncation order
-  solver->wmGain          = argF("--wmgain", 1.0);  // ibslip 4: feedback gain
-  solver->wmAnchor        = argF("--wmanchor", 1.0); // ibslip 4: anchor start, cells behind wall
-  solver->wmNormal        = argI("--wmnormal", 0);   // ibslip 4: feedback the normal component too
-  solver->wmPush          = argI("--wmpush", 0);     // ibslip 4: allow accelerating feedback
   solver->ibFieldAllLvls  = argI("--fieldall", 0); // field dump: all leaves, not finest only
-  solver->brinkAnalyticGrad = argI("--brinkgrad", 0); // analytic p grad(phi) source
-  solver->ibBrink         = argI("--ibbrink", 0);     // pressure-tight volume penalization
-  solver->ibBrinkEps      = argF("--brinkeps", 1e-6); // volume fraction inside the body
-  solver->ibBrinkDelta    = argF("--brinkdelta", 1.5);// tanh thickness, in cells
-  solver->ibBrinkRate     = argF("--brinkrate", 0.125); // interior Darcy damping / (lambda/h)
-  solver->ibBrinkShift    = argF("--brinkshift", 4.0);// Darcy mask retreat into the body, cells
-  solver->ibBrinkDarcyFac = argF("--brinkdfac", 0.5); // Darcy mask width / delta (paper: 1/2)
   solver->ibTurbFlux      = argI("--ibturb", 1);   // 0 = no k~/tau~ wall flux (diagnostic)
   solver->gridTrace       = argI("--gridtrace", 0);  // dump the build-cascade grids
   solver->adaptEvery      = argI("--adaptevery", 8);  // adaptation cadence (~5 syncs/call)
   solver->dtEvery         = argI("--dtevery", 4);  // dt reduction cadence (hard sync per call)
+  // Steady-state residual monitor.  R = RMS of L(q) over live fluid cells,
+  // sampled on RK stage 0 where the LSRK accumulator is exactly L(q^n).  One
+  // hard sync per sample, so keep the cadence coarse (100+).  --restol ends the
+  // march when R/R0 drops below it, which is what you want instead of guessing
+  // --tend (and the only sane stopping rule under --lts, where t is not physical).
+  // Iteration cap.  The march normally ends on t >= tEnd, but that clock is not
+  // race past any tEnd long before the solution converges.  --maxiter caps the
+  // step COUNT instead, which is the meaningful axis for a steady march.
+  const i32 maxIter = argI("--maxiter", 0);      // 0 = no cap  (applied inside step())
+  solver->maxIter         = maxIter;
+  solver->residEvery      = argI("--residevery", 0);
+  solver->resTol          = argF("--restol", 0.0);
+  solver->resFar          = argF("--resfar", 4.0);   // wall-free residual: exclude cells within this many local h of the body
   solver->dtDipThresh     = argF("--dtdip", 0.0);  // report argmin cell when stable dt < this (0 = off)
   solver->envCheck        = argI("--envcheck", 0); // per-step state-envelope check with neighborhood report
   solver->ibFluxRecon     = argI("--ibrecon", 2);  // 1 = pure ghost Riemann, 2 = FRIB face trace + Riemann
@@ -458,6 +622,14 @@ int main(int argc, char* argv[]) {
     solver->fsV = sin(aRad);
     solver->fsP = 1.0/(gam*Ma*Ma);
   }
+  // Freestream velocity override, for the QUIESCENT well-balancedness test:
+  // --fsu 0 --fsv 0 puts uniform pressure and zero velocity around the body, a
+  // state the discretisation must hold EXACTLY.  Under the pressure-tight
+  // Brinkman form the p grad(phi) source is built from the same face porosities
+  // as the flux, so the two cancel bit-for-bit and the residual is machine
+  // zero; break that sharing (--brinkgrad 1) and the leak shows up immediately.
+  solver->fsU = argF("--fsu", solver->fsU);
+  solver->fsV = argF("--fsv", solver->fsV);
   // reference Mach^2 for the preconditioner's beta^2 floor (rho_inf = 1)
   {
     const double u2 = (double)solver->fsU*solver->fsU + (double)solver->fsV*solver->fsV;
@@ -531,13 +703,28 @@ int main(int argc, char* argv[]) {
   auto wall0 = std::chrono::steady_clock::now();
   while (t < tEnd) {
     t += solver->step(tStep);
+    // NOTE: both stopping rules only SET a flag here.  Breaking at this point
+    // skips the dump block below, which silently leaves the previous interval's
+    // .dat files on disk -- so the run looks finished but every analysis reads
+    // stale data.  Break at the BOTTOM of the loop, after the writes.
+    bool stopNow = false;
+    if (maxIter > 0 && solver->iter >= maxIter) {
+      printf("[maxiter] stopping at %d iterations (t = %f)\n", solver->iter, t);
+      stopNow = true;
+    }
+    if (solver->resTol > 0 && solver->resid0 > 0 &&
+        solver->resid/solver->resid0 < solver->resTol) {
+      printf("[resid] CONVERGED: R/R0 = %.3e < %.3e after %d iters (t = %f)\n",
+             (double)(solver->resid/solver->resid0), (double)solver->resTol,
+             solver->iter, t);
+      stopNow = true;
+    }
     // The PNG painter allocates and clears a UNIFORM-FINE image
     // (baseGrid * 2^(nLvls-1) squared): 6144^2 = 151 MB at nLvls 7, 604 MB at
     // nLvls 8, cleared AND painted every output.  Profiled at nLvls 7 it was
     // 83% of all CUDA API time and 36% of GPU kernel time -- i.e. the diagnostic
     // dominated the solve.  Off by default for the airfoil cases, which are
     // analysed from the .dat dumps; --paint 1 restores it.
-    if (jfnkVerifyOnce) { solver->jfnkVerify(); jfnkVerifyOnce = 0; }
     if (paintOn) solver->paint();
     real comp = 100.0 * real(solver->hashTable.nKeys) /
                 real(baseGridSize[0]*baseGridSize[1]*baseGridSize[2]/blockSizeTot*powi(powi(2,nLvls-1),2));
@@ -545,6 +732,17 @@ int main(int argc, char* argv[]) {
            solver->imageCounter, t, solver->hashTable.nKeys, solver->deltaT, comp);
     if (ibPlate && solver->immerserdBcType == 3)
       solver->writeIbField("output/cyl_field.dat", 0.25);
+    // annulus: one numbered dump per output so the per-cell residual pattern
+    // can be compared between two instants (standing vs travelling)
+    if (svort) { static int nSv = 0; char fn[64];
+                 snprintf(fn, sizeof fn, "output/svortex_field_%02d.dat", ++nSv);
+                 solver->writeIbField(fn, 1.5); }
+    if (canal) { static int nCa = 0; char fn[64];
+                 snprintf(fn, sizeof fn, "output/canal_field_%02d.dat", ++nCa);
+                 solver->writeIbField(fn, 3.0);
+                 solver->computeCanalMetrics(nullptr); }
+    if (ringleb) { solver->computeRinglebError();
+                   solver->writeIbField("output/ringleb_field.dat", 2.0); }
     if (afoil) { solver->writeIbSurface("output/rae2822_surface.dat");
                  solver->writeIbField("output/rae2822_field.dat", 1.5);
                  solver->writeGridBlocks("output/rae2822_grid.dat");
@@ -560,6 +758,8 @@ int main(int argc, char* argv[]) {
       double m, px, e; solver->totalConserved(m, px, e);
       printf("[cons] t=%.3f  dMass/M0=%+.3e  dEnergy/E0=%+.3e\n", t, (m-m0)/m0, (e-e0)/e0);
     }
+
+    if (stopNow) break;   // after the dumps, so the files match the final state
   }
   auto wall1 = std::chrono::steady_clock::now();
   double wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(wall1 - wall0).count();
@@ -581,7 +781,9 @@ int main(int argc, char* argv[]) {
   }
   if (svort) {
     solver->computeSvortexError();
+    if (solver->ibGMirror) solver->reportGhostQuad();
   }
+  if (canal) solver->computeCanalMetrics("output/canal_cp.dat");
   if (gresho) {
     solver->computeGreshoError();
   }
@@ -599,6 +801,7 @@ int main(int argc, char* argv[]) {
     solver->computeAcousticL2Error();
   }
   solver->printDiagnostics();
+  if (solver->ibRccm) { solver->reportDeadTaps(); solver->checkCutGeometry(); solver->checkWellBalanced(); }
   if (paintOn) solver->paintPressure("output/pressure_final.png");
   if (detailA) {   // wavelet-detail indicator maps (white = refine trigger)
     solver->paintDetail("output/detail_max.png", 0);

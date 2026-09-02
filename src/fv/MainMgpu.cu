@@ -71,7 +71,7 @@ static void runRank(int argc, char* argv[]) {
   bool haveMa  = hasArg("--ma");
   real Ma      = haveMa ? argF("--ma", 0.1) : 0.1;   // Gresho Mach number / acConv amplitude
   i32 bcArg    = argI("--bc", -1);                   // bcType override (-1 = per-testCase default)
-  i32 reconA   = argI("--recon", 1);                 // 0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola (smooth only)
+  i32 reconA   = argI("--recon", 4);                 // 0=TVD, 1=ROUND, 2=LD-ROUND, 3=unlimited parabola (smooth only), 4=van Leer (default)
   real tEndArg = argF("--tend", -1.0);               // tEnd override (-1 = per-testCase default)
   i32 mdFluxA  = argI("--mdflux", 0);                // 1 = multidimensional Osher-type corner flux (first-order states)
   real cflArg  = argF("--cfl", -1.0);                // CFL override (-1 = default 0.40; dt = cfl*min(dx/(|u|+c)))

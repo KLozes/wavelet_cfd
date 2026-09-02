@@ -1,4 +1,5 @@
 #include <iostream>
+#include <climits>
 #include <cstdio>
 #include <vector>
 #include <array>
@@ -322,6 +323,8 @@ real CompressibleSolver::step(real tStep) {
 
   while (t < tStep) {
 
+    if (maxIter > 0 && iter >= maxIter) break;
+
     clock.tick();
     // dynamic wavelet adaptation; skipped for a static (fixed) refinement grid
     // Adaptation costs ~5 host-device syncs (sortBlocks 4 + adaptGrid 1): the
@@ -338,12 +341,15 @@ real CompressibleSolver::step(real tStep) {
       haloExchange(0, NEVOLVE);   // fill last cycle's ghosts before the detail computation
 #endif
       restrictFields();
+      if (dbgChecks >= 2) scanNonFinite("restrictFields");
       if (dbgChecks) { cudaDeviceSynchronize(); sub.tick(); }
       forwardWaveletTransform();
       if (dbgChecks) { cudaDeviceSynchronize(); sub.tock(); tForwardUs += sub.duration().count(); }
       // refinement cascade; under MGPU this exchanges block activity across rank
       // seams after every create kernel so grading/support close consistently
+      if (dbgChecks >= 2) scanNonFinite("forwardWavelet");
       adaptGridConsistent();
+      if (dbgChecks >= 2) scanNonFinite("adaptGridConsistent");
 #ifdef USE_MGPU
       // the inverse reconstructs each new fine block from its (coarse) parent's
       // F_OLD; rebuild that snapshot for every block created this cycle (owned
@@ -351,9 +357,12 @@ real CompressibleSolver::step(real tStep) {
       reconstituteOldSnapshot();
 #endif
       setBoundaryConditions(F_OLD);
+      if (dbgChecks >= 2) scanNonFinite("setBC(F_OLD)");
       inverseWaveletTransform();
+      if (dbgChecks >= 2) scanNonFinite("inverseWavelet");
       if (dbgChecks) { cudaDeviceSynchronize(); sub.tick(); }
       sortBlocks();
+      if (dbgChecks >= 2) scanNonFinite("sortBlocks");
       if (dbgChecks) { cudaDeviceSynchronize(); sub.tock(); tSortUs += sub.duration().count(); }
 #ifdef USE_MGPU
       rebuildGhosts();            // prune the stale ghosts, recreate the 2-ring from neighbors
@@ -365,6 +374,7 @@ real CompressibleSolver::step(real tStep) {
       // accumulator must be zero when stage 1 begins (A_1 = 0)
       zeroAccumulator();
       stampIbGeometry();   // new blocks appeared: stamp them (moves are carried by the sort)
+      if (dbgChecks >= 2) scanNonFinite("stampIbGeometry");
       if (dbgChecks) {   // debug census: owned-interior block count must track the 1-GPU count
         cudaDeviceSynchronize();
         double nOwn = 0;
@@ -397,14 +407,6 @@ real CompressibleSolver::step(real tStep) {
     // stability edge of 1.6 leaves 44% margin), so recompute it every
     // dtEvery steps and let the queue run ahead in between.
     if (dtEvery <= 1 || iter % dtEvery == 0) computeDeltaT();
-    // Full-system implicit: the OUTER clock takes the implicit step.  The
-    // Newton solve is built for dtau = jfnkCfl * dt_local (jfnkDiagKernel), so
-    // advancing t by only the explicit CFL step would keep the explicit step
-    // count -- ~100k steps at Grid 1 -- and throw away the entire point of
-    // being implicit.  This is the paper's "implicit time integration with
-    // local time stepping": a pseudo-transient march whose global step is the
-    // implicit one.
-    if (jfnkOn) deltaT *= jfnkCfl;
     dtScale = 1.0;
     if (t + deltaT > tStep) {
       // clamp onto the output time; under LTS the local steps take the same
@@ -413,6 +415,9 @@ real CompressibleSolver::step(real tStep) {
       deltaT = tStep - t;
     }
 
+    const bool residSample = (residEvery > 0 && iter % residEvery == 0);
+    if (residSample) snapshotResidualQ();
+
     if (mdFlux == 2) {
       // CTU-Hancock: fully-discrete predictor-corrector.  The corrector is
       // FUSED into multiDRhsKernel (it updates q in place, conservative), so
@@ -420,6 +425,7 @@ real CompressibleSolver::step(real tStep) {
       // bank holds the half-step predicted primitives during the RHS.
       conservativeToPrimitive();
       setBoundaryConditions(0, 1);
+      if (recon == 5) computeShockSensor();
       computeRightHandSide();
       setBoundaryConditions();           // the fused corrector left q CONSERVATIVE
       if (nLvls > 1) {
@@ -429,11 +435,7 @@ real CompressibleSolver::step(real tStep) {
       }
     }
     else
-    // Full-system implicit (--jfnk): the RK stages' updates are all skipped, so
-    // running more than one pass is pure wasted RHS work.  A single pass keeps
-    // the BC/ghost/closure sequencing (which ktauResidual reuses) and hands the
-    // step to the Newton solve at its end.
-    for (i32 stage = jfnkOn ? nRkStages - 1 : 0; stage < nRkStages; stage++) {
+    for (i32 stage = 0; stage < nRkStages; stage++) {
       conservativeToPrimitive();
 #ifdef USE_MGPU
       haloExchange(0, NEVOLVE);   // ghosts get owners' primitives (+G) before the RHS reads them
@@ -450,7 +452,8 @@ real CompressibleSolver::step(real tStep) {
       }
 #endif
       if (ffVortex && stage == 0 && (iter % ffEvery) == 0) updateFarFieldVortex();
-      if (immerserdBcType && !rans) applyWallGhosts();   // Euler: slip ghosts
+      if (immerserdBcType && ibRccm) reconstructRCells();  // RCCM Eq. (10)
+      else if (immerserdBcType && !rans) applyWallGhosts();   // Euler: slip ghosts
       if (shash >= 2 && iter >= shashFrom && iter <= shashTo) stateHash(stage?"ghostS12":"ghost", iter);
       if (rans) {
         if (wallGeom || immerserdBcType) applyWallGhosts();
@@ -459,6 +462,7 @@ real CompressibleSolver::step(real tStep) {
         haloExchange(F_MUT, 2);     // ghosts need mu_t and F1 on both sides of a seam face
 #endif
       }
+      if (recon == 5) computeShockSensor();
       computeRightHandSide();
       if (shash >= 2 && iter >= shashFrom && iter <= shashTo) stateHash(stage?"rhsS12":"rhs", iter);
       primitiveToConservative();
@@ -466,14 +470,6 @@ real CompressibleSolver::step(real tStep) {
       setBoundaryConditions();
       if (shash >= 2 && iter >= shashFrom && iter <= shashTo) stateHash(stage?"updS12":"upd", iter);
 
-      if (jfnkOn && stage == nRkStages-1) {
-        // The mean flow keeps its explicit RK march; the k~/tau~ pair -- the only
-        // place the marginal near-wall mode lives -- takes one pseudo-transient
-        // Newton step instead.  Fields are CONSERVATIVE here (updateFields ran)
-        // and ktauResidual needs primitives, so bracket the solve.
-        ktauImplicitStep(deltaT);   // state is conservative in and out
-        setBoundaryConditions();
-      }
 
       if (nLvls > 1) {
         restrictFields();
@@ -494,6 +490,18 @@ real CompressibleSolver::step(real tStep) {
       }
     }
     cudaDeviceSynchronize();
+    if (residSample) {
+      // dq/dt over EVERY fluid cell -- the residual of the whole update.
+      resid = computeResidual();
+      if (resid0 <= 0) resid0 = resid;
+      // No time printed: step()'s t is segment-local, and under --lts the global
+      // clock is not physical -- iteration is the meaningful convergence axis.
+      printf("[resid] iter %7d  R = %.6e  R/R0 = %.3e   R(>%gh from wall) = %.3e"
+             "   max = %.3e at %.1f h from wall\n",
+             iter, (double)resid, (double)(resid0 > 0 ? resid/resid0 : 0),
+             (double)resFar, (double)residFar, (double)residMax, (double)residMaxDw);
+    }
+    if (dbgChecks >= 2) scanNonFinite("rkStages");
     clock.tock();
     tSolver += clock.duration().count();
 
@@ -524,6 +532,16 @@ void CompressibleSolver::sortFieldData(void) {
     gatherSortedFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, F_SCRATCH, F_PHI);
     copyFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, F_IBM, F_SCRATCH);
     gatherSortedFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, F_SCRATCH, F_IBM);
+    if (ibRccm)
+      for (i32 f : {F_CUTA, F_CUTAX, F_CUTAY}) {
+        copyFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, f, F_SCRATCH);
+        gatherSortedFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, F_SCRATCH, f);
+      }
+    if (ibBrink)
+      for (i32 f : {F_BRINKX, F_BRINKY}) {
+        copyFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, f, F_SCRATCH);
+        gatherSortedFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, F_SCRATCH, f);
+      }
   }
 }
 
@@ -849,6 +867,84 @@ i32 CompressibleSolver::wallResolutionCheck(bool verbose) {
   return nCoarse;
 }
 
+__global__ void scanNonFiniteKernel(CompressibleSolver &grid, i32 baseOff);
+__global__ void residualNormKernel(CompressibleSolver &grid, real *q0, real dtGlobal, real *rCell);
+__global__ void residualSnapshotKernel(CompressibleSolver &grid, real *q0);
+extern __device__ double             g_resSum;
+extern __device__ unsigned long long g_resCnt;
+extern __device__ double             g_resSumFar;
+extern __device__ unsigned long long g_resCntFar;
+extern __device__ double             g_resMax;
+extern __device__ double             g_resMaxPhi;
+
+// RMS of L(q) over live fluid cells.  Call ONLY right after
+// computeRightHandSide() on stage 0, where the accumulator is exactly L(q^n).
+// Snapshot q before the stages; the compare happens after them.
+void CompressibleSolver::snapshotResidualQ(void) {
+  if (!residQ0) cudaMallocManaged(&residQ0, (size_t)4*(size_t)nBlocksMax*(size_t)blockSizeTot*sizeof(real));
+  if (!residCell) {
+    cudaMallocManaged(&residCell, (size_t)nBlocksMax*(size_t)blockSizeTot*sizeof(real));
+    cudaMemset(residCell, 0, (size_t)nBlocksMax*(size_t)blockSizeTot*sizeof(real));
+  }
+  residualSnapshotKernel<<<cudaGridSize, cudaBlockSize>>>(*this, residQ0);
+}
+
+real CompressibleSolver::computeResidual(void) {
+  if (!residQ0) return 0;
+  double z = 0.0; unsigned long long zc = 0;
+  cudaMemcpyToSymbol(g_resSum, &z,  sizeof(double));
+  cudaMemcpyToSymbol(g_resCnt, &zc, sizeof(unsigned long long));
+  cudaMemcpyToSymbol(g_resSumFar, &z,  sizeof(double));
+  cudaMemcpyToSymbol(g_resCntFar, &zc, sizeof(unsigned long long));
+  cudaMemcpyToSymbol(g_resMax,    &z,  sizeof(double));
+  cudaMemcpyToSymbol(g_resMaxPhi, &z,  sizeof(double));
+  residualNormKernel<<<cudaGridSize, cudaBlockSize>>>(*this, residQ0, deltaT, residCell);
+  cudaDeviceSynchronize();
+  double sum = 0.0; unsigned long long cnt = 0;
+  cudaMemcpyFromSymbol(&sum, g_resSum, sizeof(double));
+  cudaMemcpyFromSymbol(&cnt, g_resCnt, sizeof(unsigned long long));
+  double sumF = 0.0, rmax = 0.0, rphi = 0.0; unsigned long long cntF = 0;
+  cudaMemcpyFromSymbol(&sumF, g_resSumFar, sizeof(double));
+  cudaMemcpyFromSymbol(&cntF, g_resCntFar, sizeof(unsigned long long));
+  cudaMemcpyFromSymbol(&rmax, g_resMax,    sizeof(double));
+  cudaMemcpyFromSymbol(&rphi, g_resMaxPhi, sizeof(double));
+  residFar = (cntF > 0) ? (real)sqrt(sumF/(double)cntF) : (real)0;
+  residMax = (real)sqrt(rmax); residMaxDw = (real)rphi;
+  return (cnt > 0) ? (real)sqrt(sum/(double)cnt) : (real)0;
+}
+
+extern __device__ int g_nfCnt;
+extern __device__ int g_nfCntZ;
+extern __device__ int g_nfCidx;
+extern __device__ int g_nfField;
+
+// AMR debug probe (--debug 2): report the first non-finite evolved cell after a
+// named phase.  Prints once per phase that newly goes bad.
+void CompressibleSolver::scanNonFinite(const char *tag) { scanNonFiniteBase(tag, 0); scanNonFiniteBase(tag, F_OLD); }
+void CompressibleSolver::scanNonFiniteBase(const char *tag, i32 baseOff) {
+  int z = 0, big = INT_MAX;
+  cudaMemcpyToSymbol(g_nfCnt,  &z,   sizeof(int));
+  cudaMemcpyToSymbol(g_nfCntZ, &z,   sizeof(int));
+  cudaMemcpyToSymbol(g_nfCidx, &big, sizeof(int));
+  cudaMemcpyToSymbol(g_nfField,&z,   sizeof(int));
+  scanNonFiniteKernel<<<cudaGridSize, cudaBlockSize>>>(*this, baseOff);
+  cudaDeviceSynchronize();
+  int n = 0, nz = 0, ci = 0, fld = 0;
+  cudaMemcpyFromSymbol(&n,  g_nfCnt,  sizeof(int));
+  cudaMemcpyFromSymbol(&nz, g_nfCntZ, sizeof(int));
+  cudaMemcpyFromSymbol(&ci, g_nfCidx, sizeof(int));
+  cudaMemcpyFromSymbol(&fld,g_nfField,sizeof(int));
+  if (n == 0 && nz == 0) return;
+  i32 bIdx = ci / blockSizeTot, idx = ci % blockSizeTot;
+  i32 lvl = -1, ib = 0, jb = 0, kb = 0;
+  u64 loc = bLocList[bIdx];
+  decode(loc, lvl, ib, jb, kb);
+  printf("[nf] iter %d  AFTER %-22s  %s k0=%d kz=%d  first: f=%d lvl=%d blk(%d,%d,%d) "
+         "cell(%d,%d,%d) %s\n", iter, tag, baseOff ? "F_OLD" : "LIVE ", n, nz, fld, lvl, ib, jb, kb,
+         idx % blockSize, (idx / blockSize) % blockSize, idx / blockSize / blockSize,
+         isInteriorBlock(lvl, ib, jb, kb) ? "interior" : "EXTERIOR");
+}
+
 void CompressibleSolver::printRansExtremes(void) {
   if (immerserdBcType != 0) {
     unsigned long long z = 0, det = 0, flx = 0, tnt = 0;
@@ -865,7 +961,11 @@ void CompressibleSolver::printRansExtremes(void) {
     setBoundaryConditions(0, 1);
     computeTurbClosure();
     zeroAccumulator();
-    computeRightHandSideKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    computeRightHandSide();   // NOT the bare kernel: under the default --detflux
+                              // the kernel only stages face fluxes and the
+                              // gather is what fills F_RHS.  Launching the
+                              // kernel alone made this census report max|Rhs|=0
+                              // always.
     cudaDeviceSynchronize();
     cudaMemcpyFromSymbol(&det, g_ibDetect, sizeof(det));
     { unsigned long long fd=0,fs=0,fi=0,nu=0;
@@ -1373,7 +1473,9 @@ void CompressibleSolver::writeIbField(const char *fileName, real halfWidth) {
   const double cx = (ibPolyN > 2) ? 0.5*((double)ibBox[0] + (double)ibBox[2]) : (double)ibCenter[0];
   const double cy = (ibPolyN > 2) ? 0.5*((double)ibBox[1] + (double)ibBox[3]) : (double)ibCenter[1];
   const double w  = (double)halfWidth*(double)ibChord;
-  fprintf(fp, "# x/c y/c rho u v p mach cp fluid   (origin at the body centre)\n");
+  fprintf(fp, "# x/c y/c rho u v p mach cp fluid resid   (origin at the body centre)\n");
+  // resid = per-cell |dq/dt| from the LAST residual sample (0 if --residevery is off)
+
   fprintf(fp, "# pInf=%.10e uInf=%.10e chord=%.6f\n",
           (double)fsP, sqrt((double)fsU*fsU + (double)fsV*fsV), (double)ibChord);
   const i32 lf = nLvls - 1;
@@ -1405,8 +1507,9 @@ void CompressibleSolver::writeIbField(const char *fileName, real halfWidth) {
       const double qInf = 0.5*((double)fsU*fsU + (double)fsV*fsV);
       const double cp = (pp - (double)fsP)/fmax(qInf,1e-30);
       const i32 fl = isFluidCell(Vec3((real)x,(real)y,(real)0), hm) ? 1 : 0;
-      fprintf(fp, "%.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %d\n",
-              (x-cx)/(double)ibChord, (y-cy)/(double)ibChord, r, u, v, pp, mach, cp, fl);
+      const double rc = residCell ? (double)residCell[m] : 0.0;
+      fprintf(fp, "%.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %d %.6e\n",
+              (x-cx)/(double)ibChord, (y-cy)/(double)ibChord, r, u, v, pp, mach, cp, fl, rc);
       nOut++;
     }
   }
@@ -1652,214 +1755,192 @@ void CompressibleSolver::writeCfProfile(const char *fileName) {
   primitiveToConservative();
 }
 
+// Verify the cut geometry against the exact body: sum(alpha)*dV must equal the
+// FLUID area, and the discrete divergence theorem sum_f A_f n_f + A_w n_w = 0
+// must hold cell by cell (it is what makes the cut update conservative).
+// Well-balancedness of the cut-cell discretisation: a UNIFORM state (rho, u=0,
+// p) makes every flux pure pressure, so the residual must vanish identically --
+//   sum_f p n_f A_f + p n_w A_w = p (sum_f n_f A_f + n_w A_w) = 0
+// by the discrete divergence theorem.  Any nonzero residual localises the term
+// that does not close, which no amount of reasoning about the algebra can.
+void CompressibleSolver::checkWellBalanced(void) {
+  cudaDeviceSynchronize();
+  real *Rho=getField(F_RHO), *U=getField(F_RHOU), *V=getField(F_RHOV),
+       *W=getField(F_RHOW), *P=getField(F_RHOE);
+  for (i32 c = 0; c < hashTable.nKeys*blockSizeTot; c++) {
+    Rho[c] = 1; U[c] = 0; V[c] = 0; W[c] = 0; P[c] = 1;
+  }
+  cudaDeviceSynchronize();
+  for (i32 f = 0; f < NEVOLVE; f++)
+    cudaMemset(getField(F_RHS+f), 0, (size_t)hashTable.nKeys*blockSizeTot*sizeof(real));
+  cudaDeviceSynchronize();
+  computeRightHandSide();
+  cudaDeviceSynchronize();
+  double mx[3] = {0,0,0}; i32 nbad = 0; double worstA = 1; i32 worstCut = -1;
+  real *A = getField(F_CUTA);
+  for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
+    if (bLocList[bIdx] == kEmpty) continue;
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      const i32 cIdx = bIdx*blockSizeTot + c;
+      if (cFlagsList[cIdx] != ACTIVE) continue;
+      if (!(A[cIdx] > (real)ibRccmAlphaMin)) continue;          // dead
+      if (getField(F_PHI)[cIdx] >= (real)0) continue;           // R-Cell
+      const double ru = fabs((double)getField(F_RHS+F_RHOU)[cIdx]);
+      const double rv = fabs((double)getField(F_RHS+F_RHOV)[cIdx]);
+      const double rr = fabs((double)getField(F_RHS+F_RHO)[cIdx]);
+      if (ru > mx[1] || rv > mx[2]) { worstA = A[cIdx]; worstCut = cIdx; }
+      mx[0] = fmax(mx[0], rr); mx[1] = fmax(mx[1], ru); mx[2] = fmax(mx[2], rv);
+      if (fmax(ru, rv) > 1e-10) nbad++;
+    }
+  }
+  printf("---- RCCM well-balanced test (uniform rho=1, u=0, p=1) ----\n");
+  printf("  max |Rhs(rho)| = %.3e\n", mx[0]);
+  printf("  max |Rhs(rhoU)|= %.3e   max |Rhs(rhoV)| = %.3e\n", mx[1], mx[2]);
+  printf("  NR cells with |Rhs(mom)| > 1e-10 : %d   (worst cell alpha = %.4f)\n",
+         nbad, worstA);
+  printf("-----------------------------------------------------------\n");
+  (void)worstCut;
+}
+
+extern __device__ unsigned long long g_rcDeadFace;
+extern __device__ unsigned long long g_rcDeadGrad;
+extern __device__ unsigned long long g_rcLiveFace;
+
+void CompressibleSolver::reportDeadTaps(void) {
+  unsigned long long df=0, dg=0, lf=0;
+  cudaMemcpyFromSymbol(&df, g_rcDeadFace, sizeof(df));
+  cudaMemcpyFromSymbol(&dg, g_rcDeadGrad, sizeof(dg));
+  cudaMemcpyFromSymbol(&lf, g_rcLiveFace, sizeof(lf));
+  printf("---- RCCM dead-cell exposure ----\n");
+  printf("  faces read with a DEAD neighbour AND open aperture : %llu\n", df);
+  printf("  live-cell faces examined                           : %llu\n", lf);
+  printf("  gradient taps skipped because dead                 : %llu\n", dg);
+  printf("---------------------------------\n");
+}
+
+void CompressibleSolver::checkCutGeometry(void) {
+  cudaDeviceSynchronize();
+  double area = 0, wallLen = 0, gclMax = 0, stampErr = 0;
+  i32 nCut = 0, nR = 0;
+  real *A = getField(F_CUTA), *AX = getField(F_CUTAX), *AY = getField(F_CUTAY);
+  for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
+    u64 loc = bLocList[bIdx];
+    if (loc == kEmpty) continue;
+    i32 lvl = loc >> 60;
+    const double dxL = domainSize[0]/double(baseGridSize[0]*powi(2,lvl));
+    const double dyL = domainSize[1]/double(baseGridSize[1]*powi(2,lvl));
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      const i32 cIdx = bIdx*blockSizeTot + c;
+      if (cFlagsList[cIdx] != ACTIVE) continue;
+      const i32 i = c % blockSize, j = (c/blockSize) % blockSize;
+      const double al = A[cIdx];
+      area += al*dxL*dyL;
+      if (al > 1e-12 && al < 1.0 - 1e-12) {
+        nCut++;
+        if (getField(F_PHI)[cIdx] > 0) nR++;
+        // GCL: A_w n = -( (aXhi-aXlo) dy , (aYhi-aYlo) dx )
+        // Recompute the HIGH-face apertures straight from the level set rather
+        // than reading the neighbour's stored low aperture: that keeps the
+        // check independent of the block layout (and cross-checks the stamp).
+        const i32 ib2 = ( loc        & ((1 << 20)-1)) - 1;
+        const i32 jb2 = ((loc >> 20) & ((1 << 20)-1)) - 1;
+        Vec3 cp((real)((ib2*blockSize + i + 0.5)*dxL),
+                (real)((jb2*blockSize + j + 0.5)*dyL), (real)0);
+        const double hx = 0.5*dxL, hy = 0.5*dyL;
+        auto ls = [&](double X, double Y) {
+          return (double)getBoundaryLevelSet(Vec3((real)X, (real)Y, cp[2])); };
+        auto edge = [](double fa, double fb) {
+          if (fa < 0 && fb < 0) return 1.0;
+          if (fa >= 0 && fb >= 0) return 0.0;
+          return fa < 0 ? fa/(fa-fb) : fb/(fb-fa); };
+        const double f00 = ls(cp[0]-hx, cp[1]-hy), f10 = ls(cp[0]+hx, cp[1]-hy);
+        const double f11 = ls(cp[0]+hx, cp[1]+hy), f01 = ls(cp[0]-hx, cp[1]+hy);
+        const double axLo = edge(f00, f01), axHi = edge(f10, f11);
+        const double ayLo = edge(f00, f10), ayHi = edge(f01, f11);
+        stampErr = fmax(stampErr, fabs(axLo - (double)AX[cIdx]));
+        stampErr = fmax(stampErr, fabs(ayLo - (double)AY[cIdx]));
+        const double nwx = -(axHi - axLo)*dyL;
+        const double nwy = -(ayHi - ayLo)*dxL;
+        wallLen += sqrt(nwx*nwx + nwy*nwy);
+        gclMax = fmax(gclMax, fabs(nwx) + fabs(nwy));
+      }
+    }
+  }
+  printf("---- RCCM cut geometry ----\n");
+  printf("  fluid area   = %.10f\n", area);
+  printf("  wall length  = %.10f\n", wallLen);
+  printf("  cut cells    = %d  (R-Cells, centre outside: %d)\n", nCut, nR);
+  printf("  max |A_w n|  = %.3e   stored-vs-exact aperture err = %.2e\n", gclMax, stampErr);
+  printf("---------------------------\n");
+}
+
 void CompressibleSolver::stampIbGeometry(void) {
   if (immerserdBcType == 0) return;
   ibStampGeometryKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
 }
 
+
 // ---- Jacobian-free Newton-Krylov: residual and matrix-free product ---------
-void CompressibleSolver::jfnkEnsure(void) {
-  const i32 need = NEVOLVE*(i32)(hashTable.nKeys*blockSizeTot);
-  if (jfnkAlloc >= need) return;
-  if (jfnkQ0) { cudaFree(jfnkQ0); cudaFree(jfnkR0); cudaFree(jfnkWrk);
-                cudaFree(jfnkBasis); cudaFree(jfnkW); }
-  cudaMalloc(&jfnkQ0,  need*sizeof(real));
-  cudaMalloc(&jfnkR0,  need*sizeof(real));
-  cudaMalloc(&jfnkWrk, need*sizeof(real));
-  cudaMalloc(&jfnkBasis, (size_t)(jfnkM+1)*need*sizeof(real));
-  cudaMalloc(&jfnkW,   need*sizeof(real));
-  jfnkAlloc = need;
-}
 
 // R(q) for the turbulence pair with everything else frozen.  The caller must
 // leave the fields PRIMITIVE and the state scattered; this reproduces exactly
 // the sequence a stage uses, so the residual is the one the explicit march sees.
 // R(q) for the WHOLE system.  The state vector is CONSERVATIVE (that is what the
-// RK update evolves), so this mirrors one stage exactly: convert to primitives,
-// apply the boundary machinery, close the turbulence, evaluate, convert back.
-void CompressibleSolver::ktauResidual(real *r) {
-  const i32 N = (i32)(hashTable.nKeys*blockSizeTot);
-  conservativeToPrimitive();
-  setBoundaryConditions(0, 1);
-  if (wallGeom || immerserdBcType) applyWallGhosts();
-  if (rans) computeTurbClosure();
-  zeroAccumulator();
-  computeRightHandSideKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-  cudaDeviceSynchronize();
-  primitiveToConservative();
-  jfnkResidualKernel<<<cudaGridSize, cudaBlockSize>>>(*this, r, N);
-  cudaDeviceSynchronize();
+extern __device__ unsigned long long g_qUsed;
+extern __device__ unsigned long long g_qDecl;
+extern __device__ unsigned long long g_rcDeadFace;
+extern __device__ unsigned long long g_rcDeadGrad;
+extern __device__ unsigned long long g_rcLiveFace;
+extern __device__ unsigned long long g_qGhostTap;
+
+// Is the implicit ghost quadratic actually being used, and is it really taking
+// ghost taps?  "Improved by 26% with iterations changing nothing" has two very
+// different explanations -- converged in one sweep, or the coupling is inert --
+// and they are indistinguishable without this.
+void CompressibleSolver::reportGhostQuad(void) {
+  unsigned long long u=0,d=0,g=0;
+  cudaMemcpyFromSymbol(&u, g_qUsed, sizeof(u));
+  cudaMemcpyFromSymbol(&d, g_qDecl, sizeof(d));
+  cudaMemcpyFromSymbol(&g, g_qGhostTap, sizeof(g));
+  printf("[ghostquad] quadratic used %llu, declined %llu (%.2f%%), ghost taps consumed %llu"
+         "  -> %.2f ghost taps per evaluation\n",
+         u, d, (u+d) ? 100.0*double(d)/double(u+d) : 0.0, g,
+         u ? double(g)/double(u) : 0.0);
 }
 
-// J*v by a directional finite difference of the residual.  eps follows the
-// usual matrix-free scaling: sqrt(machine eps) * (1 + |q|) / |v|, which balances
-// truncation against cancellation.  jfnkQ0/jfnkR0 must already hold the base
-// state and its residual.
-void CompressibleSolver::jfnkMatVec(const real *v, real *Jv) {
-  const i32 n = NEVOLVE*(i32)(hashTable.nKeys*blockSizeTot);
-  const i32 N = n/NEVOLVE;
-  const double vn = sqrt(thrust::inner_product(thrust::device, v, v+n, v, 0.0));
-  if (!(vn > 0)) { cudaMemset(Jv, 0, n*sizeof(real)); return; }
-  const double qn = sqrt(thrust::inner_product(thrust::device, jfnkQ0, jfnkQ0+n,
-                                               jfnkQ0, 0.0));
-  const double meps = (sizeof(real) == 4) ? 1.19e-7 : 2.22e-16;
-  const double eps  = sqrt(meps)*(1.0 + qn)/vn;
-  // q0 + eps v  ->  fields
-  jfnkAxpyKernel<<<256,256>>>(jfnkQ0, v, (real)eps, jfnkWrk, n);
-  cudaDeviceSynchronize();
-  jfnkScatterKernel<<<cudaGridSize, cudaBlockSize>>>(*this, jfnkWrk, N);
-  cudaDeviceSynchronize();
-  ktauResidual(Jv);
-  // (R(q0+eps v) - R(q0))/eps
-  jfnkCombKernel<<<256,256>>>(Jv, jfnkR0, (real)(1.0/eps), (real)(-1.0/eps), Jv, n);
-  cudaDeviceSynchronize();
-  // restore the base state so the caller is never left perturbed
-  jfnkScatterKernel<<<cudaGridSize, cudaBlockSize>>>(*this, jfnkQ0, N);
-  cudaDeviceSynchronize();
+// Per-cell Ducros-like compression sensor into F_RHOK (recon 5 only; the
+// bank is free because recon 5 is refused under RANS).  Runs on PRIMITIVES,
+// after the ghosts and before the RHS reads the traces.
+// RCCM Eq. (10): the R-Cells are reconstructed from the boundary conditions and
+// the fresh NR-Cell values.  An R-Cell's stencil may contain other R-Cells, so
+// the paper assembles ONE global system for all of them; the Jacobi sweeps here
+// are its iterative form (the same structure the implicit interface method uses).
+void CompressibleSolver::reconstructRCells(void) {
+  for (i32 it = 0; it < ibRccmIter; it++)
+    rccmReconstructKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
 }
 
-// GMRES(m) on  A dq = R0  with  A = I/dtau - J,  right-hand side jfnkR0.
-// Arnoldi with modified Gram-Schmidt, Givens rotations for the least squares.
-// dtau is the PSEUDO-time step: small dtau makes A diagonally dominant (easy to
-// solve, small step), large dtau approaches pure Newton.  That continuation is
-// what the paper's "implicit with local time stepping" amounts to.
-// Returns the iteration count; rrel is the achieved relative residual.
-// Result (dq) lands in jfnkWrk.
-i32 CompressibleSolver::jfnkGmres(real dtau, real tol, real &rrel) {
-  const i32 n = NEVOLVE*(i32)(hashTable.nKeys*blockSizeTot);
-  const i32 m = jfnkM;
-  const double idt = 1.0/(double)dtau;
-  std::vector<double> Hm((size_t)(m+1)*m, 0.0), cs(m,0.0), sn(m,0.0), g(m+1,0.0);
-  auto dot = [&](const real *a, const real *b) {
-    return sqrt(0.0) + thrust::inner_product(thrust::device, a, a+n, b, 0.0); };
-  auto nrm = [&](const real *a) { return sqrt(dot(a,a)); };
-  // v0 = R0 / |R0|
-  const double b0 = nrm(jfnkR0);
-  if (!(b0 > 0)) { cudaMemset(jfnkWrk, 0, n*sizeof(real)); rrel = 0; return 0; }
-  jfnkScaleKernel<<<256,256>>>(jfnkR0, (real)(1.0/b0), jfnkBasis, n);
-  cudaDeviceSynchronize();
-  g[0] = b0;
-  i32 k = 0;
-  for (; k < m; k++) {
-    real *vk = jfnkBasis + (size_t)k*n;
-    // w = A vk = vk/dtau - J vk
-    jfnkMatVec(vk, jfnkW);
-    // A v = v/dtau - J v, with dtau taken PER CELL from the local time step:
-    // local time stepping, which is what the paper pairs with implicit
-    // integration and is legitimate because only R(q) = 0 is being sought.
-    jfnkDiagKernel<<<cudaGridSize, cudaBlockSize>>>(*this, vk, jfnkW, (real)1,
-                                        (i32)(hashTable.nKeys*blockSizeTot));
-    cudaDeviceSynchronize();
-    for (i32 j = 0; j <= k; j++) {                 // modified Gram-Schmidt
-      real *vj = jfnkBasis + (size_t)j*n;
-      const double h = dot(jfnkW, vj);
-      Hm[(size_t)j*m + k] = h;
-      jfnkAxpyKernel<<<256,256>>>(jfnkW, vj, (real)(-h), jfnkW, n);
-      cudaDeviceSynchronize();
-    }
-    const double hkk = nrm(jfnkW);
-    Hm[(size_t)(k+1)*m + k] = hkk;
-    if (hkk > 1e-300) {
-      jfnkScaleKernel<<<256,256>>>(jfnkW, (real)(1.0/hkk), jfnkBasis + (size_t)(k+1)*n, n);
-      cudaDeviceSynchronize();
-    }
-    for (i32 j = 0; j < k; j++) {                  // apply past rotations
-      const double t = cs[j]*Hm[(size_t)j*m+k] + sn[j]*Hm[(size_t)(j+1)*m+k];
-      Hm[(size_t)(j+1)*m+k] = -sn[j]*Hm[(size_t)j*m+k] + cs[j]*Hm[(size_t)(j+1)*m+k];
-      Hm[(size_t)j*m+k] = t;
-    }
-    const double d = sqrt(Hm[(size_t)k*m+k]*Hm[(size_t)k*m+k] + hkk*hkk);
-    cs[k] = (d > 0) ? Hm[(size_t)k*m+k]/d : 1.0;
-    sn[k] = (d > 0) ? hkk/d : 0.0;
-    Hm[(size_t)k*m+k] = d;
-    Hm[(size_t)(k+1)*m+k] = 0.0;
-    g[k+1] = -sn[k]*g[k];
-    g[k]   =  cs[k]*g[k];
-    if (fabs(g[k+1]) <= tol*b0) { k++; break; }
-  }
-  // back-substitute, then dq = V y
-  std::vector<double> y(k, 0.0);
-  for (i32 i = k-1; i >= 0; i--) {
-    double sum = g[i];
-    for (i32 j = i+1; j < k; j++) sum -= Hm[(size_t)i*m+j]*y[j];
-    y[i] = (fabs(Hm[(size_t)i*m+i]) > 1e-300) ? sum/Hm[(size_t)i*m+i] : 0.0;
-  }
-  cudaMemset(jfnkWrk, 0, n*sizeof(real));
-  for (i32 i = 0; i < k; i++) {
-    jfnkAxpyKernel<<<256,256>>>(jfnkWrk, jfnkBasis + (size_t)i*n, (real)y[i], jfnkWrk, n);
-    cudaDeviceSynchronize();
-  }
-  rrel = (real)(fabs(g[k])/fmax(b0,1e-300));
-  return k;
-}
-
-// One pseudo-transient Newton step on the k~/tau~ pair.  The mean flow keeps its
-// explicit RK march; only the pair -- where the marginal mode lives -- is solved
-// implicitly.  dtau = jfnkCfl * dt, so this reduces to the explicit update as
-// jfnkCfl -> 0 and to Newton as jfnkCfl -> infinity.
-void CompressibleSolver::ktauImplicitStep(real dt) {
-  jfnkEnsure();
-  const i32 n = NEVOLVE*(i32)(hashTable.nKeys*blockSizeTot);
-  const i32 N = n/NEVOLVE;
-  // per-cell dtau for the local time stepping: reuse the LTS stamp.  F_SCRATCH
-  // holds the per-cell stable step from computeDeltaT, which stampLocalDtKernel
-  // turns into F_DTL.
-  // deltaT already carries the jfnkCfl factor (see step()); F_DTL is the
-  // per-cell dtau directly, and jfnkDiagKernel must NOT multiply again.
-  // Re-stamp F_SCRATCH first: the wall-flux path overwrites it with u_tau
-  // markers during the stages, and stampLocalDtKernel reads it.
-  computeDeltaTKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-  cudaDeviceSynchronize();
-  stampLocalDtKernel<<<cudaGridSize, cudaBlockSize>>>(*this, deltaT, ltsRatio*deltaT);
-  cudaDeviceSynchronize();
-  jfnkGatherKernel<<<cudaGridSize, cudaBlockSize>>>(*this, jfnkQ0, N);
-  cudaDeviceSynchronize();
-  ktauResidual(jfnkR0);
-  real rrel = 0;
-  jfnkGmres(dt, (real)1e-2, rrel);   // dtau is per cell inside jfnkDiagKernel
-  // q = q0 + dq, with the realizability floors applied by the scatter
-  jfnkAxpyKernel<<<256,256>>>(jfnkQ0, jfnkWrk, (real)1, jfnkWrk, n);
-  cudaDeviceSynchronize();
-  jfnkScatterKernel<<<cudaGridSize, cudaBlockSize>>>(*this, jfnkWrk, N);
-  cudaDeviceSynchronize();
-}
-
-// Gate for the product: J*v must be LINEAR in v and must match a directional
-// derivative taken with a different step.  Both are checked, because the first
-// alone passes trivially if J*v is silently zero.
-void CompressibleSolver::jfnkVerify(void) {
-  jfnkEnsure();
-  const i32 n = NEVOLVE*(i32)(hashTable.nKeys*blockSizeTot);
-  const i32 N = n/NEVOLVE;
-  conservativeToPrimitive();
-  jfnkGatherKernel<<<cudaGridSize, cudaBlockSize>>>(*this, jfnkQ0, N);
-  cudaDeviceSynchronize();
-  ktauResidual(jfnkR0);
-  const double r0 = sqrt(thrust::inner_product(thrust::device, jfnkR0, jfnkR0+n,
-                                               jfnkR0, 0.0));
-  // v = normalised residual: a direction the Jacobian actually acts on
-  real *v = jfnkBasis, *Jv = jfnkBasis + n, *Jv2 = jfnkBasis + 2*n;
-  const real sc = (real)(1.0/fmax(r0, 1e-300));
-  jfnkScaleKernel<<<256,256>>>(jfnkR0, sc, v, n);
-  cudaDeviceSynchronize();
-  jfnkMatVec(v, Jv);
-  const double jn = sqrt(thrust::inner_product(thrust::device, Jv, Jv+n, Jv, 0.0));
-  // linearity: J*(2v) must equal 2*(J*v)
-  jfnkScaleKernel<<<256,256>>>(v, (real)2, jfnkWrk, n);
-  cudaDeviceSynchronize();
-  real *v2 = jfnkWrk;
-  jfnkMatVec(v2, Jv2);
-  jfnkCombKernel<<<256,256>>>(Jv2, Jv, (real)1, (real)-2, Jv2, n);
-  cudaDeviceSynchronize();
-  const double ln = sqrt(thrust::inner_product(thrust::device, Jv2, Jv2+n, Jv2, 0.0));
-  printf("[jfnk] n = %d   |R0| = %.6e   |J*v| = %.6e   linearity |J(2v)-2Jv|/|Jv| = %.3e\n",
-         n, r0, jn, ln/fmax(jn, 1e-300));
-  primitiveToConservative();
+void CompressibleSolver::computeShockSensor(void) {
+  shockSensorKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
 }
 
 void CompressibleSolver::applyWallGhosts(void) {
-  if (immerserdBcType != 0) { if (!ibGhostFree) ibGhostKernel<<<cudaGridSize, cudaBlockSize>>>(*this); }
-  else                      wallGhostKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  if (immerserdBcType != 0) {
+    if (!ibGhostFree) {
+      // With the natural mirror the interpolation stencil contains ghosts, so
+      // one pass is a single Jacobi sweep of a coupled system.  Iterate it.
+      // The interface-cell mode couples the first fluid layer to itself as
+      // well (its image-point stencil contains the cell being set), so it
+      // needs at least two sweeps to resolve the self term.
+      i32 nit = (ibGMirror && ibGIter > 1) ? ibGIter : 1;
+      if (ibIface) nit = max(ibGIter, 2);
+      for (i32 it = 0; it < nit; it++) {
+        ibGhostKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+        if (ibIface) ibIfaceKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+      }
+    }
+  }
+  else wallGhostKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
 }
 
 void CompressibleSolver::computeTurbClosure(void) {
@@ -1915,8 +1996,14 @@ void CompressibleSolver::stateHash(const char *tag, i32 it) {
 void CompressibleSolver::computeRightHandSide(void) {
   // --detflux: resolve the flag once (Brinkman face weights and the multiD
   // path are incompatible) and keep the face banks sized to the hash table.
-  if (detFlux && (ibBrink || mdFlux)) {
-    printf("[detflux] disabled: incompatible with %s\n", ibBrink ? "--ibbrink" : "multiD flux");
+  if (detFlux && (mdFlux || ibRccm || ibBrink)) {
+    // The deterministic gather stores raw face fluxes and sums them per cell,
+    // so it bypasses the per-face weights entirely -- which under RCCM are the
+    // cut apertures and the 1/alpha.  Leaving it on applied the wall flux
+    // against UNWEIGHTED Cartesian faces: measured as a uniform-state momentum
+    // residual of exactly p/(alpha dx), i.e. one whole uncancelled aperture.
+    printf("[detflux] disabled: incompatible with %s\n",
+           mdFlux ? "multiD flux" : (ibRccm ? "--ibrccm" : "--ibbrink"));
     detFlux = 0;
   }
   if (detFlux) {
@@ -2640,6 +2727,181 @@ void CompressibleSolver::printDiagnostics(void) {
 //                 h whenever delta scales with h.
 // Comparing them says whether the error is wall-localised or spread.
 //
+// L2 error vs the exact Ringleb solution, split by distance from the curved
+// streamline wall -- same reporting as the annulus case so the two are directly
+// comparable.
+// Which KIND of boundary a non-fluid cell represents.  Default is a wall; only
+// bodies that have a genuine inflow/outflow segment override it.
+__host__ __device__ i32 CompressibleSolver::getBoundaryBcKind(Vec3 pos) {
+  // --ibdir 1: the analytic arcs carry the exact solution (ghost path: the
+  // prescribed ghosts keep their exact initial state; RCCM reads ibDirichlet
+  // directly, this only classifies the ghosts)
+  if (immerserdBcType == 7 && ibDirichlet) return 1;
+  if (immerserdBcType == 6 && ibPolyBc) {
+    // Nearest-segment tag.  Its own search -- caching the index from the
+    // level-set call in a shared member would be a data race across threads.
+    // Stamped once per adaptation, so the extra pass is free.  Note it never
+    // inverts anything, which is the point: the per-cell hodograph inversion
+    // collapsed at the q = qmin arc (disc -> 0) and silently classified the
+    // inflow as a WALL, which walls off the flow.
+    // Nearest WALL and nearest PRESCRIBED segment, kept separately.  A plain
+    // nearest-segment tag flips discontinuously at a junction between the two,
+    // and a cell that lands on the wall side there gets a mirror ghost across
+    // what is actually the outlet -- which showed up as rho = 1.14 against a
+    // physical maximum of 0.92 in the corner where the outlet arc meets the
+    // inner wall.  Occluding an inflow/outflow face with a spurious wall is the
+    // damaging error; carrying the known exact state one cell too far is not.
+    // So near a junction, prefer PRESCRIBED.
+    real dW = (real)1e30, dP = (real)1e30;
+    for (i32 e = 0; e < ibPolyN; e++) {
+      const i32 f = (e + 1 == ibPolyN) ? 0 : e + 1;
+      const real ax = ibPoly[2*e], ay = ibPoly[2*e+1];
+      const real bx = ibPoly[2*f], by = ibPoly[2*f+1];
+      const real ex = bx - ax, ey = by - ay;
+      const real L2 = ex*ex + ey*ey;
+      real t = (L2 > (real)0) ? ((pos[0]-ax)*ex + (pos[1]-ay)*ey)/L2 : (real)0;
+      t = fmin(fmax(t, (real)0), (real)1);
+      const real qx = pos[0] - (ax + t*ex), qy = pos[1] - (ay + t*ey);
+      const real d2 = qx*qx + qy*qy;
+      if (ibPolyBc[e] == 0) { if (d2 < dW) dW = d2; }
+      else                  { if (d2 < dP) dP = d2; }
+    }
+    const real tol = ibPolyBcTol*ibChord;      // junction width
+    return (sqrt(dP) <= sqrt(dW) + tol) ? 1 : 0;
+  }
+  if (immerserdBcType == 9) {
+    // Ringleb: the two streamlines are WALLS (flow is tangent), but the q = qmin
+    // arc is where flow enters and leaves.  Marking that arc a wall blocks the
+    // flow and no steady solution exists -- it must carry the exact state.
+    real q, k;
+    if (!ringlebInvert(pos[0] + ringlebX0, fabs(pos[1] + ringlebY0), q, k)) return 0;
+    return (q < ringlebQmin) ? 1 : 0;
+  }
+  return 0;
+}
+
+void CompressibleSolver::computeRinglebError(void) {
+  cudaDeviceSynchronize();
+  real *Rho = getField(F_RHO), *RhoU = getField(F_RHOU), *RhoV = getField(F_RHOV);
+  real *RhoW = getField(F_RHOW), *RhoE = getField(F_RHOE);
+  double l2[2] = {0,0}, l2r[2] = {0,0}, ar[2] = {0,0};
+  for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
+    u64 loc = bLocList[bIdx];
+    if (loc == kEmpty) continue;
+    i32 lvl = loc >> 60;
+    i32 kb = ((loc >> 40) & ((1 << 20)-1)) - 1;
+    i32 jb = ((loc >> 20) & ((1 << 20)-1)) - 1;
+    i32 ib = ( loc        & ((1 << 20)-1)) - 1;
+    double dxL = domainSize[0]/double(baseGridSize[0]*powi(2,lvl));
+    double dyL = domainSize[1]/double(baseGridSize[1]*powi(2,lvl));
+    i32 gx = baseGridSize[0]/blockSize*powi(2,lvl);
+    i32 gy = baseGridSize[1]/blockSize*powi(2,lvl);
+    if (ib < 0 || jb < 0 || ib >= gx || jb >= gy) continue;
+    const double band = 3.0*fmin(dxL, dyL);   // "near wall" = 3 cells
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      i32 cIdx = bIdx*blockSizeTot + c;
+      if (cFlagsList[cIdx] != ACTIVE) continue;
+      i32 i = c % blockSize, j = (c/blockSize) % blockSize, kk = c/blockSize/blockSize;
+      if (kk != 0) continue;
+      double x = (ib*blockSize + i + 0.5)*dxL, y = (jb*blockSize + j + 0.5)*dyL;
+      if (getField(F_IBM)[cIdx] == (real)0) continue;      // solid / non-fluid
+      real re_, ue_, ve_, pe_;
+      ringlebExact((real)x, (real)y, re_, ue_, ve_, pe_);
+      double r = Rho[cIdx];
+      if (!(r > 0)) continue;
+      double u = RhoU[cIdx]/r, v = RhoV[cIdx]/r, w = RhoW[cIdx]/r;
+      (void)w;
+      double dv2 = (u-(double)ue_)*(u-(double)ue_) + (v-(double)ve_)*(v-(double)ve_);
+      double dr2 = (r-(double)re_)*(r-(double)re_);
+      double A = dxL*dyL;
+      const double gap = -(double)getField(F_PHI)[cIdx];   // phi > 0 INSIDE the body
+      for (i32 z = 0; z < 2; z++) {
+        if (z == 1 && gap < band) continue;
+        l2[z] += dv2*A; l2r[z] += dr2*A; ar[z] += A;
+      }
+    }
+  }
+  printf("---- Ringleb L2 error (vs EXACT) ----\n");
+  for (i32 z = 0; z < 2; z++)
+    printf("  %-9s L2(rho) = %.6e   L2(|u|) = %.6e   (area %.4f)\n",
+           z ? "interior" : "all      ", ar[z] > 0 ? sqrt(l2r[z]/ar[z]) : 0.0,
+           ar[z] > 0 ? sqrt(l2[z]/ar[z]) : 0.0, ar[z]);
+  printf("-------------------------------------\n");
+}
+
+// Paper Sect. 4.2 metrics for the canal (case 18).  Mass flow rate through
+// two x = const sections, Eq. (38)/(39) -- summed over the cells of a grid
+// column with the WET height alpha*dy so a cut floor/ceiling cell counts its
+// fluid part only -- and the pressure coefficient along the floor, taken from
+// the lowest live cell of each column at its fluid centroid (the paper's Cp is
+// the wall-adjacent cell value; the R-Cell state IS the wall-frame fit).
+void CompressibleSolver::computeCanalMetrics(const char *cpFile) {
+  cudaDeviceSynchronize();
+  real *Rho = getField(F_RHO), *RhoU = getField(F_RHOU), *RhoV = getField(F_RHOV);
+  real *RhoW = getField(F_RHOW), *RhoE = getField(F_RHOE), *Al = getField(F_CUTA);
+  const i32 nx = baseGridSize[0];                       // base-level columns only
+  std::vector<double> mdot(nx, 0.0), cpLo(nx, 0.0), yLo(nx, 1e30), xCol(nx, 0.0);
+  std::vector<i32> nCol(nx, 0);
+  const double q = 0.5*(double)canalRhoIn*(double)canalUin*(double)canalUin;
+  for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
+    u64 loc = bLocList[bIdx];
+    if (loc == kEmpty) continue;
+    i32 lvl = loc >> 60;
+    if (lvl != 0) continue;   // uniform-grid case; the metrics assume one level
+    i32 kb = ((loc >> 40) & ((1 << 20)-1)) - 1;
+    i32 jb = ((loc >> 20) & ((1 << 20)-1)) - 1;
+    i32 ib = ( loc        & ((1 << 20)-1)) - 1;
+    i32 gx = baseGridSize[0]/blockSize, gy = baseGridSize[1]/blockSize;
+    if (ib < 0 || jb < 0 || kb != 0 || ib >= gx || jb >= gy) continue;
+    const double dxL = domainSize[0]/double(baseGridSize[0]);
+    const double dyL = domainSize[1]/double(baseGridSize[1]);
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      i32 cIdx = bIdx*blockSizeTot + c;
+      if (cFlagsList[cIdx] != ACTIVE) continue;
+      i32 i = c % blockSize, j = (c/blockSize) % blockSize, kk = c/blockSize/blockSize;
+      if (kk != 0) continue;
+      const i32 col = ib*blockSize + i;
+      const double x = (col + 0.5)*dxL, y = (jb*blockSize + j + 0.5)*dyL;
+      double al = ibRccm ? (double)Al[cIdx] : (isFluidCell(Vec3((real)x,(real)y,0), (real)dyL) ? 1.0 : 0.0);
+      if (ibRccm && al <= (double)ibRccmAlphaMin) continue;
+      if (!isFluidCell(Vec3((real)x,(real)y,0), (real)fmin(dxL,dyL))) continue;
+      const double r = Rho[cIdx], u = RhoU[cIdx]/r, v = RhoV[cIdx]/r, w = RhoW[cIdx]/r;
+      const double p = (gam-1.0)*(RhoE[cIdx] - 0.5*r*(u*u+v*v+w*w));
+      mdot[col] += r*u*al*dyL;  nCol[col]++;  xCol[col] = x;
+      if (y < yLo[col]) { yLo[col] = y; cpLo[col] = (p - (double)canalPin)/q; }
+    }
+  }
+  // Eq. (39) between the sections nearest x = 0.25 L and x = 2.75 L (one
+  // quarter-length in from each end, clear of the inlet/outlet ghosts)
+  auto colAt = [&](double xs) { return (i32)fmin(fmax(floor(xs/domainSize[0]*nx), 0.0), nx - 1.0); };
+  const i32 c1 = colAt(0.25), c2 = colAt(domainSize[0] - 0.25);
+  const i32 cIn = colAt(0.5*domainSize[0]/nx), cOut = colAt(domainSize[0] - 0.5*domainSize[0]/nx);
+  printf("---- canal (paper Sect. 4.2) ----\n");
+  printf("  mdot(x=%.3f) = %.8f   mdot(x=%.3f) = %.8f   mass-flow-rate error Eq.(39) = %.3e\n",
+         xCol[c1], mdot[c1], xCol[c2], mdot[c2], fabs(mdot[c1]-mdot[c2])/fabs(mdot[c2]));
+  printf("  mdot(inlet col) = %.8f   mdot(outlet col) = %.8f   error = %.3e\n",
+         mdot[cIn], mdot[cOut], fabs(mdot[cIn]-mdot[cOut])/fabs(mdot[cOut]));
+  double mmin = 1e30, mmax = -1e30;
+  for (i32 c = 1; c < nx-1; c++) { mmin = fmin(mmin, mdot[c]); mmax = fmax(mmax, mdot[c]); }
+  printf("  mdot over all interior columns: min %.8f  max %.8f  spread %.3e\n", mmin, mmax, (mmax-mmin)/mdot[c2]);
+  // floor Cp, shock location = steepest Cp rise on the bump
+  double dmax = 0; i32 cs = 0;
+  for (i32 c = 1; c < nx; c++) if (cpLo[c]-cpLo[c-1] > dmax) { dmax = cpLo[c]-cpLo[c-1]; cs = c; }
+  printf("  floor Cp: min %.4f   max %.4f   steepest rise at x = %.4f (bump spans [1,2]; paper frame x-1 = %.3f)\n",
+         *std::min_element(cpLo.begin(), cpLo.end()), *std::max_element(cpLo.begin(), cpLo.end()),
+         0.5*(xCol[cs]+xCol[cs-1]), 0.5*(xCol[cs]+xCol[cs-1]) - 1.0);
+  if (cpFile) {
+    FILE *f = fopen(cpFile, "w");
+    if (f) {
+      fprintf(f, "# x  Cp_floor  mdot(x)  yLowestLiveCell   (canal case 18; bump on [1,2]; Cp = (p-p_in)/(0.5 rho_in u_in^2))\n");
+      for (i32 c = 0; c < nx; c++) if (nCol[c]) fprintf(f, "%.6f %.8f %.8f %.6f\n", xCol[c], cpLo[c], mdot[c], yLo[c]);
+      fclose(f);
+      printf("  floor Cp / mdot(x) -> %s\n", cpFile);
+    }
+  }
+  printf("---------------------------------\n");
+}
+
 void CompressibleSolver::computeSvortexError(void) {
   cudaDeviceSynchronize();
   real *Rho = getField(F_RHO), *RhoU = getField(F_RHOU), *RhoV = getField(F_RHOV);
@@ -2682,6 +2944,31 @@ void CompressibleSolver::computeSvortexError(void) {
       double p = (gam-1.0)*(RhoE[cIdx] - 0.5*r*(u*u+v*v+w*w));
       double dv2 = (u-(double)ue_)*(u-(double)ue_) + (v-(double)ve_)*(v-(double)ve_);
       double dr2 = (r-(double)re_)*(r-(double)re_);
+      // where does the error actually live?  radius, cut fraction, cell type
+      {
+        static double wErr = 0; static i32 nrep = 0;
+        const double e = sqrt(dv2 + dr2);
+        if (dbgChecks && e > wErr) {
+          wErr = e;
+          if (nrep < 12) {
+            const double al = (double)getField(F_CUTA)[cIdx];
+            printf("  [err] r=%.4f gap=%.4f alpha=%.3f phi=%+.4f  err=%.3e "
+                   "(rho %.4f vs %.4f, |u| %.4f vs %.4f)\n",
+                   rr, gap, al, (double)getField(F_PHI)[cIdx], e,
+                   r, (double)re_, sqrt(u*u+v*v), sqrt((double)ue_*ue_+(double)ve_*ve_));
+            nrep++;
+          }
+        }
+      }
+      // debug: name the first cells that poison the norm
+      static i32 nBad = 0;
+      if (!(isfinite(dv2) && isfinite(dr2)) && ++nBad < 400) {
+        if (nBad<6) printf("  [norm] NON-FINITE cell at (%.5f, %.5f) r_pol=%.5f gap=%.4f: "
+               "rho=%.3e rhou=%.3e rhov=%.3e rhoE=%.3e | exact rho=%.3e\n",
+               x, y, rr, gap, (double)Rho[cIdx], (double)RhoU[cIdx],
+               (double)RhoV[cIdx], (double)RhoE[cIdx], (double)re_);
+      }
+      if (!(isfinite(dv2) && isfinite(dr2))) continue;  // count, then keep the sums finite
       double A = dxL*dyL;
       for (i32 z = 0; z < 2; z++) {
         if (z == 1 && gap < band) continue;
@@ -2690,12 +2977,102 @@ void CompressibleSolver::computeSvortexError(void) {
       (void)p; (void)pe_;
     }
   }
+  { static i32 dummy=0; (void)dummy; }
   printf("---- supersonic vortex L2 error (vs EXACT) ----\n");
   for (i32 z = 0; z < 2; z++)
     printf("  %-9s L2(rho) = %.6e   L2(|u|) = %.6e   (area %.4f)\n",
            z ? "interior" : "annulus", ar[z] > 0 ? sqrt(l2r[z]/ar[z]) : 0.0,
            ar[z] > 0 ? sqrt(l2[z]/ar[z]) : 0.0, ar[z]);
   printf("-----------------------------------------------\n");
+
+  // ---- the paper's table (Ndiaye et al. Sect. 4.4, Eqs. 40, 41, 44) --------
+  // L1 / L2 / Linf of rho and p over three cell sets: W = every live cell,
+  // I = cells strictly inside (uncut), B = cells on the boundary (cut).  Under
+  // RCCM a cut cell's average lives at its FLUID CENTROID and weighs alpha dV,
+  // so the exact solution is evaluated there and the R-Cells -- centre in the
+  // solid, excluded from the norms above -- are included, as in the paper.
+  // Without RCCM (ghost path) "B" is the first fluid row, gap < h.
+  {
+    real *CA = getField(F_CUTA);
+    double s1[3][2] = {{0,0},{0,0},{0,0}}, s2[3][2] = {{0,0},{0,0},{0,0}};
+    double sinf[3][2] = {{0,0},{0,0},{0,0}}, vol[3] = {0,0,0};
+    i32 ncell[3] = {0,0,0};
+    for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
+      u64 loc = bLocList[bIdx];
+      if (loc == kEmpty) continue;
+      i32 lvl = loc >> 60;
+      i32 kb = ((loc >> 40) & ((1 << 20)-1)) - 1;
+      i32 jb = ((loc >> 20) & ((1 << 20)-1)) - 1;
+      i32 ib = ( loc        & ((1 << 20)-1)) - 1;
+      double dxL = domainSize[0]/double(baseGridSize[0]*powi(2,lvl));
+      double dyL = domainSize[1]/double(baseGridSize[1]*powi(2,lvl));
+      i32 gx = baseGridSize[0]/blockSize*powi(2,lvl);
+      i32 gy = baseGridSize[1]/blockSize*powi(2,lvl);
+      i32 gz = pseudo2D ? baseGridSize[2]/blockSizeZ : baseGridSize[2]/blockSizeZ*powi(2,lvl);
+      if (ib < 0 || jb < 0 || kb < 0 || ib >= gx || jb >= gy || kb >= gz) continue;
+      for (i32 c = 0; c < blockSizeTot; c++) {
+        i32 cIdx = bIdx*blockSizeTot + c;
+        if (cFlagsList[cIdx] != ACTIVE) continue;
+        i32 i = c % blockSize, j = (c/blockSize) % blockSize;
+        double x = (ib*blockSize + i + 0.5)*dxL, y = (jb*blockSize + j + 0.5)*dyL;
+        const real h = (real)fmin(dxL, dyL);
+        // Under Brinkman isFluidCell is true EVERYWHERE (the body is not
+        // masked), so the body interior -- where the penalization holds a
+        // stagnant state that has nothing to do with the exact solution --
+        // would otherwise be scored.  Use the geometry directly there.
+        if (ibBrink) {
+          if (getBoundaryLevelSet(Vec3((real)x,(real)y,(real)0)) >= (real)0) continue;
+        } else if (!isFluidCell(Vec3((real)x,(real)y,(real)0), h)) continue;
+        double w = dxL*dyL, xe = x, ye = y;
+        bool bnd;
+        if (ibRccm) {
+          const double al = (double)CA[cIdx];
+          if (!(al > (double)ibRccmAlphaMin)) continue;          // dead
+          bnd = al < 1.0 - 1e-12;
+          if (bnd) {
+            real f[4], a2, ax2, ay2, cx2 = 0.5, cy2 = 0.5;
+            f[0] = getBoundaryLevelSet(Vec3((real)(x-0.5*dxL), (real)(y-0.5*dyL), 0));
+            f[1] = getBoundaryLevelSet(Vec3((real)(x+0.5*dxL), (real)(y-0.5*dyL), 0));
+            f[2] = getBoundaryLevelSet(Vec3((real)(x+0.5*dxL), (real)(y+0.5*dyL), 0));
+            f[3] = getBoundaryLevelSet(Vec3((real)(x-0.5*dxL), (real)(y+0.5*dyL), 0));
+            rccmCutGeom(f, a2, ax2, ay2, &cx2, &cy2);
+            xe = x + ((double)cx2 - 0.5)*dxL;  ye = y + ((double)cy2 - 0.5)*dyL;
+          }
+          w *= al;
+        } else {
+          const double ddx = x - (double)ibCenter[0], ddy = y - (double)ibCenter[1];
+          const double rr = sqrt(ddx*ddx + ddy*ddy);
+          bnd = fmin(rr - (double)ibRadius, (double)ibRadius2 - rr) < (double)h;
+        }
+        real re_, ue_, ve_, pe_;
+        svortexExact((real)xe, (real)ye, re_, ue_, ve_, pe_);
+        const double r = Rho[cIdx];
+        const double u = RhoU[cIdx]/r, v = RhoV[cIdx]/r, wz = RhoW[cIdx]/r;
+        const double pp = (gam-1.0)*(RhoE[cIdx] - 0.5*r*(u*u+v*v+wz*wz));
+        const double e[2] = {fabs(r - (double)re_), fabs(pp - (double)pe_)};
+        if (!(isfinite(e[0]) && isfinite(e[1]))) continue;
+        const i32 regs[2] = {0, bnd ? 2 : 1};                     // W, then I or B
+        for (i32 q = 0; q < 2; q++) {
+          const i32 z = regs[q];
+          vol[z] += w; ncell[z]++;
+          for (i32 f = 0; f < 2; f++) {
+            s1[z][f] += w*e[f]; s2[z][f] += w*e[f]*e[f];
+            if (e[f] > sinf[z][f]) sinf[z][f] = e[f];
+          }
+        }
+      }
+    }
+    printf("---- paper table: region  cells      L1(rho)      L2(rho)    Linf(rho)"
+           "        L1(p)        L2(p)      Linf(p) ----\n");
+    const char *nm[3] = {"W (all)", "I (uncut)", "B (cut)"};
+    for (i32 z = 0; z < 3; z++)
+      printf("  %-10s %7d  %.5e  %.5e  %.5e  %.5e  %.5e  %.5e\n", nm[z], ncell[z],
+             vol[z] > 0 ? s1[z][0]/vol[z] : 0.0, vol[z] > 0 ? sqrt(s2[z][0]/vol[z]) : 0.0,
+             sinf[z][0],
+             vol[z] > 0 ? s1[z][1]/vol[z] : 0.0, vol[z] > 0 ? sqrt(s2[z][1]/vol[z]) : 0.0,
+             sinf[z][1]);
+    printf("-----------------------------------------------\n");
+  }
 }
 
 void CompressibleSolver::computeVortexError(void) {
@@ -2918,7 +3295,7 @@ __device__ real CompressibleSolver::lim(real &r) {
   return ((r > 0.0 && r < 1.0) ? (2.0*r + r*r*r) / (1.0 + 2.0*r*r) : r);
 }
 
-__device__ real CompressibleSolver::tvdRec(real &ul, real &uc, real &ur) {
+__device__ real CompressibleSolver::tvdRec(real &ul, real &uc, real &ur, real theta) {
   // NVD-form face reconstruction: face = ul + psi(phi)*(ur - ul), where
   // phi = (uc-ul)/(ur-ul) is the normalised variable (== the limiter ratio r).
   // The stencil (ul,uc,ur) is ordered upwind->downwind, so the same formula
@@ -2970,6 +3347,22 @@ __device__ real CompressibleSolver::tvdRec(real &ul, real &uc, real &ur) {
     //   face = -1/6 ul + 5/6 uc + 1/3 ur
     // For SMOOTH tests only -- oscillates at shocks.
     psi = (real)(1.0/3.0) + (real)(5.0/6.0)*phi;
+  }
+  else if (recon == 6) {
+    // gradient MUSCL: the face states are built in the RHS kernel from a
+    // limited least-squares gradient, so this 1-D path is never consulted.
+    psi = (real)(1.0/3.0) + (real)(5.0/6.0)*phi;
+  }
+  else if (recon == 5) {
+    // Ducros-blended third order: the unlimited kappa=1/3 parabola pulled
+    // toward the van Leer limiter by the per-face shock sensor theta
+    // (max of the two adjacent cells' compression sensors, from F_RHOK).
+    // theta ~ 0 in smooth flow -> pure parabola; theta -> 1 in compression
+    // -> pure van Leer.  Callers without sensor information (IB traces, RANS
+    // scalar transport) use the default theta = 1 and stay safely limited.
+    const real psiP = (real)(1.0/3.0) + (real)(5.0/6.0)*phi;
+    const real psiV = (phi > (real)0 && phi < (real)1) ? phi*((real)2.0 - phi) : phi;
+    psi = theta*psiV + ((real)1 - theta)*psiP;
   }
   else {
     // smooth TVD limiter
@@ -3046,6 +3439,23 @@ __host__ __device__ real CompressibleSolver::wallDistance(Vec3 pos) {
 
 // Level set of the immersed body: POSITIVE INSIDE, and a signed DISTANCE (so
 // |grad phi| = 1 and the normal is just -grad phi).
+// Segment-list geometry with a per-segment BC tag.  setAirfoil is this with
+// every tag = wall.
+void CompressibleSolver::setPolyline(const real *xy, const i32 *bc, const real *st, i32 n) {
+  setAirfoil(xy, n);
+  if (!bc) return;
+  cudaMallocManaged(&ibPolyBc, (size_t)n*sizeof(i32));
+  for (i32 i = 0; i < n; i++) ibPolyBc[i] = bc[i];
+  cudaDeviceSynchronize();
+  if (st) {
+    cudaMallocManaged(&ibPolyState, (size_t)4*n*sizeof(real));
+    for (i32 i = 0; i < 4*n; i++) ibPolyState[i] = st[i];
+  }
+  cudaDeviceSynchronize();
+  i32 nw = 0; for (i32 i = 0; i < n; i++) nw += (bc[i] == 0);
+  printf("[ib] segment tags: %d wall, %d prescribed\n", nw, n - nw);
+}
+
 void CompressibleSolver::setAirfoil(const real *xy, i32 n) {
   ibPolyN = n;
   cudaMallocManaged(&ibPoly, (size_t)2*n*sizeof(real));
@@ -3061,6 +3471,116 @@ void CompressibleSolver::setAirfoil(const real *xy, i32 n) {
   printf("[ib] airfoil: %d points, chord %.6f, bbox [%.4f,%.4f] x [%.4f,%.4f]\n",
          n, (double)ibChord, (double)ibBox[0], (double)ibBox[2],
          (double)ibBox[1], (double)ibBox[3]);
+}
+
+//
+// ---- Ringleb flow -----------------------------------------------------------
+// Exact smooth solution of the 2-D steady compressible potential equations,
+// obtained in the hodograph plane.  Streamlines are k = const, so a CURVED wall
+// can be placed exactly on one -- which is why it is the standard verification
+// case for curved-boundary treatments: the geometry error and the flow error are
+// both known analytically.  Stagnation values are rho0 = p0 = a0 = 1.
+//
+// With q = |u| and k the streamline label:
+//   a = sqrt(1 - (g-1)/2 q^2),  rho = a^(2/(g-1)),  p = a^(2g/(g-1))/g
+//   J = 1/a + 1/(3a^3) + 1/(5a^5) - (1/2) ln((1+a)/(1-a))
+//   x = (1/(2 rho))(2/k^2 - 1/q^2) - J/2
+//   y = +- (1/(k rho q)) sqrt(1 - (q/k)^2)
+// The map (q,k) -> (x,y) is analytic; the INVERSE needs a solve, done here by
+// bisection on q along the k found from the streamline relation.  Bisection (not
+// Newton) because the Jacobian is singular at q = k (the streamline apex) and a
+// Newton step there walks straight out of the physical range 0 < q <= k.
+//
+__host__ __device__ void CompressibleSolver::ringlebHodograph(real q, real k,
+                        real &x, real &y, real &rho, real &p) const {
+  const real g = gam;
+  const real a2 = (real)1 - (real)0.5*(g - (real)1)*q*q;
+  const real a  = sqrt(fmax(a2, (real)1e-12));
+  rho = pow(a, (real)2/(g - (real)1));
+  p   = pow(a, (real)2*g/(g - (real)1))/g;
+  const real J = (real)1/a + (real)1/((real)3*a*a*a) + (real)1/((real)5*a*a*a*a*a)
+               - (real)0.5*log(((real)1 + a)/fmax((real)1 - a, (real)1e-12));
+  x = ((real)1/((real)2*rho))*((real)2/(k*k) - (real)1/(q*q)) - (real)0.5*J;
+  const real s = (real)1 - (q*q)/(k*k);
+  y = (real)1/(k*rho*q)*sqrt(fmax(s, (real)0));
+}
+
+// Invert (x,y) -> (q,k).  VERIFIED in isolation before use (round trip 1e-15 over
+// the duct, |div(rho V)| ~ 2e-6 at the finite-difference floor).
+//
+// Two things make this robust where the previous attempt was not:
+//  * It bisects on the CIRCLE IDENTITY  (x + L/2)^2 + y^2 = 1/(2 rho q^2)^2,
+//    which involves q ALONE.  The old version solved for k from y first, and
+//    that quadratic has two roots and goes complex (disc < 0) near the q = qmin
+//    arc -- so the inversion "failed" exactly at the inflow and every such cell
+//    was silently classified as a WALL.
+//  * It restricts q to the SUBSONIC branch, q < q_sonic = sqrt(2/(g+1)).
+//    Ringleb is genuinely double-valued -- subsonic and supersonic states share
+//    (x,y) -- so without this the bisection returns whichever root the bracket
+//    happens to catch, which poisoned the initial condition with near-vacuum
+//    cells (rho ~ 0.05 against a physical floor of 0.55).
+__host__ __device__ bool CompressibleSolver::ringlebInvert(real x, real y,
+                        real &q, real &k) const {
+  const real qSonic = sqrt((real)2/(gam + (real)1));
+  auto f = [&](real qq) {
+    const real b = sqrt(fmax((real)1 - (real)0.5*(gam-(real)1)*qq*qq, (real)1e-12));
+    const real r = pow(b, (real)2/(gam-(real)1));
+    const real L = (real)1/b + (real)1/((real)3*b*b*b) + (real)1/((real)5*b*b*b*b*b)
+                 - (real)0.5*log(((real)1+b)/fmax((real)1-b,(real)1e-12));
+    const real xc = x + (real)0.5*L;
+    const real rad = (real)1/((real)2*r*qq*qq);
+    return xc*xc + y*y - rad*rad;
+  };
+  real a = (real)0.05, bq = qSonic - (real)1e-6;
+  real fa = f(a), fb = f(bq);
+  if (fa*fb > (real)0) return false;
+  for (i32 it = 0; it < 100; it++) {
+    const real m = (real)0.5*(a + bq), fm = f(m);
+    if (fa*fm <= (real)0) { bq = m; fb = fm; } else { a = m; fa = fm; }
+  }
+  q = (real)0.5*(a + bq);
+  const real b = sqrt(fmax((real)1 - (real)0.5*(gam-(real)1)*q*q, (real)1e-12));
+  const real r = pow(b, (real)2/(gam-(real)1));
+  const real L = (real)1/b + (real)1/((real)3*b*b*b) + (real)1/((real)5*b*b*b*b*b)
+               - (real)0.5*log(((real)1+b)/fmax((real)1-b,(real)1e-12));
+  // 2/k^2 = 1/q^2 + 2 rho (x + L/2)   -- sign follows the -L/2 forward map
+  const real sK = (real)1/(q*q) + (real)2*r*(x + (real)0.5*L);
+  if (!(sK > (real)0)) return false;
+  k = sqrt((real)2/sK);
+  return true;
+}
+
+__host__ __device__ void CompressibleSolver::ringlebExact(real x, real y, real &rho,
+                        real &u, real &v, real &p) const {
+  // solver coordinates -> Ringleb coordinates (the map spans negative x, and the
+  // physical region is centred in the box so the domain BCs stay shielded)
+  const real X = x + ringlebX0, Y = y + ringlebY0;
+  real q, k;
+  if (!ringlebInvert(X, fabs(Y), q, k)) { rho = 1; u = 0; v = 0; p = (real)1/gam; return; }
+  real xx, yy;
+  ringlebHodograph(q, k, xx, yy, rho, p);
+  // Velocity direction is tangent to the streamline: sin(theta) = q/k, and the
+  // flow turns back on itself past the apex, so the x-sign follows dx/dq.
+  // Direction is the streamline tangent.  With sin(theta) = q/k the unit tangent
+  // is (cos theta, -sin theta) on the upper branch -- VERIFIED against a finite
+  // difference of the hodograph parametrisation d(x,y)/dq, which is the only
+  // way I trust the assignment: swapping u and v here still gives |V| = q, so
+  // the mistake is invisible in every magnitude check and only shows up as a
+  // non-converging L2 error against a solution that is not actually steady.
+  // Direction = the streamline tangent, taken as a FINITE DIFFERENCE of the
+  // forward map at fixed k.  Correct by construction: every closed-form angle
+  // relation I tried (sin th = q/k either way round) disagreed with the actual
+  // tangent, and the error is invisible in any magnitude check because |V| = q
+  // regardless -- it only shows up as a non-zero div(rho V).
+  const real hq = (real)1e-6;
+  real x1, y1, r1, p1, x2, y2, r2, p2;
+  ringlebHodograph(fmax(q - hq, (real)1e-4), k, x1, y1, r1, p1);
+  ringlebHodograph(q + hq,                   k, x2, y2, r2, p2);
+  real tx = x2 - x1, ty = y2 - y1;
+  const real tn = sqrt(fmax(tx*tx + ty*ty, (real)1e-30));
+  tx /= tn; ty /= tn;
+  if (Y < (real)0) ty = -ty;                // lower half is the mirror
+  u = q*tx;  v = q*ty;
 }
 
 __host__ __device__ void CompressibleSolver::svortexExact(real x, real y, real &rho,
@@ -3079,6 +3599,13 @@ __host__ __device__ void CompressibleSolver::svortexExact(real x, real y, real &
   p   = pow(rho, gam)/gam;
   const real ut = M*ri/r;                     // counter-clockwise
   u = -ut*dy/r;  v = ut*dx/r;
+}
+
+__host__ __device__ bool CompressibleSolver::exactState(real x, real y, real &rho,
+                                                        real &u, real &v, real &p) {
+  if (icType == 13) { svortexExact(x, y, rho, u, v, p); return true; }
+  if (icType == 14) { ringlebExact(x, y, rho, u, v, p); return true; }
+  return false;
 }
 
 __host__ __device__ real CompressibleSolver::getBoundaryLevelSet(Vec3 pos) {
@@ -3136,10 +3663,18 @@ __host__ __device__ real CompressibleSolver::getBoundaryLevelSet(Vec3 pos) {
     // where it matters and skips the O(N) loop for the bulk of the domain.
     const real ex = fmax(fmax(ibBox[0]-px, px-ibBox[2]), (real)0);
     const real ey = fmax(fmax(ibBox[1]-py, py-ibBox[3]), (real)0);
-    if (ex*ex + ey*ey > ibChord*ibChord*(real)0.04)      // > 0.2c outside the box
-      return -sqrt(ex*ex + ey*ey);
+    if (ex*ex + ey*ey > ibChord*ibChord*(real)0.04) {    // > 0.2c outside the box
+      // NOTE the sign must follow the SAME convention as the exact branch below.
+      // This early-out assumed "polyline bounds a solid body", so far == outside
+      // == fluid.  A loop bounding the FLUID (a duct) inverts that, and missing
+      // it here labelled two slabs of far-field as fluid while the exact branch
+      // labelled them solid -- the flip has to be applied at BOTH exits.
+      const real dbox = -sqrt(ex*ex + ey*ey);
+      return ibPolyFluidInside ? -dbox : dbox;
+    }
     real d2min = (real)1e30;
     i32  wind  = 0;
+    i32  eMin  = 0;                       // nearest segment (carries the BC tag)
     for (i32 e = 0; e < ibPolyN; e++) {
       const i32 f = (e + 1 == ibPolyN) ? 0 : e + 1;
       const real ax = ibPoly[2*e], ay = ibPoly[2*e+1];
@@ -3150,7 +3685,8 @@ __host__ __device__ real CompressibleSolver::getBoundaryLevelSet(Vec3 pos) {
       real t = (vv > (real)0) ? (wx*vx + wy*vy)/vv : (real)0;
       t = fmin(fmax(t, (real)0), (real)1);
       const real qx = px - (ax + t*vx), qy = py - (ay + t*vy);
-      d2min = fmin(d2min, qx*qx + qy*qy);
+      const real d2 = qx*qx + qy*qy;
+      if (d2 < d2min) { d2min = d2; eMin = e; }
       // winding number (crossing rule) -- sign is independent of the distance
       if ((ay > py) != (by > py)) {
         const real xint = ax + (py - ay)/(by - ay)*(bx - ax);
@@ -3158,7 +3694,9 @@ __host__ __device__ real CompressibleSolver::getBoundaryLevelSet(Vec3 pos) {
       }
     }
     const real dist = sqrt(d2min);
-    return (wind & 1) ? dist : -dist;      // POSITIVE INSIDE, matching the rest
+    const real sgn = (wind & 1) ? dist : -dist;   // POSITIVE INSIDE the loop
+    // Convention is POSITIVE = SOLID.  A loop bounding the fluid flips it.
+    return ibPolyFluidInside ? -sgn : sgn;
   }
   if (immerserdBcType == 8) {
     // Planar SLAB: fluid for ibPlane < y < ibRadius2, solid outside.  Used with
@@ -3166,6 +3704,26 @@ __host__ __device__ real CompressibleSolver::getBoundaryLevelSet(Vec3 pos) {
     // wrap joins solid to solid, so there is no outer boundary condition at all
     // and no inflow/outflow or blockage to contaminate the exact solution.
     return fmax(ibPlane - pos[1], pos[1] - ibRadius2);
+  }
+  if (immerserdBcType == 9) {
+    // Ringleb: the walls ARE streamlines k = ringlebKmin / kMax, so the body is
+    // "outside the band of streamlines we keep".  k is only defined inside the
+    // hodograph map; points off it are solid.  phi is k-distance scaled by the
+    // local streamline spacing so it behaves like a distance near the wall --
+    // the IB only needs the sign and a locally-consistent magnitude.
+    const real X = pos[0] + ringlebX0, Y = pos[1] + ringlebY0;
+    real q, k;
+    if (!ringlebInvert(X, fabs(Y), q, k)) return (real)1;   // off the map = solid
+    const real w = (real)0.5*(ringlebKmax - ringlebKmin);
+    const real c = (real)0.5*(ringlebKmax + ringlebKmin);
+    // The level set defines the FLUID PARTITION only: fluid is the streamline
+    // band AND q >= qmin.  It does NOT say what kind of boundary each side is --
+    // that is getBoundaryBcKind, which marks the q = qmin arc as PRESCRIBED
+    // (flow enters and leaves there) and the two streamlines as WALLS.  Both are
+    // then imposed through the same ghost cells.
+    const real dk = fabs(k - c) - w;          // > 0 outside the streamline band
+    const real dq = ringlebQmin - q;          // > 0 inside the q = qmin arc
+    return fmax(dk, dq)*(ringlebScale > 0 ? ringlebScale : (real)1);
   }
   if (immerserdBcType == 7) {          // concentric annulus (supersonic vortex)
     // Solid for r < ibRadius OR r > ibRadius2.  max() of the two half-space
@@ -3178,6 +3736,15 @@ __host__ __device__ real CompressibleSolver::getBoundaryLevelSet(Vec3 pos) {
   if (immerserdBcType == 3) {          // cylinder about the z axis
     const real dx = pos[0]-ibCenter[0], dy = pos[1]-ibCenter[1];
     return ibRadius - sqrt(dx*dx + dy*dy);
+  }
+  if (immerserdBcType == 10) {         // canal: floor U bump disc U ceiling
+    // Union of three solids -> max of the three signed distances, which is the
+    // EXACT distance on the fluid side (the only side the cut apertures and the
+    // R-Cell foot points read).  The disc meets the floor at the bump's two
+    // corners, where both terms vanish together.
+    const real dx = pos[0]-ibCenter[0], dy = pos[1]-ibCenter[1];
+    const real bump = ibRadius - sqrt(dx*dx + dy*dy);
+    return fmax(fmax(canalY0 - pos[1], bump), pos[1] - canalY1);
   }
   else {
     // No body.  NEGATIVE means "infinitely far outside", matching the sphere
@@ -3192,132 +3759,6 @@ __host__ __device__ real CompressibleSolver::getBoundaryLevelSet(Vec3 pos) {
 // so that direction is -grad(phi); for a signed distance |grad phi| = 1, but the
 // explicit normalisation keeps this honest for level sets that are only
 // approximately distances.
-// Volume fraction phi = V_fluid/V_total for the pressure-tight penalization,
-// Reiss 2021 Eq. (28):  phi = eps + (1-eps)*(1 + tanh(s/delta))/2, with s the
-// signed distance (positive in the fluid) and delta = ibBrinkDelta * h.
-//
-// The tanh is not cosmetic and a smoothstep is NOT a substitute.  The scheme
-// divides the RHS by phi, so what has to stay bounded is the LOGARITHMIC slope
-// d(ln phi)/ds, which the tanh caps at 2/delta -- giving a phi ratio of only
-// ~2 between neighbouring cells no matter how small eps is.  A polynomial
-// blend lands on the eps plateau abruptly and the same ratio reaches ~1e4.
-// That bounded log-slope is the "non-stiff" of the paper's title: at
-// delta = 1.5h the measured stiffness rises just 25% (paper Fig. 5, Sec 4.1.3).
-__host__ __device__ real CompressibleSolver::brinkPhi(real s, real h) {
-  const real x = s/fmax(ibBrinkDelta*h, (real)1e-30);
-  // (1 + tanh x)/2 evaluated as the logistic sigmoid 1/(1 + exp(-2x)).  These
-  // are identical in exact arithmetic, but the literal tanh form is unusable
-  // here: deep in the body tanh(x) -> -1 and "1 + tanh(x)" cancels away every
-  // significant digit, so phi degenerates to round-off noise below ~1e-7 in
-  // fp32 -- exactly the range this method lives in.  The sigmoid underflows
-  // gracefully to 0 instead and keeps full RELATIVE accuracy at every depth,
-  // which is what the 1/phi division needs.
-  const real g = (x > (real)0) ? (real)1/((real)1 + exp((real)-2*x))
-                               : exp((real)2*x)/((real)1 + exp((real)2*x));
-  return ibBrinkEps + ((real)1 - ibBrinkEps)*g;
-}
-
-// Darcy friction mask: 1 deep inside the body, 0 at the wall and in the fluid.
-// Same profile (28) as the volume fraction but with its own, SHARPER width --
-// the paper uses delta_Darcy = delta/2 "to ensure a quick decay of the
-// tangential velocity" -- and retreated ibBrinkShift cells into the body.
-//
-// The sharper width is what makes a slip wall and a damped interior compatible.
-// The mask must be ~0 wherever fluid actually flows: chi looks negligible per
-// step, but it compounds, and a mask of only 5e-3 at the wall removes ~90% of
-// the tangential velocity over a few hundred steps -- a silently no-slip wall.
-// Halving the width drops the wall value by ~200x and buys back the slip.
-//
-// Written as sigmoid(-2x) rather than 1 - phi on purpose: 1 - 0.99999 in fp32
-// keeps barely one significant digit, so the literal difference IS the noise
-// floor exactly where the mask has to be small and accurate.
-__host__ __device__ real CompressibleSolver::brinkDarcyMask(real s, real h) {
-  const real dD = fmax(ibBrinkDelta*ibBrinkDarcyFac*h, (real)1e-30);
-  const real x  = (s + ibBrinkShift*h)/dD;
-  return (x > (real)0) ? exp((real)-2*x)/((real)1 + exp((real)-2*x))
-                       : (real)1/((real)1 + exp((real)2*x));
-}
-
-// phi_f/phi_c without ever forming the quotient of two tiny numbers.
-//
-//   phi(s) = eps + (1-eps) g(s),   g(s) = sigmoid(2s/delta)
-//
-// so the ratio is (eps + (1-eps) g_f)/(eps + (1-eps) g_c).  The trap is that
-// deep in the band both g are far below fp32 resolution while their RATIO is
-// perfectly well conditioned -- and it is the ratio, not either value, that
-// multiplies the flux.  Use the identity
-//
-//   g(a)/g(b) = (1 + e^-b)/(1 + e^-a)
-//
-// which is exact and cancellation-free for every a, b, then fold the eps floor
-// back in through r = g_f/g_c:
-//
-//   phi_f/phi_c = (eps/g_c + (1-eps) r)/(eps/g_c + (1-eps))
-//
-// with eps/g_c = eps (1 + e^-b) evaluated in a guarded form.  Where the band is
-// well above the floor this is just r; where it saturates it tends to 1.
-__host__ __device__ real CompressibleSolver::brinkRatio(real sF, real sC, real h) {
-  const real d = fmax(ibBrinkDelta*h, (real)1e-30);
-  const real a = (real)2*sF/d, b = (real)2*sC/d;
-  const real ea = exp(-fabs(a)), eb = exp(-fabs(b));
-  // (1 + e^-b)/(1 + e^-a), written so neither exponent ever overflows
-  const real na = (a >= (real)0) ? ((real)1 + ea) : ((real)1 + ea)/ea;
-  const real nb = (b >= (real)0) ? ((real)1 + eb) : ((real)1 + eb)/eb;
-  const real r  = nb/fmax(na, (real)1e-30);            // = g_f/g_c, exact
-  // eps/g_c, guarded: g_c = 1/(1 + e^-b) for b>=0, else e^b/(1+e^b)
-  const real invgc = (b >= (real)0) ? ((real)1 + eb) : ((real)1 + eb)/eb;
-  const real t = ibBrinkEps*invgc;
-  if (!isfinite(t) || t > (real)1e12) return (real)1;   // both deep on the floor
-  return (t + ((real)1 - ibBrinkEps)*r)/(t + ((real)1 - ibBrinkEps));
-}
-
-__host__ __device__ void CompressibleSolver::brinkGradPhiOverPhi(real s, Vec3 n,
-                                                                 real h, real gp[3]) {
-  const real d = fmax(ibBrinkDelta*h, (real)1e-30);
-  const real x = (real)2*s/d;
-  // g and 1-g in the cancellation-free form (same reason as brinkPhi)
-  const real e = exp(-fabs(x));
-  const real g  = (x > (real)0) ? (real)1/((real)1 + e) : e/((real)1 + e);
-  const real omg = (real)1 - g;
-  const real phi = ibBrinkEps + ((real)1 - ibBrinkEps)*g;
-  // (dphi/ds)/phi = (1-eps)(2/delta) g(1-g) / (eps + (1-eps) g)
-  const real f = ((real)1 - ibBrinkEps)*((real)2/d)*g*omg/fmax(phi,(real)1e-30);
-  gp[0] = f*n[0]; gp[1] = f*n[1]; gp[2] = f*n[2];
-}
-
-__host__ __device__ real CompressibleSolver::brinkPhiFaceAvg(real s1, real s2, real h) {
-  const real d  = fmax(ibBrinkDelta*h, (real)1e-30);
-  const real ds = s2 - s1;
-  if (fabs(ds) < (real)1e-6*d) return brinkPhi((real)0.5*(s1+s2), h);  // degenerate
-  // softplus(x) = ln(1+e^x), evaluated without overflow
-  #define SP_(X) (((X) > (real)0) ? ((X) + log1p(exp(-(X)))) : log1p(exp(X)))
-  const real a1 = (real)2*s1/d, a2 = (real)2*s2/d;
-  const real gbar = (d/(real)2)*(SP_(a2) - SP_(a1))/ds;
-  #undef SP_
-  return ibBrinkEps + ((real)1 - ibBrinkEps)*gbar;
-}
-
-__host__ __device__ real CompressibleSolver::brinkPhiFaceAvgSeg(Vec3 p0, Vec3 p1,
-                                                                  real h, i32 nseg) {
-  const real d = fmax(ibBrinkDelta*h, (real)1e-30);
-  if (nseg < 1) nseg = 1;
-  #define SP_(X) (((X) > (real)0) ? ((X) + log1p(exp(-(X)))) : log1p(exp(X)))
-  real s0 = -getBoundaryLevelSet(p0);
-  real tot = (real)0;
-  for (i32 i = 1; i <= nseg; i++) {
-    const real t = (real)i/(real)nseg;
-    const real s1 = -getBoundaryLevelSet(Vec3(p0[0] + (p1[0]-p0[0])*t,
-                                              p0[1] + (p1[1]-p0[1])*t,
-                                              p0[2] + (p1[2]-p0[2])*t));
-    const real a = (real)2*s0/d, b = (real)2*s1/d, ds = s1 - s0;
-    if (fabs(ds) > (real)1e-9*d) tot += (d/(real)2)*(SP_(b) - SP_(a))/ds;
-    else { const real e = exp(-fabs(a));
-           tot += (a >= (real)0) ? (real)1/((real)1+e) : e/((real)1+e); }
-    s0 = s1;
-  }
-  #undef SP_
-  return ibBrinkEps + ((real)1 - ibBrinkEps)*tot/(real)nseg;
-}
 
 __host__ __device__ Vec3 CompressibleSolver::wallNormal(Vec3 pos, real h) {
   // EXACT closest-point normal (user's call): the direction from the closest
@@ -3340,6 +3781,27 @@ __host__ __device__ Vec3 CompressibleSolver::wallNormal(Vec3 pos, real h) {
     real dx=pos[0]-ibCenter[0], dy=pos[1]-ibCenter[1];
     const real m = sqrt(dx*dx+dy*dy);
     if (m > (real)1e-30) return Vec3(dx/m, dy/m, 0);
+  }
+  if (immerserdBcType == 7) {          // annulus: radial, sign by nearer wall
+    // ANALYTIC normal.  Without this branch the annulus fell through to the
+    // mollified finite-difference fallback below -- an O(h) normal at the one
+    // geometry used for every order study, feeding an O(h)|u| error straight
+    // into the tangential projection of every wall treatment.  Body -> fluid:
+    // +r_hat off the inner cylinder, -r_hat off the outer shell, switching at
+    // the midradius exactly where the fmax() in the level set switches.
+    real dx=pos[0]-ibCenter[0], dy=pos[1]-ibCenter[1];
+    const real m = sqrt(dx*dx+dy*dy);
+    if (m > (real)1e-30) {
+      const real sg = (ibRadius - m >= m - ibRadius2) ? (real)1 : (real)-1;
+      return Vec3(sg*dx/m, sg*dy/m, 0);
+    }
+  }
+  if (immerserdBcType == 10) {         // canal: nearest of floor / bump / ceiling
+    const real dx=pos[0]-ibCenter[0], dy=pos[1]-ibCenter[1];
+    const real m = sqrt(dx*dx+dy*dy);
+    const real fl = canalY0 - pos[1], bp = ibRadius - m, ce = pos[1] - canalY1;
+    if (bp >= fl && bp >= ce && m > (real)1e-30) return Vec3(dx/m, dy/m, 0);
+    return (fl >= ce) ? Vec3(0, 1, 0) : Vec3(0, -1, 0);
   }
   if (immerserdBcType == 4 || immerserdBcType == 5) {
     // quarter-plane, possibly rotated: faces at sAlong = 0 (front) and
@@ -3444,13 +3906,78 @@ __host__ __device__ Vec3 CompressibleSolver::wallNormal(Vec3 pos, real h) {
 // A cell counts as FLUID only if it lies entirely outside the body: following
 // UTCart, every cell the surface intersects is treated as non-fluid and carries
 // no solution.  For a signed distance that is phi(centre) < -(half diagonal).
+// ---- Brinkman volume penalization: porosity helpers ------------------------
+// Restored 2026-09-02 (brinkman branch) from the pre-cleanup solver, verbatim:
+// these are the numerically delicate part of the method and the fp32-safe
+// forms below were arrived at by measurement, not preference.
+// Volume fraction phi = V_fluid/V_total for the pressure-tight penalization,
+// Reiss 2021 Eq. (28):  phi = eps + (1-eps)*(1 + tanh(s/delta))/2, with s the
+// signed distance (positive in the fluid) and delta = ibBrinkDelta * h.
+//
+// The tanh is not cosmetic and a smoothstep is NOT a substitute.  The scheme
+// divides the RHS by phi, so what has to stay bounded is the LOGARITHMIC slope
+// d(ln phi)/ds, which the tanh caps at 2/delta -- giving a phi ratio of only
+// ~2 between neighbouring cells no matter how small eps is.  A polynomial
+// blend lands on the eps plateau abruptly and the same ratio reaches ~1e4.
+// That bounded log-slope is the "non-stiff" of the paper's title: at
+// delta = 1.5h the measured stiffness rises just 25% (paper Fig. 5, Sec 4.1.3).
+__host__ __device__ real CompressibleSolver::brinkPhi(real s, real h) {
+  const real x = s/fmax(ibBrinkDelta*h, (real)1e-30);
+  // (1 + tanh x)/2 evaluated as the logistic sigmoid 1/(1 + exp(-2x)).  These
+  // are identical in exact arithmetic, but the literal tanh form is unusable
+  // here: deep in the body tanh(x) -> -1 and "1 + tanh(x)" cancels away every
+  // significant digit, so phi degenerates to round-off noise below ~1e-7 in
+  // fp32 -- exactly the range this method lives in.  The sigmoid underflows
+  // gracefully to 0 instead and keeps full RELATIVE accuracy at every depth,
+  // which is what the 1/phi division needs.
+  const real g = (x > (real)0) ? (real)1/((real)1 + exp((real)-2*x))
+                               : exp((real)2*x)/((real)1 + exp((real)2*x));
+  return ibBrinkEps + ((real)1 - ibBrinkEps)*g;
+}
+
+__host__ __device__ real CompressibleSolver::brinkPhiFaceAvgSeg(Vec3 p0, Vec3 p1,
+                                                                  real h, i32 nseg) {
+  const real d = fmax(ibBrinkDelta*h, (real)1e-30);
+  if (nseg < 1) nseg = 1;
+  #define SP_(X) (((X) > (real)0) ? ((X) + log1p(exp(-(X)))) : log1p(exp(X)))
+  real s0 = -getBoundaryLevelSet(p0);
+  real tot = (real)0;
+  for (i32 i = 1; i <= nseg; i++) {
+    const real t = (real)i/(real)nseg;
+    const real s1 = -getBoundaryLevelSet(Vec3(p0[0] + (p1[0]-p0[0])*t,
+                                              p0[1] + (p1[1]-p0[1])*t,
+                                              p0[2] + (p1[2]-p0[2])*t));
+    const real a = (real)2*s0/d, b = (real)2*s1/d, ds = s1 - s0;
+    if (fabs(ds) > (real)1e-9*d) tot += (d/(real)2)*(SP_(b) - SP_(a))/ds;
+    else { const real e = exp(-fabs(a));
+           tot += (a >= (real)0) ? (real)1/((real)1+e) : e/((real)1+e); }
+    s0 = s1;
+  }
+  #undef SP_
+  return ibBrinkEps + ((real)1 - ibBrinkEps)*tot/(real)nseg;
+}
+
 __host__ __device__ bool CompressibleSolver::isFluidCell(Vec3 pos, real h) {
   if (immerserdBcType == 0) return true;
   // Volume penalization does NOT mask the body: the equations are solved
-  // everywhere and the wall appears as a source term, so every cell is fluid.
-  // This one line switches off the sharp-IB machinery wholesale -- no wall
-  // faces, no ghost fill, no update/dt masking.
+  // everywhere and the wall appears through the porosity weights and the
+  // p grad(phi) source, so every cell is fluid.  This one line switches off the
+  // sharp-IB machinery wholesale -- no wall faces, no ghost fill, no update or
+  // dt masking.
   if (ibBrink) return true;
+  // RCCM keeps every cell the body only PARTIALLY covers -- that is the whole
+  // point of a cut-cell discretisation, and it is the exact opposite of the
+  // UTCart rule below ("any intersecting cell is non-fluid").  A cell is live
+  // when any corner is in the fluid; the small ones among them become R-Cells
+  // and are reconstructed rather than advanced.
+  if (ibRccm) {
+    const real hh = (real)0.5*h;
+    for (i32 a = -1; a <= 1; a += 2)
+      for (i32 b = -1; b <= 1; b += 2)
+        if (getBoundaryLevelSet(Vec3(pos[0]+a*hh, pos[1]+b*hh, pos[2])) < (real)0)
+          return true;
+    return false;
+  }
   // UTCart's rule is "every INTERSECTING cell is non-fluid", and a cell is
   // intersected exactly when the level set changes sign across its CORNERS.
   // The old test compared phi at the centre against the half-DIAGONAL, i.e. the

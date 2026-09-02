@@ -43,12 +43,18 @@ static constexpr int cudaGridSize = 1000;
 #endif
 static constexpr int nCellsMax = NCELLS_MAX;
 
-// solver precision: float by default; -DUSE_DOUBLE builds the wave3d_dp binary
-// (used for convergence studies where float roundoff floors the error)
-#ifdef USE_DOUBLE
-typedef double real;
-#else
+// Solver precision: DOUBLE by default (user's call, 2026-08-30); -DUSE_SINGLE
+// opts back into float.  Measured on the RAE steady march: in float the residual
+// ||dq/dt|| floors at ~5e-3 and stops, because dq cannot resolve below eps*|q|
+// and the 1/dt in the norm amplifies that round-off (worst in the finest cells,
+// which have the smallest dt).  The identical case in double runs 7 orders down
+// to ~1.7e-6.  Every "convergence stall" chased before this -- adaptation, the
+// limiter, ghosts vs ghost-free vs Brinkman, JFNK -- was that float floor.
+// -DUSE_DOUBLE is still accepted so existing *_dp targets keep working.
+#ifdef USE_SINGLE
 typedef float real;
+#else
+typedef double real;
 #endif
 
 #endif

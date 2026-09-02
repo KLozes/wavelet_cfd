@@ -39,6 +39,7 @@
 #include "PolyFit.h"
 #include "SayeQuad.h"
 #include "CutQuadCompress.h"
+#include "CutLinQuad.h"
 #include "IgaElem.h"
 
 static inline u64 qpKey(i32 I, i32 J, i32 K) {
@@ -125,6 +126,10 @@ struct CutDev {
   const i32 *eNode, *nMap; const char *nRot; real cph, sph;
   const i32 *intList, *cutElem;                    // interior cells; cut-cell -> element
   const SayeNode *volP, *surfP; const i32 *volOff, *surfOff; const char *surfDir;
+  const i32 *surfDirN;   // per cut cell: how many surface pts carry a BC.  They are
+                         // the PREFIX of the cell's block, so the operator stops
+                         // there; the rest exist for the stress report / VTU only.
+                         // nullptr => fall back to the whole block (correct, slower).
   const i32 *gfM, *gfP, *gfD; const real *Kref, *Kg[3];
   i32 cyl; LevelSet ls; const i32 *eCijk, *eCut;   // cylindrical: analytic metric per element (ci,cj,ck), per-element cut index
   const real *volJ, *surfJ;                        // precomputed metric [Jinv(9),detJ(1)] at Saye vol/surf points (shared across p-levels)
@@ -194,7 +199,7 @@ __global__ void cutCellK(CutDev S,const real*xn,real*yn){ IgaBasis B=S.B; i32 nd
       real wq=vn->w*S.h;
       for(i32 a=0;a<ndof;a++)for(i32 i2=0;i2<3;i2++) atomicAdd(&yl[3*a+i2],wq*(sig[i2][0]*gb[3*a]+sig[i2][1]*gb[3*a+1]+sig[i2][2]*gb[3*a+2])); }
     // Nitsche surface (Dirichlet points only)
-    i32 s0=S.surfOff[c], ns=S.surfOff[c+1]-s0; const SayeNode*sn=S.surfP+s0;
+    i32 s0=S.surfOff[c], ns=S.surfDirN?S.surfDirN[c]:(S.surfOff[c+1]-s0); const SayeNode*sn=S.surfP+s0;
     for(i32 q=threadIdx.x;q<ns;q+=blockDim.x){ if(!S.surfDir[s0+q]) continue;
       real gb[3*CUT_QN3], vb[CUT_QN3];
       real xr[3]={sn[q].x[0],sn[q].x[1],sn[q].x[2]}, nn[3]={sn[q].n[0],sn[q].n[1],sn[q].n[2]};
@@ -251,7 +256,7 @@ __global__ void cutCylK(CutDev S,const real*xn,real*yn){ IgaBasis B=S.B; i32 ndo
       double wdet=fabs(detJ)*wq;
       for(i32 a=0;a<ndof;a++)for(i32 i2=0;i2<3;i2++) atomicAdd(&yl[3*a+i2],(real)(wdet*(sig[i2][0]*gxl[3*a]+sig[i2][1]*gxl[3*a+1]+sig[i2][2]*gxl[3*a+2])));
     }
-    if(cut){ i32 s0=S.surfOff[c], ns=S.surfOff[c+1]-s0; const SayeNode*sn=S.surfP+s0;
+    if(cut){ i32 s0=S.surfOff[c], ns=S.surfDirN?S.surfDirN[c]:(S.surfOff[c+1]-s0); const SayeNode*sn=S.surfP+s0;
       i32 spm=S.sp[0]<S.sp[1]?S.sp[0]:S.sp[1]; spm=spm<S.sp[2]?spm:S.sp[2];   // Nitsche penalty ~ 1/h_elem: smallest extent (coercivity-safe)
       double penC=(double)S.gammaD/(spm*S.h);
       for(i32 q=threadIdx.x;q<ns;q+=blockDim.x){ if(!S.surfDir[s0+q])continue; real xr[3]={sn[q].x[0],sn[q].x[1],sn[q].x[2]};
@@ -507,12 +512,84 @@ void CutFemSolver::runIga(void) {
   // -------------------------------------------------------------------------
   //  per-element level-set polynomial + Saye cut quadrature
   // -------------------------------------------------------------------------
+  //  CUT_GEOMSUB=s (default 1) builds the cut rule on an s^3 lattice of SUB-CELLS
+  //  with its own level-set fit per sub-cell, instead of one polynomial per
+  //  element.  This is Potter Sec. 4.9 ("Pruning inefficient rules"): the fine
+  //  composite rule is a MOMENT GENERATOR, not the rule the solver runs on.  NNLS
+  //  immediately prunes it back to the same m = C(2p+3,3) points per cell, so the
+  //  matvec cost is IDENTICAL and only setup pays.  The paper's words for exactly
+  //  this: "for curved domains, adaptive refinement can ensure the mapped rule
+  //  computes the moments to within a prescribed error tolerance ... once these
+  //  moments are known, the elementwise structure becomes irrelevant."
+  //
+  //  What it buys is GEOMETRY.  The surface displacement error of the fit is
+  //  O(h^{gq+1}), so sub-cells cut it by s^{gq+1} (64x at s=4, gq=2) WITHOUT
+  //  raising the fit degree -- which aa4ae1b measured as saturating at ~3e-4 on
+  //  the blade, because the loft is piecewise linear between ~13 sections and a
+  //  higher-degree polynomial has nothing left to converge to.  Sub-cells attack
+  //  the OTHER term.  A CSG crease is also confined to the few sub-cells that
+  //  actually contain it rather than making the whole element's fit oscillate.
+  //
+  //  Build and prune are FUSED per cut element.  The fine rule is ~s^3 times
+  //  larger, so materializing the whole fine pool before pruning would cost tens
+  //  of GB on a blade run; here only one fine element rule per thread is live.
   std::vector<PolyND> ePoly(nE);
   std::vector<i32> cutIdx(nE,-1); i32 nCutQ=0;
   for (i32 e=0;e<nE;e++){ ePoly[e]=fitPoly3(gq,&ephi[(size_t)e*gnd]); if (elems[e].cut) cutIdx[e]=nCutQ++; }
+  std::vector<i32> cutE(nCutQ); for (i32 e=0;e<nE;e++) if (elems[e].cut) cutE[cutIdx[e]]=e;
+  // CUT_GEOM = saye (default) | lin.  'lin' drops the Saye height-function
+  // recursion entirely and cuts a PIECEWISE-LINEAR level set sampled on an
+  // (s+1)^3 oracle lattice (see CutLinQuad.h): exact purity test, exact
+  // discrete closure, no recursion depth cap, and 125 oracle calls per cut
+  // element at s=4 against 1728 for a per-sub-cell Saye fit.
+  const char *gmEnv = getenv("CUT_GEOM");
+  const bool linMode = gmEnv && !strcmp(gmEnv,"lin");
+  // s=1 in lin mode is the crude trilinear-on-element-corners geometry (the p=1
+  // model); the whole point is to sub-sample, so default to 4 when unset.
+  i32 gs = getenv("CUT_GEOMSUB")? atoi(getenv("CUT_GEOMSUB")) : (linMode?4:1); if (gs<1) gs=1;
+  const bool doPrune = !getenv("CUT_NOPRUNE") && nCutQ>0;
+  const char*ue=getenv("CUT_UNIFORM"); const int gN=ue?atoi(ue):0;  // >0 : paper's uniform-grid candidates
+  // CUT_CANDMAX=n (0 = off, the old behaviour): cap the number of NNLS CANDIDATE
+  // nodes at n by striding the fine rule, while the moment vector still comes from
+  // ALL of it.  Potter Sec. 4.9 -- accuracy rides on the moments, cost rides on the
+  // candidates, and there is no reason for an 8x finer level set to make the prune
+  // 512x slower.  The reported moment residual is the check that the smaller
+  // candidate set can still reproduce the fine moments.
+  const i32 candMax = getenv("CUT_CANDMAX")? atoi(getenv("CUT_CANDMAX")) : 0;
+  // CUT_CANDGRID=gN (lin mode): Potter Algorithm 4.2 done properly -- candidates
+  // on a UNIFORM gN^3 grid inside the polyhedron, using the exact piecewise-linear
+  // inside test, instead of striding the emitted rule.  This is what makes a fine
+  // lattice affordable: NNLS cost follows gN^3, not the s^3 moment-point count.
+  const i32 candGrid = getenv("CUT_CANDGRID")? atoi(getenv("CUT_CANDGRID")) : 0;
+  // The interface rule is consumed ONLY where a boundary condition lives on Gamma:
+  // the Nitsche terms, which applyCutCart/applyElemCyl gate on prob.isDirichlet,
+  // and a Neumann traction.  A traction-FREE piece of Gamma needs no surface term
+  // at all -- sigma.n = 0 is the natural condition, already carried by the volume
+  // term.  On the blade only the clamped platform underside is Dirichlet and
+  // prob.trac is zero, so 90% of the surface points contribute EXACTLY zero and
+  // exist only to be skipped once per CG apply.  Dropping them is bit-identical.
+  // CUT_KEEPFREESURF=1 retains them (needed to inspect the free surface, e.g. the
+  // closure diagnostic below, which must see the whole closed body).
+  // The test is per POINT and exact: keep it if a Dirichlet condition lives there,
+  // or if the Neumann data is nonzero.  Anything else contributes identically zero
+  // to both the operator and the RHS, so dropping it cannot change the answer for
+  // ANY case -- no reliance on prob.trac being globally zero.
+  // NOT a filter: the points are PARTITIONED, Dirichlet/Neumann-loaded ones first,
+  // and only that prefix is looped by the operator and the RHS.  Deleting the rest
+  // was wrong -- the stress report and the VTU SAMPLE the wall at these very
+  // points, and on a thin blade the peak bending stress sits on the traction-free
+  // aerofoil, i.e. exactly the part with no BC.  Dropping it reported the peak
+  // 7.6x low and in the wrong place (2.13e8 at the aerofoil -> 2.82e7 at the
+  // platform).  So: solver reads [surfOff[c], surfOff[c]+surfDirN[c]), everything
+  // that reports reads the full [surfOff[c], surfOff[c+1]).
+  const bool surfPart = !getenv("CUT_NOSURFPART");
+  if (linMode) printf("geom   : PIECEWISE-LINEAR level set, %d^3 sub-cubes/element "
+                      "(%d^3 oracle samples, marching tets, no Saye)\n", gs, gs+1);
+  else if (gs>1) printf("geom   : level-set sub-cell lattice %d^3/element (fit degree %d per sub-cell, "
+                   "effective %d^3 phi samples/cell)\n", gs, gq, gs*gn);
   std::vector<SayeNode> volPool, surfPool;
-  std::vector<i32> volOff(nCutQ+1,0), surfOff(nCutQ+1,0);
-  { std::vector<SayeNode> arena(1<<18), out(1<<16);
+  std::vector<i32> volOff(nCutQ+1,0), surfOff(nCutQ+1,0), surfDirN(nCutQ,0);
+  {
     // CUT_SAYEDBG=<us>: report any cut cell whose Saye build exceeds that many
     // microseconds, separately for the VOLUME and SURFACE rules.  Added to locate
     // the p4-on-the-blade hang: Potter's point is that the moments need not come
@@ -520,58 +597,246 @@ void CutFemSolver::runIga(void) {
     // WHICH of the two rules explodes decides whether dropping the volume
     // recursion would actually buy anything.
     const long dbgUs = getenv("CUT_SAYEDBG")? atol(getenv("CUT_SAYEDBG")) : 0;
-    long tVol=0, tSurf=0; i32 nSlowV=0, nSlowS=0;
-    for (i32 e=0;e<nE;e++) if (elems[e].cut){ i32 c=cutIdx[e];
-      long t0=dbgUs?qpNowUs():0;
-      SayeArena ar; ar.buf=arena.data(); ar.cap=1<<18; ar.top=0;
-      SayeSet ov; ov.p=out.data(); ov.n=0; ov.cap=1<<16; ov.ovf=false;
-      sayeVolume(ePoly[e],&ov,&ar,SayeCfg::def());
-      long t1=dbgUs?qpNowUs():0;
-      for (i32 q=0;q<ov.n;q++) volPool.push_back(ov.p[q]); volOff[c+1]=(i32)volPool.size();
-      SayeArena ar2; ar2.buf=arena.data(); ar2.cap=1<<18; ar2.top=0;
-      SayeSet sv; sv.p=out.data(); sv.n=0; sv.cap=1<<16; sv.ovf=false;
-      sayeSurface(ePoly[e],&sv,&ar2,SayeCfg::def());
-      long t2=dbgUs?qpNowUs():0;
-      for (i32 q=0;q<sv.n;q++) surfPool.push_back(sv.p[q]); surfOff[c+1]=(i32)surfPool.size();
-      if (dbgUs) { tVol+=t1-t0; tSurf+=t2-t1;
-        if (t1-t0>dbgUs){ nSlowV++; printf("  [saye] elem %d cell(%d,%d,%d) VOLUME  %.1f ms -> %d pts%s\n",
-              e,elems[e].ci,elems[e].cj,elems[e].ck,(t1-t0)*1e-3,ov.n,ov.ovf?" OVERFLOW":""); fflush(stdout); }
-        if (t2-t1>dbgUs){ nSlowS++; printf("  [saye] elem %d cell(%d,%d,%d) SURFACE %.1f ms -> %d pts%s\n",
-              e,elems[e].ci,elems[e].cj,elems[e].ck,(t2-t1)*1e-3,sv.n,sv.ovf?" OVERFLOW":""); fflush(stdout); }
+    long long tVol=0, tSurf=0, tPrn=0, tPhi=0, nSlowV=0, nSlowS=0, nRawV=0, nRawS=0, sNs=0;
+    double sS2=0, sMax=0, sNx=0, sNy=0, sNz=0, sAw=0;
+    std::vector<std::vector<SayeNode>> pcV(nCutQ), pcS(nCutQ);
+    std::vector<i32> pcSn(nCutQ,0);          // per cell: how many surface pts carry a BC
+    std::vector<double> resid(nCutQ,0.0);
+    const long tAll0=qpNowUs();
+    #pragma omp parallel reduction(+:tVol,tSurf,tPrn,tPhi,nSlowV,nSlowS,nRawV,nRawS,sNs,sS2,sNx,sNy,sNz,sAw) \
+                         reduction(max:sMax)
+    {
+      std::vector<SayeNode> arena(1<<18), out(1<<16);
+      std::vector<SayeNode> fineV, fineS;
+      std::vector<real> lat((size_t)(gs+1)*(gs+1)*(gs+1));
+      std::vector<SayeNode> cand;
+      const GaussRule gsub = gaussLegendre(p+1);   // wholly-interior sub-cell: exact to degree 2p+1
+      #pragma omp for schedule(dynamic,1)
+      for (i32 c=0;c<nCutQ;c++) {
+        const i32 e=cutE[c]; const i32 Eci=elems[e].ci, Ecj=elems[e].cj, Eck=elems[e].ck;
+        fineV.clear(); fineS.clear();
+        long tv=0, ts=0, tp=0;
+        if (linMode) {                             // ---- piecewise-linear level set ----
+          const long tl0=qpNowUs();
+          const double dl=1.0/(double)gs;
+          for (i32 k=0;k<=gs;k++) for (i32 j=0;j<=gs;j++) for (i32 i=0;i<=gs;i++)
+            lat[(size_t)i+(gs+1)*((size_t)j+(gs+1)*(size_t)k)] =
+              ls.phi((Eci+i*dl)*h, (Ecj+j*dl)*h, (Eck+k*dl)*h);
+          const long tl1=qpNowUs(); tPhi+=tl1-tl0;
+          cutLinRule(lat.data(), gs, 2*p, fineV, fineS);
+          tv=qpNowUs()-tl1;
+        } else if (gs==1) {                        // ---- legacy single-polynomial path ----
+          long t0=qpNowUs();
+          SayeArena ar; ar.buf=arena.data(); ar.cap=1<<18; ar.top=0;
+          SayeSet ov; ov.p=out.data(); ov.n=0; ov.cap=1<<16; ov.ovf=false;
+          sayeVolume(ePoly[e],&ov,&ar,SayeCfg::def());
+          long t1=qpNowUs(); tv=t1-t0;
+          for (i32 q=0;q<ov.n;q++) fineV.push_back(ov.p[q]);
+          SayeArena ar2; ar2.buf=arena.data(); ar2.cap=1<<18; ar2.top=0;
+          SayeSet sv; sv.p=out.data(); sv.n=0; sv.cap=1<<16; sv.ovf=false;
+          sayeSurface(ePoly[e],&sv,&ar2,SayeCfg::def());
+          long t2=qpNowUs(); ts=t2-t1;
+          for (i32 q=0;q<sv.n;q++) fineS.push_back(sv.p[q]);
+          if (dbgUs && (tv>dbgUs||ts>dbgUs)) {
+            #pragma omp critical
+            { if(tv>dbgUs){ nSlowV++; printf("  [saye] elem %d cell(%d,%d,%d) VOLUME  %.1f ms -> %d pts%s\n",
+                    e,Eci,Ecj,Eck,tv*1e-3,ov.n,ov.ovf?" OVERFLOW":""); }
+              if(ts>dbgUs){ nSlowS++; printf("  [saye] elem %d cell(%d,%d,%d) SURFACE %.1f ms -> %d pts%s\n",
+                    e,Eci,Ecj,Eck,ts*1e-3,sv.n,sv.ovf?" OVERFLOW":""); }
+              fflush(stdout); }
+          }
+        } else {                                   // ---- s^3 sub-cell composite rule ----
+          const real inv=(real)1/(real)gs;
+          const real wV=(real)1/(real)((double)gs*gs*gs), wS=(real)1/(real)((double)gs*gs);
+          const real diag=(real)(1.7320508075688772*h/gs);   // sub-cell diagonal, physical
+          real v[PNC*PNC*PNC];
+          for (i32 sk=0;sk<gs;sk++) for (i32 sj=0;sj<gs;sj++) for (i32 si=0;si<gs;si++) {
+            long tq0=qpNowUs();
+            bool anyNeg=false, anyPos=false; real amin=(real)1e30;
+            for (i32 k=0;k<gn;k++) for (i32 j=0;j<gn;j++) for (i32 i=0;i<gn;i++) {
+              const real f = ls.phi((Eci+(si+tgll[i])*inv)*h,
+                                    (Ecj+(sj+tgll[j])*inv)*h,
+                                    (Eck+(sk+tgll[k])*inv)*h);
+              v[i+gn*(j+gn*k)]=f; if(f<0)anyNeg=true; else anyPos=true;
+              const real a=(f<0)?-f:f; if(a<amin)amin=a;
+            }
+            long tq1=qpNowUs(); tPhi+=tq1-tq0;
+            // phi is a (pseudo-)signed distance and hence 1-Lipschitz, so min|phi|
+            // over the samples EXCEEDING the sub-cell diagonal PROVES there is no
+            // zero crossing inside -- a rigorous fast path, not a sign heuristic.
+            // When it does not hold we run Saye, which is correct either way.
+            const bool pure = (amin>diag) && (anyNeg!=anyPos);
+            if (pure && anyPos) continue;                     // wholly outside: nothing
+            if (pure && anyNeg) {                             // wholly inside: tensor Gauss
+              for (i32 k=0;k<gsub.n;k++) for (i32 j=0;j<gsub.n;j++) for (i32 i=0;i<gsub.n;i++) {
+                SayeNode nd{}; nd.x[0]=(si+gsub.x[i])*inv; nd.x[1]=(sj+gsub.x[j])*inv; nd.x[2]=(sk+gsub.x[k])*inv;
+                nd.w=gsub.w[i]*gsub.w[j]*gsub.w[k]*wV; fineV.push_back(nd); }
+              continue;
+            }
+            const PolyND ps = fitPoly3(gq, v);
+            long ta=qpNowUs();
+            SayeArena ar; ar.buf=arena.data(); ar.cap=1<<18; ar.top=0;
+            SayeSet ov; ov.p=out.data(); ov.n=0; ov.cap=1<<16; ov.ovf=false;
+            sayeVolume(ps,&ov,&ar,SayeCfg::def());
+            long tb=qpNowUs(); tv+=tb-ta;
+            for (i32 q=0;q<ov.n;q++) { SayeNode nd=ov.p[q];
+              nd.x[0]=(si+nd.x[0])*inv; nd.x[1]=(sj+nd.x[1])*inv; nd.x[2]=(sk+nd.x[2])*inv;
+              nd.w*=wV; fineV.push_back(nd); }
+            SayeArena ar2; ar2.buf=arena.data(); ar2.cap=1<<18; ar2.top=0;
+            SayeSet sv; sv.p=out.data(); sv.n=0; sv.cap=1<<16; sv.ovf=false;
+            sayeSurface(ps,&sv,&ar2,SayeCfg::def());
+            long tc=qpNowUs(); ts+=tc-tb;
+            // the surface normal is invariant under the uniform sub-cell scaling;
+            // only the measure changes, by (1/s)^2 for an area against (1/s)^3 for
+            // a volume.
+            for (i32 q=0;q<sv.n;q++) { SayeNode nd=sv.p[q];
+              nd.x[0]=(si+nd.x[0])*inv; nd.x[1]=(sj+nd.x[1])*inv; nd.x[2]=(sk+nd.x[2])*inv;
+              nd.w*=wS; fineS.push_back(nd); }
+          }
+          if (dbgUs && (tv>dbgUs||ts>dbgUs)) {
+            #pragma omp critical
+            { if(tv>dbgUs){ nSlowV++; printf("  [saye] elem %d cell(%d,%d,%d) VOLUME  %.1f ms -> %zu pts\n",
+                    e,Eci,Ecj,Eck,tv*1e-3,fineV.size()); }
+              if(ts>dbgUs){ nSlowS++; printf("  [saye] elem %d cell(%d,%d,%d) SURFACE %.1f ms -> %zu pts\n",
+                    e,Eci,Ecj,Eck,ts*1e-3,fineS.size()); }
+              fflush(stdout); }
+          }
+        }
+        tVol+=tv; tSurf+=ts;
+        nRawV+=(long long)fineV.size(); nRawS+=(long long)fineS.size();
+        // Surface diagnostics are taken over the WHOLE reconstructed interface,
+        // before any Dirichlet filtering -- closure only means something on the
+        // closed body, and |phi| should describe the geometry, not the subset the
+        // load case happens to use.
+        { size_t keep=0;
+          for (size_t q=0;q<fineS.size();q++) {
+            const double xc=(Eci+(double)fineS[q].x[0])*h,
+                         yc=(Ecj+(double)fineS[q].x[1])*h,
+                         zc2=(Eck+(double)fineS[q].x[2])*h;
+            const double d=fabs((double)ls.phi((real)xc,(real)yc,(real)zc2));
+            sS2+=d*d; sNs++; if(d>sMax)sMax=d;
+            const double w=(double)fineS[q].w;
+            sNx+=w*(double)fineS[q].n[0]; sNy+=w*(double)fineS[q].n[1];
+            sNz+=w*(double)fineS[q].n[2]; sAw+=w;
+            bool used=true;
+            if (surfPart) {
+              real X0,X1,X2; ls.toPhys((real)xc,(real)yc,(real)zc2,X0,X1,X2);
+              if (!prob.isDirichlet(X0,X1,X2)) {
+                const real nr[3]={fineS[q].n[0],fineS[q].n[1],fineS[q].n[2]};
+                real gN3[3]; prob.neumannData(X0,X1,X2,nr,gN3);
+                used = !(gN3[0]==0 && gN3[1]==0 && gN3[2]==0);
+              }
+            }
+            if (used) { const SayeNode t=fineS[keep]; fineS[keep]=fineS[q]; fineS[q]=t; keep++; }
+          }
+          pcSn[c]=(i32)keep; }
+        // ---- NNLS compression (Potter): prune the fine composite VOLUME rule to a
+        //      minimal positive rule with the same total-degree P^3_{2p} moments.
+        //      Exact for polynomial integrands (stiffness always; polynomial body
+        //      load).  The SURFACE rule is passed through -- it carries a normal per
+        //      point, so pruning it needs the normal-weighted moments too.
+        long tp0=qpNowUs();
+        if (doPrune) {
+          const i32 nf=(i32)fineV.size();
+          if (gN>0) resid[c]=compressVolUniform(fineV.data(),nf,ePoly[e],p,gN,pcV[c]);
+          else if (linMode && candGrid>0) {
+            cutLinCandidates(lat.data(), gs, candGrid, 0.0, cand);
+            if ((i32)cand.size() > 0)
+              resid[c]=compressVolMom(fineV.data(),nf,cand.data(),(i32)cand.size(),p,pcV[c]);
+            else resid[c]=compressVol(fineV.data(),nf,p,pcV[c]);   // grid missed a sliver
+          }
+          else if (candMax>0 && nf>candMax) {
+            cand.clear(); const i32 st=(nf+candMax-1)/candMax;
+            for (i32 q=0;q<nf;q+=st) cand.push_back(fineV[q]);
+            resid[c]=compressVolMom(fineV.data(),nf,cand.data(),(i32)cand.size(),p,pcV[c]);
+          } else resid[c]=compressVol(fineV.data(),nf,p,pcV[c]);
+        } else pcV[c]=fineV;
+        tp=qpNowUs()-tp0; tPrn+=tp;
+        pcS[c].swap(fineS);
       }
     }
-    if (dbgUs) printf("  [saye] TOTAL volume %.2f s (%d slow cells), surface %.2f s (%d slow cells)\n",
-                      tVol*1e-6,nSlowV,tSurf*1e-6,nSlowS);
+    for (i32 c=0;c<nCutQ;c++) {
+      for (auto&s:pcV[c]) volPool.push_back(s);  volOff[c+1]=(i32)volPool.size();
+      for (auto&s:pcS[c]) surfPool.push_back(s); surfOff[c+1]=(i32)surfPool.size();
+      surfDirN[c]=pcSn[c];
+    }
+    // ---- interface fit error: the LOCAL, non-cancelling geometry metric -------
+    //  |Omega_h| and |Gamma_h| are SIGNED global integrals, so their errors
+    //  cancel over a closed body -- the sphere's 0.001% area error at s=1 is
+    //  largely luck, and both measures move NON-MONOTONICALLY under refinement
+    //  (baseline |Omega_h|: 0.034% / 0.050% / 0.006% at res 8/16/32).  They
+    //  therefore cannot rank one level-set representation against another.
+    //  phi IS a signed distance, so |phi(x)| evaluated at the rule's OWN surface
+    //  points is exactly the displacement of the reconstructed interface from
+    //  the true one: local, positive, nothing to cancel.  This is the same
+    //  quantity aa4ae1b measured by hand at the blade stress peak, now reported
+    //  for every run.  On the volume side a point with phi>0 has leaked outside
+    //  the body, which no amount of cancellation can hide either.
+    if (nCutQ>0) {
+      // vol-pt leak: a volume point with phi > 0 has escaped the body.  Taken on
+      // the PRUNED rule, which is what the solver integrates on.
+      double vmax=0;
+      #pragma omp parallel for schedule(static) reduction(max:vmax)
+      for (i32 c=0;c<nCutQ;c++) { const i32 e=cutE[c];
+        for (i32 q=volOff[c];q<volOff[c+1];q++) {
+          const double d=(double)ls.phi((elems[e].ci+volPool[q].x[0])*h,
+                                        (elems[e].cj+volPool[q].x[1])*h,
+                                        (elems[e].ck+volPool[q].x[2])*h);
+          if(d>vmax)vmax=d; } }
+      if (sNs) printf("       : interface |phi| at %lld surf pts: rms %.3e (%.4f%% h) max %.3e (%.3f%% h)"
+                     " | vol-pt leak max phi %.3e\n",
+                     sNs, sqrt(sS2/(double)sNs), 100.0*sqrt(sS2/(double)sNs)/h, sMax, 100.0*sMax/h, vmax);
+      // CLOSURE.  For a closed body the divergence theorem with a constant field
+      // gives int_Gamma n dS = 0 exactly, and the element-wise pieces telescope
+      // (each element contributes Gamma \cap K).  A polyhedral interface satisfies
+      // this to round-off; a recursion that DROPS surface pieces does not, and the
+      // deficit is invisible in |Gamma_h| because that measure has no sign to
+      // cancel against.  This is the cheapest test that the wall is watertight.
+      // Accumulated over the FULL interface, before the Dirichlet filter.
+      if (sAw>0) printf("       : closure |int_Gamma n dS| / |Gamma| = %.3e\n",
+                        sqrt(sNx*sNx+sNy*sNy+sNz*sNz)/sAw);
+    }
+    if (nCutQ>0) {
+      if (doPrune)
+        printf("prune  : NNLS %s volume %lld -> %zu pts (%.1fx, %.0f/cell -> %.0f/cell)\n",
+               gN>0?"uniform-grid":"Saye", nRawV, volPool.size(),
+               (double)nRawV/std::max<size_t>(volPool.size(),1),
+               (double)nRawV/nCutQ, (double)volPool.size()/nCutQ);
+      // WALL for the fused build+prune, then the CPU split summed over threads.
+      // (The old "in %.2fs" on the prune line was a thread-SUM printed as if it
+      // were wall -- it read ~nThreads x too slow the moment the loop went
+      // parallel, so the two are now labelled.)
+      printf("       : quadrature %.2fs wall | cpu phi %.1f + saye vol %.1f surf %.1f + nnls %.1f s"
+             " | surface %zu pts (%.0f/cell, unpruned)\n",
+             (qpNowUs()-tAll0)*1e-6, tPhi*1e-6, tVol*1e-6, tSurf*1e-6, tPrn*1e-6,
+             surfPool.size(), (double)surfPool.size()/nCutQ);
+      if (surfPart) { long long nd=0; for (i32 c=0;c<nCutQ;c++) nd+=surfDirN[c];
+        printf("       : surface pts carrying a BC: %lld of %zu (%.1f%% skipped by the operator; "
+               "traction-free Gamma needs no surface term, but the stress report still samples it)\n",
+               nd, surfPool.size(), 100.0*(double)((long long)surfPool.size()-nd)/std::max<size_t>(surfPool.size(),1)); }
+      if (getenv("CUT_NNLSSTAT")) {      // where does the prune time go? (reform vs gradient scan)
+        long long rc=0,rf=0,sf=0,ou=0;
+        #pragma omp parallel reduction(+:rc,rf,sf,ou)
+        { rc+=g_nnlsStat.reformCalls; rf+=g_nnlsStat.reformFlops;
+          sf+=g_nnlsStat.scanFlops;   ou+=g_nnlsStat.outer; }
+        printf("       : nnls outer %lld, reform calls %lld (%.2f/outer) | flops: reform %.3e  scan %.3e  (reform/scan %.1fx)\n",
+               ou, rc, ou? (double)rc/ou : 0.0, (double)rf, (double)sf, sf? (double)rf/sf : 0.0); }
+      if (gN>0) { double mr=0,ar=0; for(double v:resid){ if(v>mr)mr=v; ar+=v; }
+        printf("       : uniform grid %d^3, moment residual: max %.2e, mean %.2e (0 => reproduces Saye moments exactly)\n",gN,mr,ar/nCutQ); }
+      else if (doPrune) { double mr=0,ar=0; for(double v:resid){ if(v>mr)mr=v; ar+=v; }
+        printf("       : candidates %s, RELATIVE moment residual: max %.2e, mean %.2e\n",
+               (linMode&&candGrid>0)? "uniform grid (Potter Alg 4.2)" :
+               candMax>0? "capped by striding (moments from the full rule)" : "= the full rule",
+               mr, ar/nCutQ); }
+    }
+    if (dbgUs) printf("  [saye] TOTAL phi %.2f s, volume %.2f s (%lld slow cells), surface %.2f s (%lld slow cells)\n",
+                      tPhi*1e-6,tVol*1e-6,nSlowV,tSurf*1e-6,nSlowS);
   }
 
-  // ---- NNLS quadrature compression (ON by default; CUT_NOPRUNE=1 to disable): shrink each
-  //      cut cell's Saye volume rule to a minimal positive rule with the same Q_{2p} moments.
-  //      Exact for polynomial integrands (stiffness always; polynomial body load) ----
-  if (!getenv("CUT_NOPRUNE") && nCutQ>0) {
-    long t0=qpNowUs(); size_t n0=volPool.size();
-    const char*ue=getenv("CUT_UNIFORM"); int gN=ue?atoi(ue):0;   // >0 : paper's uniform-grid candidates
-    std::vector<i32> cutE(nCutQ); for (i32 e=0;e<nE;e++) if (elems[e].cut) cutE[cutIdx[e]]=e;
-    std::vector<std::vector<SayeNode>> pc(nCutQ); std::vector<double> resid(nCutQ,0.0);
-    #pragma omp parallel for schedule(dynamic,1)
-    for (i32 c=0;c<nCutQ;c++){ i32 v0=volOff[c],nv=volOff[c+1]-v0;
-      if(gN>0) resid[c]=compressVolUniform(&volPool[v0],nv,ePoly[cutE[c]],p,gN,pc[c]);
-      else compressVol(&volPool[v0],nv,p,pc[c]); }
-    std::vector<SayeNode> vp2; vp2.reserve(n0); std::vector<i32> vo2(nCutQ+1,0);
-    for (i32 c=0;c<nCutQ;c++){ for (auto&s:pc[c]) vp2.push_back(s); vo2[c+1]=(i32)vp2.size(); }
-    printf("prune  : NNLS %s volume %zu -> %zu pts (%.1fx, %.0f/cell -> %.0f/cell) in %.2fs\n",
-           gN>0?"uniform-grid":"Saye", n0, vp2.size(), (double)n0/std::max<size_t>(vp2.size(),1),
-           (double)n0/nCutQ, (double)vp2.size()/nCutQ, (qpNowUs()-t0)*1e-6);
-    if(getenv("CUT_NNLSSTAT")){          // where does the prune time go? (reform vs gradient scan)
-      long long rc=0,rf=0,sf=0,ou=0;
-      #pragma omp parallel reduction(+:rc,rf,sf,ou)
-      { rc+=g_nnlsStat.reformCalls; rf+=g_nnlsStat.reformFlops;
-        sf+=g_nnlsStat.scanFlops;   ou+=g_nnlsStat.outer; }
-      printf("       : nnls outer %lld, reform calls %lld (%.2f/outer) | flops: reform %.3e  scan %.3e  (reform/scan %.1fx)\n",
-             ou, rc, ou? (double)rc/ou : 0.0, (double)rf, (double)sf, sf? (double)rf/sf : 0.0); }
-    if(gN>0){ double mr=0,ar=0; for(double v:resid){ if(v>mr)mr=v; ar+=v; }
-      printf("       : uniform grid %d^3, moment residual: max %.2e, mean %.2e (0 => reproduces Saye moments exactly)\n",gN,mr,ar/nCutQ); }
-    volPool.swap(vp2); volOff.swap(vo2);
-  }
+  // CUT_GEOMONLY=1: stop after the quadrature diagnostics.  CUT_DUMP does this
+  // too but writes the point clouds, which is hundreds of MB at a fine lattice --
+  // this is the flag for sweeping geometry settings.
+  if (getenv("CUT_GEOMONLY")) return;
 
   // ghost faces (interior faces of cut elements; wrap the theta seam if periodic)
   // GRID-NATIVE: face pairing is a +1 step on a regular cell grid, so the partner
@@ -639,8 +904,12 @@ void CutFemSolver::runIga(void) {
         for (i32 c=0;c<8;c++){ real xr[3]={(real)(c&1),(real)((c>>1)&1),(real)((c>>2)&1)},X[3]; physOf(elems[e],xr,X); os<<","<<X[0]<<","<<X[1]<<","<<X[2]; } os<<"\n"; } }
     { std::ofstream os((base+"_sayevol.csv").c_str()); os<<"x,y,z,w\n";
       for (i32 e=0;e<nE;e++) if(elems[e].cut){ i32 c=cutIdx[e]; for(i32 q=volOff[c];q<volOff[c+1];q++){ real xr[3]={volPool[q].x[0],volPool[q].x[1],volPool[q].x[2]},X[3]; physOf(elems[e],xr,X); os<<X[0]<<","<<X[1]<<","<<X[2]<<","<<volPool[q].w<<"\n"; } } }
-    { std::ofstream os((base+"_sayesurf.csv").c_str()); os<<"x,y,z\n";
-      for (i32 e=0;e<nE;e++) if(elems[e].cut){ i32 c=cutIdx[e]; for(i32 q=surfOff[c];q<surfOff[c+1];q++){ real xr[3]={surfPool[q].x[0],surfPool[q].x[1],surfPool[q].x[2]},X[3]; physOf(elems[e],xr,X); os<<X[0]<<","<<X[1]<<","<<X[2]<<"\n"; } } }
+    // phi at each surface point is the interface displacement error (phi is a
+    // signed distance), so the plot can colour by it instead of guessing.
+    { std::ofstream os((base+"_sayesurf.csv").c_str()); os<<"x,y,z,phi\n";
+      for (i32 e=0;e<nE;e++) if(elems[e].cut){ i32 c=cutIdx[e]; for(i32 q=surfOff[c];q<surfOff[c+1];q++){ real xr[3]={surfPool[q].x[0],surfPool[q].x[1],surfPool[q].x[2]},X[3]; physOf(elems[e],xr,X);
+        const double pv=(double)ls.phi((elems[e].ci+xr[0])*h,(elems[e].cj+xr[1])*h,(elems[e].ck+xr[2])*h);
+        os<<X[0]<<","<<X[1]<<","<<X[2]<<","<<pv<<"\n"; } } }
     printf("dump   : %d cells (%d cut), %zu Saye vol pts, %zu surf pts -> %s_{cells,sayevol,sayesurf}.csv\n",
            nE,nCutQ,volPool.size(),surfPool.size(),base.c_str());
     return;
@@ -656,7 +925,7 @@ void CutFemSolver::runIga(void) {
     for (i32 a=0;a<ndof3;a++) ul[a]=(real)uloc[a];
     qpElemCoreSaye(Bp,(real)mu,(real)lam,h,vn,nv,ul,yl);
     for (i32 a=0;a<ndof3;a++) yloc[a]=yl[a];
-    i32 ns=surfOff[c+1]-surfOff[c]; const SayeNode*sn=&surfPool[surfOff[c]];
+    i32 ns=surfDirN[c]; const SayeNode*sn=&surfPool[surfOff[c]];      // BC prefix only
     real gb[3*QN_MAX*QN_MAX*QN_MAX], vb[QN_MAX*QN_MAX*QN_MAX];
     for (i32 q=0;q<ns;q++){ real xr[3]={sn[q].x[0],sn[q].x[1],sn[q].x[2]};
       real X[3]; physOf(elems[e],xr,X); if (!prob.isDirichlet(X[0],X[1],X[2])) continue;
@@ -705,7 +974,7 @@ void CutFemSolver::runIga(void) {
         yloc[3*a+i2]+=wdet*(sig[i2][0]*gX[a][0]+sig[i2][1]*gX[a][1]+sig[i2][2]*gX[a][2]); }
     if (!nitsche || !elems[e].cut) return;
     // Nitsche on the physical (Nanson) surface at Dirichlet points
-    i32 c=cutIdx[e]; i32 ns=surfOff[c+1]-surfOff[c]; const SayeNode*sn=&surfPool[surfOff[c]];
+    i32 c=cutIdx[e]; i32 ns=surfDirN[c]; const SayeNode*sn=&surfPool[surfOff[c]];   // BC prefix only
     real vb[QN_MAX*QN_MAX*QN_MAX];
     for (i32 q=0;q<ns;q++){ real xr[3]={sn[q].x[0],sn[q].x[1],sn[q].x[2]};
       real X[3]; physOf(elems[e],xr,X); if (!prob.isDirichlet(X[0],X[1],X[2])) continue;
@@ -863,7 +1132,7 @@ void CutFemSolver::runIga(void) {
           double*Bn=&blkNode[9*nod[a]]; for(i32 i2=0;i2<3;i2++)for(i32 j2=0;j2<3;j2++)
             Bn[3*i2+j2]+=wdiag*(mu*((i2==j2?gsq:0)+gX[a][i2]*gX[a][j2])+lam*gX[a][i2]*gX[a][j2])*sc; } }
       // surface source
-      if (elems[e].cut){ i32 c=cutIdx[e]; i32 ns=surfOff[c+1]-surfOff[c]; const SayeNode*sn=&surfPool[surfOff[c]];
+      if (elems[e].cut){ i32 c=cutIdx[e]; i32 ns=surfDirN[c]; const SayeNode*sn=&surfPool[surfOff[c]];  // BC prefix only
         for (i32 q=0;q<ns;q++){ real xr[3]={sn[q].x[0],sn[q].x[1],sn[q].x[2]}; real X[3]; physOf(elems[e],xr,X);
           Bp.allGradRef(xr,gb); Bp.allVal(xr,vb);
           double nP[3], dS; double gX[QN_MAX*QN_MAX*QN_MAX][3];
@@ -939,6 +1208,7 @@ void CutFemSolver::runIga(void) {
       SayeNode *d_volP,*d_surfP; cudaMallocManaged(&d_volP,(volPool.size()?volPool.size():1)*sizeof(SayeNode)); if(volPool.size())memcpy(d_volP,volPool.data(),volPool.size()*sizeof(SayeNode));
       cudaMallocManaged(&d_surfP,(surfPool.size()?surfPool.size():1)*sizeof(SayeNode)); if(surfPool.size())memcpy(d_surfP,surfPool.data(),surfPool.size()*sizeof(SayeNode));
       i32 *d_volOff=cpI(volOff.data(),nCutQ+1), *d_surfOff=cpI(surfOff.data(),nCutQ+1);
+      i32 *d_surfDirN=cpI(surfDirN.data(),nCutQ);
       char *d_surfDir; cudaMallocManaged(&d_surfDir,surfDir.size()); memcpy(d_surfDir,surfDir.data(),surfDir.size());
       i32 *d_gfM,*d_gfP,*d_gfD; cudaMallocManaged(&d_gfM,(nGFQ?nGFQ:1)*sizeof(i32)); cudaMallocManaged(&d_gfP,(nGFQ?nGFQ:1)*sizeof(i32)); cudaMallocManaged(&d_gfD,(nGFQ?nGFQ:1)*sizeof(i32));
       for(i32 f=0;f<nGFQ;f++){ d_gfM[f]=gf[f].eM; d_gfP[f]=gf[f].eP; d_gfD[f]=gf[f].d; }
@@ -981,7 +1251,7 @@ void CutFemSolver::runIga(void) {
         std::vector<real> cutInvH((size_t)nCutQ*m3*m3);
         #pragma omp parallel for schedule(dynamic,2)
         for(i32 c=0;c<nCutQ;c++){ i32 e=cutElem[c]; std::vector<double> Ke((size_t)m3*m3,0.0);
-          i32 v0=volOff[c], nv=volOff[c+1]-v0, s0=surfOff[c], ns=surfOff[c+1]-s0;
+          i32 v0=volOff[c], nv=volOff[c+1]-v0, s0=surfOff[c], ns=surfDirN[c];
           real ulc[3*QN_MAX*QN_MAX*QN_MAX], ylc[3*QN_MAX*QN_MAX*QN_MAX];
           for(i32 k=0;k<m3;k++){ for(i32 i=0;i<m3;i++) ulc[i]=(i==k)?(real)1:(real)0;
             qpElemCoreSaye(Bp,(real)mu,(real)lam,h,&volPool[v0],nv,ulc,ylc);          // volume stiffness column
@@ -1099,7 +1369,7 @@ void CutFemSolver::runIga(void) {
         { CutDev S0{}; S0.B=Bp; S0.nE=nE; S0.nCut=nCutQ; S0.nGFQ=nGFQ; S0.nNode=nNodeQ; S0.ndof=ndof; S0.ndof3=ndof3; S0.mG=mG;
           S0.h=h; S0.mu=(real)mu; S0.lam=(real)lam; S0.gammaD=(real)gammaD_; S0.cph=(real)cph; S0.sph=(real)sph;
           S0.eNode=d_eNode; S0.nMap=d_nMap; S0.nRot=d_nRot; S0.intList=d_intList; S0.cutElem=d_cutElem;
-          S0.volP=d_volP; S0.surfP=d_surfP; S0.volOff=d_volOff; S0.surfOff=d_surfOff; S0.surfDir=d_surfDir;
+          S0.volP=d_volP; S0.surfP=d_surfP; S0.volOff=d_volOff; S0.surfOff=d_surfOff; S0.surfDir=d_surfDir; S0.surfDirN=d_surfDirN;
           S0.gfM=d_gfM; S0.gfP=d_gfP; S0.gfD=d_gfD; S0.Kref=d_Kref; S0.Kg[0]=d_Kg0; S0.Kg[1]=d_Kg1; S0.Kg[2]=d_Kg2;
           S0.cyl=cyl?1:0; S0.ls=ls; S0.eCijk=d_eCijk; S0.eCut=d_eCut; S0.volJ=d_volJ; S0.surfJ=d_surfJ;
           S0.sp[0]=S0.sp[1]=S0.sp[2]=1; Slev[0]=S0; }
@@ -1145,7 +1415,7 @@ void CutFemSolver::runIga(void) {
         { CutDev S0{}; S0.B=Bp; S0.nE=nE; S0.nCut=nCutQ; S0.nGFQ=nGFQ; S0.nNode=nNodeQ; S0.ndof=ndof; S0.ndof3=ndof3; S0.mG=mG;
           S0.h=h; S0.mu=(real)mu; S0.lam=(real)lam; S0.gammaD=(real)gammaD_; S0.cph=(real)cph; S0.sph=(real)sph;
           S0.eNode=d_eNode; S0.nMap=d_nMap; S0.nRot=d_nRot; S0.intList=d_intList; S0.cutElem=d_cutElem;
-          S0.volP=d_volP; S0.surfP=d_surfP; S0.volOff=d_volOff; S0.surfOff=d_surfOff; S0.surfDir=d_surfDir;
+          S0.volP=d_volP; S0.surfP=d_surfP; S0.volOff=d_volOff; S0.surfOff=d_surfOff; S0.surfDir=d_surfDir; S0.surfDirN=d_surfDirN;
           S0.gfM=d_gfM; S0.gfP=d_gfP; S0.gfD=d_gfD; S0.Kref=d_Kref; S0.Kg[0]=d_Kg0; S0.Kg[1]=d_Kg1; S0.Kg[2]=d_Kg2;
           S0.cyl=cyl?1:0; S0.ls=ls; S0.eCijk=d_eCijk; S0.eCut=d_eCut; S0.volJ=d_volJ; S0.surfJ=d_surfJ;
           S0.sp[0]=S0.sp[1]=S0.sp[2]=1; Slev[0]=S0; }
@@ -1358,10 +1628,10 @@ void CutFemSolver::runIga(void) {
           printf("hmg    : %d-level SEMI-COARSENED h-hierarchy [", nLev);
           for(i32 L=0;L<nLev;L++) printf("%dn%s", nNodeLev[L], L<nLev-1?" -> ":""); printf("]\n"); }
       }
-      CutDev S; S.B=Bp; S.nE=nE; S.nCut=nCutQ; S.nGFQ=nGFQ; S.nNode=nNodeQ; S.ndof=ndof; S.ndof3=ndof3; S.mG=mG;
+      CutDev S{}; S.B=Bp; S.nE=nE; S.nCut=nCutQ; S.nGFQ=nGFQ; S.nNode=nNodeQ; S.ndof=ndof; S.ndof3=ndof3; S.mG=mG;
       S.h=h; S.mu=(real)mu; S.lam=(real)lam; S.gammaD=(real)gammaD_; S.cph=(real)cph; S.sph=(real)sph;
       S.eNode=d_eNode; S.nMap=d_nMap; S.nRot=d_nRot; S.intList=d_intList; S.cutElem=d_cutElem;
-      S.volP=d_volP; S.surfP=d_surfP; S.volOff=d_volOff; S.surfOff=d_surfOff; S.surfDir=d_surfDir;
+      S.volP=d_volP; S.surfP=d_surfP; S.volOff=d_volOff; S.surfOff=d_surfOff; S.surfDir=d_surfDir; S.surfDirN=d_surfDirN;
       S.gfM=d_gfM; S.gfP=d_gfP; S.gfD=d_gfD; S.Kref=d_Kref; S.Kg[0]=d_Kg0; S.Kg[1]=d_Kg1; S.Kg[2]=d_Kg2;
       S.cyl=cyl?1:0; S.ls=ls; S.eCijk=d_eCijk; S.eCut=d_eCut; S.volJ=d_volJ; S.surfJ=d_surfJ;
       S.sp[0]=S.sp[1]=S.sp[2]=1;

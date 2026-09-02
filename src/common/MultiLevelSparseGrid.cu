@@ -422,8 +422,12 @@ __device__ i32 MultiLevelSparseGrid::getNbrIdx(i32 bIdx, i32 i, i32 j, i32 k) {
   // the pseudo2D guard discards the z-flux), and k = -2 would otherwise index
   // nbrIdxList at kb = -1 -- out of bounds.  Returning the same plane is exactly
   // right: in pseudo2D every z-layer holds identical data.
-  // blockSizeZ is constexpr, so this vanishes in the 3-D build.
-  if (blockSizeZ == 1) k = 0;
+  // blockSizeZ is constexpr, so this vanishes in the 3-D build -- but the SAME
+  // invariant holds whenever pseudo2D is set, even when the block is physically
+  // blockSize thick: only the k == 0 plane is ever evolved, the k > 0 layers go
+  // stale between broadcastZ() calls, and no z-neighbour block exists.  Without
+  // this the wavelet prediction stencil reaches kp +- 1 out of the live plane.
+  if (blockSizeZ == 1 || pseudo2D) k = 0;
   i += blockSize;
   j += blockSize;
   k += blockSizeZ;                 // z extent is blockSizeZ, not blockSize

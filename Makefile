@@ -7,6 +7,11 @@
 #   wavewsdf - the wavelet / BVH-oracle SDF + dual contour
 # All executables are placed in this (root) directory and write to ./output.
 #
+# PRECISION: `real` is DOUBLE by default (2026-08-30).  fp32 floored the steady
+# residual at ~1e-3 relative; the same case in fp64 converges ~7 orders.  Build
+# with -DUSE_SINGLE for float; wavesdf/wavefem/wavewsdf keep it explicitly
+# because their cell caps are sized for 4-byte reals.
+#
 # Sources are split one directory per solver, plus src/common for the shared
 # core (grid, hash table, comm, geometry/BVH helpers):
 #   src/common      - Settings/Util/Vec3f, HashTable, MultiLevelSparseGrid, Comm,
@@ -54,20 +59,22 @@ WAVEFEM_INC   = $(INC_COMMON) -I./$(SRC_DIR)/fem
 # cFlagsList/nbrIdxList/prntIdxList/imageDataX); with the fp32 Sdf that is ~310
 # B/block, so 384M cells (6M blocks, ~2.2 GB) fit on a 3 GB card -- enough for a
 # clean res 2048 (~1.9M blocks).
-WAVE3D_DEFS  = -DNCELLS_MAX=64000000
-WAVESDF_DEFS = -DNCELLS_MAX=384000000
+# reals are 8 B by default now, so the cap is halved to keep the same ~7.7 GB
+# footprint the 64M/fp32 cap had.  -DUSE_SINGLE + 64M restores the old build.
+WAVE3D_DEFS  = -DNCELLS_MAX=32000000
+WAVESDF_DEFS = -DNCELLS_MAX=384000000 -DUSE_SINGLE   # 384M cells only fits at fp32
 # wavewsdf (the wavelet / BVH-oracle SDF) stores the 1-jet per cell (value +
 # gradient = 16 B/cell).  Its surface-fit octree is ~1000x sparser than a
 # narrowband, so 64M cells (1M blocks, ~1 GB) is ample even at high res and fits a
 # 3 GB card.
-WAVEWSDF_DEFS = -DNCELLS_MAX=64000000
+WAVEWSDF_DEFS = -DNCELLS_MAX=64000000 -DUSE_SINGLE   # archived; 1-jet budget is fp32
 # wavefem materializes the FULL bounding-box background grid before pruning it
 # down to the blocks the body actually touches, so the cap must cover the DENSE
 # grid, not the active mesh: res^3 cells at the longest axis.  256M cells allows
 # res ~ 512 on a cube-ish bbox.  The FEM data itself (24x24 per CUT element,
 # 12 reals per stabilized face) scales with the SURFACE, so it is never the
 # binding constraint.
-WAVEFEM_DEFS  = -DNCELLS_MAX=256000000
+WAVEFEM_DEFS  = -DNCELLS_MAX=256000000 -DUSE_SINGLE  # 256M cells; wavefem_dp is the fp64 twin
 
 # headers (no automatic dependency tracking, so rebuild on any header change)
 HDRS = $(wildcard $(SRC_DIR)/*/*.cuh) $(wildcard $(SRC_DIR)/*/*.h) \
@@ -99,7 +106,7 @@ WAVE3D_2D_DEFS = -DUSE_DOUBLE -DCOLLAPSE_2D
 WAVE3D_2D_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_2d/%.cu.o,$(WAVE3D_SRCS))
 
 # single-precision pseudo-2D build: the fp32 gate/validation twin of wave3d_2d
-WAVE3D_2D_SP_DEFS = -DCOLLAPSE_2D
+WAVE3D_2D_SP_DEFS = -DCOLLAPSE_2D -DUSE_SINGLE
 WAVE3D_2D_SP_OBJS = $(patsubst %,$(OBJ_DIR)/wave3d_2d_sp/%.cu.o,$(WAVE3D_SRCS))
 
 # multi-resolution DGSEM solver (leaf-only AMR, one block = one p=3 element of
@@ -131,7 +138,7 @@ WAVEDG_P1_OBJS = $(patsubst %,$(OBJ_DIR)/wavedg3d_p1/%.cu.o,$(WAVEDG_SRCS))
 WAVEFEM_SRCS = $(COMMON_SRCS) \
                fem/CutFemSolver fem/CutFemSolverKernels fem/CutFemIga fem/CutFemSbm fem/FemMain
 WAVEFEM_OBJS    = $(patsubst %,$(OBJ_DIR)/wavefem/%.cu.o,$(WAVEFEM_SRCS))
-WAVEFEM_DP_DEFS = $(WAVEFEM_DEFS) -DUSE_DOUBLE
+WAVEFEM_DP_DEFS = -DNCELLS_MAX=256000000            # fp64 (the default)
 WAVEFEM_DP_OBJS = $(patsubst %,$(OBJ_DIR)/wavefem_dp/%.cu.o,$(WAVEFEM_SRCS))
 
 # multi-GPU (domain-decomposed) Euler build.  Same solver + the Comm layer and a
@@ -323,9 +330,10 @@ clean:
 ktau_test: $(SRC_DIR)/fv/KtauTest.cu $(HDRS) $(SRC_DIR)/fv/KtauSst.h
 	$(NVCC) -O2 -std=$(STD) -arch=$(ARCH) -DUSE_DOUBLE $(WAVE3D_INC) $< -o $@
 
-# ... and the SAME gates in single precision, which is what wave3d actually builds
+# ... and the SAME gates in single precision.  (wave3d itself is fp64 now, so
+# this is a deliberate float gate, no longer "what wave3d actually builds".)
 ktau_test_sp: $(SRC_DIR)/fv/KtauTest.cu $(HDRS) $(SRC_DIR)/fv/KtauSst.h
-	$(NVCC) -O2 -std=$(STD) -arch=$(ARCH) $(WAVE3D_INC) $< -o $@
+	$(NVCC) -O2 -std=$(STD) -arch=$(ARCH) -DUSE_SINGLE $(WAVE3D_INC) $< -o $@
 
 # Tier-0 cut-element Jacobian + runtime-rule-mismatch probe (no solver needed)
 dgcutjac_test: $(SRC_DIR)/dg/DgCutJacTest.cu $(HDRS)

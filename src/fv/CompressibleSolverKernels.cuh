@@ -83,18 +83,16 @@ __global__ void turbClosureKernel(CompressibleSolver &grid);
 
 __global__ void wallUtauKernel(CompressibleSolver &grid);
 
-__global__ void jfnkAxpyKernel(const real *x, const real *y, real a, real *out, i32 n);
-__global__ void jfnkScaleKernel(const real *x, real a, real *out, i32 n);
-__global__ void jfnkCombKernel(const real *x, const real *y, real a, real b, real *out, i32 n);
-__global__ void jfnkGatherKernel(CompressibleSolver &grid, real *q, i32 N);
-__global__ void jfnkScatterKernel(CompressibleSolver &grid, const real *q, i32 N);
-__global__ void jfnkResidualKernel(CompressibleSolver &grid, real *r, i32 N);
-__global__ void jfnkDiagKernel(CompressibleSolver &grid, const real *v, real *Jv, real cflMul, i32 N);
+__global__ void zeroFieldKernel(CompressibleSolver &grid, i32 f);
+__global__ void cutGeometryKernel(CompressibleSolver &grid);
 __global__ void ransFieldProbeKernel(CompressibleSolver &grid, i32 which);
 
 __global__ void wallGhostKernel(CompressibleSolver &grid);
 
 __global__ void ibGhostKernel(CompressibleSolver &grid);
+__global__ void ibIfaceKernel(CompressibleSolver &grid);
+__global__ void shockSensorKernel(CompressibleSolver &grid);
+__global__ void rccmReconstructKernel(CompressibleSolver &grid);
 __global__ void zeroTrashBlockKernel(CompressibleSolver &grid, i32 f);
 __global__ void zeroScalesKernel(CompressibleSolver &grid);
 __global__ void zeroFlagsKernel(CompressibleSolver &grid);

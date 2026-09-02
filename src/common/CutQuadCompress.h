@@ -191,8 +191,19 @@ static void nnlsFactored(const std::vector<double>&PF,const std::vector<double>&
 
 // compress a Saye VOLUME rule (points in the reference cube [0,1]^3) to a positive rule
 // matching all tensor Q_{2p} moments; reuses a subset of the input node positions.
-static void compressVol(const SayeNode*in,int nIn,int p,std::vector<SayeNode>&out){
-  int K=2*p,n1=K+1,n=nIn; out.clear();
+// Potter Sec. 4.9 in its general form: the MOMENTS and the CANDIDATE NODES are
+// independent inputs.  `mom` (the full fine rule) fixes the target moment vector;
+// NNLS then searches only among `cand` for a positive rule reproducing it.  With
+// cand == mom this is exactly the old compressVol, bit for bit -- b accumulates
+// over the same points in the same order.  Decoupling matters because NNLS cost
+// scales with the CANDIDATE count, while accuracy scales with the MOMENT count:
+// a level set sampled 8x finer must not make the prune 8^3 times slower.
+// Returns ||A w - b||_inf, the moment mismatch -- 0 when the candidate set can
+// reproduce the fine moments exactly (which cand == mom does by construction).
+static double compressVolMom(const SayeNode*mom,int nMom,
+                             const SayeNode*cand,int nCand,
+                             int p,std::vector<SayeNode>&out){
+  int K=2*p,n1=K+1,n=nCand; out.clear();
   // MOMENT TARGET -- DEFAULT IS POTTER'S TOTAL-DEGREE SPACE P^d_{2p} (i0+i1+i2 <= 2p).
   //  The alternative (CUT_PRUNETOTAL=0) is the full TENSOR set (partial degree
   //  <= 2p), which is what a tensor-product FEM stiffness integrand formally needs
@@ -222,17 +233,32 @@ static void compressVol(const SayeNode*in,int nIn,int p,std::vector<SayeNode>&ou
     if(useTotal && (i+j+k)>K) continue;
     mi.push_back(i); mi.push_back(j); mi.push_back(k); }
   const int m=(int)(mi.size()/3);
-  if(n<=m){ for(int q=0;q<n;q++) out.push_back(in[q]); return; }   // already minimal
+  if(n<=m){ for(int q=0;q<nMom;q++) out.push_back(mom[q]); return 0.0; }  // already minimal
   // FACTORED candidate matrix: 3*n1 Legendre factors per node, expanded on the fly
   // inside nnls (16x smaller working set at p3, L2-resident -- see the note there).
   std::vector<double> PF((size_t)n*3*n1),b(m,0.0),Px(n1),Py(n1),Pz(n1);
-  for(int q=0;q<n;q++){ legShift(in[q].x[0],K,Px.data()); legShift(in[q].x[1],K,Py.data()); legShift(in[q].x[2],K,Pz.data());
+  for(int q=0;q<nMom;q++){ legShift(mom[q].x[0],K,Px.data()); legShift(mom[q].x[1],K,Py.data()); legShift(mom[q].x[2],K,Pz.data());
+    for(int t=0;t<m;t++){ const int*I=&mi[3*t]; b[t]+=(double)mom[q].w*Px[I[0]]*Py[I[1]]*Pz[I[2]]; } }
+  for(int q=0;q<n;q++){ legShift(cand[q].x[0],K,Px.data()); legShift(cand[q].x[1],K,Py.data()); legShift(cand[q].x[2],K,Pz.data());
     double*F=&PF[(size_t)q*3*n1];
-    for(int i=0;i<n1;i++){ F[i]=Px[i]; F[n1+i]=Py[i]; F[2*n1+i]=Pz[i]; }
-    for(int t=0;t<m;t++){ const int*I=&mi[3*t]; b[t]+=(double)in[q].w*Px[I[0]]*Py[I[1]]*Pz[I[2]]; } }
+    for(int i=0;i<n1;i++){ F[i]=Px[i]; F[n1+i]=Py[i]; F[2*n1+i]=Pz[i]; } }
   std::vector<double> w; nnlsFactored(PF,b,mi,m,n,n1,w);
-  for(int q=0;q<n;q++) if(w[q]>1e-13){ SayeNode s=in[q]; s.w=(real)w[q]; out.push_back(s); }
-  if(out.empty()){ for(int q=0;q<nIn;q++) out.push_back(in[q]); }   // NNLS failed -> keep original
+  for(int q=0;q<n;q++) if(w[q]>1e-13){ SayeNode s=cand[q]; s.w=(real)w[q]; out.push_back(s); }
+  if(out.empty()){ for(int q=0;q<nMom;q++) out.push_back(mom[q]); return 0.0; }  // NNLS failed -> keep original
+  double res=0;                       // how well the retained nodes match the fine moments
+  { std::vector<double> acc(m,0.0);
+    for(size_t r=0;r<out.size();r++){ legShift(out[r].x[0],K,Px.data()); legShift(out[r].x[1],K,Py.data()); legShift(out[r].x[2],K,Pz.data());
+      for(int t=0;t<m;t++){ const int*I=&mi[3*t]; acc[t]+=(double)out[r].w*Px[I[0]]*Py[I[1]]*Pz[I[2]]; } }
+    double bn=0; for(int t=0;t<m;t++) bn=fmax(bn,fabs(b[t]));
+    for(int t=0;t<m;t++){ double d=fabs(acc[t]-b[t]); if(d>res)res=d; }
+    res /= fmax(bn,1e-300); }   // RELATIVE to the largest moment: an absolute
+  // mismatch means nothing without knowing the cell's volume fraction, and a
+  // sliver cell's moments are tiny.
+  return res;
+}
+// the original signature: candidates ARE the input rule (bit-identical to before)
+static double compressVol(const SayeNode*in,int nIn,int p,std::vector<SayeNode>&out){
+  return compressVolMom(in,nIn,in,nIn,p,out);
 }
 // Paper's discretization: candidates on a UNIFORM grid inside Omega ({phi<0} via the level-set fit),
 // moments still taken from the Saye rule.  Returns ||Aw-b||_inf (moment mismatch: ~0 iff the grid can

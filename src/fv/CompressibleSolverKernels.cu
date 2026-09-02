@@ -275,6 +275,23 @@ __global__ void setInitialConditionsKernel(CompressibleSolver &grid) {
       Rho[cIdx] = rho;  U[cIdx] = uc;  V[cIdx] = 0.0;  W[cIdx] = 0.0;  P[cIdx] = p;
     }
 
+    if (grid.icType == 14) {
+      // Ringleb: initialise with the EXACT solution.  It is steady, so any later
+      // L2 error is purely what the scheme and the curved streamline wall did to
+      // an exact equilibrium -- the same design as icType 13.
+      real rho, uc, vc, pp;
+      grid.ringlebExact(pos[0], pos[1], rho, uc, vc, pp);
+      Rho[cIdx] = rho;  U[cIdx] = uc;  V[cIdx] = vc;  W[cIdx] = 0.0;  P[cIdx] = pp;
+    }
+
+    if (grid.icType == 15) {
+      // Canal with bump: the undisturbed inlet stream everywhere (uniform
+      // M = canalMa isentropic state from p0 = rho0 = 1); the bump and the
+      // boundary conditions do the rest.
+      Rho[cIdx] = grid.canalRhoIn;  U[cIdx] = grid.canalUin;  V[cIdx] = 0.0;  W[cIdx] = 0.0;
+      P[cIdx]   = grid.canalPin;
+    }
+
     if (grid.icType == 13) {
       // Supersonic vortex: initialise with the EXACT solution.  It is steady, so
       // the L2 error at any later time is purely what the scheme (and the curved
@@ -697,6 +714,63 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, 
             }
           }
         }
+        else if (grid.bcType == 7) {
+          // ---- canal with bump (paper Sect. 4.2, Fig. 9) --------------------
+          //   x-min  subsonic inlet: total conditions p0 = rho0 = 1 (so R T0 = 1)
+          //          and axial flow; the velocity is taken from the interior and
+          //          the static state follows isentropically from it
+          //   x-max  subsonic outlet: hold the static pressure canalPout,
+          //          extrapolate density and velocity
+          //   y      slip (the physical floor/ceiling are immersed; these faces
+          //          sit in the dead zone above/below them)
+          real r = Rho[bcIdx], uu, vv, ww, p;
+          if (prim) { uu = RhoU[bcIdx]; vv = RhoV[bcIdx]; ww = RhoW[bcIdx]; p = RhoE[bcIdx]; }
+          else {
+            uu = RhoU[bcIdx]/r; vv = RhoV[bcIdx]/r; ww = RhoW[bcIdx]/r;
+            p = (gam - 1.0)*(RhoE[bcIdx] - 0.5*r*(uu*uu + vv*vv + ww*ww));
+          }
+          if (ib < 0) {                            // inlet
+            // T/T0 = 1 - (gam-1) u^2/(2 gam) with c_p = gam/(gam-1), R = 1;
+            // clamp so a transient over-speed cannot drive T through zero
+            const real ui = fmax(uu, (real)0);
+            const real tr = fmax((real)1 - (gam - 1.0)*ui*ui/(2.0*gam), (real)0.2);
+            p  = pow(tr, gam/(gam - 1.0));
+            r  = pow(tr, (real)1/(gam - 1.0));
+            uu = ui; vv = 0.0; ww = 0.0;
+          }
+          else if (ib >= gridSize[0]) {            // outlet
+            p = grid.canalPout;
+          }
+          else {                                   // y / z faces: slip
+            vv = yWall ? -vv : vv;
+            ww = zWall ? -ww : ww;
+          }
+          Rho[cIdx]  = r;
+          RhoU[cIdx] = prim ? uu : r*uu;
+          RhoV[cIdx] = prim ? vv : r*vv;
+          RhoW[cIdx] = prim ? ww : r*ww;
+          RhoE[cIdx] = prim ? p : (p/(gam - 1.0) + 0.5*r*(uu*uu + vv*vv + ww*ww));
+        }
+        else if (grid.bcType == 6) {
+          // ---- exact-solution Dirichlet (verification cases) --------------
+          // Every exterior ghost carries the analytic state of the running
+          // case at its own position -- the paper's vortex test (Sect. 4.4)
+          // imposes the analytical solution on all boundaries.  Supersonic in
+          // AND out here, so a full-state Dirichlet is well posed on both.
+          Vec3 gpos = grid.getCellPos(lvl, ib, jb, kb, i, j, k);
+          real r, u, v, p;
+          if (grid.exactState(gpos[0], gpos[1], r, u, v, p)) {
+            Rho[cIdx]  = r;
+            RhoU[cIdx] = prim ? u : r*u;
+            RhoV[cIdx] = prim ? v : r*v;
+            RhoW[cIdx] = 0.0;
+            RhoE[cIdx] = prim ? p : (p/(gam - 1.0) + 0.5*r*(u*u + v*v));
+          } else {                                  // no exact state: transmissive
+            RhoU[cIdx] = RhoU[bcIdx];
+            RhoV[cIdx] = RhoV[bcIdx];
+            RhoW[cIdx] = RhoW[bcIdx];
+          }
+        }
         else {
           // bcType == 3 : transmissive / outflow (zero gradient)
           RhoU[cIdx] = RhoU[bcIdx];
@@ -799,6 +873,28 @@ __device__ inline double atomicMaxFloat(double *addr, double val) {
 // DIAG: count near-vacuum cells (rho < 0.05; physical min is the 0.125 ambient),
 // split by owned block vs ghost block, to locate an unphysical density overshoot.
 __device__ unsigned long long g_vacOwned;
+__device__ unsigned long long g_qUsed;     // implicit-ghost quadratic evaluations
+__device__ unsigned long long g_qDecl;     // ... declined (unreachable stencil)
+__device__ unsigned long long g_qGhostTap;
+__device__ unsigned long long g_rcDeadFace;  // face read with a DEAD neighbour and nonzero aperture
+__device__ unsigned long long g_rcDeadGrad;  // gradient stencil that skipped a dead tap
+__device__ unsigned long long g_rcLiveFace; // ghost taps actually consumed
+// Steady-state residual accumulators (see CompressibleSolver::computeResidual).
+__device__ double             g_resSum;   // sum of L(q)^2 over live fluid cells
+__device__ unsigned long long g_resCnt;   // cells contributing
+__device__ double             g_resSumFar;// same, but only cells > 4h from the body
+__device__ unsigned long long g_resCntFar;
+__device__ double             g_resMax;   // largest per-cell |L|
+__device__ double             g_resMaxPhi;// wall distance (-phi) of that cell, in local h
+
+// --- AMR debug probe: locate the FIRST non-finite evolved value ------------
+// g_nfKey packs (cIdx) of the lowest-index offender; g_nfCnt counts all of
+// them, split by z-layer so a pseudo2D staleness bug is visible directly.
+__device__ int g_nfCnt;      // non-finite cells found (k == 0 plane)
+__device__ int g_nfCntZ;     // non-finite cells found (k > 0 stale layers)
+__device__ int g_nfCidx;     // lowest offending cIdx (INT_MAX if none)
+__device__ int g_nfField;    // which field
+
 // Image-point stencil purity (--debug).  The IP must never interpolate from a
 // cell whose OWN reconstruction is wall-degraded: under ibGhostFree the remap
 // `if (!isFluidCell(cpos - 2h)) d2R = d1R;` slaves such a cell to the forced
@@ -931,7 +1027,8 @@ __global__ void computePressureKernel(CompressibleSolver &grid) {
 __device__ inline bool ibSample(CompressibleSolver &grid, Vec3 p, i32 lvl,
                                 i32 bIdx, i32 ci, i32 cj, i32 ck,
                                 i32 gi, i32 gj, i32 gk,
-                                real **F, i32 nf, real *out, bool tally = false)
+                                real **F, i32 nf, real *out, bool tally = false,
+                                bool allowGhost = false)
 {
   const real dx = grid.getDx(lvl), dy = grid.getDy(lvl), dz = grid.getDz(lvl);
   const real fx = p[0]/dx - (real)0.5, fy = p[1]/dy - (real)0.5;
@@ -962,7 +1059,15 @@ __device__ inline bool ibSample(CompressibleSolver &grid, Vec3 p, i32 lvl,
         if (m >= cEmpty) continue;
         Vec3 cp((((real)(i0+a)) + (real)0.5)*dx, (((real)(j0+b)) + (real)0.5)*dy,
                 (((real)(grid.pseudo2D ? gk : k0+c)) + (real)0.5)*dz);
-        if (grid.getField(F_IBM)[m] <= (real)0.5) continue;   // solid: no solution (cached mask)
+        // Solid taps carry no solution -- UNLESS this is the implicit ghost
+        // method, where first-layer ghosts hold a meaningful (iterated) state
+        // and dropping them is exactly the order loss we are trying to remove.
+        if (grid.getField(F_IBM)[m] <= (real)0.5) {
+          if (!allowGhost) continue;
+          const real phiT = grid.getField(F_PHI)[m];
+          const real hT   = fmin(dx, dy);
+          if (!(phiT <= (real)2.5*hT)) continue;    // beyond the filled band
+        }
         if (grid.dbgChecks && tally) {
           // is THIS tap's own reconstruction wall-degraded?  (+-2 taps, matching
           // the d2R/l2R remap condition, not +-1)
@@ -997,7 +1102,8 @@ __device__ inline bool ibSample(CompressibleSolver &grid, Vec3 p, i32 lvl,
 __device__ inline bool ibSampleQuad(CompressibleSolver &grid, Vec3 p, i32 lvl,
                                     i32 bIdx, i32 ci, i32 cj, i32 ck,
                                     i32 gi, i32 gj, i32 gk,
-                                    real **F, i32 nf, real *out)
+                                    real **F, i32 nf, real *out,
+                                    bool allowGhost = false)
 {
   const real dx = grid.getDx(lvl), dy = grid.getDy(lvl), dz = grid.getDz(lvl);
   const real fx = p[0]/dx - (real)0.5, fy = p[1]/dy - (real)0.5;
@@ -1017,7 +1123,10 @@ __device__ inline bool ibSampleQuad(CompressibleSolver &grid, Vec3 p, i32 lvl,
   const i32 di = i0 - gi, dj = j0 - gj, dk = grid.pseudo2D ? 0 : k0 - gk;
   const i32 lo = -blockSize + 1, hi = 2*blockSize - 2;   // room for the +-1 ring
   if (ci+di-1 < lo || ci+di+1 > hi || cj+dj-1 < lo || cj+dj+1 > hi ||
-      (!grid.pseudo2D && (ck+dk-1 < lo || ck+dk+1 > hi))) return false;
+      (!grid.pseudo2D && (ck+dk-1 < lo || ck+dk+1 > hi))) {
+    if (allowGhost) atomicAdd(&g_qDecl, 1ull);
+    return false;
+  }
   for (i32 f = 0; f < nf; f++) out[f] = 0;
   const i32 cEmpty = bEmpty*blockSizeTot;
   const i32 c0 = grid.pseudo2D ? 1 : 0, c1 = grid.pseudo2D ? 2 : 3;
@@ -1026,11 +1135,25 @@ __device__ inline bool ibSampleQuad(CompressibleSolver &grid, Vec3 p, i32 lvl,
       for (i32 c = c0; c < c1; c++) {
         const i32 m = grid.getNbrIdx(bIdx, ci+di+a-1, cj+dj+b-1,
                                      grid.pseudo2D ? ck : ck+dk+c-1);
-        if (m >= cEmpty) return false;                            // unreachable
-        if (grid.getField(F_IBM)[m] <= (real)0.5) return false;   // solid tap
+        if (m >= cEmpty) { if (allowGhost) atomicAdd(&g_qDecl, 1ull); return false; }
+        // Under the implicit ghost method a solid tap is NOT a reason to
+        // decline -- accepting ghost taps IS the method.  The ghosts carry an
+        // iterated state, so the quadratic always uses its full 3x3 stencil and
+        // never silently falls back to a lower-order fluid-only fit.  Declining
+        // here would give back exactly the order this is meant to recover.
+        if (!allowGhost && grid.getField(F_IBM)[m] <= (real)0.5) return false;
+        if (allowGhost && grid.getField(F_IBM)[m] <= (real)0.5) {
+          // beyond the filled band the ghost holds stale init data (rho can be
+          // 0 there, so its primitives are NaN after the first conversion) --
+          // tapping it poisoned the interface cells at the thin outer ring
+          const real phiT = grid.getField(F_PHI)[m];
+          if (!(phiT <= (real)2.5*fmin(dx, dy))) return false;
+          atomicAdd(&g_qGhostTap, 1ull);
+        }
         const real w = wx[a]*wy[b]*wz[c];
         for (i32 f = 0; f < nf; f++) out[f] += w*F[f][m];
       }
+  if (allowGhost) atomicAdd(&g_qUsed, 1ull);
   return true;
 }
 
@@ -1275,6 +1398,32 @@ __device__ inline bool ibFaceTraceFlux(CompressibleSolver &grid,
   Vec5 qW(0,0,0,0,0);
   bool haveQ = false;
 
+  // ---- paper slip BC (--ibgslip 1): NO image point ------------------------
+  // Ali et al., J Eng Math 146:5 (2024) Sect. 2.5.  Velocity is not built from
+  // a mirror: the primitives are interpolated at the WALL point itself and the
+  // normal component is simply dropped, leaving the tangential part (their
+  // U sin(t)cos(d) - V sin(t)sin(d) written frame-free).  rho and p are Neumann
+  // -- the interpolated wall values ARE the face values, their Eq. (26)
+  // coefficient (1 - B21) rather than the Dirichlet (2 - B21).
+  //
+  // The point is structural, not cosmetic: the mirror path below carries
+  // u_n * (d_FC/s*), which diverges as s* -> 0.  That division is what made the
+  // ghost mirror degenerate -- 11% velocity overshoot at N=512 with a 0.25h
+  // floor, needing 0.5h to behave.  Sampling AT the wall has no s* in it.
+  // The stencil straddles the boundary and only closes because the ghost values
+  // are unknowns of the implicit system: this BC is the reason the method has
+  // to be implicit in the first place.
+  if (grid.ibGSlip == 1) {
+    real qw[5];
+    if (ibSampleQuad(grid, foot, lvl, bIdx, ci, cj, ck, gi, gj, gk, Fs, 5, qw, true)
+        && qw[0] > (real)0 && qw[4] > (real)0) {
+      const real un = qw[1]*n[0] + qw[2]*n[1] + qw[3]*n[2];
+      qW = Vec5(qw[0], qw[1] - un*n[0], qw[2] - un*n[1], qw[3] - un*n[2], qw[4]);
+      for (i32 m = 0; m < 5; m++) qS[m] = qw[m];
+      haveQ = true;
+    }
+  }
+
   // ---- two-image-point quadratic trace (--ipquad 1) -----------------------
   // The single-point trace below is zeroth order in rho and p (plain Neumann:
   // the image-point values ARE the face values) and first order in u_n (a line
@@ -1297,7 +1446,7 @@ __device__ inline bool ibFaceTraceFlux(CompressibleSolver &grid,
   const bool qSamp = (grid.ibIpQuad == 1 || grid.ibIpQuad == 3 || grid.ibIpQuad == 4);
   const bool qTwo  = (grid.ibIpQuad == 1 || grid.ibIpQuad == 2 || grid.ibIpQuad == 4);
   const bool qNonly= (grid.ibIpQuad == 4);
-  if (qTwo) {
+  if (!haveQ && qTwo) {
     const real s1 = sStar, s2 = sStar + h;
     real qa[5], qb[5];
     Vec3 ip2(foot[0]+s2*n[0], foot[1]+s2*n[1], foot[2]+s2*n[2]);
@@ -1353,6 +1502,27 @@ __device__ inline bool ibFaceTraceFlux(CompressibleSolver &grid,
     const real sc = un*(dFc/sStar - (real)1);        // u - un*n + un*(dFc/s*)*n
     qW = Vec5(q[0], q[1] + sc*n[0], q[2] + sc*n[1], q[3] + sc*n[2], q[4]);
     for (i32 m = 0; m < 5; m++) qS[m] = q[m];
+  }
+
+  // ---- mode 2: paper velocity, existing p/rho ------------------------------
+  // The paper's velocity rule and its Neumann p,rho are separable, and on a
+  // curved wall they grade very differently.  Measured on the annulus at N=256,
+  // t=40: the wall-point velocity gives a SMOOTH field (no staircase serration
+  // at all) and max|u| = 0.2006 against an exact 0.2, where the mirror is 3.2%
+  // low -- but Neumann p,rho throws away dp/dn = rho u_t^2 kappa and costs 5x in
+  // L2.  Neither --ibthermo nor --ibcurv can repair it: with the sample taken AT
+  // the wall there is no second node on the normal, so the closure is degenerate
+  // (measured an exact no-op) and the curvature ramp overshoots 31%.
+  // So keep the velocity and let p, rho come from the trace above, which already
+  // carries the curvature.
+  if (grid.ibGSlip == 2) {
+    real qw[5];
+    if (ibSampleQuad(grid, foot, lvl, bIdx, ci, cj, ck, gi, gj, gk, Fs, 5, qw, true)) {
+      const real un = qw[1]*n[0] + qw[2]*n[1] + qw[3]*n[2];
+      qW[1] = qw[1] - un*n[0];
+      qW[2] = qw[2] - un*n[1];
+      qW[3] = qw[3] - un*n[2];
+    }
   }
 
   // ---- curvature ramp on u_t (--ibcurv 1) ----------------------------------
@@ -2213,34 +2383,16 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
         if (grid.rans) lam = fmax(lam, vel);
       }
       DeltaT[cIdx] = dx / (lam + 1e-32);
+      // RCCM Eq. (11): the step is taken over the NON-reconstructed cells only.
+      // The R-Cells are the small ones, and not letting them into the reduction
+      // is precisely what removes the small-cell time-step restriction -- they
+      // are reconstructed, never advanced, so no CFL applies to them.
+      if (grid.ibRccm && grid.rccmRCell(cIdx)) DeltaT[cIdx] = (real)1e30;
 
-      // Brinkman: every face flux entering this cell is scaled by w_f =
-      // phibar_f/phi_c, which is >> 1 on the body side of a thin interface
-      // (~exp(h/delta)).  The wave speed the step must respect is lam*max_f w_f,
-      // not lam.  Measured without this guard: the cylinder gate diverges at
-      // delta <= 0.5h for EVERY face quadrature, yet runs clean at cfl 0.2
-      // (0.35h) and 0.05 (0.25h) and the answer converges -- i.e. the scheme is
-      // fine down there and the floor was purely a step-size limit.
-      if (grid.ibBrink && grid.brinkDtW && grid.immerserdBcType != 0) {
-        const real hb = fmin(grid.getDx(grid.nLvls-1),
-                             fmin(grid.getDy(grid.nLvls-1), grid.getDz(grid.nLvls-1)));
-        const i32 lidx = cIdx % blockSizeTot;
-        Vec3 cp = grid.getCellPos(lvl, ib, jb, kb, lidx % blockSize,
-                                  (lidx / blockSize) % blockSize,
-                                  lidx / blockSize / blockSize);
-        const real dxl = grid.getDx(lvl), dyl = grid.getDy(lvl), dzl = grid.getDz(lvl);
-        const real phiC = grid.brinkPhi(-grid.getBoundaryLevelSet(cp), hb);
-        real wmax = (real)1;
-        for (i32 d = 0; d < (grid.pseudo2D ? 2 : 3); d++) {
-          const real hd = (d==0) ? dxl : ((d==1) ? dyl : dzl);
-          for (i32 sgn = -1; sgn <= 1; sgn += 2) {
-            Vec3 fp = cp;  fp[d] += (real)0.5*sgn*hd;
-            const real pf = grid.brinkPhi(-grid.getBoundaryLevelSet(fp), hb);
-            wmax = fmax(wmax, pf/fmax(phiC, (real)1e-30));
-          }
-        }
-        DeltaT[cIdx] = fmin(DeltaT[cIdx], dx/(lam*wmax + (real)1e-32));
-      }
+      // No phi-ratio dt clause: the pressure-tight form (Reiss 2021, Sec. 2.1)
+      // leaves u +- c unchanged, so the plain acoustic CFL above is the whole
+      // limit, and the point-implicit stamp in the RHS absorbs the band source
+      // magnitude without touching the step.
 
       // Diffusive limit dt <= dx^2 / (2 * ndim * nu_max).  The binding
       // diffusivity is the larger of the kinematic viscosity nu = mu/rho and
@@ -2273,17 +2425,8 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
                           nuMol + ktau::sigK2*fmax(ktt,(real)0));
         real ndim  = grid.pseudo2D ? (real)2.0 : (real)3.0;
         DeltaT[cIdx] = fmin(DeltaT[cIdx], dx*dx/((real)2.0*ndim*numax + (real)1e-32));
-        // Under Brinkman the body cells ARE evolved and F_IBM is 1 everywhere by
-        // design, so the dtSolid guard above does NOT exclude them -- while tau~
-        // is penalized to 0 inside the solid.  tau~/beta* then drives the GLOBAL
-        // step to zero: measured as a run that never reached its first output.
-        // The turbulence penalization is already point-implicit (F_LAMK/F_LAMT),
-        // so this limit is not needed there.  Identify the body by the LEVEL SET,
-        // never by F_IBM, anywhere Brinkman is active.
-        const bool inBodyDt = grid.ibBrink && grid.immerserdBcType != 0
-                            && grid.getField(F_PHI)[cIdx] >= (real)0;
         real tt = grid.getField(F_RHOTAU)[cIdx]/(q[0] + (real)1e-32);
-        if (tt > 0 && !inBodyDt) DeltaT[cIdx] = fmin(DeltaT[cIdx], tt/ktau::betaStar);
+        if (tt > 0) DeltaT[cIdx] = fmin(DeltaT[cIdx], tt/ktau::betaStar);
 
         // The wall boundary flux is by far the stiffest thing in the problem and
         // is invisible to every limit above: at the leading edge tau~ has to fall
@@ -2615,78 +2758,32 @@ __global__ void ransWallProbeKernel(CompressibleSolver &grid, real uTau, real yp
 // are not active interior are held at zero so they cannot pollute a dot product.
 // flat vector helpers (plain kernels, not device lambdas: the build does not
 // enable --extended-lambda and this is not worth changing it for)
-__global__ void jfnkAxpyKernel(const real *x, const real *y, real a, real *out, i32 n) {
-  for (i32 i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += gridDim.x*blockDim.x)
-    out[i] = x[i] + a*y[i];
-}
-__global__ void jfnkScaleKernel(const real *x, real a, real *out, i32 n) {
-  for (i32 i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += gridDim.x*blockDim.x)
-    out[i] = a*x[i];
-}
-__global__ void jfnkCombKernel(const real *x, const real *y, real a, real b, real *out, i32 n) {
-  for (i32 i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += gridDim.x*blockDim.x)
-    out[i] = a*x[i] + b*y[i];
-}
 
 // FULL-SYSTEM gather: all NEVOLVE conservative DOFs, laid out field-major.
 // The paper solves the whole system implicitly with local time stepping, not
 // just the turbulence pair, so the Newton state is every evolved variable.
-__global__ void jfnkGatherKernel(CompressibleSolver &grid, real *q, i32 N) {
-  START_CELL_LOOP
-    GET_CELL_INDICES
-    u64 loc = grid.bLocList[bIdx];
-    i32 lvl, ib, jb, kb; grid.decode(loc, lvl, ib, jb, kb);
-    const bool live = (loc != kEmpty) && grid.isInteriorBlock(lvl, ib, jb, kb);
-    for (i32 f = 0; f < NEVOLVE; f++)
-      q[(size_t)f*N + cIdx] = live ? grid.getField(f)[cIdx] : (real)0;
-  END_CELL_LOOP
-}
+// cells inside the immersed body are NOT evolved -- the BC/ghost machinery sets
+// them -- and the shared accumulator bank legitimately holds non-finite junk
+// there (the face-flux scatter writes it and nothing cleans it).  Including them
+// put NaN into R0, which poisoned every GMRES inner product.  Gather, residual
+// and scatter must all use THIS test or the vector space is inconsistent.
 
-__global__ void jfnkScatterKernel(CompressibleSolver &grid, const real *q, i32 N) {
-  START_CELL_LOOP
-    GET_CELL_INDICES
-    u64 loc = grid.bLocList[bIdx];
-    i32 lvl, ib, jb, kb; grid.decode(loc, lvl, ib, jb, kb);
-    if ((loc != kEmpty) && grid.isInteriorBlock(lvl, ib, jb, kb)) {
-      for (i32 f = 0; f < NEVOLVE; f++) grid.getField(f)[cIdx] = q[(size_t)f*N + cIdx];
-      // Realizability, not clipping of the answer: a Krylov direction can
-      // transiently propose a negative density or turbulence variable, and the
-      // closure and the pressure both divide by them.
-      real *R = grid.getField(F_RHO);
-      R[cIdx] = fmax(R[cIdx], (real)1e-8);
-      grid.getField(F_RHOK)[cIdx]   = fmax(grid.getField(F_RHOK)[cIdx],   (real)0);
-      grid.getField(F_RHOTAU)[cIdx] = fmax(grid.getField(F_RHOTAU)[cIdx], (real)0);
-    }
-  END_CELL_LOOP
-}
 
-__global__ void jfnkResidualKernel(CompressibleSolver &grid, real *r, i32 N) {
-  START_CELL_LOOP
-    GET_CELL_INDICES
-    u64 loc = grid.bLocList[bIdx];
-    i32 lvl, ib, jb, kb; grid.decode(loc, lvl, ib, jb, kb);
-    const bool live = (loc != kEmpty) && grid.isInteriorBlock(lvl, ib, jb, kb);
-    for (i32 f = 0; f < NEVOLVE; f++)
-      r[(size_t)f*N + cIdx] = live ? grid.getField(F_RHS + f)[cIdx] : (real)0;
-  END_CELL_LOOP
-}
+
 
 // A*v = v/dtau_local - J*v, with dtau taken PER CELL from the local time step
 // (F_DTL).  Local time stepping is what the paper pairs with implicit
 // integration: each cell advances toward the steady state at its own stable
 // rate, which is legitimate precisely because only R(q) = 0 is being sought.
-__global__ void jfnkDiagKernel(CompressibleSolver &grid, const real *v, real *Jv,
-                               real cflMul, i32 N) {
-  real *Dtl = grid.getField(F_DTL);
+// Zero one field over every live cell (kernel, not a memset of the full cap).
+__global__ void zeroFieldKernel(CompressibleSolver &grid, i32 f) {
+  real *F = grid.getField(f);
   START_CELL_LOOP
-    GET_CELL_INDICES
-    const real dt = fmax(Dtl[cIdx]*cflMul, (real)1e-30);
-    for (i32 f = 0; f < NEVOLVE; f++) {
-      const size_t m = (size_t)f*N + cIdx;
-      Jv[m] = v[m]/dt - Jv[m];
-    }
+    F[cIdx] = (real)0;
   END_CELL_LOOP
 }
+
+
 
 __global__ void ransFieldProbeKernel(CompressibleSolver &grid, i32 which) {
   real *Rho = grid.getField(F_RHO);
@@ -2849,9 +2946,8 @@ __global__ void turbClosureKernel(CompressibleSolver &grid) {
         // (measured: RAE 2822 TE at x = 12.44, inf -> NaN in nu~, which then
         // spreads).  The centre test is the one that matches what the closure
         // needs -- a wall distance for THIS cell centre -- so require both.
-        && (grid.ibBrink ? (grid.getField(F_PHI)[cIdx] >= (real)0)
-                         : (grid.getField(F_IBM)[cIdx] <= (real)0.5
-                            || grid.getField(F_PHI)[cIdx] >= (real)0));
+        && (grid.getField(F_IBM)[cIdx] <= (real)0.5
+            || grid.getField(F_PHI)[cIdx] >= (real)0);
     if (inBody) {
       MuT[cIdx] = 0;
       TF1[cIdx] = 0;
@@ -2891,7 +2987,6 @@ __global__ void turbClosureKernel(CompressibleSolver &grid) {
     // stable.  Half a LOCAL cell is the physical resolution limit of "distance
     // to the wall" for a cell centre; below that the identities are being fed
     // sub-grid geometry noise.
-    if (grid.ibBrink) d = fmax(d, (real)0.5*fmin(hh[0], hh[1]));
     const real rd  = (grid.dCutoff > 0)
                    ? fmax(grid.dCutoff/fmax(d, (real)0.5*fmin(hh[0], hh[1])), (real)1)
                    : (real)1;
@@ -3188,9 +3283,14 @@ __global__ void zeroAccumulatorKernel(CompressibleSolver &grid) {
   END_CELL_LOOP
 }
 
+// rccmCutGeom (apertures / volume fraction / centroid from the four corner
+// level-set values) lives in CompressibleSolver.cuh so the host error norms can
+// evaluate the exact solution at the same fluid centroid the kernels use.
+
 __global__ void ibStampGeometryKernel(CompressibleSolver &grid) {
   real *Phi = grid.getField(F_PHI);
   real *Ibm = grid.getField(F_IBM);
+  real *Bc  = grid.getField(F_IBBC);
   START_CELL_LOOP
     GET_CELL_INDICES
     u64 loc = grid.bLocList[bIdx];
@@ -3201,6 +3301,727 @@ __global__ void ibStampGeometryKernel(CompressibleSolver &grid) {
       Phi[cIdx] = grid.getBoundaryLevelSet(pos);
       Ibm[cIdx] = grid.isFluidCell(pos, fmin(grid.getDx(lvl), grid.getDy(lvl)))
                 ? (real)1 : (real)0;
+      Bc[cIdx]  = (real)grid.getBoundaryBcKind(pos);
+      if (grid.ibBrink) {
+        // ---- Brinkman face porosities, stamped once (see F_BRINKX) ---------
+        // phibar over this cell's LOW-x and LOW-y faces, by the same rule the
+        // RHS used to evaluate live: --brinkface 3 splits the face into
+        // --brinkseg pieces and integrates the sigmoid in closed form on each
+        // (exact for a plane wall, and its error is geometric, not spectral --
+        // it does not grow as the band narrows); --brinkface 2 is the single
+        // endpoint-to-endpoint average.  delta is the FIXED physical length
+        // taken from the finest level, never the local cell size, so a cell's
+        // own dx enters only through the face it is integrating over.
+        const real dx = grid.getDx(lvl), dy = grid.getDy(lvl);
+        const real hb = fmin(grid.getDx(grid.nLvls-1),
+                             grid.pseudo2D ? grid.getDx(grid.nLvls-1)
+                                           : grid.getDy(grid.nLvls-1));
+        const real hx = (real)0.5*dx, hy = (real)0.5*dy;
+        const real xl = pos[0]-hx, yd = pos[1]-hy;
+        grid.getField(F_BRINKX)[cIdx] =
+          grid.brinkPhiFaceAvgSeg(Vec3(xl, pos[1]-hy, pos[2]),
+                                  Vec3(xl, pos[1]+hy, pos[2]), hb, grid.brinkNSeg);
+        grid.getField(F_BRINKY)[cIdx] =
+          grid.brinkPhiFaceAvgSeg(Vec3(pos[0]-hx, yd, pos[2]),
+                                  Vec3(pos[0]+hx, yd, pos[2]), hb, grid.brinkNSeg);
+      }
+      if (grid.ibRccm) {
+        const real dx = grid.getDx(lvl), dy = grid.getDy(lvl);
+        real f[4];
+        f[0] = grid.getBoundaryLevelSet(Vec3(pos[0]-(real)0.5*dx, pos[1]-(real)0.5*dy, pos[2]));
+        f[1] = grid.getBoundaryLevelSet(Vec3(pos[0]+(real)0.5*dx, pos[1]-(real)0.5*dy, pos[2]));
+        f[2] = grid.getBoundaryLevelSet(Vec3(pos[0]+(real)0.5*dx, pos[1]+(real)0.5*dy, pos[2]));
+        f[3] = grid.getBoundaryLevelSet(Vec3(pos[0]-(real)0.5*dx, pos[1]+(real)0.5*dy, pos[2]));
+        real al, ax, ay;
+        rccmCutGeom(f, al, ax, ay);
+        grid.getField(F_CUTA)[cIdx]  = al;
+        grid.getField(F_CUTAX)[cIdx] = ax;
+        grid.getField(F_CUTAY)[cIdx] = ay;
+      }
+      // A PRESCRIBED cell holds the boundary state for the whole run: the body
+      // is static and the state is time-independent, so stamp it once here and
+      // let ibGhostKernel leave these cells alone.  The value comes from the
+      // nearest SEGMENT (forward-evaluated at setup), never from inverting at
+      // this cell centre -- which lies outside the map and would fail.
+      if (Bc[cIdx] > (real)0.5 && grid.ibPolyState && grid.ibPolyBc) {
+        real d2min = (real)1e30; i32 eMin = 0;
+        for (i32 e = 0; e < grid.ibPolyN; e++) {
+          const i32 f = (e + 1 == grid.ibPolyN) ? 0 : e + 1;
+          const real ax = grid.ibPoly[2*e], ay = grid.ibPoly[2*e+1];
+          const real bx = grid.ibPoly[2*f], by = grid.ibPoly[2*f+1];
+          const real ex = bx-ax, ey = by-ay, L2 = ex*ex + ey*ey;
+          real t = (L2 > (real)0) ? ((pos[0]-ax)*ex + (pos[1]-ay)*ey)/L2 : (real)0;
+          t = fmin(fmax(t,(real)0),(real)1);
+          const real qx = pos[0]-(ax+t*ex), qy = pos[1]-(ay+t*ey);
+          const real d2 = qx*qx + qy*qy;
+          if (d2 < d2min) { d2min = d2; eMin = e; }
+        }
+        // ibPolyState holds PRIMITIVES (rho,u,v,p); the solver holds the state
+        // CONSERVATIVE between steps, so stamp conservative or every prescribed
+        // cell reads back a velocity of u/rho.  That was the whole "|V| = 1.37
+        // against a physical max of 0.85" wedge: 0.85/0.62 = 1.37 exactly.
+        const real rr = grid.ibPolyState[4*eMin+0];
+        const real uu = grid.ibPolyState[4*eMin+1];
+        const real vv = grid.ibPolyState[4*eMin+2];
+        const real pp = grid.ibPolyState[4*eMin+3];
+        grid.getField(F_RHO )[cIdx] = rr;
+        grid.getField(F_RHOU)[cIdx] = rr*uu;
+        grid.getField(F_RHOV)[cIdx] = rr*vv;
+        grid.getField(F_RHOW)[cIdx] = (real)0;
+        grid.getField(F_RHOE)[cIdx] = pp/(gam-(real)1) + (real)0.5*rr*(uu*uu + vv*vv);
+      }
+    }
+  END_CELL_LOOP
+}
+
+// ---- interface-cell prescription (--ibiface, Ali et al. J Eng Math 146:5) --
+//
+// The paper's actual architecture: the unknowns of the wall treatment are the
+// FIRST FLUID CELLS (interface cells -- fluid cells with a non-fluid face
+// neighbour), which are excluded from the solve and PRESCRIBED after each
+// sweep.  Solid cells are never touched; there is no wall Riemann problem.
+// Here the RK update is left alone and the interface cells are simply
+// overwritten each stage before the RHS reads them -- the evolved value never
+// reaches any flux, which is the same thing without touching the update kernel.
+// (The price the paper does not dwell on: conservation is given up in this one
+// cell layer.)
+//
+// Per interface cell C at wall distance d = -phi (phi < 0 in the fluid):
+//   foot P = C - d n,  image I = C + d n  (2d off the wall; C is the midpoint
+//   of P and I, which is exactly what makes the paper's Dirichlet relation
+//   f = (phi_I + phi_B)/2 a linear interpolation).
+//   rho, p (and k~, tau~): Neumann -- the value AT I is the value at C, their
+//   Eq. (26): f (1 - B21) = sum of fluid terms.  The stencil at I contains
+//   interface cells, C itself included; each pass of this kernel is one Jacobi
+//   sweep of that implicit system.
+//   velocity: slip -- built at the FOOT, normal component dropped.  Mode 1
+//   follows the paper: a plane through the non-interface fluid cells of the
+//   bilinear window around I (their points 5, 6, 10), evaluated at P; the
+//   interface cell is excluded, so velocity is explicit.  Mode 2 samples at P
+//   with the implicit triquadratic, which straddles the wall and taps ghosts.
+// mode 1 = paper verbatim (bilinear; the fluid-only renormalising fallback in
+//          ibSample IS their Sect. 3.4 three-point corner fix)
+// mode 2 = implicit triquadratic (3x3, 3x3x3 off the pseudo-2D path) for
+//          everything, falling back to bilinear where the window is out of reach
+// ---- Ducros-like shock sensor (recon 5) ------------------------------------
+// The DG solver's dgAvNuKernel sensor, cell-centred FV form: compression rate
+// against acoustic rate,
+//     theta = (div u)^2 / ((div u)^2 + K c^2/h^2)    (K = --ksensor, DG --avk)
+// Unlike the DG original this fires on BOTH signs of div u -- see below.
+// Central differences of the PRIMITIVE velocity; where the stencil is
+// unavailable (domain edge, seam gap) theta = 1, i.e. fall back to van Leer.
+// Written into F_RHOK, which is free outside RANS (recon 5 + RANS is refused
+// at startup) and rides along in field dumps as a bonus diagnostic.
+__global__ void shockSensorKernel(CompressibleSolver &grid) {
+  real *Rho = grid.getField(F_RHO);
+  real *U   = grid.getField(F_RHOU);
+  real *V   = grid.getField(F_RHOV);
+  real *W   = grid.getField(F_RHOW);
+  real *P   = grid.getField(F_RHOE);
+  real *Th  = grid.getField(F_RHOK);
+
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      i32 lvl, ib, jb, kb;
+      grid.decode(loc, lvl, ib, jb, kb);
+      const real dx = grid.getDx(lvl), dy = grid.getDy(lvl);
+      const i32 cEmpty = bEmpty*blockSizeTot;
+      const i32 xm = grid.getNbrIdx(bIdx, i-1, j, k), xp = grid.getNbrIdx(bIdx, i+1, j, k);
+      const i32 ym = grid.getNbrIdx(bIdx, i, j-1, k), yp = grid.getNbrIdx(bIdx, i, j+1, k);
+      real th = (real)1;                     // no stencil -> stay limited
+      bool ok = xm < cEmpty && xp < cEmpty && ym < cEmpty && yp < cEmpty;
+      real divu = 0;
+      if (ok) divu = (U[xp]-U[xm])/((real)2*dx) + (V[yp]-V[ym])/((real)2*dy);
+      if (ok && !(blockSizeZ == 1 || grid.pseudo2D)) {
+        const i32 zm = grid.getNbrIdx(bIdx, i, j, k-1), zp = grid.getNbrIdx(bIdx, i, j, k+1);
+        if (zm < cEmpty && zp < cEmpty)
+          divu += (W[zp]-W[zm])/((real)2*grid.getDz(lvl));
+        else ok = false;
+      }
+      if (ok) {
+        const real c2   = gam*fmax(P[cIdx], (real)1e-30)/fmax(Rho[cIdx], (real)1e-30);
+        const real h    = fmin(dx, dy);
+        // BOTH signs of div u fire the sensor (user call 2026-09-01): the
+        // Brinkman blow-up sat on the EXPANSION side of the forming shock
+        // foot, where a compression-only sensor is blind by construction.
+        // Resolved smooth waves stay below the K c^2/h^2 acoustic floor
+        // either way, so the smooth-flow limit is unchanged.
+        const real comp = divu*divu;
+        th = comp/(comp + grid.kSensor*c2/(h*h) + (real)1e-30);
+      }
+      Th[cIdx] = th;
+    }
+  END_CELL_LOOP
+}
+
+// Offset of a cell's FLUID centroid from its Cartesian centre, in units of h.
+__device__ inline void rccmCentroidOff(CompressibleSolver &grid, Vec3 cp,
+                                       real dx, real dy, real h,
+                                       real &ox, real &oy)
+{
+  real f[4];
+  f[0] = grid.getBoundaryLevelSet(Vec3(cp[0]-(real)0.5*dx, cp[1]-(real)0.5*dy, cp[2]));
+  f[1] = grid.getBoundaryLevelSet(Vec3(cp[0]+(real)0.5*dx, cp[1]-(real)0.5*dy, cp[2]));
+  f[2] = grid.getBoundaryLevelSet(Vec3(cp[0]+(real)0.5*dx, cp[1]+(real)0.5*dy, cp[2]));
+  f[3] = grid.getBoundaryLevelSet(Vec3(cp[0]-(real)0.5*dx, cp[1]+(real)0.5*dy, cp[2]));
+  real al, ax, ay, cx = (real)0.5, cy = (real)0.5;
+  rccmCutGeom(f, al, ax, ay, &cx, &cy);
+  ox = (cx - (real)0.5)*dx/h;
+  oy = (cy - (real)0.5)*dy/h;
+}
+
+// Tangential position of the OPEN part of a face's centroid, relative to the
+// face midpoint, in units of the face length.  The face is a segment whose
+// fluid part is one contiguous piece (piecewise-linear phi along the edge), so
+// the open part runs from one end and its centroid is half the aperture in.
+__device__ inline real rccmFaceCen(real fLo, real fHi) {
+  const bool oLo = fLo < (real)0, oHi = fHi < (real)0;
+  if (oLo == oHi) return (real)0;                     // fully open or fully shut
+  const real a = oLo ? fLo/(fLo - fHi) : fHi/(fHi - fLo);
+  return oLo ? (real)0.5*a - (real)0.5 : (real)0.5 - (real)0.5*a;
+}
+
+// Central-difference gradient of one field over LIVE neighbours.
+__device__ inline void rccmGrad(CompressibleSolver &grid, const real *F, i32 bIdx,
+                                i32 i, i32 j, i32 k, real dx, real dy,
+                                real &gx, real &gy)
+{
+  const i32 cE = bEmpty*blockSizeTot;
+  const i32 xm = grid.getNbrIdx(bIdx, i-1, j, k), xp = grid.getNbrIdx(bIdx, i+1, j, k);
+  const i32 ym = grid.getNbrIdx(bIdx, i, j-1, k), yp = grid.getNbrIdx(bIdx, i, j+1, k);
+  gx = 0; gy = 0;
+  if (xm < cE && xp < cE && grid.rccmLive(xm) && grid.rccmLive(xp))
+    gx = (F[xp] - F[xm])/((real)2*dx);
+  if (ym < cE && yp < cE && grid.rccmLive(ym) && grid.rccmLive(yp))
+    gy = (F[yp] - F[ym])/((real)2*dy);
+}
+
+// Move a face state from where the uniform-grid MUSCL implicitly evaluated it
+// (the cell's Cartesian centre, pushed half a cell along the face normal) to
+// where the cut geometry actually needs it: from the cell's FLUID CENTROID to
+// the OPEN FACE's centroid.  Both endpoints move on a cut cell, so the shift is
+//     D = (x_faceCentroid - x_cellCentroid) - (half-cell normal step)
+// and the state is carried along the cell's own gradient.  Without this the
+// scheme is first order at every cut face however good the cell values are --
+// the values are simply being used at the wrong points.
+__device__ inline void rccmShiftFace(CompressibleSolver &grid, real *Fs[4],
+                                     i32 bIdx, i32 i, i32 j, i32 k,
+                                     real dx, real dy, real h,
+                                     real ocx, real ocy, real tFace,
+                                     i32 d, Vec5 &q)
+{
+  // D in physical units: normal part cancels the assumed half-cell step, the
+  // tangential part carries the face centroid offset.
+  const real Dx = (d == 0) ? -ocx*h : (tFace*dx - ocx*h);
+  const real Dy = (d == 0) ? (tFace*dy - ocy*h) : -ocy*h;
+  const i32 slot[4] = {0, 1, 2, 4};                 // rho, u, v, p in q[]
+  for (i32 f = 0; f < 4; f++) {
+    real gx, gy;
+    rccmGrad(grid, Fs[f], bIdx, i, j, k, dx, dy, gx, gy);
+    q[slot[f]] += gx*Dx + gy*Dy;
+  }
+  if (!(q[0] > (real)0) || !(q[4] > (real)0)) {     // never let it invert
+    q[0] = fmax(q[0], (real)1e-12); q[4] = fmax(q[4], (real)1e-12);
+  }
+}
+
+// ---- gradient MUSCL for cut cells (--recon 6) -------------------------------
+//
+// The 1-D limited slopes of tvdRec assume cell values sit at Cartesian centres
+// a uniform dx apart.  On a cut cell neither holds: the average lives at the
+// FLUID CENTROID and its neighbours' centroids are at arbitrary offsets.  So
+// build the gradient the way an unstructured code does --
+//   * least squares over the live neighbours, using centroid-to-centroid
+//     separations, which absorbs the non-uniform spacing exactly;
+//   * a Barth-Jespersen limiter, which is a CELL-based monotonicity condition
+//     (the reconstruction may not exceed the neighbour min/max anywhere it is
+//     evaluated) rather than a 1-D stencil test -- this is what an unlimited
+//     parabola lacks near a cut cell, where the stencil is not smooth;
+//   * evaluation from the cell centroid to the OPEN FACE centroid.
+// Gradients are recomputed per thread rather than stored: 8 extra fields would
+// be ~0.5 GB here, and the kernel is launch-bound rather than flop-bound.
+__device__ inline void rccmGradLimited(CompressibleSolver &grid, real *Fs[4],
+                                       i32 bIdx, i32 i, i32 j, i32 k,
+                                       Vec3 cpos, real dx, real dy, real h,
+                                       real ocx, real ocy,
+                                       real g[4][2], real lim[4])
+{
+  const i32 cE = bEmpty*blockSizeTot;
+  const i32 cIdx0 = grid.getNbrIdx(bIdx, i, j, k);
+  real Sxx = 0, Sxy = 0, Syy = 0;
+  real Sxf[4] = {0,0,0,0}, Syf[4] = {0,0,0,0};
+  real qmn[4], qmx[4], q0[4];
+  for (i32 f = 0; f < 4; f++) { q0[f] = Fs[f][cIdx0]; qmn[f] = q0[f]; qmx[f] = q0[f]; }
+  // neighbour offsets and their centroids
+  real nx[8], ny[8], dq[8][4]; i32 nn = 0;
+  for (i32 dj = -1; dj <= 1; dj++)
+    for (i32 di = -1; di <= 1; di++) {
+      if (di == 0 && dj == 0) continue;
+      const i32 m = grid.getNbrIdx(bIdx, i+di, j+dj, k);
+      if (m >= cE) continue;
+      if (grid.ibRccm && !grid.rccmLive(m)) {
+        if (grid.dbgChecks) atomicAdd(&g_rcDeadGrad, 1ull);
+        continue;
+      }
+      real onx = 0, ony = 0;
+      if (grid.ibRccm && grid.getField(F_CUTA)[m] < (real)1 - (real)1e-12)
+        rccmCentroidOff(grid, Vec3(cpos[0] + (real)di*dx, cpos[1] + (real)dj*dy, cpos[2]),
+                        dx, dy, h, onx, ony);
+      const real rx = (real)di*dx + (onx - ocx)*h;
+      const real ry = (real)dj*dy + (ony - ocy)*h;
+      const real w  = (real)1/(rx*rx + ry*ry);
+      Sxx += w*rx*rx; Sxy += w*rx*ry; Syy += w*ry*ry;
+      for (i32 f = 0; f < 4; f++) {
+        const real d = Fs[f][m] - q0[f];
+        Sxf[f] += w*rx*d; Syf[f] += w*ry*d;
+        qmn[f] = fmin(qmn[f], Fs[f][m]);
+        qmx[f] = fmax(qmx[f], Fs[f][m]);
+      }
+      nx[nn] = rx; ny[nn] = ry;
+      for (i32 f = 0; f < 4; f++) dq[nn][f] = Fs[f][m] - q0[f];
+      nn++;
+    }
+  const real det = Sxx*Syy - Sxy*Sxy;
+  for (i32 f = 0; f < 4; f++) {
+    if (nn >= 2 && fabs(det) > (real)1e-30) {
+      g[f][0] = ( Syy*Sxf[f] - Sxy*Syf[f])/det;
+      g[f][1] = (-Sxy*Sxf[f] + Sxx*Syf[f])/det;
+    } else { g[f][0] = 0; g[f][1] = 0; }
+    // Limiter: largest scaling that keeps the reconstruction inside
+    // [qmn, qmx] at every neighbour position.
+    //   1  Barth-Jespersen: hard min().  Non-differentiable, and at a steady
+    //      state it CHATTERS -- a cell whose gradient sits on the clip flips
+    //      between phi<1 and phi=1 from step to step, so the residual there
+    //      never drops below the size of the flip.  Measured on the annulus:
+    //      the residual max sat on the first fluid row at the grid-aligned
+    //      wall points, 100x the interior, and did not decay.
+    //   2  Venkatakrishnan (AIAA 93-0880): the same bound made smooth, with a
+    //      threshold eps^2 = (K h)^3 below which variations are not limited at
+    //      all -- so a converged smooth field is left alone and the limiter
+    //      cannot hold a limit cycle.  K ~ 5 is the usual choice.
+    //   0  none (smooth flows only; blows up on a shock).
+    //  -1  FIRST ORDER: the gradient is dropped altogether, which is the
+    //      piecewise-constant scheme of the paper (their Sect. 2.2, Roe with
+    //      cell averages).  Only for reproducing their convergence tables.
+    real phi = (grid.gradLim < 0) ? (real)0 : (real)1;
+    if (grid.gradLim == 1) {
+      for (i32 t = 0; t < nn; t++) {
+        const real d = g[f][0]*nx[t] + g[f][1]*ny[t];
+        if (d > (real)1e-30)       phi = fmin(phi, (qmx[f] - q0[f])/d);
+        else if (d < (real)-1e-30) phi = fmin(phi, (qmn[f] - q0[f])/d);
+      }
+    } else if (grid.gradLim == 2) {
+      const real kh = grid.gradLimK*h;
+      // scale the threshold with the field so rho, p and u are limited alike
+      const real sc = fmax(fabs(q0[f]), (real)1e-30);
+      const real e2 = kh*kh*kh*sc*sc;
+      for (i32 t = 0; t < nn; t++) {
+        const real dm = g[f][0]*nx[t] + g[f][1]*ny[t];          // Delta_-
+        if (fabs(dm) <= (real)1e-30) continue;
+        const real dp = (dm > 0) ? (qmx[f] - q0[f]) : (qmn[f] - q0[f]);   // Delta_+
+        const real ph = ((dp*dp + e2) + (real)2*dm*dp)/(dp*dp + (real)2*dm*dm + dm*dp + e2);
+        phi = fmin(phi, ph);
+      }
+    }
+    lim[f] = fmin(fmax(phi, (real)0), (real)1);
+  }
+}
+
+// ---- RCCM reconstruction of the R-Cells (Ndiaye et al. Sect. 2.3.2) --------
+//
+// Each primitive phi is fitted with a LINEAR function about the R-Cell centre
+//     phi = a + b (x - x0) + c (y - y0)                            (their Eq. 8)
+// from a stencil of solved neighbours plus points ON the boundary carrying the
+// boundary condition.  The fitted value at the centre, a, is the new R-Cell
+// value (Eq. 10).
+//
+// Stencil (their Fig. 3): the face+diagonal neighbours that are LIVE, each at
+// its own centre, plus the R-Cell's own wall foot point.  The paper notes an
+// R-Cell's stencil may contain other R-Cells, so the systems couple and are
+// assembled globally; each pass of this kernel is one Jacobi sweep of that
+// system, and the driver runs --rccmiter of them.
+//
+// Boundary condition, inviscid wall: the NORMAL velocity vanishes there, while
+// rho, p and the tangential velocity have no Dirichlet data.  So the wall point
+// enters the fit only for u_n (value 0, weighted like any other row) and the
+// scalars are fitted from the fluid rows alone -- which is the "Neumann" half of
+// the paper's Sect. 2.5 discussion, imposed by leaving the wall out of the fit
+// rather than by asserting a gradient.
+//
+// The 3x3 normal equations are solved by Cramer; a degenerate stencil (fewer
+// than 3 usable rows, or a near-singular fit) falls back to inverse-distance
+// weighting, which is monotone and always available.
+__global__ void rccmReconstructKernel(CompressibleSolver &grid) {
+  real *Rho = grid.getField(F_RHO);
+  real *U   = grid.getField(F_RHOU);
+  real *V   = grid.getField(F_RHOV);
+  real *W   = grid.getField(F_RHOW);
+  real *P   = grid.getField(F_RHOE);
+
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb, kb;
+    grid.decode(loc, lvl, ib, jb, kb);
+    // Exterior (domain-ghost) blocks are the domain BC's, not the body's: a
+    // bcType 6 exact-Dirichlet ghost that happens to be a small cut cell must
+    // keep its prescribed state, not a reconstruction of it.
+    if (loc != kEmpty && !grid.isExteriorBlock(lvl, ib, jb, kb) && grid.rccmRCell(cIdx)) {
+      const real dx = grid.getDx(lvl), dy = grid.getDy(lvl);
+      const real h  = fmin(dx, dy);
+      Vec3 pc = grid.getCellPos(lvl, ib, jb, kb, i, j, k);
+      const i32 cE = bEmpty*blockSizeTot;
+      // Reconstruct at the FLUID CENTROID, not the Cartesian centre (their
+      // Sect. 2.3.3).  For an R-Cell the Cartesian centre is inside the solid,
+      // so a fit evaluated there is an extrapolation ACROSS the wall -- which
+      // showed up as tangential momentum being destroyed at the wall, in uncut
+      // cells too, once that state entered the R-Cell/NR-Cell face fluxes.
+      real o0x = 0, o0y = 0;
+      rccmCentroidOff(grid, pc, dx, dy, h, o0x, o0y);
+      Vec3 p0(pc[0] + o0x*h, pc[1] + o0y*h, pc[2]);
+      // Wall frame at the centroid; the foot point is where the normal meets
+      // the wall, which is also the boundary-face centre the paper uses.
+      Vec3 n = grid.wallNormal(p0, h);
+      const real phi = grid.getBoundaryLevelSet(p0);
+      const real tx = -n[1], ty = n[0];             // unit tangent (2-D)
+
+      // Fit rho, p, u_n, u_t.  Working in the WALL FRAME is what lets the
+      // boundary condition enter as a row of the fit (the paper's "points on
+      // the boundary" carrying the BC) instead of being imposed afterwards:
+      // for an inviscid wall the datum is u_n = 0 AT THE FOOT POINT, and there
+      // is no Dirichlet datum for rho, p or u_t, so only the u_n system gets a
+      // boundary row.  Imposing u_n = 0 at the R-Cell CENTRE instead -- which
+      // is what the first cut of this kernel did -- asserts the wall condition
+      // at a point inside the solid, a different (and wrong) condition.
+      real M[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
+      real Mn[3][3] = {{0,0,0},{0,0,0},{0,0,0}};    // u_n system (extra BC row)
+      real rhsF[4][3] = {{0,0,0},{0,0,0},{0,0,0},{0,0,0}};   // rho,p,u_t,u_n
+      real wsum = 0, fb[4] = {0,0,0,0};
+      real qmn[4] = { (real)1e30, (real)1e30, (real)1e30, (real)1e30};
+      real qmx[4] = {(real)-1e30,(real)-1e30,(real)-1e30,(real)-1e30};
+      i32 nrow = 0;
+      for (i32 dj = -1; dj <= 1; dj++)
+        for (i32 di = -1; di <= 1; di++) {
+          if (di == 0 && dj == 0) continue;
+          const i32 m = grid.getNbrIdx(bIdx, i+di, j+dj, k);
+          if (m >= cE || !grid.rccmLive(m)) continue;
+          // row position = the NEIGHBOUR's centroid, relative to ours: a cut
+          // neighbour's average does not live at its Cartesian centre either
+          real onx = 0, ony = 0;
+          if (grid.getField(F_CUTA)[m] < (real)1 - (real)1e-12)
+            rccmCentroidOff(grid, Vec3(pc[0] + (real)di*dx, pc[1] + (real)dj*dy, pc[2]),
+                            dx, dy, h, onx, ony);
+          const real xi  = (real)di*dx/h + onx - o0x;
+          const real eta = (real)dj*dy/h + ony - o0y;
+          // A tap that is itself an R-Cell is an UNKNOWN of the same system, not
+          // data.  Weighting it like a solved cell is what makes the Jacobi
+          // iteration of the paper's global system diverge where R-Cells
+          // cluster (measured at N=64: 10 sweeps -> max|u| = 3e23, while the
+          // paper's direct solve has no such failure mode).  Halving those rows
+          // shrinks the iteration matrix; the fixed point is unchanged, since
+          // at convergence every row is consistent anyway.
+          const real wR  = grid.rccmRCell(m) ? (real)0.5 : (real)1;
+          const real wgt = wR/(xi*xi + eta*eta);
+          const real un = U[m]*n[0] + V[m]*n[1];
+          const real ut = U[m]*tx   + V[m]*ty;
+          const real q[4] = {Rho[m], P[m], ut, un};
+          M[0][0] += wgt;        M[0][1] += wgt*xi;      M[0][2] += wgt*eta;
+          M[1][1] += wgt*xi*xi;  M[1][2] += wgt*xi*eta;  M[2][2] += wgt*eta*eta;
+          for (i32 f = 0; f < 4; f++) {
+            rhsF[f][0] += wgt*q[f];
+            rhsF[f][1] += wgt*q[f]*xi;
+            rhsF[f][2] += wgt*q[f]*eta;
+            fb[f] += wgt*q[f];
+            qmn[f] = fmin(qmn[f], q[f]);
+            qmx[f] = fmax(qmx[f], q[f]);
+          }
+          wsum += wgt; nrow++;
+        }
+      M[1][0] = M[0][1]; M[2][0] = M[0][2]; M[2][1] = M[1][2];
+      for (i32 a = 0; a < 3; a++)
+        for (i32 b = 0; b < 3; b++) Mn[a][b] = M[a][b];
+      // boundary row for u_n: value 0 at the foot, weighted like a near tap
+      {
+        const real xf = phi*n[0]/h, ef = phi*n[1]/h;
+        const real wB = (real)4;                 // BC is data, not a suggestion
+        Mn[0][0] += wB;       Mn[0][1] += wB*xf;      Mn[0][2] += wB*ef;
+        Mn[1][0] += wB*xf;    Mn[1][1] += wB*xf*xf;   Mn[1][2] += wB*xf*ef;
+        Mn[2][0] += wB*ef;    Mn[2][1] += wB*xf*ef;   Mn[2][2] += wB*ef*ef;
+        // rhs contribution is zero (u_n = 0), so rhsF[3] is unchanged
+      }
+      // Dirichlet boundary (--ibdir 1): the exact state is known AT the foot
+      // point, so every primitive gets a boundary row -- the paper's "Dirichlet
+      // boundary condition" datum in its Sect. 2.3.2 stencil.  M then carries
+      // the same geometric row Mn already has, and u_n takes the exact value
+      // instead of 0.
+      real unB = 0;                                // u_n datum at the foot
+      if (grid.ibDirichlet) {
+        real rD, uD, vD, pD;
+        if (grid.exactState(p0[0] + phi*n[0], p0[1] + phi*n[1], rD, uD, vD, pD)) {
+          const real qD[4] = {rD, pD, uD*tx + vD*ty, uD*n[0] + vD*n[1]};
+          const real xf = phi*n[0]/h, ef = phi*n[1]/h;
+          const real wB = (real)4;
+          M[0][0] += wB;       M[0][1] += wB*xf;      M[0][2] += wB*ef;
+          M[1][0] += wB*xf;    M[1][1] += wB*xf*xf;   M[1][2] += wB*xf*ef;
+          M[2][0] += wB*ef;    M[2][1] += wB*xf*ef;   M[2][2] += wB*ef*ef;
+          for (i32 f = 0; f < 4; f++) {
+            rhsF[f][0] += wB*qD[f];
+            rhsF[f][1] += wB*qD[f]*xf;
+            rhsF[f][2] += wB*qD[f]*ef;
+            qmn[f] = fmin(qmn[f], qD[f]);
+            qmx[f] = fmax(qmx[f], qD[f]);
+            if (f < 3) fb[f] += wB*qD[f];
+          }
+          wsum += wB;
+          unB = qD[3];
+        }
+      }
+      // Neumann rows for rho, p, u_t (the paper's Sect. 2.3.2: "for points on
+      // a boundary with a Neumann boundary condition ... the information is
+      // the derivative of the primitive variable along the normal").  Leaving
+      // the wall out of the scalar fits is NOT the same thing: along a wall
+      // that runs parallel to the grid the R-Cells form a row whose only data
+      // in the normal direction are (a) one row of NR-Cells and (b) each
+      // other.  A plane through both rows fits exactly for ANY value of the
+      // R-Cell row, so the normal slope -- and with it the R-Cell value -- is
+      // a free mode of the Jacobi iteration (eigenvalue 1).  Measured on the
+      // canal floor (76x32, alpha = 0.3): the R-Cell row drifted to a stagnant
+      // layer, p -> p0 and u -> 0 under a stream that kept moving, and the
+      // mass flow decayed 0.61 -> 0.38.  The row (0, n_x, n_y) . (a,b,c) =
+      // h dphi/dn closes the system; any positive weight selects the same
+      // fixed point in the degenerate case, and the weight only sets how fast
+      // the sweep contracts there (1 -> factor ~0.4 per sweep).  The data are
+      // the inviscid wall relations rather than plain zero-slope, so a curved
+      // wall is not biased:  dp/dn = rho u_t^2 kappa  (centripetal balance),
+      // drho/dn = dp/dn / c^2  (isentropic),  du_t/dn = -kappa u_t
+      // (irrotational).  All three are invariant under n -> -n, and kappa =
+      // div n is taken from the tangential difference of the wall normal at
+      // the foot.  Not used under --ibdir 1, where every primitive already has
+      // its Dirichlet row.
+      if (!grid.ibDirichlet && grid.ibRccmNeu > (real)0 && wsum > (real)0) {
+        const real wN = grid.ibRccmNeu;
+        Vec3 xf(p0[0] + phi*n[0], p0[1] + phi*n[1], p0[2]);
+        const real dl = (real)0.5*h;
+        Vec3 nP = grid.wallNormal(Vec3(xf[0] + dl*tx, xf[1] + dl*ty, xf[2]), h);
+        Vec3 nM = grid.wallNormal(Vec3(xf[0] - dl*tx, xf[1] - dl*ty, xf[2]), h);
+        const real kap = ((nP[0] - nM[0])*tx + (nP[1] - nM[1])*ty)/((real)2*dl);
+        const real rm = fb[0]/wsum, pm = fb[1]/wsum, um = fb[2]/wsum;
+        const real dpn = rm*um*um*kap;
+        const real gN[3] = { dpn*rm/(gam*pm), dpn, -kap*um };   // rho, p, u_t
+        M[1][1] += wN*n[0]*n[0];  M[1][2] += wN*n[0]*n[1];
+        M[2][1] += wN*n[0]*n[1];  M[2][2] += wN*n[1]*n[1];
+        for (i32 f = 0; f < 3; f++) {
+          rhsF[f][1] += wN*n[0]*gN[f]*h;
+          rhsF[f][2] += wN*n[1]*gN[f]*h;
+        }
+      }
+
+      #define RCCM_DET(A) ((A)[0][0]*((A)[1][1]*(A)[2][2]-(A)[1][2]*(A)[2][1]) \
+                         - (A)[0][1]*((A)[1][0]*(A)[2][2]-(A)[1][2]*(A)[2][0]) \
+                         + (A)[0][2]*((A)[1][0]*(A)[2][1]-(A)[1][1]*(A)[2][0]))
+      #define RCCM_SOLVE0(A, R) ((R)[0]*((A)[1][1]*(A)[2][2]-(A)[1][2]*(A)[2][1]) \
+                               - (A)[0][1]*((R)[1]*(A)[2][2]-(A)[1][2]*(R)[2])    \
+                               + (A)[0][2]*((R)[1]*(A)[2][1]-(A)[1][1]*(R)[2]))
+      real out[4];
+      bool ok = false;
+      if (nrow >= 3) {
+        const real det  = RCCM_DET(M);
+        const real detN = RCCM_DET(Mn);
+        const real tol  = (real)1e-8*wsum*wsum*wsum;
+        if (fabs(det) > tol && fabs(detN) > tol) {
+          for (i32 f = 0; f < 3; f++) out[f] = RCCM_SOLVE0(M, rhsF[f])/det;
+          out[3] = RCCM_SOLVE0(Mn, rhsF[3])/detN;      // u_n, with the wall row
+          ok = (out[0] > (real)0) && (out[1] > (real)0);
+        }
+      }
+      #undef RCCM_DET
+      #undef RCCM_SOLVE0
+      // Keep the reconstruction inside the convex hull of its own stencil.  A
+      // one-sided stencil lets the linear fit EXTRAPOLATE past its data, and
+      // chaining those through the R-Cell coupling is what diverges (10 sweeps
+      // -> 1e34 even damped).  Clamping makes the sweep non-expansive in the
+      // max norm, so the iteration is a contraction; where the fit is already
+      // sane -- the common case -- the clamp never binds and nothing is lost.
+      // u_n additionally admits its wall value 0, which is genuine data.
+      if (ok) {
+        qmn[3] = fmin(qmn[3], unB); qmx[3] = fmax(qmx[3], unB);
+        for (i32 f = 0; f < 4; f++) out[f] = fmin(fmax(out[f], qmn[f]), qmx[f]);
+      }
+      if (!ok && wsum > (real)0) {                 // inverse-distance fallback
+        for (i32 f = 0; f < 3; f++) out[f] = fb[f]/wsum;
+        out[3] = unB;                              // boundary value for u_n
+        ok = (out[0] > (real)0) && (out[1] > (real)0);
+      }
+      if (ok) {
+        // Damped Jacobi: the fixed point is identical, but the iteration is
+        // stable where the plain sweep is not.
+        const real w = grid.ibRccmRelax, w1 = (real)1 - w;
+        Rho[cIdx] = w1*Rho[cIdx] + w*out[0];
+        P[cIdx]   = w1*P[cIdx]   + w*out[1];
+        U[cIdx]   = w1*U[cIdx]   + w*(out[2]*tx + out[3]*n[0]);
+        V[cIdx]   = w1*V[cIdx]   + w*(out[2]*ty + out[3]*n[1]);
+        W[cIdx]   = 0;
+      }
+    }
+  END_CELL_LOOP
+}
+
+__global__ void ibIfaceKernel(CompressibleSolver &grid) {
+  real *Rho = grid.getField(F_RHO);
+  real *U   = grid.getField(F_RHOU);
+  real *V   = grid.getField(F_RHOV);
+  real *W   = grid.getField(F_RHOW);
+  real *P   = grid.getField(F_RHOE);
+  real *K   = grid.getField(F_RHOK);
+  real *Tau = grid.getField(F_RHOTAU);
+
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb, kb;
+    grid.decode(loc, lvl, ib, jb, kb);
+    if (loc != kEmpty && grid.getField(F_IBM)[cIdx] > (real)0.5) {
+      const i32 cEmpty = bEmpty*blockSizeTot;
+      // interface cell?  any non-fluid FACE neighbour.  A neighbour in a
+      // PRESCRIBED (inflow/outflow) region vetoes the prescription: those
+      // ghosts carry the exact state and the ordinary update is correct.
+      bool iface = false, veto = false;
+      const i32 nd = (blockSizeZ == 1 || grid.pseudo2D) ? 2 : 3;
+      for (i32 d = 0; d < nd; d++)
+        for (i32 sgn = -1; sgn <= 1; sgn += 2) {
+          const i32 m = grid.getNbrIdx(bIdx, i + (d==0)*sgn, j + (d==1)*sgn,
+                                       k + (d==2)*sgn);
+          if (m >= cEmpty) continue;
+          if (grid.getField(F_IBM)[m] <= (real)0.5) {
+            iface = true;
+            if (grid.getField(F_IBBC)[m] > (real)0.5) veto = true;
+          }
+        }
+      if (iface && !veto) {
+        const real h = fmin(grid.getDx(lvl), grid.getDy(lvl));
+        Vec3 p = grid.getCellPos(lvl, ib, jb, kb, i, j, k);
+        const real phi = grid.getField(F_PHI)[cIdx];    // < 0 here (fluid side)
+        const real d0  = -phi;
+        if (d0 > (real)0) {
+          Vec3 n = grid.wallNormal(p, h);               // points into the fluid
+          Vec3 foot(p[0] + phi*n[0], p[1] + phi*n[1], p[2] + phi*n[2]);
+          Vec3 ipt (p[0] + d0 *n[0], p[1] + d0 *n[1], p[2] + d0 *n[2]);
+          const i32 gi = ib*blockSize+i, gj = jb*blockSize+j, gk = kb*blockSizeZ+k;
+          real *Fp[7] = {Rho, U, V, W, P, Tau, K};
+          real q[7];
+          bool okI = false;
+          if (grid.ibIface >= 2)
+            okI = ibSampleQuad(grid, ipt, lvl, bIdx, i, j, k, gi, gj, gk, Fp, 7, q, true);
+          if (!okI)
+            okI = ibSample(grid, ipt, lvl, bIdx, i, j, k, gi, gj, gk, Fp, 7, q,
+                           false, grid.ibIface >= 2);
+          if (okI) {
+            // mode 1 keeps the paper's Neumann rho/p verbatim.  Mode 2 does not:
+            // on a curved wall the normal pressure gradient is not zero, it is
+            // the centripetal balance dp/ds = rho u_t^2 kappa (s along n, kappa
+            // = div n, positive on a convex body) -- and dropping it is the ONE
+            // systematic error every smooth-BC variant measured today shares
+            // (paper slip 2.7e-2 vs mirror 5.3e-3 on the annulus, all of the
+            // gap in rho/p).  Integrate it from I (s = 2d) down to C (s = d)
+            // and move rho along the isentrope.
+            real pC = q[4], rC = q[0];
+            if (grid.ibIface >= 2) {
+              const real e2 = (real)0.5*h;
+              Vec3 nxp = grid.wallNormal(Vec3(foot[0]+e2, foot[1], foot[2]), h);
+              Vec3 nxm = grid.wallNormal(Vec3(foot[0]-e2, foot[1], foot[2]), h);
+              Vec3 nyp = grid.wallNormal(Vec3(foot[0], foot[1]+e2, foot[2]), h);
+              Vec3 nym = grid.wallNormal(Vec3(foot[0], foot[1]-e2, foot[2]), h);
+              real kap = (nxp[0]-nxm[0] + nyp[1]-nym[1])/((real)2*e2);
+              const real kM = (real)0.5/h;
+              kap = fmin(fmax(kap, -kM), kM);
+              const real unI = q[1]*n[0] + q[2]*n[1] + q[3]*n[2];
+              const real ut2 = fmax(q[1]*q[1] + q[2]*q[2] + q[3]*q[3] - unI*unI,
+                                    (real)0);
+              real dp = -q[0]*ut2*kap*d0;              // I -> C is -d0 along n
+              dp = fmin(fmax(dp, (real)-0.2*q[4]), (real)0.2*q[4]);
+              pC = q[4] + dp;
+              const real a2 = gam*q[4]/fmax(q[0], (real)1e-30);
+              rC = fmax(q[0] + dp/a2, (real)1e-30);    // along the isentrope
+            }
+            Rho[cIdx] = rC;
+            P[cIdx]   = pC;
+            Tau[cIdx] = q[5];
+            K[cIdx]   = q[6];
+            // ---- velocity at the foot --------------------------------------
+            real uf[3]; bool okV = false;
+            if (grid.ibIface >= 2) {
+              real qf[5];
+              okV = ibSampleQuad(grid, foot, lvl, bIdx, i, j, k, gi, gj, gk, Fp, 5, qf, true)
+                 || ibSample    (grid, foot, lvl, bIdx, i, j, k, gi, gj, gk, Fp, 5, qf,
+                                 false, true);
+              if (okV) { uf[0] = qf[1]; uf[1] = qf[2]; uf[2] = qf[3]; }
+            }
+            else if (grid.ibIface == 1) {
+              // paper mode: plane through the NON-interface fluid taps of the
+              // bilinear window around I, evaluated at the foot
+              // (mode 3 skips this fit and projects the I sample instead --
+              // the isolation probe for the mode-1 NaN)
+              const real dx = grid.getDx(lvl), dy = grid.getDy(lvl);
+              const real fx = ipt[0]/dx - (real)0.5, fy = ipt[1]/dy - (real)0.5;
+              const i32 i0 = (i32)floor((double)fx), j0 = (i32)floor((double)fy);
+              const i32 di = i0 - gi, dj = j0 - gj;
+              real A[3] = {0,0,0};                      // sum xx, xy, yy
+              real bu[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
+              real s1 = 0, sx = 0, sy = 0;
+              i32 npt = 0;
+              for (i32 a = 0; a <= 1; a++)
+                for (i32 b = 0; b <= 1; b++) {
+                  const i32 m = grid.getNbrIdx(bIdx, i+di+a, j+dj+b, k);
+                  if (m >= cEmpty || grid.getField(F_IBM)[m] <= (real)0.5) continue;
+                  bool tapIface = false;                // exclude interface taps
+                  for (i32 dd = 0; dd < 2 && !tapIface; dd++)
+                    for (i32 sg = -1; sg <= 1; sg += 2) {
+                      const i32 mn = grid.getNbrIdx(bIdx, i+di+a + (dd==0)*sg,
+                                                    j+dj+b + (dd==1)*sg, k);
+                      if (mn < cEmpty && grid.getField(F_IBM)[mn] <= (real)0.5)
+                        { tapIface = true; break; }
+                    }
+                  if (tapIface) continue;
+                  const real xr = ((real)(i0+a) + (real)0.5)*dx - foot[0];
+                  const real yr = ((real)(j0+b) + (real)0.5)*dy - foot[1];
+                  s1 += 1; sx += xr; sy += yr;
+                  A[0] += xr*xr; A[1] += xr*yr; A[2] += yr*yr;
+                  for (i32 f = 0; f < 3; f++) {
+                    const real v = Fp[1+f][m];
+                    bu[f][0] += v; bu[f][1] += v*xr; bu[f][2] += v*yr;
+                  }
+                  npt++;
+                }
+              if (npt >= 3) {
+                // normal equations for c0 + cx x + cy y, centred on the foot
+                const real M[3][3] = {{s1, sx, sy}, {sx, A[0], A[1]}, {sy, A[1], A[2]}};
+                const real det = M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1])
+                               - M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0])
+                               + M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0]);
+                // det ~ dx^4: three nearly-collinear taps pass an absolute
+                // 1e-20 test and the wall extrapolation then explodes (NaN by
+                // t=16 on the annulus).  Guard in the fit's own units.
+                if (fabs(det) > (real)1e-2*dx*dx*dx*dx) {
+                  for (i32 f = 0; f < 3; f++) {
+                    // Cramer, first component only (the value at the foot)
+                    uf[f] = (bu[f][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1])
+                           - M[0][1]*(bu[f][1]*M[2][2]-M[1][2]*bu[f][2])
+                           + M[0][2]*(bu[f][1]*M[2][1]-M[1][1]*bu[f][2]))/det;
+                  }
+                  okV = true;
+                }
+              }
+            }
+            if (!okV) { uf[0] = q[1]; uf[1] = q[2]; uf[2] = q[3]; }
+            const real un = uf[0]*n[0] + uf[1]*n[1] + uf[2]*n[2];
+            U[cIdx] = uf[0] - un*n[0];                  // tangential part only
+            V[cIdx] = uf[1] - un*n[1];
+            W[cIdx] = uf[2] - un*n[2];
+          }
+        }
+      }
     }
   END_CELL_LOOP
 }
@@ -3230,7 +4051,16 @@ __global__ void ibGhostKernel(CompressibleSolver &grid) {
       // their freestream initial state puts u = u_inf immediately under the wall
       // and wrecks every near-wall stencil.
       const bool nonFluid = grid.getField(F_IBM)[cIdx] <= (real)0.5;   // cached mask
-      if (nonFluid && phi <= (real)2.5*h) {
+      // PRESCRIBED boundary (inflow/outflow): the exact state is known here, so
+      // the ghost simply carries it.  No mirror, no extrapolation -- and unlike a
+      // wall, where only ONE boundary value is known and the ghost has to be
+      // built so the reconstructed FACE satisfies it, a region with a known
+      // solution gives the stencil exact data on both sides and keeps full
+      // scheme order for free.  2.5h covers the halo-2 reconstruction reach.
+      // PRESCRIBED cells were stamped with the boundary state and are constant
+      // in time -- leave them.  Only WALL ghosts are rebuilt each stage.
+      if (nonFluid && phi <= (real)2.5*h &&
+          grid.getField(F_IBBC)[cIdx] <= (real)0.5) {
         Vec3 n = grid.wallNormal(p, h);
         Vec3 surf(p[0] + phi*n[0], p[1] + phi*n[1], p[2] + phi*n[2]);
         // NOT every non-fluid cell is inside the body.  The UTCart rule tags two
@@ -3262,14 +4092,34 @@ __global__ void ibGhostKernel(CompressibleSolver &grid) {
         // s* = 2h also keeps the whole bilinear stencil in genuinely fluid
         // cells, so the fluid-only renormalisation inside ibSample -- another
         // per-cell jitter source -- almost never triggers.
-        const real sStar = (real)2*h;
+        // --ibgmirror: the NATURAL mirror -- reflect this ghost across the wall,
+        // so the image sits at its own wall distance rather than a fixed 2h
+        // standoff.  Compact and second-order-consistent per cell; the price is
+        // that the stencil now contains ghosts (handled by the Jacobi sweeps).
+        // dG = -phi is NEGATIVE for a ghost (phi > 0 inside the body), so the mirror
+        // distance is |phi|, not dG -- taking dG collapsed this to the 0.25h floor,
+        // putting the image point on the wall itself and producing NaN.
+        const real sStar = grid.ibGMirror ? fmax(fabs(dG), grid.ibGFloor*h) : (real)2*h;
         Vec3 mir(surf[0] + sStar*n[0], surf[1] + sStar*n[1], surf[2] + sStar*n[2]);
         real dS = -grid.getBoundaryLevelSet(mir);   // measured, not assumed = s*
         if (dS < (real)0.5*h) dS = sStar;           // curvature pathology guard
         real *Fp[7] = {Rho, U, V, W, P, Tau, K};
         real q[7];
-        if (ibSample(grid, mir, lvl, bIdx, i, j, k,
-                     ib*blockSize+i, jb*blockSize+j, kb*blockSizeZ+k, Fp, 7, q)) {
+        bool okS = grid.ibGMirror
+          ? ibSampleQuad(grid, mir, lvl, bIdx, i, j, k,
+                         ib*blockSize+i, jb*blockSize+j, kb*blockSizeZ+k, Fp, 7, q,
+                         true /* ghosts allowed: the coupled system */)
+          : ibSample(grid, mir, lvl, bIdx, i, j, k,
+                     ib*blockSize+i, jb*blockSize+j, kb*blockSizeZ+k, Fp, 7, q);
+        // A declined mirror quad must NOT leave the ghost stale: where the
+        // solid is thinner than the window (the outer ring near the axes) the
+        // stale cell still holds init data and every later sample of it is
+        // poison.  The renormalising bilinear always produces something sane.
+        if (!okS && grid.ibGMirror)
+          okS = ibSample(grid, mir, lvl, bIdx, i, j, k,
+                         ib*blockSize+i, jb*blockSize+j, kb*blockSizeZ+k, Fp, 7, q,
+                         false, true);
+        if (okS) {
           Rho[cIdx] = q[0];                     // Neumann density and pressure
           P[cIdx]   = q[4];
           // --ibho: the flat-wall Neumann rho/p above is O(h) wrong on a
@@ -3623,7 +4473,23 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     i32 l2R = l2Idx, l1R = l1Idx, r1R = r1Idx;
     i32 d2R = d2Idx, d1R = d1Idx, u1R = u1Idx;
     i32 b2R = b2Idx, b1R = b1Idx, f1R = f1Idx;
-    if (grid.immerserdBcType != 0 && grid.ibGhostFree) {
+    // Under RCCM the collapse is MANDATORY, not an --ibgf option: dead cells
+    // (alpha = 0) are never advanced AND never ghost-filled -- the R-Cell
+    // reconstruction replaced applyWallGhosts -- so they hold their INITIAL
+    // state for the whole run.  A 1-D slope that reads one is differencing
+    // against frozen data forever.  Measured with the gradient path (recon 6),
+    // which excludes them properly: 1.8e9 dead taps encountered per run.
+    if (grid.immerserdBcType != 0 && grid.ibRccm) {
+      #define RCCM_DEAD(IDX) ((IDX) < bEmpty*blockSizeTot && !grid.rccmLive(IDX))
+      if (RCCM_DEAD(l1Idx)) l1R = cIdx;
+      if (RCCM_DEAD(l2Idx)) l2R = l1R;
+      if (RCCM_DEAD(r1Idx)) r1R = cIdx;
+      if (RCCM_DEAD(d1Idx)) d1R = cIdx;
+      if (RCCM_DEAD(d2Idx)) d2R = d1R;
+      if (RCCM_DEAD(u1Idx)) u1R = cIdx;
+      #undef RCCM_DEAD
+    }
+    else if (grid.immerserdBcType != 0 && grid.ibGhostFree) {
       const real hm = fmin(dx, dy);
       if (!grid.isFluidCell(Vec3(cpos[0]-dx,   cpos[1], cpos[2]), hm)) l1R = cIdx;
       if (!grid.isFluidCell(Vec3(cpos[0]-2*dx, cpos[1], cpos[2]), hm)) l2R = l1R;
@@ -3641,40 +4507,109 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     Vec5 qL, qR, qD, qU, qB, qF;
 
     // TVD reconstructed primitive states on each face
-    qL[0] = grid.tvdRec(Rho[l2R], Rho[l1R], Rho[cIdx]);
-    qR[0] = grid.tvdRec(Rho[r1R], Rho[cIdx],  Rho[l1R]);
-    qD[0] = grid.tvdRec(Rho[d2R], Rho[d1R], Rho[cIdx]);
-    qU[0] = grid.tvdRec(Rho[u1R], Rho[cIdx],  Rho[d1R]);
-    qB[0] = grid.tvdRec(Rho[b2R], Rho[b1R], Rho[cIdx]);
-    qF[0] = grid.tvdRec(Rho[f1R], Rho[cIdx],  Rho[b1R]);
+    // recon 5: per-face sensor = max of the two adjacent cells' theta.  qL/qR
+    // are the two states of THIS cell's minus-x face (l1|c), so both take the
+    // same face theta; likewise qD/qU (minus-y) and qB/qF (minus-z).
+    real thX = 1, thY = 1, thZ = 1;
+    if (grid.recon == 5) {
+      const real *Th = grid.getField(F_RHOK);
+      thX = fmax(Th[cIdx], Th[l1R]);
+      thY = fmax(Th[cIdx], Th[d1R]);
+      thZ = (blockSizeZ == 1 || grid.pseudo2D) ? thX : fmax(Th[cIdx], Th[b1R]);
+    }
+    qL[0] = grid.tvdRec(Rho[l2R], Rho[l1R], Rho[cIdx], thX);
+    qR[0] = grid.tvdRec(Rho[r1R], Rho[cIdx],  Rho[l1R], thX);
+    qD[0] = grid.tvdRec(Rho[d2R], Rho[d1R], Rho[cIdx], thY);
+    qU[0] = grid.tvdRec(Rho[u1R], Rho[cIdx],  Rho[d1R], thY);
+    qB[0] = grid.tvdRec(Rho[b2R], Rho[b1R], Rho[cIdx], thZ);
+    qF[0] = grid.tvdRec(Rho[f1R], Rho[cIdx],  Rho[b1R], thZ);
 
-    qL[1] = grid.tvdRec(U[l2R], U[l1R], U[cIdx]);
-    qR[1] = grid.tvdRec(U[r1R], U[cIdx],  U[l1R]);
-    qD[1] = grid.tvdRec(U[d2R], U[d1R], U[cIdx]);
-    qU[1] = grid.tvdRec(U[u1R], U[cIdx],  U[d1R]);
-    qB[1] = grid.tvdRec(U[b2R], U[b1R], U[cIdx]);
-    qF[1] = grid.tvdRec(U[f1R], U[cIdx],  U[b1R]);
+    qL[1] = grid.tvdRec(U[l2R], U[l1R], U[cIdx], thX);
+    qR[1] = grid.tvdRec(U[r1R], U[cIdx],  U[l1R], thX);
+    qD[1] = grid.tvdRec(U[d2R], U[d1R], U[cIdx], thY);
+    qU[1] = grid.tvdRec(U[u1R], U[cIdx],  U[d1R], thY);
+    qB[1] = grid.tvdRec(U[b2R], U[b1R], U[cIdx], thZ);
+    qF[1] = grid.tvdRec(U[f1R], U[cIdx],  U[b1R], thZ);
 
-    qL[2] = grid.tvdRec(V[l2R], V[l1R], V[cIdx]);
-    qR[2] = grid.tvdRec(V[r1R], V[cIdx],  V[l1R]);
-    qD[2] = grid.tvdRec(V[d2R], V[d1R], V[cIdx]);
-    qU[2] = grid.tvdRec(V[u1R], V[cIdx],  V[d1R]);
-    qB[2] = grid.tvdRec(V[b2R], V[b1R], V[cIdx]);
-    qF[2] = grid.tvdRec(V[f1R], V[cIdx],  V[b1R]);
+    qL[2] = grid.tvdRec(V[l2R], V[l1R], V[cIdx], thX);
+    qR[2] = grid.tvdRec(V[r1R], V[cIdx],  V[l1R], thX);
+    qD[2] = grid.tvdRec(V[d2R], V[d1R], V[cIdx], thY);
+    qU[2] = grid.tvdRec(V[u1R], V[cIdx],  V[d1R], thY);
+    qB[2] = grid.tvdRec(V[b2R], V[b1R], V[cIdx], thZ);
+    qF[2] = grid.tvdRec(V[f1R], V[cIdx],  V[b1R], thZ);
 
-    qL[3] = grid.tvdRec(W[l2R], W[l1R], W[cIdx]);
-    qR[3] = grid.tvdRec(W[r1R], W[cIdx],  W[l1R]);
-    qD[3] = grid.tvdRec(W[d2R], W[d1R], W[cIdx]);
-    qU[3] = grid.tvdRec(W[u1R], W[cIdx],  W[d1R]);
-    qB[3] = grid.tvdRec(W[b2R], W[b1R], W[cIdx]);
-    qF[3] = grid.tvdRec(W[f1R], W[cIdx],  W[b1R]);
+    qL[3] = grid.tvdRec(W[l2R], W[l1R], W[cIdx], thX);
+    qR[3] = grid.tvdRec(W[r1R], W[cIdx],  W[l1R], thX);
+    qD[3] = grid.tvdRec(W[d2R], W[d1R], W[cIdx], thY);
+    qU[3] = grid.tvdRec(W[u1R], W[cIdx],  W[d1R], thY);
+    qB[3] = grid.tvdRec(W[b2R], W[b1R], W[cIdx], thZ);
+    qF[3] = grid.tvdRec(W[f1R], W[cIdx],  W[b1R], thZ);
 
-    qL[4] = grid.tvdRec(P[l2R], P[l1R], P[cIdx]);
-    qR[4] = grid.tvdRec(P[r1R], P[cIdx],  P[l1R]);
-    qD[4] = grid.tvdRec(P[d2R], P[d1R], P[cIdx]);
-    qU[4] = grid.tvdRec(P[u1R], P[cIdx],  P[d1R]);
-    qB[4] = grid.tvdRec(P[b2R], P[b1R], P[cIdx]);
-    qF[4] = grid.tvdRec(P[f1R], P[cIdx],  P[b1R]);
+    qL[4] = grid.tvdRec(P[l2R], P[l1R], P[cIdx], thX);
+    qR[4] = grid.tvdRec(P[r1R], P[cIdx],  P[l1R], thX);
+    qD[4] = grid.tvdRec(P[d2R], P[d1R], P[cIdx], thY);
+    qU[4] = grid.tvdRec(P[u1R], P[cIdx],  P[d1R], thY);
+    qB[4] = grid.tvdRec(P[b2R], P[b1R], P[cIdx], thZ);
+    qF[4] = grid.tvdRec(P[f1R], P[cIdx],  P[b1R], thZ);
+
+    // ---- gradient MUSCL (--recon 6): centroid -> open-face centroid ---------
+    // Replaces the 1-D limited slopes entirely: one limited least-squares
+    // gradient per cell, evaluated from that cell's fluid centroid to the open
+    // face's centroid.  This is the reconstruction the cut geometry actually
+    // calls for -- the earlier fix-up (an unlimited central-difference shift
+    // bolted onto a limited 1-D slope) was inconsistent between the value and
+    // its correction, and left nothing to stop an overshoot at a cut face.
+    if (grid.recon == 6) {
+      real *Fs[4] = {Rho, U, V, P};
+      const real hR = fmin(dx, dy);
+      const real hx = (real)0.5*dx, hy = (real)0.5*dy;
+      real f00 = -1, f10 = -1, f01 = -1;
+      real ocx = 0, ocy = 0, olx = 0, oly = 0, odx = 0, ody = 0;
+      real tX = 0, tY = 0;
+      if (grid.ibRccm) {
+        f00 = grid.getBoundaryLevelSet(Vec3(cpos[0]-hx, cpos[1]-hy, cpos[2]));
+        f10 = grid.getBoundaryLevelSet(Vec3(cpos[0]+hx, cpos[1]-hy, cpos[2]));
+        f01 = grid.getBoundaryLevelSet(Vec3(cpos[0]-hx, cpos[1]+hy, cpos[2]));
+        tX = rccmFaceCen(f00, f01);
+        tY = rccmFaceCen(f00, f10);
+        rccmCentroidOff(grid, cpos, dx, dy, hR, ocx, ocy);
+        rccmCentroidOff(grid, Vec3(cpos[0]-dx, cpos[1], cpos[2]), dx, dy, hR, olx, oly);
+        rccmCentroidOff(grid, Vec3(cpos[0], cpos[1]-dy, cpos[2]), dx, dy, hR, odx, ody);
+      }
+      real gC[4][2], lC[4], gL[4][2], lL[4], gD[4][2], lD[4];
+      rccmGradLimited(grid, Fs, bIdx, i,   j,   k, cpos, dx, dy, hR, ocx, ocy, gC, lC);
+      rccmGradLimited(grid, Fs, bIdx, i-1, j,   k,
+                      Vec3(cpos[0]-dx, cpos[1], cpos[2]), dx, dy, hR, olx, oly, gL, lL);
+      rccmGradLimited(grid, Fs, bIdx, i,   j-1, k,
+                      Vec3(cpos[0], cpos[1]-dy, cpos[2]), dx, dy, hR, odx, ody, gD, lD);
+      if (grid.ibRccm && grid.dbgChecks) {
+        real *CA = grid.getField(F_CUTA);
+        real *AXf = grid.getField(F_CUTAX), *AYf = grid.getField(F_CUTAY);
+        const bool deadL = !(CA[l1Idx] > grid.ibRccmAlphaMin);
+        const bool deadD = !(CA[d1Idx] > grid.ibRccmAlphaMin);
+        if (deadL && AXf[cIdx] > (real)1e-12) atomicAdd(&g_rcDeadFace, 1ull);
+        if (deadD && AYf[cIdx] > (real)1e-12) atomicAdd(&g_rcDeadFace, 1ull);
+        if (grid.rccmLive(cIdx)) atomicAdd(&g_rcLiveFace, 2ull);
+      }
+      const i32 slot[4] = {0, 1, 2, 4};
+      // face centroid positions relative to each cell's own centroid
+      const real xfL = -hx - ocx*hR,          yfL = tX*dy - ocy*hR;   // c  -> low-x face
+      const real xfLn =  hx - olx*hR,         yfLn = tX*dy - oly*hR;  // l1 -> same face
+      const real xfD = tY*dx - ocx*hR,        yfD = -hy - ocy*hR;     // c  -> low-y face
+      const real xfDn = tY*dx - odx*hR,       yfDn =  hy - ody*hR;    // d1 -> same face
+      for (i32 f = 0; f < 4; f++) {
+        qR[slot[f]] = Rho[cIdx]*0 + Fs[f][cIdx]   + lC[f]*(gC[f][0]*xfL  + gC[f][1]*yfL);
+        qL[slot[f]] =               Fs[f][l1Idx]  + lL[f]*(gL[f][0]*xfLn + gL[f][1]*yfLn);
+        qU[slot[f]] =               Fs[f][cIdx]   + lC[f]*(gC[f][0]*xfD  + gC[f][1]*yfD);
+        qD[slot[f]] =               Fs[f][d1Idx]  + lD[f]*(gD[f][0]*xfDn + gD[f][1]*yfDn);
+      }
+      // positivity is guaranteed by the limiter for the neighbour hull, but a
+      // hull that already contains a tiny value can still land near zero
+      qR[0] = fmax(qR[0], (real)1e-12); qR[4] = fmax(qR[4], (real)1e-12);
+      qL[0] = fmax(qL[0], (real)1e-12); qL[4] = fmax(qL[4], (real)1e-12);
+      qU[0] = fmax(qU[0], (real)1e-12); qU[4] = fmax(qU[4], (real)1e-12);
+      qD[0] = fmax(qD[0], (real)1e-12); qD[4] = fmax(qD[4], (real)1e-12);
+    }
 
     Vec5 fluxL = grid.hllcFlux(grid.prim2cons(qL), grid.prim2cons(qR), Vec3(1,0,0));
     Vec5 fluxD = grid.hllcFlux(grid.prim2cons(qD), grid.prim2cons(qU), Vec3(0,1,0));
@@ -3756,7 +4691,7 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     // penalization.  Running both at once is a direct conflict -- it put NaN in
     // k~/tau~ on the first Brinkman+RANS attempt while the mean flow stayed
     // finite, because ibWallFlux was writing wall fluxes into a smeared interface.
-    if (grid.immerserdBcType != 0 && !grid.ibBrink
+    if (grid.immerserdBcType != 0
         && (grid.rans || grid.ibFluxRecon != 1)) {
       real Fi[5], Ki, Ti, Ut;
       // SLIP faces under RANS must use the SAME trace+Riemann path the
@@ -3781,6 +4716,15 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
       const real *Ibm = grid.getField(F_IBM);
       const i32 cEmptyI = bEmpty*blockSizeTot;
       const bool fC = Ibm[cIdx] > (real)0.5;
+      // The WLS/face traces impose a SLIP WALL (u_n = 0 plus FRIB Eq. 19 on
+      // u_t).  That is only valid where the boundary IS a wall -- applying it at
+      // a prescribed inflow/outflow face walls off the flow, which is exactly
+      // what made --ibwls degrade the Ringleb duct (order 1.48 -> 0.58).
+      real *BcF = grid.getField(F_IBBC);
+      #define IB_FACE_IS_WALL(NBRIDX) \
+        (!grid.ibPolyBc ? true \
+          : (((NBRIDX) < cEmptyI) ? (BcF[NBRIDX] <= (real)0.5) \
+                                  : (BcF[cIdx]  <= (real)0.5)))
       #define IB_NBR_FLUID(IDX, PX, PY, PZ, HH) \
         (((IDX) < cEmptyI) ? (Ibm[IDX] > (real)0.5) \
                            : grid.isFluidCell(Vec3((PX),(PY),(PZ)), (HH)))
@@ -3790,7 +4734,7 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
                        || fc[0] > grid.wmX1)) {
           // constrained quadratic WLS first; it declines (and falls through to
           // the point-sample trace) in 3-D or when the stencil is too cut up
-          bool got = grid.ibWls
+          bool got = grid.ibWls && IB_FACE_IS_WALL(fC ? l1Idx : cIdx)
                   && ibWlsTrace(grid, Rho, U, V, W, P, lvl, fc, 0, dx,
                                 fC ? cIdx : l1Idx, fC, Fi, bIdx, i, j, k,
                                 ib*blockSize+i, jb*blockSize+j, kb*blockSizeZ+k);
@@ -3821,7 +4765,7 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
         Vec3 fc(cpos[0], cpos[1]-(real)0.5*dy, cpos[2]);
         if (trace2 && (!(grid.rans || grid.ibWmles) || fc[0] < x0wSlip
                        || fc[0] > grid.wmX1)) {
-          bool got = grid.ibWls
+          bool got = grid.ibWls && IB_FACE_IS_WALL(fC ? d1Idx : cIdx)
                   && ibWlsTrace(grid, Rho, U, V, W, P, lvl, fc, 1, dy,
                                 fC ? cIdx : d1Idx, fC, Fi, bIdx, i, j, k,
                                 ib*blockSize+i, jb*blockSize+j, kb*blockSizeZ+k);
@@ -3878,126 +4822,71 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
       #undef IB_NBR_FLUID
     }
 
-    // ---- pressure-tight volume penalization (Reiss 2021) -------------------
-    // Paper Eqs. (4)-(6); see CompressibleSolver::brinkPhi and the block comment
-    // on ibBrink.  Every face flux is scaled by the face volume fraction and the
-    // RHS is divided by the cell's own volume fraction.
-    //
-    // Two implementation choices matter.  (a) We divide EACH FACE by the
-    // receiving cell's phi rather than dividing the summed RHS, so every factor
-    // is the O(1) ratio phi_face/phi_cell -- with phi ~ 1e-8 the alternative
-    // multiplies then divides by 1e-8 and loses the result to cancellation in
-    // fp32.  (b) The momentum source uses the SAME phi_face as the flux, which
-    // makes it exactly -p_cell * (that same weight): a quiescent uniform-pressure
-    // state then cancels to zero in every cell bit-for-bit, however steep phi is.
-    // That exact cancellation is the "pressure-tight" property -- lose it and the
-    // smeared wall leaks a spurious force proportional to grad(phi).
+    // ---- Brinkman porosity face weights (pressure-tight penalization) -------
+    // Every flux entering this cell is scaled by w_f = phibar_f/phi_c, and the
+    // p grad(phi) source below is built from the SAME phibar_f.  With that one
+    // sharing, a quiescent uniform-pressure state cancels bit-for-bit: the
+    // pressure part of the flux divergence, sum_f p phibar_f n_f A_f / (phi_c V),
+    // is exactly what the source subtracts.  Measured on a quiescent body:
+    // residual 0.000000e+00 shared, 8.76e-03 with an analytic grad(phi) that
+    // does not share the face quadrature -- which is why only the shared form
+    // survives here.
     real wLc = 1, wLn = 1, wDc = 1, wDn = 1, wBc = 1, wBn = 1, phiC = 1;
-    real sCb = 0, hbF = 1;   // cell signed distance and the finest h, for the Darcy mask
     if (grid.ibBrink && grid.immerserdBcType != 0) {
       real *PhiG = grid.getField(F_PHI);
       const i32 cEmptyI = bEmpty*blockSizeTot;
-      // Same validity guard the wall-face code uses: the cached level set is
-      // only meaningful for real cells; anything past cEmptyI is evaluated.
-      // Level set is positive INSIDE, so the signed distance is its negation.
+      // The cached level set is only meaningful for real cells; anything past
+      // cEmptyI is evaluated.  phi is positive INSIDE, so s = -phi.
       #define BRINK_S(IDX, PX, PY, PZ) \
         (-(((IDX) < cEmptyI) ? PhiG[IDX] \
                              : grid.getBoundaryLevelSet(Vec3((PX),(PY),(PZ)))))
       // delta is a FIXED PHYSICAL length taken from the finest level, never the
-      // local cell size.  phi is a property of the immersed body, so it has to
-      // be one single field: keying it to the local h redefines the wall across
-      // every coarse-fine interface, the two sides of a hanging face disagree
-      // about phi, and the solution diverges there (nLvls 1 is fine, nLvls >= 2
-      // goes NaN).  The band is refined to the finest level anyway.
+      // local cell size.  phi is a property of the body, so it has to be one
+      // single field: keying it to the local h redefines the wall across every
+      // coarse-fine interface, the two sides of a hanging face disagree about
+      // phi, and the solution diverges there (nLvls 1 fine, nLvls >= 2 NaN).
       const real hb = fmin(grid.getDx(grid.nLvls-1),
                            grid.pseudo2D ? grid.getDx(grid.nLvls-1)
                                          : grid.getDy(grid.nLvls-1));
       const real sC = BRINK_S(cIdx,  cpos[0], cpos[1], cpos[2]);
-      sCb = sC; hbF = hb;
       phiC = grid.brinkPhi(sC, hb);
-      // ---- --ibpure 1: the IB is ENTIRELY source terms ---------------------
-      // The volume-filtering wall-model papers carry the volume fraction
-      // INSIDE their transported variable (eps_f ubar), so their solid
-      // interior decays by construction and they need no permeability and no
-      // flux machinery.  We evolve the UNWEIGHTED state, and this mode drops
-      // the porosity machinery to match their spirit: every face weight stays
-      // 1, no p grad(phi) source, no porosity stamps -- the wall is carried
-      // entirely by the band momentum/turbulence sources (normal penalty,
-      // traction, interior seal).  phiC and sCb are still computed: the
-      // sources' band masks are level-set shapes, not flux weights.  Trade:
-      // impermeability is only as strong as the forcing (classical
-      // penalization, eta ~ h^2) instead of exact phi-sealing -- but the
-      // 1/phi amplification, the curved-wall mass drain, and the whole
-      // seal/repair pathology are gone BY CONSTRUCTION.
-      if (!grid.ibPureSource) {
       const real sL = BRINK_S(l1Idx, cpos[0]-dx, cpos[1], cpos[2]);
       const real sD = BRINK_S(d1Idx, cpos[0], cpos[1]-dy, cpos[2]);
-      // ---- face signed distance --------------------------------------------
-      // The average 0.5(s_c + s_n) is EXACT for a plane (s is a signed distance,
-      // hence linear there) but only second order on a curved wall -- and its
-      // error enters through exp(2 ds/delta), so a small distance error is an
-      // exponentially amplified phi error.  Evaluating the level set AT the face
-      // is exact for any geometry; it costs one extra SDF call per face, which
-      // is why it is a flag.
-      real sfL, sfD;
-      real pbL = -1, pbD = -1;          // >=0 once a face AVERAGE is available
-      if (grid.brinkFaceLS >= 3) {
-        // Exact VOLUME-averaged grad(phi): by the divergence theorem it equals
-        // sum_f phibar_f n_f A_f / V, i.e. the same flux-scatter the momentum
-        // source already uses.  Well-balancing is therefore RETAINED for free --
-        // it is a consistency requirement (source and flux share phibar_f), not
-        // an accuracy one, so phibar_f may be made as accurate as we like.
-        const real hy = (real)0.5*dy, hx = (real)0.5*dx;
-        const real xl = cpos[0]-(real)0.5*dx, yd = cpos[1]-(real)0.5*dy;
-        pbL = grid.brinkPhiFaceAvgSeg(Vec3(xl, cpos[1]-hy, cpos[2]),
-                                      Vec3(xl, cpos[1]+hy, cpos[2]), hb, grid.brinkNSeg);
-        pbD = grid.brinkPhiFaceAvgSeg(Vec3(cpos[0]-hx, yd, cpos[2]),
-                                      Vec3(cpos[0]+hx, yd, cpos[2]), hb, grid.brinkNSeg);
-        sfL = -grid.getBoundaryLevelSet(Vec3(xl, cpos[1], cpos[2]));
-        sfD = -grid.getBoundaryLevelSet(Vec3(cpos[0], yd, cpos[2]));
-      } else if (grid.brinkFaceLS >= 2) {
-        // brinkface 2: EXACT face average from the two face endpoints.  This is
-        // what makes sum_f phi_f n_f A_f equal the true grad(phi) by the
-        // divergence theorem, i.e. what well-balances the MULTIDIMENSIONAL
-        // equilibrium (uniform flow parallel to an inclined wall).  A modified
-        // Riemann solver cannot do this: HLLC never sees phi -- the weighting is
-        // applied to its output -- so the imbalance lives in the quadrature.
-        const real hy = (real)0.5*dy, hx = (real)0.5*dx;
-        const real l1 = -grid.getBoundaryLevelSet(Vec3(cpos[0]-(real)0.5*dx, cpos[1]-hy, cpos[2]));
-        const real l2 = -grid.getBoundaryLevelSet(Vec3(cpos[0]-(real)0.5*dx, cpos[1]+hy, cpos[2]));
-        const real d1_ = -grid.getBoundaryLevelSet(Vec3(cpos[0]-hx, cpos[1]-(real)0.5*dy, cpos[2]));
-        const real d2_ = -grid.getBoundaryLevelSet(Vec3(cpos[0]+hx, cpos[1]-(real)0.5*dy, cpos[2]));
-        pbL = grid.brinkPhiFaceAvg(l1, l2, hb);
-        pbD = grid.brinkPhiFaceAvg(d1_, d2_, hb);
-        sfL = (real)0.5*(l1 + l2);
-        sfD = (real)0.5*(d1_ + d2_);
-      } else if (grid.brinkFaceLS) {
-        sfL = -grid.getBoundaryLevelSet(Vec3(cpos[0]-(real)0.5*dx, cpos[1], cpos[2]));
-        sfD = -grid.getBoundaryLevelSet(Vec3(cpos[0], cpos[1]-(real)0.5*dy, cpos[2]));
-      } else {
-        sfL = (real)0.5*(sC + sL);
-        sfD = (real)0.5*(sC + sD);
-      }
-      // ---- weights as ANALYTIC ratios --------------------------------------
-      // phi_f/phi_c straight from the two distances (see brinkRatio): the
-      // quotient of two separately-evaluated sigmoids loses fp32 precision
-      // exactly where the band is deep, and that ratio multiplies every flux.
-      if (pbL >= (real)0) {
-        wLc = pbL/phiC;                       wLn = pbL/grid.brinkPhi(sL, hb);
-        wDc = pbD/phiC;                       wDn = pbD/grid.brinkPhi(sD, hb);
-      } else {
-        wLc = grid.brinkRatio(sfL, sC, hb);  wLn = grid.brinkRatio(sfL, sL, hb);
-        wDc = grid.brinkRatio(sfD, sC, hb);  wDn = grid.brinkRatio(sfD, sD, hb);
-      }
-      if (!grid.pseudo2D) {
-        const real sB = BRINK_S(b1Idx, cpos[0], cpos[1], cpos[2]-dz);
-        const real sfB = grid.brinkFaceLS
-          ? -grid.getBoundaryLevelSet(Vec3(cpos[0], cpos[1], cpos[2]-(real)0.5*dz))
-          : (real)0.5*(sC + sB);
-        wBc = grid.brinkRatio(sfB, sC, hb);  wBn = grid.brinkRatio(sfB, sB, hb);
-      }
-      }   // end !ibPureSource: face weights stay 1 in pure-source mode
+      // ---- face porosity: CACHED (F_BRINKX/F_BRINKY) ------------------------
+      // The body is static, so phibar over each low face was stamped once by
+      // ibStampGeometry and carried through every block sort.  Two consequences,
+      // both load-bearing: the segmented quadrature costs nothing per stage
+      // (measured 24.3 -> 5.0 ms/iteration at nlvls 4), and both cells sharing a
+      // face read the ONE stored number, which is what keeps the flux and the
+      // p grad(phi) source exactly consistent.
+      const real pbL = grid.getField(F_BRINKX)[cIdx];
+      const real pbD = grid.getField(F_BRINKY)[cIdx];
+      wLc = pbL/phiC;   wLn = pbL/grid.brinkPhi(sL, hb);
+      wDc = pbD/phiC;   wDn = pbD/grid.brinkPhi(sD, hb);
+      // 2-D ONLY.  The z faces have no stamped bank, and evaluating them live
+      // here is not an option: brinkPhiFaceAvgSeg loops over the polyline SDF,
+      // and inlining that into this kernel -- already at REG:255 with stack
+      // spills -- cost 3x the wall time even with the branch dead under
+      // pseudo2D (measured 22.6 s -> 64.9 s on the RAE at nlvls 4).  A 3-D run
+      // needs a third stamped field, F_BRINKZ, not a live quadrature.
       #undef BRINK_S
+    }
+
+    // ---- RCCM cut-cell weighting (their Eqs. 4, 9) --------------------------
+    // The FVM update on a cut cell is  dU/dt = -(1/dV_i) sum_f F_f A_f, with
+    // dV_i = alpha_i dx dy and A_f the OPEN part of each face.  The existing
+    // scatter already divides each face by the receiving cell (that structure
+    // outlived the Brinkman weights it was built for), so the aperture goes in
+    // as A_f/alpha_recv and nothing else in the flux path changes.
+    if (grid.ibRccm) {
+      real *CA = grid.getField(F_CUTA);
+      real *AXf = grid.getField(F_CUTAX), *AYf = grid.getField(F_CUTAY);
+      const real aC = fmax(CA[cIdx], grid.ibRccmAlphaMin);
+      const real aL = fmax(CA[l1Idx], grid.ibRccmAlphaMin);
+      const real aD = fmax(CA[d1Idx], grid.ibRccmAlphaMin);
+      const real apX = AXf[cIdx], apY = AYf[cIdx];   // this cell's LOW faces
+      wLc = apX/aC;  wLn = apX/aL;
+      wDc = apY/aC;  wDn = apY/aD;
     }
 
     real *Rhs[5] = {RhsRho, RhsRhoU, RhsRhoV, RhsRhoW, RhsRhoE};
@@ -4016,557 +4905,153 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
       atomicAdd(&Rhs[n][l1Idx], - fluxL[n]*ax*wLn);
       atomicAdd(&Rhs[n][d1Idx], - fluxD[n]*ay*wDn);
     }
+
     if (grid.ibBrink && grid.immerserdBcType != 0) {
-      if (!grid.ibPureSource) {
-      // (p grad(phi) + porosity stamps skipped under --ibpure: with unit face
-      // weights there is nothing to balance and no porosity stiffness; the
-      // band SOURCE terms below still run)
       // ---- p grad(phi) in flux-scatter form, POINT-IMPLICIT ----------------
-      // The scatter is unchanged (it shares the face weights, so a quiescent
-      // uniform-pressure state still cancels bit-for-bit -- the pressure-tight
-      // property), but the momentum update is now RELAXED rather than applied
-      // outright.
+      // The scatter mirrors the flux scatter exactly (same face weights), so a
+      // quiescent uniform-pressure state cancels bit-for-bit; only the momentum
+      // UPDATE is relaxed rather than applied outright.
       //
       // Why this term and not the others: in the smeared band |grad phi| ~
       // 1/delta, so p grad(phi) can change a cell's momentum by many times its
-      // own magnitude in a single explicit step.  It is the stiffest term in the
-      // penalization and the one that set the delta >= 1.5h floor -- below that
-      // the run died at ANY CFL, which is the signature of a term whose
-      // magnitude, not whose wave speed, is the limit.  Stamping
-      //     lambda = |p grad(phi)| / max(rho|u|, 1e-3 rho a)
-      // and dividing the momentum update by (1 + B dt lambda) caps the change at
-      // the momentum actually present.  Fixed points are untouched: where the
-      // source vanishes so does lambda, so the converged answer is unchanged --
-      // the same argument the wall-flux point-implicit treatment rests on.
-      real sU, sV;
-      if (grid.brinkAnalyticGrad) {
-        // ANALYTIC source: p grad(phi)/phi by the chain rule through the level
-        // set, with the exact closest-point normal.  Pointwise this is exact --
-        // no differencing error at all -- but it no longer shares the face phi
-        // with the flux, so the uniform-pressure cancellation is only as good as
-        // the truncation error of the flux divergence.  That is the trade the
-        // measurement below settles.
-        Vec3 nb = grid.wallNormal(cpos, hbF);
-        real gpv[3];
-        grid.brinkGradPhiOverPhi(sCb, nb, hbF, gpv);
-        sU = P[cIdx]*gpv[0];
-        sV = P[cIdx]*gpv[1];
-        atomicAdd(&RhsRhoU[cIdx], sU);
-        atomicAdd(&RhsRhoV[cIdx], sV);
-        if (!grid.pseudo2D) atomicAdd(&RhsRhoW[cIdx], P[cIdx]*gpv[2]);
-      } else {
-      sU = -P[cIdx]*ax*wLc;
-      sV = -P[cIdx]*ay*wDc;
-      atomicAdd(&RhsRhoU[cIdx],  sU);
+      // own magnitude in one explicit step.  It is the stiffest term in the
+      // penalization.  Dividing the update by (1 + B dt lambda) caps the change
+      // at the momentum actually present, and fixed points are untouched: where
+      // the source vanishes so does lambda.
+      atomicAdd(&RhsRhoU[cIdx], -P[cIdx]*ax*wLc);
       atomicAdd(&RhsRhoU[l1Idx],  P[l1Idx]*ax*wLn);
-      atomicAdd(&RhsRhoV[cIdx],  sV);
+      atomicAdd(&RhsRhoV[cIdx], -P[cIdx]*ay*wDc);
       atomicAdd(&RhsRhoV[d1Idx],  P[d1Idx]*ay*wDn);
-      }
-      if (grid.brinkPI >= 2) {
-        // FULL point-implicit stamp.  Split the porosity-weighted divergence
-        // into the plain one plus a pointwise excess:
+      {
+        // Point-implicit stamp of the porosity stiffness.  Split the weighted
+        // divergence into the plain one plus a pointwise excess:
         //   (1/phi_c) sum_f phibar_f F_f n_f / h
-        //     = sum_f F_f n_f / h  +  sum_f (w_f - 1) F_f n_f / h,   w_f = phibar_f/phi_c.
+        //     = sum_f F_f n_f / h + sum_f (w_f - 1) F_f n_f / h,  w_f = phibar_f/phi_c.
         // Only the second is stiff -- it carries the exp(h/delta) amplification
-        // that sets the step -- and it is LOCAL, so a diagonal treatment can
-        // absorb it.  Its Jacobian spectral radius is (|u| + a) sum_f |w_f - 1|/h.
-        // brinkpi 1 stamped only (gamma-1)|u||grad phi|/phi on the MOMENTUM rows,
-        // i.e. the pressure term alone; the same w_f multiplies the mass and
-        // energy fluxes too, which is why brinkpi 1 measured no CFL benefit.
-        // The cell's own high faces are not carried by the low-face scatter, so
-        // evaluate them here rather than stamping the neighbours (a scatter into
-        // a solid or PARENT cell is never read back, hence never cleared).
-        const real hy = (real)0.5*dy, hx = (real)0.5*dx;
-        const real xr = cpos[0]+(real)0.5*dx, yu = cpos[1]+(real)0.5*dy;
-        real wR, wU;
-        if (grid.brinkFaceLS >= 3) {
-          wR = grid.brinkPhiFaceAvgSeg(Vec3(xr, cpos[1]-hy, cpos[2]),
-                                       Vec3(xr, cpos[1]+hy, cpos[2]), hbF, grid.brinkNSeg)
-               /fmax(phiC,(real)1e-30);
-          wU = grid.brinkPhiFaceAvgSeg(Vec3(cpos[0]-hx, yu, cpos[2]),
-                                       Vec3(cpos[0]+hx, yu, cpos[2]), hbF, grid.brinkNSeg)
-               /fmax(phiC,(real)1e-30);
-        } else {
-          wR = grid.brinkRatio(-grid.getBoundaryLevelSet(Vec3(xr, cpos[1], cpos[2])), sCb, hbF);
-          wU = grid.brinkRatio(-grid.getBoundaryLevelSet(Vec3(cpos[0], yu, cpos[2])), sCb, hbF);
-        }
+        // that sets the step -- and it is LOCAL, so a diagonal treatment absorbs
+        // it.  Its Jacobian spectral radius is (|u| + a) sum_f |w_f - 1|/h.
+        //
+        // This is what makes a narrow band affordable, and it is not optional:
+        // at delta = h/8 on the RAE this reaches t = 2 in 239 iterations, while
+        // stamping only the pressure term on the momentum rows (the old
+        // --brinkpi 1) had not reached t = 40 in 31000.  The delta >= 1.5h floor
+        // in the original method was an artifact of not having this.
+        //
+        // The cell's own HIGH faces are not carried by the low-face scatter, so
+        // read them from the neighbours' stamped LOW faces.  Guard the index:
+        // past cEmptyI the bank was never stamped (it reads as the allocator's
+        // zero), and a phibar of 0 would inflate this cell's stamp.
+        const i32 cE2 = bEmpty*blockSizeTot;
+        const real wR = (r1Idx < cE2) ? grid.getField(F_BRINKX)[r1Idx]/fmax(phiC,(real)1e-30) : (real)1;
+        const real wU = (u1Idx < cE2) ? grid.getField(F_BRINKY)[u1Idx]/fmax(phiC,(real)1e-30) : (real)1;
         const real a2   = gam*P[cIdx]/fmax(Rho[cIdx],(real)1e-30);
         const real lamC = sqrt(U[cIdx]*U[cIdx] + V[cIdx]*V[cIdx] + W[cIdx]*W[cIdx])
                         + sqrt(fmax(a2,(real)0));
         const real sw = (fabs(wLc-(real)1) + fabs(wR-(real)1))*ax
                       + (fabs(wDc-(real)1) + fabs(wU-(real)1))*ay;
         atomicAdd(&grid.getField(F_LAMM)[cIdx], lamC*sw);
-      } else if (grid.brinkPI) {
-        // lambda is the TRUE local Jacobian of this source w.r.t. the momentum,
-        //   d(p grad phi)/d(rho u) = grad(phi) dp/d(rho u) = -(gamma-1) u grad(phi),
-        // i.e.  lambda = (gamma-1) |u| |grad phi| / phi.
-        // NOT |p grad phi| / (rho|u|): that rate is large even where the source
-        // and the flux cancel exactly -- which is everywhere the pressure-tight
-        // form is doing its job -- so it damps the CORRECT balance and suppresses
-        // the solution.  The Jacobian form vanishes with u, so it is inert in
-        // the quiescent interior and acts only where the flow is actually being
-        // turned by the smeared wall.
-        const real gPhi = fabs(ax*wLc) + fabs(ay*wDc);
-        const real spd  = sqrt(U[cIdx]*U[cIdx] + V[cIdx]*V[cIdx] + W[cIdx]*W[cIdx]);
-        atomicAdd(&grid.getField(F_LAMM)[cIdx], (gam-(real)1)*spd*gPhi);
       }
-      }   // end !ibPureSource (p grad(phi) + porosity stamps)
-      if (grid.ibNoSlip) {
-        // Classical volume penalization for a NO-SLIP wall, which is what the
-        // volume-filtering framework calls the IB bodyforce F_IB: it imposes a
-        // Dirichlet velocity through a volumetric term rather than a flux BC.
-        //   d(rho u)/dt = -sigma rho u,   sigma = rate (1 - phi) (|u| + c)/h
-        // (1 - phi) is the SOLID fraction, so the term is active across the
-        // interface and inside the body and vanishes in clean fluid.  This is
-        // deliberately NOT the Darcy term: that one is retreated 4 cells INTO
-        // the body (see ibBrinkShift) precisely so it never touches the wall,
-        // which is why the wall has behaved as SLIP until now.
-        //
-        // Energy: damping momentum at fixed rho takes u -> u(1 - sigma dt), so
-        // d(KE)/dt = -sigma rho |u|^2.  Subtracting exactly that from rho E
-        // leaves the INTERNAL energy untouched, i.e. no spurious heating of the
-        // interface from the penalization itself.
-        const real rC  = fmax(Rho[cIdx], (real)1e-30);
-        // Velocity scale for the penalization rate: the FREESTREAM speed, NOT
-        // (|u| + c).  Using the sound speed makes sigma Mach-dependent, so the
-        // same --noslipRate means a 4x stiffer wall at Ma 0.05 than at Ma 0.2 --
-        // measured as a spurious Mach "trend" in the exact channel gate (0.63%
-        // -> 2.52% error), which compensating the rate by c removed. |u| alone
-        // is no good either: it vanishes inside the body, exactly where the
-        // penalization has to act.
-        // Floor at the unit code speed: cases without a freestream (the
-        // supersonic-vortex annulus sets no fsU/fsV) would otherwise have
-        // uRef ~ 0 and every band source silently OFF.  All wall cases here
-        // are unit-normalized, so the floor is inert for them.
-        const real uRef = fmax(sqrt(grid.fsU*grid.fsU + grid.fsV*grid.fsV), (real)1);
-        const real sig = grid.ibNoSlipRate*((real)1 - phiC)*uRef/hbF;
-        // Target velocity the penalization relaxes TOWARDS.  Plain no-slip is
-        // the DNS limit u_slip = 0; the slip-length model gives it a nonzero
-        // wall-parallel value.  Relaxing toward a target rather than toward zero
-        // is what the volume-filtering framework calls closing F_IB by modelling
-        // u_slip = ubar_f|_w - u_w (their Eq. 2.19).
-        real tU = 0, tV = 0, tW = 0;
-        real sigOverride = -1, nuEff = 0, tracX = 0, tracY = 0;
-        if (grid.ibSlipModel >= 1) {
-          Vec3 nb = grid.wallNormal(cpos, hbF);   // points INTO the fluid
-          // ---- strong-normal / weak-tangential split --------------------
-          // Jaiswal, Rajanna, Islam, Hsu & Bazilevs, Eng. w. Computers 42:16
-          // (2026): compressible WEAK (slip) walls go unstable when nothing
-          // controls the wall-normal velocity -- the cited hypersonic and
-          // transonic cases were only stable with the NORMAL component
-          // enforced strongly, and their stabilized operator is a list of
-          // penalties on u.n row by row (continuity, momentum, the
-          // rho cv T (u.n) energy term they flag as THE key modification).
-          // Measured here to match: every RAE blowup nucleates near the
-          // stagnation region (flow INTO the wall), requires rans x traction
-          // (mu_t is the amplifier), and is Mach/model/precision-agnostic,
-          // while plain no-slip (both components damped) is stable.  So damp
-          // ONLY the normal component at the FULL (1-phi) band strength; the
-          // slip tail that route 3's physics lives on is tangential and is
-          // untouched -- on a flat plate u.n ~ 0 and this whole term is a
-          // no-op, which is why the plate gates never needed it.
-          // Point-implicit through F_LAMN: the isotropic divisor slightly
-          // over-relaxes tangential updates but leaves fixed points exact.
-          // The normal penalty exists ONLY in pure-source mode, where there
-          // is no flux sealing and it IS the wall.  On the phi path the
-          // pressure-tight machinery already enforces the normal condition
-          // EXACTLY (phi-sealed fluxes + well-balanced p grad(phi)), so the
-          // penalty double-treats that dof -- and in the fluid-side band
-          // tail (phi < 1) it is not even neutral, it is spurious stiffness
-          // on physical cells.  Measured (user's call): dropping it on the
-          // phi path leaves the RAE stable and the plate bit-comparable;
-          // the wall model there ADDS only the tangential traction.
-          if (grid.ibPureSource)
-          {
-            // Route 5 (pure slip): the normal penalty is the WHOLE wall, so
-            // its mask extends through the interior ((1-phi) + deep seal) and
-            // the isotropic seal below is off -- u_t stays undamped
-            // EVERYWHERE, so there is no tangential jump between the sliding
-            // band and the interior for the scheme's numerical viscosity to
-            // turn into spurious skin friction (measured on the supersonic
-            // vortex: the isotropic-seal variant's L2(|u|) sat at 0.25,
-            // 12-45x the phi path -- a first-order numerical drag on the
-            // sliding wall flow).
-            real mN = (real)1 - phiC;
-            if (grid.ibSlipModel == 5) {
-              const real xS = (sCb + grid.ibTurbShift*hbF)/((real)0.5*hbF);
-              const real mS = (xS > (real)0) ? exp((real)-2*xS)/((real)1+exp((real)-2*xS))
-                                             : (real)1/((real)1+exp((real)2*xS));
-              mN = fmax(mN, mS);
+    }
+
+    // ---- RCCM wall face ----------------------------------------------------
+    // The cut cell's remaining face is the wall segment.  Its area-normal is
+    // NOT stored: the discrete divergence theorem fixes it exactly,
+    //     A_w n_w = -sum_f A_f n_f  =  -( (aXhi-aXlo) dy , (aYhi-aYlo) dx ),
+    // which is what makes the update conservative to machine precision (a
+    // stored normal from a separate geometric fit would not close).  For an
+    // inviscid slip wall the flux is pressure only.
+    if (grid.ibRccm && grid.rccmLive(cIdx)) {
+      real *CA = grid.getField(F_CUTA);
+      real *AXf = grid.getField(F_CUTAX), *AYf = grid.getField(F_CUTAY);
+      const real aC = fmax(CA[cIdx], grid.ibRccmAlphaMin);
+      if (CA[cIdx] < (real)1 - (real)1e-12) {
+        const i32 cE = bEmpty*blockSizeTot;
+        const i32 xp = grid.getNbrIdx(bIdx, i+1, j, k);
+        const i32 yp = grid.getNbrIdx(bIdx, i, j+1, k);
+        const real axHi = (xp < cE) ? AXf[xp] : AXf[cIdx];
+        const real ayHi = (yp < cE) ? AYf[yp] : AYf[cIdx];
+        const real nwx = -(axHi - AXf[cIdx]);      // already area/dy
+        const real nwy = -(ayHi - AYf[cIdx]);
+        // Wall pressure.  The cell AVERAGE is only first order at the wall, and
+        // on a curved wall the normal pressure gradient is not small -- it is
+        // the centripetal balance dp/dn = rho u_t^2 kappa that turns the flow.
+        // Extrapolate to the wall face along the cell's own pressure gradient
+        // (central differences over live neighbours), which captures that term
+        // without needing the curvature explicitly and is the ordinary
+        // cut-cell treatment.  --rccmpw 0 restores the cell-average pressure.
+        real pw = P[cIdx];
+        if (grid.ibRccmPw) {
+          const i32 xm = grid.getNbrIdx(bIdx, i-1, j, k);
+          const i32 ym = grid.getNbrIdx(bIdx, i, j-1, k);
+          real gpx = 0, gpy = 0;
+          if (xp < cE && xm < cE && grid.rccmLive(xp) && grid.rccmLive(xm))
+            gpx = (P[xp] - P[xm])/((real)2*dx);
+          if (yp < cE && ym < cE && grid.rccmLive(yp) && grid.rccmLive(ym))
+            gpy = (P[yp] - P[ym])/((real)2*dy);
+          Vec3 nb = grid.wallNormal(cpos, fmin(dx, dy));
+          const real ph = grid.getField(F_PHI)[cIdx];        // < 0 in the fluid
+          const real dpw = gpx*ph*nb[0] + gpy*ph*nb[1];      // x_w - x_c = phi n
+          // never let the extrapolation invert the pressure
+          pw = fmax(P[cIdx] + dpw, (real)0.2*P[cIdx]);
+        }
+        real rD, uD, vD, pD;
+        if (grid.ibDirichlet) {
+          // ---- Dirichlet boundary (--ibdir 1) --------------------------------
+          // The exact state is known on the segment, so the wall is an ordinary
+          // Riemann face against that state -- ghost = Dirichlet datum, which is
+          // what a Dirichlet condition means in a Roe/HLLC FV code and what the
+          // paper's Sect. 4.4 imposes on the arcs.  Evaluate the datum at the
+          // segment MIDPOINT: the two edge crossings of the corner level sets
+          // (a saddle-cut cell, 0 or 4 crossings, falls back to the foot of the
+          // cell centre).
+          const real hx = (real)0.5*dx, hy = (real)0.5*dy;
+          const real fc[4] = {
+            grid.getBoundaryLevelSet(Vec3(cpos[0]-hx, cpos[1]-hy, cpos[2])),
+            grid.getBoundaryLevelSet(Vec3(cpos[0]+hx, cpos[1]-hy, cpos[2])),
+            grid.getBoundaryLevelSet(Vec3(cpos[0]+hx, cpos[1]+hy, cpos[2])),
+            grid.getBoundaryLevelSet(Vec3(cpos[0]-hx, cpos[1]+hy, cpos[2]))};
+          const real ccx[4] = {-hx, hx, hx, -hx}, ccy[4] = {-hy, -hy, hy, hy};
+          real mx = 0, my = 0; i32 nc = 0;
+          for (i32 e = 0; e < 4; e++) {
+            const i32 a = e, b = (e + 1) & 3;
+            if ((fc[a] < (real)0) != (fc[b] < (real)0)) {
+              const real t = fc[a]/(fc[a] - fc[b]);
+              mx += ccx[a] + t*(ccx[b] - ccx[a]);
+              my += ccy[a] + t*(ccy[b] - ccy[a]); nc++;
             }
-            const real sigNn = grid.ibNoSlipRate*mN*uRef/hbF;
-            const real unrm  = U[cIdx]*nb[0] + V[cIdx]*nb[1];
-            atomicAdd(&RhsRhoU[cIdx], -sigNn*rC*unrm*nb[0]);
-            atomicAdd(&RhsRhoV[cIdx], -sigNn*rC*unrm*nb[1]);
-            atomicAdd(&RhsRhoE[cIdx], -sigNn*rC*unrm*unrm);   // exact KE of the removed component
-            atomicAdd(&grid.getField(F_LAMN)[cIdx], sigNn);
           }
-          // ---- deep-body MASS repair ------------------------------------
-          // Continuity is the one equation nothing damps ("no-slip must
-          // never damp mass"), and the RAE seed, caught alive at t=0.16 in
-          // an otherwise-clean field, is exactly a mass drain: the single
-          // out-of-envelope cell in the domain was a body cell 3.6h deep
-          // with rho = 0.044 at NORMAL pressure and damped velocity -- so
-          // c ~ 1/sqrt(rho) = 6.7 and u = rhoU/rho detonate a few steps
-          // later.  Through the nose band rho was scattered 0.04..2.0 while
-          // u and p stayed healthy: in the retreat zone the residual
-          // phi-weighted mass-flux imbalance of a CURVED wall (a straight
-          // wall's cancels exactly -- the plate never sees this) integrates
-          // unopposed under the 1/phi amplification.  brinkeps 1e-4 does
-          // NOT stop it (measured), so repair the STATE: relax rho toward
-          // rho_inf in cells deeper than the wall-model retreat, leaving
-          // rhoU and rhoE alone (deep-body u ~ 0, so p = (gam-1) rhoE is
-          // untouched and no wave is launched).  Explicit is fine:
-          // sig_m dt = rate * cfl / (1+c) << 1.
-          if (grid.ibMassRepair > (real)0) {
-            // Mask centred 1.2 cells inside with width h/2 -- SHALLOWER than
-            // the velocity retreat, because the measured drain zone is
-            // 1.5-3h deep and at nLvls 8 the shallow part outruns a repair
-            // that only starts at 2.5h (nLvls 6 passed, 8 still died).  The
-            // shallow reach is safe because the target is the LOCAL-pressure
-            //-consistent density rho = p / T_inf, not rho_inf: exact at the
-            // freestream, correct (~1.19) under the stagnation pressure, so
-            // the p grad(phi) wall balance is not disturbed; at the wall
-            // itself the mask is sigmoid(-4.8) ~ 8e-3.
-            const real xM  = (sCb + (real)1.2*hbF)/((real)0.5*hbF);
-            const real mM  = (xM > (real)0) ? exp((real)-2*xM)/((real)1+exp((real)-2*xM))
-                                            : (real)1/((real)1+exp((real)2*xM));
-            const real sigM = grid.ibMassRepair*mM*uRef/hbF;
-            const real rTgt = P[cIdx]/fmax(grid.fsP, (real)1e-30);
-            atomicAdd(&grid.getField(F_RHS + F_RHO)[cIdx], sigM*(rTgt - Rho[cIdx]));
+          Vec3 pw3;
+          if (nc == 2) pw3 = Vec3(cpos[0] + (real)0.5*mx, cpos[1] + (real)0.5*my, cpos[2]);
+          else {
+            Vec3 nb = grid.wallNormal(cpos, fmin(dx, dy));
+            const real ph = grid.getField(F_PHI)[cIdx];
+            pw3 = Vec3(cpos[0] + ph*nb[0], cpos[1] + ph*nb[1], cpos[2]);
           }
-          // Wall-parallel velocity gradient.  The paper evaluates this AT THE
-          // WALL (every slip equation carries |_w; p.13 defines
-          // <u_slip> = <ubar_f>|_y=0 - <u_f>|_y=0).  Differencing at the CELL
-          // CENTRE instead samples INSIDE the penalization band, where the
-          // penalization has already flattened the profile toward its own target
-          // -- a negative feedback that starves the slip.  Measured: it needed
-          // a1 = 6.0 against the published 0.30 to recover the grid-aligned
-          // reference, i.e. the gradient was ~11x low (the same factor arrives
-          // independently from u_slip ~ g^1.265).
-          // So probe the velocity along the normal OUTSIDE the band, at
-          // delta_f = pi*delta and delta_f + h from the WALL, and difference
-          // there.  The wall sits at cpos - nb*s, hence the (L - s) offsets.
-          real g = 0, gx = 0, gy = 0;
-          const real dlt = fmax(grid.ibBrinkDelta*hbF, (real)1e-30);
-          // Matching distance.  Default: delta_f = pi*delta (y+ ~ 52 here) -- the
-          // filter scale, the paper's natural height.  --wmmatch M overrides to
-          // M * h_fine: the Cf FLATTENED downstream at the default (0.0052 ->
-          // 0.0053 while the reference fell 0.0043 -> 0.0033), consistent with
-          // matching too low to feel the boundary layer growing above; standard
-          // WMLES matches at the 2nd-3rd cell (y+ ~ 100-200) for exactly this.
-          const real Lp  = (grid.slipMatchH > (real)0)
-                         ? grid.slipMatchH*hbF
-                         : (real)3.14159265358979323846*dlt;     // delta_f
-          real *Fs[2] = {U, V};
-          // Initialise to the LOCAL velocity: on the fallback path ibSample never
-          // writes these, and the traction branch reads qa.  Reading them
-          // uninitialised produced NaN everywhere and a garbage dt (1.35e-2 vs
-          // the usual 5e-6).
-          real qa[2] = {U[cIdx], V[cIdx]}, qb[2] = {U[cIdx], V[cIdx]};
-          const i32 gi = ib*blockSize+i, gj = jb*blockSize+j, gk = kb*blockSizeZ+k;
-          // Route 5 -- PURE SLIP: no probes, no wall function, no traction,
-          // no slip-length model.  The wall is the strong-normal penalty
-          // above plus the deep interior seal in the sigU dispatch below;
-          // the tangential flow in the band is left entirely free.  This is
-          // the inviscid/Euler wall of the pure-source path (the source-term
-          // analogue of the phi path's slip Brinkman).
-          if (grid.ibSlipModel == 5) { }
-          else if (grid.ibSlipModel == 4) {
-            // Hausmann & van Wachem (JFM 1022 R4, 2025): formally exact wall BC.
-            // The volume-filtered velocity AT the wall must satisfy (their 3.8)
-            //   u_eps|_w = c1 bL du_eps/dn|_w + c2 bL^2 d2u_eps/dn2|_w + O(bL^3),
-            // per Cartesian component, with u|_w = 0 on a stationary wall.  The
-            // coefficients are KERNEL-SPECIFIC; for our logistic kernel of scale
-            // bL = delta/2 the same derivation gives (pipeline validated by
-            // reproducing their Gaussian Table 1 to all published digits):
-            //   N=1: c1 = 1.38629 (= 2 ln 2)      N=2: c1 = 1.83745, c2 = -0.90232
-            // No assumed velocity profile, no log law, no empirical parameter --
-            // the streamwise development is the flow's own, which is exactly what
-            // the equilibrium-wall-function traction (ibslip 3) erased.
-            // Enforcement: their VF-WMLES solves for the wall-segment stress such
-            // that the wall value is met; the explicit-RK analogue is a
-            // kernel-localised proportional feedback force
-            //   F = -rho K G(s) (u_eps,w - u_target),  K = noslipRate * uRef,
-            // whose steady-state residual  e_ss = tau_w/(rho K) ~ 4e-4 U  is
-            // negligible, and dt*K*G_max ~ 0.14 so it is explicitly stable.
-            real qw[2] = {U[cIdx], V[cIdx]}, qp[2] = {U[cIdx], V[cIdx]},
-                 qm[2] = {U[cIdx], V[cIdx]};
-            Vec3 pw(cpos[0] - nb[0]*sCb,        cpos[1] - nb[1]*sCb,        cpos[2]);
-            Vec3 pp(cpos[0] + nb[0]*(hbF-sCb),  cpos[1] + nb[1]*(hbF-sCb),  cpos[2]);
-            Vec3 pm(cpos[0] - nb[0]*(hbF+sCb),  cpos[1] - nb[1]*(hbF+sCb),  cpos[2]);
-            bool ok4 = ibSample(grid, pw, lvl, bIdx, i, j, k, gi, gj, gk, Fs, 2, qw)
-                    && ibSample(grid, pp, lvl, bIdx, i, j, k, gi, gj, gk, Fs, 2, qp)
-                    && ibSample(grid, pm, lvl, bIdx, i, j, k, gi, gj, gk, Fs, 2, qm);
-            if (ok4) {
-              const real bL = (real)0.5*dlt;
-              const real C1 = (grid.wmOrder >= 2) ? (real)1.83745 : (real)1.38629;
-              const real C2 = (grid.wmOrder >= 2) ? (real)-0.90232 : (real)0;
-              const real xg = (real)2*sCb/dlt;
-              const real eg = exp(-fabs(xg));
-              const real gg = (xg >= (real)0) ? (real)1/((real)1+eg) : eg/((real)1+eg);
-              const real Gk = ((real)2/dlt)*gg*((real)1-gg);
-              const real fMax = (real)10*rC*uRef*uRef/hbF;
-              real fx_ = 0, fy_ = 0;
-              for (i32 cmp = 0; cmp < 2; cmp++) {
-                const real du  = (qp[cmp] - qm[cmp])/((real)2*hbF);
-                const real d2u = (qp[cmp] - (real)2*qw[cmp] + qm[cmp])/(hbF*hbF);
-                const real ut4 = C1*bL*du + C2*bL*bL*d2u;
-                const real e4  = qw[cmp] - ut4;
-                const real f4  = -rC*grid.wmGain*uRef*Gk*e4;
-                if (cmp == 0) fx_ = f4; else fy_ = f4;
-              }
-              // TANGENTIAL error only.  Enforcing the penetration (normal)
-              // component through feedback acts as a mass pump: measured with it
-              // on, the boundary layer FREEZES at d95 = 0.0021 for all x --
-              // thinner than the reference anywhere -- while plain no-slip grows
-              // 0.016 -> 0.040 over the same fetch.  The anchor plus continuity
-              // already handle penetration; the normal-derivative probe is also
-              // the least reliable input.  (--wmnormal 1 restores it.)
-              if (!grid.wmNormal) {
-                const real en_ = fx_*nb[0] + fy_*nb[1];
-                fx_ -= en_*nb[0];  fy_ -= en_*nb[1];
-              }
-              // DRAG-ONLY.  A proportional servo is bidirectional: when the
-              // layer thickens, the wall velocity falls below target, e < 0, and
-              // the controller ACCELERATES the near-wall flow -- replenishing
-              // precisely the momentum deficit that development IS.  Measured:
-              // d95 frozen at 0.0021-0.0023 for all x (normal component on or
-              // off; both gains) while plain no-slip grows 0.016 -> 0.040.  A
-              // physical wall only removes momentum, so clip: keep the force
-              // only when it OPPOSES the local flow.  (--wmpush 1 restores the
-              // bidirectional servo.)
-              if (!grid.wmPush && fx_*qw[0] + fy_*qw[1] > (real)0) { fx_ = 0; fy_ = 0; }
-              const real fm_ = sqrt(fx_*fx_ + fy_*fy_);
-              if (fm_ > fMax) { fx_ *= fMax/fm_; fy_ *= fMax/fm_; }
-              tracX = fx_;  tracY = fy_;
-            }
-          } else {
-          Vec3 pa(cpos[0] + nb[0]*(Lp - sCb), cpos[1] + nb[1]*(Lp - sCb), cpos[2]);
-          Vec3 pb(cpos[0] + nb[0]*(Lp + hbF - sCb),
-                  cpos[1] + nb[1]*(Lp + hbF - sCb), cpos[2]);
-          bool got = ibSample(grid, pa, lvl, bIdx, i, j, k, gi, gj, gk, Fs, 2, qa)
-                  && ibSample(grid, pb, lvl, bIdx, i, j, k, gi, gj, gk, Fs, 2, qb);
-          if (got) {
-            // tangential component of each probe, then difference along n
-            const real na = qa[0]*nb[0] + qa[1]*nb[1];
-            const real nbv= qb[0]*nb[0] + qb[1]*nb[1];
-            const real ax_ = qa[0] - na*nb[0], ay_ = qa[1] - na*nb[1];
-            const real bx_ = qb[0] - nbv*nb[0], by_ = qb[1] - nbv*nb[1];
-            gx = (bx_ - ax_)/hbF;  gy = (by_ - ay_)/hbF;
-            g  = sqrt(gx*gx + gy*gy);
-            // direction: use the tangential velocity at the inner probe, which is
-            // the direction the slip should point (the difference can be noisy)
-            const real am = sqrt(ax_*ax_ + ay_*ay_);
-            if (am > (real)1e-30) { gx = ax_/am*g; gy = ay_/am*g; }
-          } else {
-            // stencil left the reachable ring: fall back to the local difference
-            const i32 xm = grid.getNbrIdx(bIdx, i-1, j, k), xp = grid.getNbrIdx(bIdx, i+1, j, k);
-            const i32 ym = grid.getNbrIdx(bIdx, i, j-1, k), yp = grid.getNbrIdx(bIdx, i, j+1, k);
-            const real dun = (U[xp]-U[xm])/((real)2*dx)*nb[0] + (U[yp]-U[ym])/((real)2*dy)*nb[1];
-            const real dvn = (V[xp]-V[xm])/((real)2*dx)*nb[0] + (V[yp]-V[ym])/((real)2*dy)*nb[1];
-            const real dn  = dun*nb[0] + dvn*nb[1];
-            gx = dun - dn*nb[0]; gy = dvn - dn*nb[1];
-            g  = sqrt(gx*gx + gy*gy);
-          }
-          }   // end ibSlipModel != 4
-          if (g > (real)1e-30) {
-            const real muE = grid.viscosity(P[cIdx]/rC)
-                           + (grid.rans ? grid.getField(F_MUT)[cIdx] : (real)0);
-            nuEff = muE/rC;
-            const real nuM = grid.viscosity(P[cIdx]/rC)/rC;
-            const real uTau = sqrt(fmax(muE*g/rC, (real)0));
-            const real dl   = fmax(grid.ibBrinkDelta*hbF, (real)1e-30);
-            const real dfp  = (real)3.14159265358979323846*dl*uTau/fmax(nuM,(real)1e-30);
-            const real lam  = (real)1 + grid.slipA1*pow(fmax(dfp,(real)0), grid.slipN1);
-            const real lx   = dl*(lam - (real)1);          // l = delta (lambda - 1)
-            if (grid.ibSlipModel == 3) {
-              // THE PAPER'S OWN F_IB: the filtered interfacial TRACTION
-              // (Eqs. 2.23-2.24), a force density spread over the band by the
-              // filter kernel, with no free coefficient, no velocity target and
-              // no permeability.  Units: [Pa] * [1/m] = N/m^3.
-              //   F_IB = -tau_w * t_hat * G(s),   G = dphi/ds = (2/delta) g(1-g)
-              // which integrates to tau_w across the band since int G ds = 1.
-              // tau_w comes from the equilibrium wall function at a MATCHING
-              // POINT outside the band (the probe already sampled there).
-              const real dm  = Lp;                       // matching distance from the wall
-              const real utm = sqrt(qa[0]*qa[0] + qa[1]*qa[1]);
-              const real nuM2= grid.viscosity(P[cIdx]/rC)/rC;
-              const real uT  = ktau::uTauFromWallFunction(utm, dm, nuM2);
-              const real tauW= rC*uT*uT;
-              const real xg  = (real)2*sCb/dlt;
-              const real eg  = exp(-fabs(xg));
-              const real gg  = (xg >= (real)0) ? (real)1/((real)1+eg) : eg/((real)1+eg);
-              const real Gk  = ((real)2/dlt)*gg*((real)1-gg);       // kernel, int = 1
-              // direction: oppose the wall-parallel flow at the matching point
-              const real am2 = fmax(utm, (real)1e-30);
-              // Clamp: the kernel peaks at 1/(2 delta), so a bad u_tau can inject
-              // an enormous body force before anything else notices.
-              const real fMax = (real)10*rC*uRef*uRef/hbF;
-              real fx_ = -tauW*Gk*qa[0]/am2, fy_ = -tauW*Gk*qa[1]/am2;
-              const real fm_ = sqrt(fx_*fx_ + fy_*fy_);
-              if (fm_ > fMax) { fx_ *= fMax/fm_; fy_ *= fMax/fm_; }
-              tracX = fx_;  tracY = fy_;
-            }
-            else if (grid.ibSlipModel == 2) {
-              // SLIP VIA PERMEABILITY (Navier slip), not via a target velocity.
-              // A Brinkman layer solves nu u'' - sigma u = 0 inside the solid,
-              // whose screening length sqrt(nu_eff/sigma) IS the Navier slip
-              // length.  So impose l_x by choosing sigma, and leave the target at
-              // ZERO -- the slip then emerges from the flow instead of being
-              // painted on.  Relaxing the whole band toward a constant u_slip
-              // instead makes the velocity UNIFORM across the band (measured:
-              // u(0.002) and u(0.004) identical to 3 digits at every a1), which
-              // cannot reproduce the reference profile's real gradient no matter
-              // how a1 is tuned.
-              sigOverride = nuEff/fmax(lx*lx, (real)1e-30);
-            } else {
-              const real us = lx*g;
-              tU = us*gx/g;  tV = us*gy/g;
+          if (grid.exactState(pw3[0], pw3[1], rD, uD, vD, pD)) {
+            // unit outward (fluid -> solid) normal and |A_w|/dV of the segment
+            const real anx = nwx*ax, any = nwy*ay;          // A_w n_w / dV_uncut
+            const real am  = sqrt(anx*anx + any*any);
+            if (am > (real)1e-30) {
+              const Vec3 nu(anx/am, any/am, 0);
+              const real rC = Rho[cIdx], uC = U[cIdx], vC = V[cIdx], wC = W[cIdx];
+              const real pC = P[cIdx];
+              Vec5 qLw(rC, rC*uC, rC*vC, rC*wC,
+                       pC/(gam-(real)1) + (real)0.5*rC*(uC*uC + vC*vC + wC*wC));
+              Vec5 qRw(rD, rD*uD, rD*vD, (real)0,
+                       pD/(gam-(real)1) + (real)0.5*rD*(uD*uD + vD*vD));
+              Vec5 Fw = grid.hllcFlux(qLw, qRw, nu);
+              atomicAdd(&RhsRho [cIdx], -Fw[0]*am/aC);
+              atomicAdd(&RhsRhoU[cIdx], -Fw[1]*am/aC);
+              atomicAdd(&RhsRhoV[cIdx], -Fw[2]*am/aC);
+              atomicAdd(&RhsRhoE[cIdx], -Fw[4]*am/aC);
+              pw = (real)-1;                                 // handled
             }
           }
         }
-        // slip-by-permeability replaces the rate outright.  The TRACTION route
-        // (ibslip 3) instead retreats the penalization deep into the body with
-        // the Darcy mask -- it is then only blocking through-flow, and the WALL
-        // STRESS is carried entirely by the traction.  (The paper asserts F_IB
-        // recovers no-slip as delta_f -> 0 but never runs it a posteriori, so
-        // blocking through-flow at finite delta_f is our addition, not theirs.)
-        real sigU;
-        if (grid.ibSlipModel == 4) {
-          // Route 4 anchor.  Our transported variable is ubar-like, NOT the
-          // superficial u_eps = eps_f*ubar of Hausmann & van Wachem, so the
-          // solid side of the band has no natural decay (in their form eps_f -> 0
-          // kills it).  With the Darcy mask retreated 4 cells, the solid-side
-          // band cells are FREE INTEGRATORS of the feedback force: measured as
-          // wound-up negative velocity (-0.22 at d=0.002) and Cf 10x low.  The
-          // filtered field should be ~zero by -delta_f/2 ~ -0.8h anyway, so
-          // anchor from wmAnchor cells behind the wall with the delta/2 width.
-          const real dl4 = fmax(grid.ibBrinkDelta*hbF, (real)1e-30);
-          const real xa  = ((real)2*(sCb + grid.wmAnchor*hbF))/((real)0.5*dl4);
-          const real ea  = exp(-fabs(xa));
-          const real ma  = (xa <= (real)0) ? (real)1/((real)1+ea) : ea/((real)1+ea);
-          sigU = grid.ibNoSlipRate*ma*uRef/hbF;
-        } else if (grid.ibSlipModel == 3) {
-          // Same shortened retreat as the turbulence mask (see mTn above), for
-          // the same measured reason: with the 4-cell Darcy retreat the whole
-          // interior of an airfoil NOSE is an undamped free integrator, and
-          // under RANS the phi-amplified face viscous flux (face mu_t from the
-          // fluid side / cell phi ~ e^{-12}) has no straight-wall cancellation
-          // to hide behind -- the MEAN flow at 3h inside the RAE LE hit 1e29
-          // in ~100 steps even with tau~ fully damped there.  The filtered
-          // slip tail route 3 needs lives within ~1.2h of the wall (logistic
-          // decay ~ delta_f/2 = 0.8h), so damping from ibWmRetreat = 1.5 cells
-          // in preserves the plate-validated physics; the plate regression
-          // gate re-run confirms.
-          const real xU  = (sCb + grid.ibTurbShift*hbF)/((real)0.5*hbF);
-          const real mUn = (xU > (real)0) ? exp((real)-2*xU)/((real)1+exp((real)-2*xU))
-                                          : (real)1/((real)1+exp((real)2*xU));
-          sigU = grid.ibNoSlipRate*fmax(grid.brinkDarcyMask(sCb, hbF), mUn)*uRef/hbF;
-          // --ibtang 1: no isotropic seal either -- the interior is Darcy's
-          // job on the phi path (its native, validated treatment); the wall
-          // model contributes the TRACTION and nothing else.  --ibtang 2
-          // keeps the deep seal and drops only the normal penalty, to split
-          // which of the two is load-bearing on curved bodies.
-          if (grid.ibTangOnly == 1) sigU = 0;
-        } else if (grid.ibSlipModel == 5) {
-          // Pure slip: NO isotropic damping anywhere -- the wall is entirely
-          // the normal penalty above (whose mask now spans band + interior).
-          // Damping u_t in the interior manufactures a tangential jump that
-          // the scheme's dissipation turns into first-order skin friction on
-          // the sliding flow (see the normal-penalty comment).
-          sigU = 0;
-        } else {
-          sigU = (sigOverride >= 0) ? sigOverride*((real)1 - phiC) : sig;
+        if (pw >= (real)0) {
+          atomicAdd(&RhsRhoU[cIdx], -pw*nwx*ax/aC);
+          atomicAdd(&RhsRhoV[cIdx], -pw*nwy*ay/aC);
         }
-        const real du = U[cIdx]-tU, dv = V[cIdx]-tV, dw = W[cIdx]-tW;
-        // Energy: d(KE)/dt = u . d(rho u)/dt = -sigma rho u.(u - u_target), which
-        // leaves the INTERNAL energy untouched (reduces to -sigma rho |u|^2 when
-        // the target is zero).
-        const real ud = U[cIdx]*du + V[cIdx]*dv + W[cIdx]*dw;
-        atomicAdd(&RhsRhoU[cIdx], tracX);
-        atomicAdd(&RhsRhoV[cIdx], tracY);
-        atomicAdd(&RhsRhoE[cIdx], tracX*U[cIdx] + tracY*V[cIdx]);   // rate of work
-        atomicAdd(&RhsRhoU[cIdx], -sigU*rC*du);
-        atomicAdd(&RhsRhoV[cIdx], -sigU*rC*dv);
-        if (!grid.pseudo2D) atomicAdd(&RhsRhoW[cIdx], -sigU*rC*dw);
-        atomicAdd(&RhsRhoE[cIdx], -sigU*rC*ud);
-        // Turbulence wall condition, by the same volumetric route as momentum.
-        // At a solid wall k~ -> 0 and tau~ -> 0, so penalize BOTH toward zero
-        // with the same (1 - phi) mask.  Doing it volumetrically is what lets
-        // Brinkman carry RANS at all: there are no ghost cells here and no
-        // fluid/solid FACE to hang a boundary flux on -- the sharp path's
-        // ibWallFlux has no analogue in a smeared interface.
-        // mu_t follows k~ to zero on its own, so the eddy viscosity needs no
-        // separate treatment.
-        if (grid.rans) {
-          // K/Tau are PRIMITIVE here (the RHS kernel reads primitives), but the
-          // RHS is for the CONSERVATIVE rho k~ / rho tau~ -- hence the rC.
-          const real kC = grid.getField(F_RHOK)[cIdx];
-          const real tC = grid.getField(F_RHOTAU)[cIdx];
-          // The turbulence mask depends on WHICH wall condition the momentum is
-          // using, because they are not the same physics:
-          //   no-slip (wall-RESOLVED): k~ -> 0 AT the wall, so the same (1-phi)
-          //     mask as momentum is right -- it is 1/2 at the wall.
-          //   slip model (wall-MODELLED): the near-wall layer is NOT resolved and
-          //     the wall model expects k~ to be FINITE at the first point.  The
-          //     (1-phi) mask would suppress it by half exactly there.  Use the
-          //     sharpened, body-retreated Darcy mask instead, so the turbulence
-          //     is killed INSIDE the solid and left alone in the fluid.
-          // >= 1, not == 1: EVERY wall-MODELLED route (slip target, permeability,
-          // traction) leaves the near-wall layer unresolved and needs k~ finite
-          // at the first point.  With == 1 the traction route fell through to the
-          // wall-RESOLVED (1-phi) mask, which kills k~ at the wall -- so there was
-          // no eddy viscosity to resupply momentum against the applied traction
-          // and the near-wall flow decelerated until it REVERSED (-0.064).
-          // BUT the Darcy mask's 4-cell retreat is deeper than the LE nose of
-          // an airfoil is thick: at nLvls 6-8 the RAE 2822 nose radius is 1-4
-          // cells, so the entire nose interior sits in the retreat zone --
-          // body cells with phi ~ e^{-6..-16} whose k~/tau~ transport is
-          // 1/phi-amplified and damped by NOTHING.  Measured: tau~ = 1e25 and
-          // instant NaN at (x,y) ~ 8%c, 3h inside the surface, in the first
-          // ~100 steps, on both the bare-RANS and traction configs, while the
-          // straight plate (same masks) is stable.  So the wall-modelled
-          // turbulence mask gets its OWN, SHORTER retreat: transition centred
-          // ibTurbShift (default 1.5) cells INSIDE with width h/2 -- at the
-          // wall it suppresses only sigmoid(-6) ~ 2.5e-3 of k~ (the finite-k~
-          // requirement that motivated the retreat, see above), by 2h deep it
-          // is ~0.9, so no near-interface body cell is left a free integrator.
-          const real xT = (sCb + grid.ibTurbShift*hbF)/((real)0.5*hbF);
-          const real mTn = (xT > (real)0) ? exp((real)-2*xT)/((real)1+exp((real)-2*xT))
-                                          : (real)1/((real)1+exp((real)2*xT));
-          const real mT = (grid.ibSlipModel >= 1)
-                        ? fmax(grid.brinkDarcyMask(sCb, hbF), mTn)
-                        : ((real)1 - phiC);
-          const real sigT = grid.ibNoSlipRate*mT*uRef/hbF;
-          atomicAdd(&grid.getField(F_RHS + F_RHOK)[cIdx],   -sigT*rC*kC);
-          atomicAdd(&grid.getField(F_RHS + F_RHOTAU)[cIdx], -sigT*rC*tC);
-          // Stiff, so stamp it: the update already divides the k~/tau~ rows by
-          // (1 + B dt lambda) through F_LAMK / F_LAMT.
-          atomicAdd(&grid.getField(F_LAMK)[cIdx], sigT);
-          atomicAdd(&grid.getField(F_LAMT)[cIdx], sigT);
-        }
-        // The wall is only sharp when sigma is LARGE, so this term is stiff by
-        // construction; stamp it for the point-implicit update instead of
-        // letting it set the time step.
-        atomicAdd(&grid.getField(F_LAMN)[cIdx], sigU);
-      }
-      if (grid.ibBrinkRate > (real)0) {
-        // Darcy friction through the RETREATED mask (see ibBrinkRate).  Damps
-        // the body interior, where the collapsing phi would otherwise amplify
-        // any inbound disturbance like 1/sqrt(phi); ~0 at the wall, so the wall
-        // itself stays slip.  Explicit stability needs chi*dt < O(1), and
-        // chi*dt = ibBrinkRate*CFL by construction.
-        const real rC = fmax(Rho[cIdx], (real)1e-30);
-        const real cS = sqrt(fabs(gam*P[cIdx]/rC));
-        const real mask = grid.brinkDarcyMask(sCb, hbF);
-        const real chi = grid.ibBrinkRate*mask
-                       * (fabs(U[cIdx]) + fabs(V[cIdx]) + fabs(W[cIdx]) + cS)/hbF;
-        atomicAdd(&RhsRhoU[cIdx], -chi*rC*U[cIdx]);
-        atomicAdd(&RhsRhoV[cIdx], -chi*rC*V[cIdx]);
-        if (!grid.pseudo2D) atomicAdd(&RhsRhoW[cIdx], -chi*rC*W[cIdx]);
-        atomicAdd(&RhsRhoE[cIdx], -chi*rC*(U[cIdx]*U[cIdx] + V[cIdx]*V[cIdx]
-                                         + W[cIdx]*W[cIdx]));
       }
     }
 
@@ -4591,18 +5076,6 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
           const u64 b0 = (u64)(15 + 4*dd2)*NN + (u64)cIdx;
           FF[b0] = 0; FF[b0 + NN] = 0; FF[b0 + 2*NN] = 0; FF[b0 + 3*NN] = 0;
         }
-      }
-      // Brinkman does not take the sharp fluid/solid face path above, so ktX/ktY
-      // were never cleared there -- which let the INTERIOR turbulence flux run on
-      // faces inside the body, where the wall distance is 0 and tau~ is penalized
-      // to 0, so the closure's 1/tau~ terms blow up.  That put NaN in k~/tau~ in
-      // EVERY cell (49408/49408) while the mean flow stayed finite. Apply the
-      // same suppression rule the sharp path uses, minus the flux replacement.
-      if (grid.ibBrink && grid.rans && grid.immerserdBcType != 0) {
-        real *PhiG = grid.getField(F_PHI);      // > 0 INSIDE the solid
-        const bool bodyC = PhiG[cIdx] >= (real)0;
-        if (bodyC || PhiG[l1Idx] >= (real)0) ktX = false;
-        if (bodyC || PhiG[d1Idx] >= (real)0) ktY = false;
       }
       if (ibX) {
         if (grid.detFlux) {
@@ -4678,10 +5151,6 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
       for (i32 n = 0; n < 5; n++) {
         atomicAdd(&Rhs[n][cIdx],    fluxB[n]*az*wBc);
         atomicAdd(&Rhs[n][b1Idx], - fluxB[n]*az*wBn);
-      }
-      if (grid.ibBrink && grid.immerserdBcType != 0) {
-        atomicAdd(&RhsRhoW[cIdx],  -P[cIdx] *az*wBc);
-        atomicAdd(&RhsRhoW[b1Idx],  P[b1Idx]*az*wBn);
       }
       if (grid.rans && ktZ) {
         ktauFaceFlux(grid, Rho, P, grid.getField(F_RHOK), grid.getField(F_RHOTAU),
@@ -5119,6 +5588,11 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
     bool ibSolid = false;
     if (grid.immerserdBcType != 0)
       ibSolid = grid.getField(F_IBM)[cIdx] <= (real)0.5;   // cached mask
+    // RCCM: R-Cells get their new value from the reconstruction (Eq. 10), never
+    // from the FVM update -- advancing them is exactly the small-cell blow-up
+    // the method exists to avoid.
+    if (grid.ibRccm && grid.immerserdBcType != 0)
+      ibSolid = !grid.rccmLive(cIdx) || grid.rccmRCell(cIdx);
 
     // Covered parents are NOT evolved -- restrictFields overwrites them from
     // their children after every stage, so their only legitimate source is
@@ -5135,26 +5609,18 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
       // diagonal relaxation rate of the stiff k~/tau~ wall flux; dividing the
       // update by (1 + B dt lambda) bounds it for ANY dt while leaving every
       // fixed point of the RHS -- hence the converged solution -- unchanged.
-      real lamK = 0, lamT = 0, lamM = 0;
-      // Brinkman+RANS stamps the same slots for its volumetric wall condition,
-      // so they must be read AND cleared even with --wallpi 0, or the stamps
-      // accumulate across stages without bound.
-      if (grid.rans && (grid.wallPointImplicit || (grid.ibBrink && grid.ibNoSlip))) {
+      real lamK = 0, lamT = 0;
+      if (grid.rans && grid.wallPointImplicit) {
         lamK = grid.getField(F_LAMK)[cIdx];
         lamT = grid.getField(F_LAMT)[cIdx];
       }
-      // Brinkman p grad(phi) relaxation, stamped in the RHS.  Read and cleared
-      // unconditionally so a stale stamp can never accumulate across stages.
-      if (grid.ibBrink && grid.brinkPI) {
+      // Brinkman porosity stiffness, stamped by the RHS in the band.  Read and
+      // CLEARED here (not in the sweep below) because a stale stamp must never
+      // survive a stage: the rate is a per-stage quantity.
+      real lamM = 0;
+      if (grid.ibBrink) {
         lamM = grid.getField(F_LAMM)[cIdx];
         grid.getField(F_LAMM)[cIdx] = 0;
-      }
-      // No-slip penalization rate.  Read and cleared unconditionally for the
-      // same reason as F_LAMM -- a stale stamp must never survive a stage.
-      real lamN = 0;
-      if (grid.ibBrink && grid.ibNoSlip) {
-        lamN = grid.getField(F_LAMN)[cIdx];
-        grid.getField(F_LAMN)[cIdx] = 0;
       }
       // Low-Mach preconditioning of the mean-flow residual (rank-one; steady
       // states are fixed points of P R exactly as they are of R).
@@ -5173,28 +5639,16 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
         precondResidual(Rm, u, v, w, Hh, c2, precondBeta2(grid, q2, c2));
       }
       for (i32 f = 0; f < NEVOLVE; f++) {
-        // Operator split under --jfnk: the k~/tau~ pair is NOT advanced by the
-        // explicit RK stages at all.  It is held at q^n through the whole step
-        // and advanced once, implicitly, after the last stage.  Without this the
-        // implicit step would be a SECOND update stacked on the RK one.
-        // Full-system implicit (--jfnk): the RK stages advance NOTHING.  The
-        // whole state is advanced once, implicitly, after the last stage.
-        if (grid.jfnkOn) continue;
         real *Q = grid.getField(f);
         real *S = grid.getField(F_RHS + f);
         real fac = 1;
         if (f == F_RHOK   && lamK > 0) fac = (real)1/((real)1 + Bw[stage]*dt*lamK);
         if (f == F_RHOTAU && lamT > 0) fac = (real)1/((real)1 + Bw[stage]*dt*lamT);
-        // brinkpi 1: momentum only -- p grad(phi) enters no other equation.
-        // brinkpi 2: the stiff excess (w_f - 1) multiplies the mass and energy
-        // fluxes as well, so the same diagonal applies to all five rows.
-        const bool lamAll = (grid.brinkPI >= 2) && (f < 5);
-        if (lamM > 0 && (lamAll || f == F_RHOU || f == F_RHOV || f == F_RHOW))
+        // The stiff excess (w_f - 1) multiplies the mass and energy fluxes
+        // just as it does the momentum ones, so the same diagonal applies to
+        // all five mean-flow rows.
+        if (lamM > 0 && f < 5)
           fac = (real)1/((real)1 + Bw[stage]*dt*lamM);
-        // No-slip: momentum and its kinetic energy only.  MASS IS NEVER DAMPED --
-        // the penalization moves momentum, it does not destroy fluid.
-        if (lamN > 0 && (f == F_RHOU || f == F_RHOV || f == F_RHOW || f == F_RHOE))
-          fac /= ((real)1 + Bw[stage]*dt*lamN);
         const real Sv = (grid.precond && f < 5) ? Rm[f] : S[cIdx];
         if (grid.rkScheme != 0) {
           // Jameson: every stage restarts from q_n.  At stage 0 the field still
@@ -5220,10 +5674,14 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
       grid.getField(F_RHS + f)[cIdx] *= Anext[stage];
     // consume the wall-flux relaxation rates: they are per-stage quantities,
     // and this also clears stamps on cells that skipped the update (parents)
-    if (grid.rans && (grid.wallPointImplicit || (grid.ibBrink && grid.ibNoSlip))) {
+    if (grid.rans && grid.wallPointImplicit) {
       real *LK = grid.getField(F_LAMK), *LT = grid.getField(F_LAMT);
       if (LK[cIdx] != 0) LK[cIdx] = 0;
       if (LT[cIdx] != 0) LT[cIdx] = 0;
+    }
+    if (grid.ibBrink) {
+      real *LM = grid.getField(F_LAMM);
+      if (LM[cIdx] != 0) LM[cIdx] = 0;      // parents / skipped cells
     }
 
   END_CELL_LOOP
@@ -5739,26 +6197,6 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
     // Watch the ibWallFlux fail census (--debug) if this is ever revisited: a
     // missing same-level neighbour shows up there as ipSample failures.
 
-    // ---- volume-penalization band -----------------------------------------
-    // Hold the whole phi transition at the finest level; see inBrinkBand().
-    // Same shape as the wall-model band below, and for the same reason: it must
-    // sit outside the detail-driven branch, which only starts at level 1, so it
-    // can lift level 0 too.
-    if (grid.ibBrink && grid.immerserdBcType != 0
-        && grid.isInteriorBlock(lvl, ib, jb, kb)
-#ifdef USE_MGPU
-        && grid.isOwnedBlock(lvl, ib, jb, kb)
-#endif
-        && grid.inBrinkBand(ls)) {
-      grid.bFlagsList[bIdx] = KEEP;
-      if (lvl > 0) grid.bFlagsList[grid.prntIdxList[bIdx]] = KEEP;
-      if (lvl < grid.nLvls-1) {
-        i32 bSize = blockSize/2;
-        i32 kc = grid.pseudo2D ? kb : (2*kb + k/bSize);
-        grid.activateBlock(lvl+1, 2*ib+i/bSize, 2*jb+j/bSize, kc);
-      }
-    }
-
     // Two-sided surface distance for immersed walls: wallDistance() clips to 0
     // INSIDE the body, so every body-interior cell would pass the band test and
     // the whole body gets held at the finest level.  Invisible when the body is
@@ -6055,3 +6493,108 @@ __global__ void migrateInsertKernel(CompressibleSolver &grid, u64 *locs, i32 n, 
   slots[t] = idx;
 }
 #endif
+
+// AMR debug probe: scan every live cell (both z-planes) for non-finite evolved
+// data.  Deliberately NOT cell-looped: pseudo2D's START_CELL_LOOP skips k > 0,
+// and the stale z-layers are exactly what we need to see.
+__global__ void scanNonFiniteKernel(CompressibleSolver &grid, i32 baseOff) {
+  i32 cIdx = blockIdx.x * blockDim.x + threadIdx.x;
+  const i32 nCell = grid.hashTable.nKeys * blockSizeTot;
+  while (cIdx < nCell) {
+    i32 bIdx = cIdx / blockSizeTot;
+    u64 loc  = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      for (i32 f = 0; f < NEVOLVE; f++) {
+        real v = grid.getField(baseOff + f)[cIdx];
+        if (!isfinite((double)v)) {
+          if ((cIdx % blockSizeTot) < blockSize*blockSize) atomicAdd(&g_nfCnt, 1);
+          else                                             atomicAdd(&g_nfCntZ, 1);
+          if (atomicMin(&g_nfCidx, cIdx) > cIdx) g_nfField = f;
+          break;
+        }
+      }
+    }
+    cIdx += gridDim.x*blockDim.x;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Steady-state residual.  The RHS kernels ACCUMULATE L onto the pre-scaled
+// accumulator as S_i = A_i S_{i-1} + L(q_{i-1}), and A_1 = 0, so immediately
+// after computeRightHandSide() on stage 0 the bank holds exactly L(q^n) -- the
+// residual of the semi-discrete system, with no dt or RK coefficient in it.
+//
+// Masked to LIVE INTERIOR FLUID cells: the accumulator legitimately holds junk
+// (including non-finite values) in exterior/ghost slots and in cells buried in
+// the immersed body, because the face-flux scatter writes there and nothing
+// ever cleans it.  An unmasked norm is NaN, not large.
+//
+__global__ void residualNormKernel(CompressibleSolver &grid, real *q0, real dtGlobal, real *rCell) {
+  real *Q[4] = {grid.getField(F_RHO),  grid.getField(F_RHOU),
+                grid.getField(F_RHOV), grid.getField(F_RHOE)};
+  real *Dtl  = grid.getField(F_DTL);
+  real *Ibm  = grid.getField(F_IBM);
+  const i32 stride = nBlocksMax*blockSizeTot;
+
+  START_CELL_LOOP
+
+    double s2 = 0.0, s2f = 0.0;
+    unsigned long long cnt = 0, cntf = 0;
+    if (rCell) rCell[cIdx] = (real)0;   // non-live cells map to 0 in the dump
+
+    i32 lvl, ib, jb, kb;
+    grid.decode(grid.bLocList[bIdx], lvl, ib, jb, kb);
+    // EVERY fluid cell counts.  Only true non-DOFs are excluded: exterior
+    // blocks, coarse/fine GHOST cells, and cells inside the body.
+    const bool live = grid.isInteriorBlock(lvl, ib, jb, kb)
+                   && grid.cFlagsList[cIdx] != GHOST
+                   && (!grid.immerserdBcType || Ibm[cIdx] != (real)0);
+    if (live) {
+      // dq/dt is the residual of the WHOLE update, however it is composed --
+      // RK accumulator, wall ghosts, prescribed wall flux, any source.  Unlike
+      // ||L(q)|| it cannot be defeated by a term applied outside the bank.
+      const double dt = (double)((grid.lts && Dtl[cIdx] > (real)0) ? Dtl[cIdx] : dtGlobal);
+      double a = 0.0;
+      for (i32 f = 0; f < 4; f++) {
+        const double d = ((double)Q[f][cIdx] - (double)q0[(size_t)f*stride + cIdx])/dt;
+        a += d*d;
+      }
+      if (isfinite(a)) {
+        s2 = a; cnt = 1;
+        if (rCell) rCell[cIdx] = (real)sqrt(a);
+        const double h  = (double)grid.getDx(lvl);
+        const double dw = grid.immerserdBcType
+                        ? -(double)grid.getField(F_PHI)[cIdx]/h : 1e30;
+        if (dw > (double)grid.resFar) { s2f = a; cntf = 1; }
+        double old = g_resMax;
+        if (a > old) { atomicMax((unsigned long long*)&g_resMax,
+                                 (unsigned long long)__double_as_longlong(a));
+                       g_resMaxPhi = dw; }
+      }
+    }
+
+    for (int off = 16; off > 0; off >>= 1) {
+      s2   += __shfl_down_sync(0xffffffff, s2,   off);
+      cnt  += __shfl_down_sync(0xffffffff, cnt,  off);
+      s2f  += __shfl_down_sync(0xffffffff, s2f,  off);
+      cntf += __shfl_down_sync(0xffffffff, cntf, off);
+    }
+    if ((threadIdx.x & 31) == 0) {
+      atomicAdd(&g_resSum, s2);      atomicAdd(&g_resCnt, cnt);
+      atomicAdd(&g_resSumFar, s2f);  atomicAdd(&g_resCntFar, cntf);
+    }
+
+  END_CELL_LOOP
+}
+
+// Snapshot q for the dq/dt residual.  Taken AFTER adaptation (sortBlocks
+// renumbers blocks) and before the RK stages, so indices match at compare time.
+__global__ void residualSnapshotKernel(CompressibleSolver &grid, real *q0) {
+  real *Q[4] = {grid.getField(F_RHO),  grid.getField(F_RHOU),
+                grid.getField(F_RHOV), grid.getField(F_RHOE)};
+  const i32 stride = nBlocksMax*blockSizeTot;
+  START_CELL_LOOP
+    for (i32 f = 0; f < 4; f++) q0[(size_t)f*stride + cIdx] = Q[f][cIdx];
+  END_CELL_LOOP
+}
+

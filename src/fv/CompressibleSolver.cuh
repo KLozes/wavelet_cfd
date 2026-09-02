@@ -88,15 +88,19 @@ enum CompressibleField {
   // Local time stepping: this cell's own cfl-scaled stable step.  Needs its own
   // bank because computeDeltaT reports per-cell limits through F_SCRATCH, which
   // the RHS then reuses for the u_tau / C_f stamp within the same step.
-  // Per-cell relaxation rate for the point-implicit Brinkman pressure source.
-  // Same lifecycle as F_LAMK/F_LAMT: stamped in the RHS, consumed and zeroed in
-  // updateFields, never sorted.
-  F_LAMM = 29,
-  // No-slip volume-penalization rate, stamped by the RHS and consumed
-  // point-implicitly by the update.  SEPARATE from F_LAMM: that one carries the
-  // porosity-flux stiffness and (under brinkpi 2) scales ALL FIVE rows, whereas
-  // no-slip damps momentum and its kinetic energy ONLY -- mass must not be damped.
-  F_LAMN = 30,
+  // ---- RCCM cut-cell geometry (Ndiaye et al., IJHFF 114 (2025) 109775) ------
+  // Stamped beside F_PHI/F_IBM and carried through the sort for the same reason:
+  // a pure function of position for a static body.  2-D (pseudo2D) for now.
+  //   F_CUTA  = fluid VOLUME fraction alpha_i = dV_i/dV_uncut (their Eq. 15)
+  //   F_CUTAX = open fraction of the cell's LOW-x face
+  //   F_CUTAY = open fraction of the cell's LOW-y face
+  // High faces are the neighbour's low faces, exactly as the flux scatter is
+  // already organised.  The wall segment is NOT stored: the discrete divergence
+  // theorem fixes it, A_w n = -sum_f A_f n_f, which is what makes the cut-cell
+  // update conservative to machine precision.
+  F_CUTA  = 29,
+  F_CUTAX = 30,
+  F_CUTAY = 32,
   F_DTL = 21,
   // q_n register for the Jameson schemes (rkScheme != 0), banks 22..28.
   // Williamson 2N canNOT express q_k = q_n + alpha_k dt L_{k-1} for m >= 3:
@@ -104,10 +108,95 @@ enum CompressibleField {
   // alpha_1 dt L_0 term from stage 3 on (verified numerically -- the 5-stage
   // diverges even at cfl 0.4 when forced into 2N form).  Jameson's family is
   // 2R-storage in (q_n, q), not 2N in (q, S), so it needs its own bank.
-  F_QN = 22
+  F_QN = 22,
+  // Boundary-condition KIND for each non-fluid cell, cached beside F_PHI/F_IBM
+  // because it is (like them) a pure function of position for a static body:
+  //   0 = wall      -> the ghost is built to satisfy the wall condition
+  //   1 = prescribed-> the ghost carries the exact solution (inflow/outflow)
+  // One mechanism for every boundary: ghost cells, then the ordinary Riemann
+  // solve on the face (the FRIB architecture the Euler path already documents).
+  F_IBBC = 31,
+  // Point-implicit relaxation rate for the Brinkman porosity stiffness.  Same
+  // lifecycle as F_LAMK/F_LAMT: stamped by the RHS in the penalization band,
+  // consumed and zeroed by updateFields.  Under --brinkpi 2 it scales all five
+  // mean-flow rows, because the stiff excess (w_f - 1) multiplies the mass and
+  // energy fluxes exactly as it does the momentum ones.
+  F_LAMM = 33,
+  // Brinkman FACE POROSITIES, phibar over this cell's LOW-x and LOW-y faces.
+  // Stamped beside F_PHI/F_IBM and carried through the sort for exactly the
+  // reason the RCCM apertures are: for a static body they are a pure function
+  // of position, so recomputing them every stage was paying an O(N)-segment
+  // level-set walk per face per RK stage for an answer that never changes.
+  // High faces are the neighbour's low faces, which is how the flux scatter is
+  // already organised -- and storing ONE value per face is also what keeps the
+  // flux and the p grad(phi) source sharing the identical phibar_f, i.e. what
+  // makes the pressure-tight cancellation exact.
+  //
+  // 2-D (pseudo2D) only; a 3-D run still evaluates its z faces live.  The
+  // quadrature stored here is whatever --brinkface selects, so raising
+  // --brinkseg is now free at run time: it is paid once per adaptation.
+  F_BRINKX = 34,
+  F_BRINKY = 35
 };
 static constexpr i32 NEVOLVE = 7;                 // evolved DOFs (fields 0..6)
-static constexpr i32 nCompressibleFields = 31;
+static constexpr i32 nCompressibleFields = 36;
+
+// ---- RCCM cut-cell geometry (2-D) ------------------------------------------
+// Apertures and volume fraction of a Cartesian cell cut by the level set, from
+// the four CORNER values.  phi is POSITIVE INSIDE the body, so the fluid region
+// is {phi < 0} and the fluid fraction of an edge is found by linear
+// interpolation of phi along it -- the same piecewise-linear interface model
+// CutLinQuad uses on the DG side, in its cheapest 2-D form.
+//
+// The area is the marching-squares polygon area, computed by the shoelace
+// formula over the fluid polygon's vertices in order.  Rather than enumerate
+// the 16 cases, walk the four edges in cyclic order and emit (a) the corner if
+// it is fluid, (b) the crossing point if the edge changes sign.  That single
+// loop IS the case table, and it is exact for the bilinear-free (piecewise
+// linear along edges) model.
+__host__ __device__ inline void rccmCutGeom(const real f[4], real &alpha,
+                                   real &aXlo, real &aYlo,
+                                   real *cenX = nullptr, real *cenY = nullptr)
+{
+  // corners in cyclic order: (0,0) (1,0) (1,1) (0,1)
+  real px[8], py[8]; i32 n = 0;
+  const real cx[4] = {0, 1, 1, 0}, cy[4] = {0, 0, 1, 1};
+  for (i32 e = 0; e < 4; e++) {
+    const i32 a = e, b = (e + 1) & 3;
+    if (f[a] < (real)0) { px[n] = cx[a]; py[n] = cy[a]; n++; }
+    if ((f[a] < (real)0) != (f[b] < (real)0)) {
+      const real t = f[a]/(f[a] - f[b]);          // phi = 0 crossing
+      px[n] = cx[a] + t*(cx[b] - cx[a]);
+      py[n] = cy[a] + t*(cy[b] - cy[a]); n++;
+    }
+  }
+  real A2 = 0, Cx = 0, Cy = 0;
+  for (i32 v = 0; v < n; v++) {
+    const i32 w = (v + 1 == n) ? 0 : v + 1;
+    const real cr = px[v]*py[w] - px[w]*py[v];
+    A2 += cr;
+    Cx += (px[v] + px[w])*cr;
+    Cy += (py[v] + py[w])*cr;
+  }
+  alpha = fmin(fmax((real)0.5*fabs(A2), (real)0), (real)1);
+  // Polygon centroid, in cell-local [0,1]^2 coordinates.  This is the point the
+  // cut cell's average actually LIVES at -- the paper reconstructs there
+  // ("the centroid of the R-Cells is used as the center of the reconstruction"),
+  // and for an R-Cell it sits in the FLUID sliver, while the Cartesian centre
+  // is inside the solid.  Sampling the Cartesian centre instead hands every
+  // R-Cell/NR-Cell face a state taken from the wrong side of the wall.
+  if (cenX && cenY) {
+    if (fabs(A2) > (real)1e-20) { *cenX = Cx/((real)3*A2); *cenY = Cy/((real)3*A2); }
+    else                        { *cenX = (real)0.5;       *cenY = (real)0.5; }
+  }
+  // low-x face is corner 0 -> corner 3 ; low-y face is corner 0 -> corner 1
+  #define RCCM_EDGE(FA, FB) (((FA) < (real)0 && (FB) < (real)0) ? (real)1 : \
+                            (((FA) >= (real)0 && (FB) >= (real)0) ? (real)0 : \
+                             ((FA) < (real)0 ? (FA)/((FA)-(FB)) : (FB)/((FB)-(FA)))))
+  aXlo = RCCM_EDGE(f[0], f[3]);
+  aYlo = RCCM_EDGE(f[0], f[1]);
+  #undef RCCM_EDGE
+}
 
 class CompressibleSolver : public MultiLevelSparseGrid {
 public:
@@ -123,8 +212,9 @@ public:
   real waveletThresh;
 
   i32 recon;            // face reconstruction of rho/p/tangential (and FV normal) velocity:
-                        // 0 = smooth TVD limiter, 1 = ROUND (default), 2 = LD-ROUND,
-                        // 3 = unlimited 3rd-order parabola (kappa=1/3; smooth tests only)
+                        // 0 = smooth TVD limiter, 1 = ROUND, 2 = LD-ROUND,
+                        // 3 = unlimited 3rd-order parabola (kappa=1/3; smooth tests only),
+                        // 4 = van Leer harmonic limiter in NVD form (DEFAULT)
                         // (ROUND/LD-ROUND: Huang, Deng, Matar & Ying, JCP 555 (2026), Eqs. 4.1/4.2)
                         // ROUND: 6-7x lower smooth-wave error than TVD, cleaner low-Mach,
                         // shocks stay spike-free (soft ~1% non-TVD overshoots by design)
@@ -223,6 +313,8 @@ public:
       waveletThresh = .005;
       iter = 0;
       immerserdBcType = 0;
+      ringlebKmin = 0.6; ringlebKmax = 0.98; ringlebScale = 1.0;
+      ringlebQmin = 0.5; ringlebX0 = -1.88; ringlebY0 = -2.4;
       ibPoly = nullptr; ibPolyN = 0; ibChord = 1.0;
       ibBox[0]=ibBox[1]=ibBox[2]=ibBox[3]=0;
       ibCenter[0] = 0.5; ibCenter[1] = 0.5; ibCenter[2] = 0.5;
@@ -253,30 +345,21 @@ public:
       paintOn = 1;
       ibIpQuad = 0;
       ibThermoRec = 0;
-      ibWls = 0;
+      ibWls = 0; ibGMirror = 0; ibGIter = 1; ibGFloor = 0.25; ibGSlip = 0; ibIface = 0;
+      ibBrink = 0; ibBrinkEps = 1e-6; ibBrinkDelta = 0.125; brinkNSeg = 4;
+      ibRccm = 0; ibRccmIter = 3; ibRccmAlphaMin = 1e-9; ibRccmPw = 1; ibRccmNeu = 1.0; ibRccmRelax = 0.7; ibDirichlet = 0; svQuarter = 0; canalY0 = 0; canalY1 = 1; canalMa = 0.675; canalPout = canalPin = canalRhoIn = 1; canalUin = 0; gradLim = 1; gradLimK = 5.0; kSensor = 0.05;
       ransA7Tol = 1e-6;
-      jfnkOn = 0; jfnkM = 15; jfnkAlloc = 0;
-      jfnkQ0 = jfnkR0 = jfnkWrk = jfnkBasis = jfnkW = nullptr;
-      jfnkCfl = 50.0;
       ibWallMode = 0; ibInfinite = 0; turbModel = 0; nutInf = 0;
       wmX0 = -1;
       wmRamp = 0;
       dtDipThresh = 0; dtDipPrints = 0; dtDipCooldown = 0;
       envCheck = 0; envPrints = 0;
-      ibMassRepair = 1.0;
-      ibPureSource = 0;
-      ibTangOnly = 0;
-      ibTurbShift = 2.5;
-      ibBrink = 0; brinkPI = 1; brinkFaceLS = 1; brinkAnalyticGrad = 0;
-      ibBrinkEps = 1e-6;
-      ibBrinkDelta = 1.5;
-      ibBrinkRate = 0.125;
-      ibBrinkShift = 4.0;
-      ibBrinkDarcyFac = 0.5;
       ibTurbFlux = 1;
       gridTrace = 0;
       adaptEvery = 4;
       dtEvery = 4;
+      maxIter = 0; residEvery = 0; resTol = 0; resid = 0; resid0 = 0;
+      residFar = 0; residMax = 0; residMaxDw = 0; resFar = 4;
       ibFluxRecon = 1;
       ibCurv = 0;
       ibHo = 0;
@@ -351,8 +434,14 @@ public:
 
   void computeDeltaT(void);
   void computeTurbClosure(void);   // RANS: fill F_MUT/F_TF1 and accumulate the k~/tau~ sources
-  void stampIbGeometry(void);      // IB: cache F_PHI/F_IBM (once per adaptation; body is static)
-  void applyWallGhosts(void);      // RANS: overwrite wall ghost rows with the wall-model profile
+  void stampIbGeometry(void);
+  void checkCutGeometry(void);
+  void reportDeadTaps(void);
+  void checkWellBalanced(void);      // IB: cache F_PHI/F_IBM (once per adaptation; body is static)
+  void applyWallGhosts(void);
+  void computeShockSensor(void);
+  void reconstructRCells(void);
+  void reportGhostQuad(void);      // RANS: overwrite wall ghost rows with the wall-model profile
   void computeRightHandSide(void);
   void stateHash(const char *tag, i32 it);
   void updateFarFieldVortex(void);   // measure C_l, refresh ffGamma
@@ -404,6 +493,12 @@ public:
   void writeGridBlocks(const char *fileName);  // AMR block structure, for plotting
   void writeCfProfile(const char *fileName);   // skin-friction coefficient along the modeled wall
   void printRansExtremes(void);                // max k~ / tau~ range / mu_t / dt limits
+  void scanNonFinite(const char *tag);          // AMR debug: first non-finite evolved cell (--debug 2)
+  void scanNonFiniteBase(const char *tag, i32 baseOff);
+  real computeResidual(void);                  // RMS of dq/dt over ALL live fluid cells
+  void snapshotResidualQ(void);                // q snapshot for the dq/dt residual
+  real *residQ0 = nullptr;                     // [4][nBlocksMax*blockSizeTot]
+  real *residCell = nullptr;                   // per-cell |dq/dt| from the last sample (field dump)
   i32  wallResolutionCheck(bool verbose = true);   // count wall-row blocks NOT at the finest level
   void writeSolution(const char *fieldFile, const char *profFile, real xStation);
   void computeAcousticReflection(const char *fileName); // acoustic wave reflection at coarse/fine interface
@@ -415,6 +510,7 @@ public:
   void printDiagnostics(void);                  // AMR-boundary spike / pseudo-2D diagnostics
   void computeVortexError(void);
   void computeSvortexError(void);                // L2 error vs the exact stationary isentropic vortex
+  void computeCanalMetrics(const char *cpFile); // paper Sect. 4.2: mass-flow-rate error Eq. (39) + floor Cp
   void computeGreshoError(void);                // L2 velocity error + KE retention vs the exact Gresho vortex
   void totalConserved(double &mass, double &momx, double &energy); // domain totals of the conserved variables
   void paintPressure(const char *fileName);     // render the pressure field to a png
@@ -423,7 +519,7 @@ public:
   __device__ Vec5 prim2cons(Vec5 prim);
   __device__ Vec5 cons2prim(Vec5 cons);
   __device__ real lim(real &r);
-  __device__ real tvdRec(real &ul, real &uc, real &ur);
+  __device__ real tvdRec(real &ul, real &uc, real &ur, real theta = (real)1);
   // van Leer harmonic limiter, unconditionally.  The paper leaves the mass /
   // momentum / energy MUSCL UNLIMITED but limits the turbulence convection, to
   // stop k~ and tau~ going negative at the boundary-layer edge -- so this is a
@@ -539,6 +635,94 @@ public:
   // 1 = constrained quadratic weighted-least-squares wall trace: fit every
   // fluid cell in a 5x5 window, with u_n Dirichlet at the foot point, u_t free,
   // and (s,H) Neumann along the normal.  2-D only; falls back otherwise.
+  // ---- implicit ghost-cell method -----------------------------------------
+  // Natural mirror image point (reflect the ghost across the wall) with
+  // quadratic interpolation.  The compact stencil then CONTAINS ghost cells, so
+  // the ghost values satisfy a coupled linear system G = M G + b; ibGIter Jacobi
+  // sweeps before each stage solve it.  The existing scheme instead pushes the
+  // image point out to s* = 2h purely to keep the stencil in fluid, which
+  // samples 2h from the wall and drops the interpolation order where it matters.
+  i32 ibGMirror;   // 1 = natural mirror + ghosts allowed in the stencil
+  i32 ibGIter;     // ghost-fill sweeps per stage (1 = explicit, the old behaviour)
+  // Floor on the mirror distance, in cells.  |phi| -> 0 for a cell centre that
+  // happens to sit near the wall, and the image point then lands ON the wall
+  // where the fit degenerates -- a small-cell problem in ghost form.  The floor
+  // trades the mirror's accuracy for robustness; too small and the error blows
+  // up at high resolution (11% velocity overshoot at N=512 with 0.25h).
+  real ibGFloor;
+  // Ali et al. Sect. 2.5 slip wall: interpolate at the wall point and drop the
+  // normal velocity, instead of mirroring through an image point.  No s* at all.
+  i32 ibGSlip;
+  // Ali et al. interface-cell architecture: prescribe the first fluid layer
+  // each stage instead of imposing wall face states.  0 = off, 1 = paper
+  // (bilinear implicit), 2 = implicit triquadratic.
+  i32 ibIface;
+  // RCCM: 1 = cut-cell discretisation with reconstructed small cells.
+  i32 ibRccm;
+  // RCCM cell taxonomy (their Sect. 2.3.3), from the cached geometry:
+  //   alpha == 0            dead, outside the domain
+  //   0 < alpha, phi <  0   NR-Cell: advanced by the cut FVM (Eq. 9)
+  //   0 < alpha, phi >= 0   R-Cell : small cell, RECONSTRUCTED (Eq. 10) and
+  //                         excluded from the dt reduction (Eq. 11)
+  __device__ bool rccmLive(i32 cIdx) {
+    return getField(F_CUTA)[cIdx] > ibRccmAlphaMin;
+  }
+  __device__ bool rccmRCell(i32 cIdx) {
+    return getField(F_CUTA)[cIdx] > ibRccmAlphaMin
+        && getField(F_PHI)[cIdx] >= (real)0;
+  }
+  // ---- Brinkman volume penalization, PRESSURE-TIGHT form -------------------
+  // Reiss, "A family of energy stable, skew-symmetric finite difference schemes
+  // on collocated grids" / the non-stiff pressure-tight penalization
+  // (docs/pressureTIghtBrinkman.pdf).  The body is not masked at all: the Euler
+  // equations are solved everywhere on a smeared volume fraction
+  //     phi(s) = eps + (1-eps) (1 + tanh(s/delta))/2,   s = signed distance,
+  // and the wall enters as (a) porosity weights phibar_f/phi_c on every face
+  // flux and (b) a p grad(phi) momentum source built from the SAME face
+  // porosities.  Sharing phibar_f between the two is what makes a quiescent
+  // uniform-pressure state cancel bit-for-bit -- the "pressure-tight" property.
+  // Restored 2026-09-02 on the brinkman branch (it had been deleted in the
+  // 2026-08-29 IB cleanup); this is the inviscid SLIP wall only -- the no-slip
+  // penalization, the wall model and the RANS band sources stay gone.
+  i32  ibBrink;        // 1 = volume penalization instead of the sharp/cut IB
+  real ibBrinkEps;     // volume fraction deep inside the body (paper: 1e-6..1e-8)
+  real ibBrinkDelta;   // tanh band half-width, in FINEST cells
+  i32  brinkNSeg;      // sub-segments per face in the stamped porosity quadrature
+  __host__ __device__ real brinkPhi(real s, real h);
+  __host__ __device__ real brinkPhiFaceAvgSeg(Vec3 p0, Vec3 p1, real h, i32 nseg);
+  i32 ibRccmIter;      // Jacobi sweeps of the coupled R-Cell reconstruction
+  real ibRccmAlphaMin;
+  real ibRccmRelax;    // damped-Jacobi factor for the R-Cell system
+  i32  gradLim;        // recon 6 limiter: 0 = none, 1 = Barth-Jespersen, 2 = Venkatakrishnan
+  real gradLimK;       // Venkatakrishnan threshold: eps^2 = (K h)^3
+  i32 ibRccmPw;        // 1 = gradient-extrapolated wall pressure // alpha below which a cell is treated as fully dead
+  real ibRccmNeu;      // weight of the Neumann (normal-derivative) rows in the R-Cell fit; 0 = off
+  // The immersed boundary carries the EXACT solution as a Dirichlet datum
+  // (Ndiaye et al. Sect. 4.4: "the analytical solution is imposed as Dirichlet
+  // boundary condition on all the boundaries").  Under RCCM the R-Cell fit gets
+  // a boundary row for every primitive and the wall segment takes an HLLC flux
+  // against the exact state; under the ghost path the ghosts are PRESCRIBED
+  // (kind 1) and simply keep the exact initial state.  0 = slip wall.
+  i32 ibDirichlet;
+  // Supersonic vortex on the QUARTER annulus of the paper (Fig. 16): centre at
+  // the domain corner, inflow/outflow through the straight x = 0 / y = 0 planes
+  // as exact Dirichlet domain boundaries (bcType 6).  The closed full annulus
+  // (svQuarter 0) traps its acoustics and its conservation error forever; the
+  // open quarter lets both leave, so a genuine steady state exists.
+  i32 svQuarter;
+  // Transonic canal with a 10% circular-arc bump (Ni 1982; paper Sect. 4.2,
+  // immerserdBcType 10 / bcType 7 / icType 15).  The floor (y = canalY0), the
+  // bump (disc ibCenter/ibRadius) and the ceiling (y = canalY1) are all
+  // immersed; the inlet holds total conditions p0 = rho0 = 1 and the outlet the
+  // static pressure canalPout of an isentropic M = canalMa stream.  canalPin /
+  // canalRhoIn / canalUin are the inlet static state, used for the initial
+  // field and as the Cp reference.
+  real canalY0, canalY1, canalMa, canalPout, canalPin, canalRhoIn, canalUin;
+  // Ducros-like shock sensor gain for recon 5 (the DG solver's dgAvNuKernel
+  // formulation, --avk there): theta = comp^2/(comp^2 + kSensor c^2/h^2) with
+  // comp = min(div u, 0) -- compression rate against acoustic rate, so smooth
+  // acoustics leave theta ~ 0 and the parabola unlimited.
+  real kSensor;
   i32 ibWls;
   // Relative threshold for the Appendix-A (A.7) fallback at a wall face.  The
   // (A.6) branch carries the ratio tau~_1^2/tau~_FC^2, which makes the wall
@@ -552,25 +736,6 @@ public:
   // plate: for a grid-aligned wall plateX0 is a SLIP RUN-UP on a wall that
   // already spans the domain, but for ibtype 5 plateX0 is the plate's own
   // LEADING EDGE, so the model starts at the sharp tip with no run-up at all.
-  // ---- Jacobian-free Newton-Krylov for the k~/tau~ pair (--jfnk) -----------
-  // See the block comment above jfnkGatherKernel.  Workspace is allocated
-  // lazily and sized to the CURRENT block count; the Krylov solve happens
-  // inside one step, with no adaptation, so that layout is fixed while it runs.
-  i32   jfnkOn;        // 1 = solve the pair implicitly
-  i32   jfnkM;         // GMRES restart length
-  i32   jfnkAlloc;     // vector length currently allocated (2N)
-  real *jfnkQ0;        // base state
-  real *jfnkR0;        // base residual
-  real *jfnkWrk;       // scratch (perturbed state / J*v)
-  real *jfnkBasis;     // (m+1) Krylov vectors
-  real *jfnkW;         // A*v scratch (jfnkWrk is used inside the product)
-  real  jfnkCfl;       // pseudo-time CFL multiplier on the local dt
-  void  jfnkEnsure(void);
-  void  ktauResidual(real *r);                 // R(q) for the pair, in place
-  void  jfnkMatVec(const real *v, real *Jv);   // matrix-free J*v
-  void  jfnkVerify(void);                      // gate: J*v vs a directional FD
-  i32   jfnkGmres(real dtau, real tol, real &rrel);  // (I/dtau - J) dq = R0 -> jfnkWrk
-  void  ktauImplicitStep(real dt);             // one psi-tc Newton step on the pair
   // 0 = k~-tau~ SST (default), 1 = Spalart-Allmaras with the Tamaki near-wall
   // modification.  In SA mode rho*nu~ occupies the F_RHOK slot and F_RHOTAU is
   // idle, so the field count, block sort, halo exchange and domain BCs are all
@@ -598,65 +763,6 @@ public:
   //  is an unbalanced body force (that is how the deleted DG port applied it,
   //  and it blows up immediately).  Because phi leaves the speed of sound
   //  untouched, the usual CFL condition still holds.
-  //  Slip vs no-slip is a modelling choice, not a tuning knob: a vanishing
-  //  volume fraction already enforces non-penetration and so gives a SLIP wall,
-  //  while the Darcy friction chi is what adds the no-slip part.
-  i32  brinkPI;        // 1 = point-implicit p grad(phi) (see the RHS stamp)
-  i32  ibBrink;        // 1 = volume penalization instead of the sharp IB
-  real ibBrinkEps;     // volume fraction inside the body (paper: 1e-6..1e-8)
-  real ibBrinkDelta;   // tanh thickness delta in cells (paper: 1.5)
-  // Darcy friction.  Applied through a mask built from the SAME profile (28)
-  // but RETREATED ibBrinkShift cells into the body, exactly as the paper does
-  // for its potential-cylinder case.  The retreat is what keeps this compatible
-  // with a slip wall: the paper is explicit that Darcy friction "necessarily
-  // creates non-slip boundaries", so it must be ~0 at the wall itself, and the
-  // shifted mask is ~0.005 there while reaching 1 deep inside.
-  //
-  // It is not optional.  Inside the body phi falls by six decades, and a
-  // disturbance running inward through that is a horn: its amplitude grows like
-  // 1/sqrt(phi), i.e. ~1000x.  The impulsive start alone then drives the
-  // interior density negative and the run dies.  Damping the interior is what
-  // the paper's interior filter and shifted Darcy term are both there to do.
-  real ibBrinkRate;    // Darcy rate / (lambda/h); 0 disables interior damping
-  real ibBrinkShift;   // Darcy mask retreat into the body, in finest cells
-  real ibBrinkDarcyFac;// Darcy mask width as a fraction of delta (paper: 1/2)
-  __host__ __device__ real brinkDarcyMask(real s, real h);
-  __host__ __device__ real brinkPhi(real s, real h);
-  // phi_face / phi_cell, formed ANALYTICALLY from the two signed distances.
-  // The naive quotient evaluates two sigmoids that are both ~eps deep in the
-  // band and divides them, which in fp32 leaves ~1 significant digit in exactly
-  // the ratio that multiplies every flux.  See the definition for the identity
-  // that makes it cancellation-free.
-  __host__ __device__ real brinkRatio(real sFace, real sCell, real h);
-  // grad(phi)/phi analytically, by the chain rule through the level set:
-  //   grad(phi) = (dphi/ds) grad(s) = (dphi/ds) n,   |grad s| = 1 for an SDF,
-  //   dphi/ds   = (1-eps)(2/delta) g (1-g),  g = sigmoid(2s/delta)
-  // n is the EXACT closest-point normal, so this carries no differencing error
-  // at all.  Returns grad(phi)/phi, which is what the penalized RHS actually
-  // wants and which is BOUNDED by 2/delta (the same bounded log-slope that
-  // makes the tanh profile non-stiff).
-  __host__ __device__ void brinkGradPhiOverPhi(real s, Vec3 n, real h, real gp[3]);
-  // EXACT face-average of phi between two endpoint signed distances.
-  //
-  // Why an average and not the face-centre value: the discrete gradient the
-  // scheme actually forms is sum_f phi_f n_f A_f / V.  By the divergence theorem
-  // that equals the true grad(phi) EXACTLY when phi_f is the face AVERAGE, and
-  // only to truncation order when it is the face-centre point value.  That
-  // difference is precisely the multidimensional equilibrium the inclined-plane
-  // gate tests: uniform flow parallel to the wall has u.grad(phi) = 0
-  // analytically, which discretely needs the x- and y-face contributions to
-  // cancel.  phi is an analytic function of an (affine) signed distance along a
-  // face, so the average has a closed form:
-  //   int sigmoid(2s/delta) ds = (delta/2) softplus(2s/delta)
-  __host__ __device__ real brinkPhiFaceAvg(real s1, real s2, real h);
-  // Segmented face average: the signed distance is RE-EVALUATED from the true
-  // level set at each segment node, so the wall's CURVATURE is captured, while
-  // the sharp sigmoid nonlinearity is still integrated exactly within each
-  // segment.  Measured against the exact cell-averaged grad(phi) on a cylinder,
-  // the face-CENTRE point value errs 3.5% at delta=1.5h and 57% at 0.25h -- the
-  // error GROWS as the interface thins, which is the delta-floor mechanism --
-  // whereas 4 segments hold ~2e-4 across the whole range.
-  __host__ __device__ real brinkPhiFaceAvgSeg(Vec3 p0, Vec3 p1, real h, i32 nseg);
 
   // Supersonic vortex (testCase 16): EXACT steady solution of the 2-D Euler
   // equations in a concentric annulus.  With rho_i = 1 and p = rho^gam/gam the
@@ -665,64 +771,55 @@ public:
   // Verified against radial momentum: dp/dr = rho M_i^2 r_i^2 / r^3 = rho u^2/r.
   // A FULL annulus needs no inflow/outflow BC at all -- the only boundaries are
   // the two curved slip walls, so every bit of the error is the wall treatment.
+  // Ringleb flow (exact, curved streamline walls) -- see CompressibleSolver.cu
+  real ringlebKmin, ringlebKmax, ringlebScale, ringlebQmin, ringlebX0, ringlebY0;
+  __host__ __device__ void ringlebHodograph(real q, real k, real &x, real &y,
+                                            real &rho, real &p) const;
+  __host__ __device__ bool ringlebInvert(real x, real y, real &q, real &k) const;
+  __host__ __device__ void ringlebExact(real x, real y, real &rho, real &u,
+                                        real &v, real &p) const;
+  void computeRinglebError(void);
+  __host__ __device__ i32 getBoundaryBcKind(Vec3 pos);   // 0 = wall, 1 = prescribed
+  // Per-SEGMENT boundary-condition tag, parallel to ibPoly.  All geometry is a
+  // segment list (triangles later, in 3-D); the tag says what each piece of the
+  // boundary MEANS, so one closed loop can carry walls and inflow/outflow at
+  // once.  nullptr = every segment is a wall (the airfoil case).
+  i32 *ibPolyBc = nullptr;
+  // Does the closed loop bound the SOLID (an airfoil) or the FLUID (a duct such
+  // as Ringleb)?  Same segments, opposite sign -- getting this wrong marks the
+  // entire flow region solid, which is silent: the run completes and every norm
+  // reports zero area.
+  i32 ibPolyFluidInside = 0;
+  real ibPolyBcTol = 0.0;   // junction width (x chord) biasing a corner to PRESCRIBED
+  // Boundary STATE per segment (rho,u,v,p), evaluated FORWARD at setup.  A
+  // prescribed ghost needs the state ON the boundary, not at its own centre --
+  // and its centre lies outside the map where the inversion fails, which is how
+  // the ghosts were silently getting the uniform fallback state.
+  real *ibPolyState = nullptr;
+  void setPolyline(const real *xy, const i32 *bc, const real *st, i32 n);
   __host__ __device__ void svortexExact(real x, real y, real &rho, real &u,
                                         real &v, real &p);
-  i32 brinkAnalyticGrad;   // 1 = analytic p grad(phi) source (breaks the exact
-                           // discrete cancellation -- see the measurement)
-  i32 brinkFaceLS;
-  i32 brinkNSeg;      // face-average segments (brinkface 3)     // 1 = face phi from the level set AT THE FACE (exact for
-  i32 brinkDtW;       // 1 = include the phi ratio in the dt limit
+  // exact state of the running verification case (icType 13 / 14) at (x, y);
+  // the bcType 6 exact-Dirichlet domain boundary and the error norms use it
+  __host__ __device__ bool exactState(real x, real y, real &rho, real &u,
+                                      real &v, real &p);
   i32 ibFieldAllLvls; // writeIbField dumps every leaf, not just the finest level
   real ibRadius2;     // OUTER radius (immerserdBcType 7, annulus)
   real svMach;        // supersonic-vortex Mach number at the inner wall
-  i32  ibNoSlip;      // 1 = volume-penalized NO-SLIP wall (viscous Brinkman)
-  real ibNoSlipRate;  // penalization rate / ((|u|+c)/h); larger = stiffer wall
-  // Slip-length wall model (Rickard & Kasbaoui, JFM 1039 A17, Eqs. 4.18-4.21,
-  // 7.2-7.3).  Our porosity IS their fluid volume fraction alpha_f: phi is the
-  // CDF of a LOGISTIC kernel of scale delta/2, so G1(0) = 1/(2 delta) and
-  // alpha_f,w = 1/2 exactly as for their planar walls.  Their
-  //   l = (alpha_f,w / G1(0)) (lambda - 1)
-  // therefore collapses to  l = delta (lambda - 1),  with the filter width that
-  // enters their lambda fit given by matching G1(0): delta_f = pi delta.
-  // Specialising the same algebra to their cosine kernel reproduces their
-  // l+ = 0.0798 delta_f+^1.5385, which is the check that the mapping is right.
-  i32  ibSlipModel;   // 0 = plain no-slip, 1 = slip-length model
-  real slipA1, slipN1;  // lambda_x = 1 + a1 (delta_f+)^n1   (paper: 0.30, 0.53)
-  real slipMatchH;    // wall-model matching height / h_fine (0 = delta_f)
-  real ibTurbShift;   // wall-modelled turbulence damping: retreat of the k~/tau~ mask, cells INSIDE (< Darcy's 4 so thin noses stay damped)
-  real ibMassRepair;  // deep-body rho relaxation rate toward rho_inf (0 = off); repairs the curved-wall mass drain
-  i32  ibPureSource;  // 1 = IB entirely from band SOURCE terms: unit face weights, no p grad(phi), no porosity stamps
-  i32  ibTangOnly;    // 1 = wall model adds ONLY tangential forcing: no normal penalty, no isotropic band/deep seal (pressure-tight owns the normal dof; Darcy owns the interior)
   i32  ibHo;          // 1 = FRIB high-order (k=2) wall condition in H/S form + curvature-consistent ghosts
-  i32  wmOrder;       // ibslip 4: truncation order of the exact wall BC (1 or 2)
-  real wmGain;        // ibslip 4: feedback gain / (uRef/h)
-  real wmAnchor;      // ibslip 4: solid-side anchor start, cells behind the wall
-  i32  wmNormal;      // ibslip 4: also feedback the penetration component
-  i32  wmPush;        // ibslip 4: allow the servo to accelerate (bidirectional)
-                       // curved walls) instead of the averaged cell distances
-  // Is this point inside the region where phi still VARIES?  (ls = level set,
-  // positive inside the body.)  The penalized RHS is divided by the cell's own
-  // phi while its fluxes carry the FACE phi, so the amplification across a cell
-  // is exp(2h/delta): harmless at h = delta, but a level-0 cell with
-  // delta = 1.5*h_finest amplifies ~14x at nLvls 2 and ~200x at nLvls 3, and the
-  // body interior blows up.  phi must therefore be resolved wherever it moves.
-  // The tanh does not settle onto its plateaus at +-delta: reaching within 1% of
-  // eps takes (delta/2)|ln(0.01 eps)| ~ 10-17 finest cells into the body, versus
-  // only ~2.3 delta out into the fluid.  Beyond that phi is flat and every ratio
-  // is exactly 1, so coarse cells are free there.  The paper never meets this --
-  // it runs on a uniform grid.
-  __device__ bool inBrinkBand(real ls) {
-    const real hf = fmin(getDx(nLvls-1), pseudo2D ? getDx(nLvls-1) : getDy(nLvls-1));
-    const real d  = ibBrinkDelta*hf;
-    const real intoBody  = (real)0.5*d*(-log((real)0.01*fmax(ibBrinkEps,(real)1e-30)))
-                         + (real)2*hf;
-    const real intoFluid = (real)2.3*d + (real)2*hf;
-    return (ls < intoBody) && (ls > -intoFluid);
-  }
   i32 ibTurbFlux;  // 0 = drop the k~/tau~ wall fluxes (diagnostic)
   i32 gridTrace;   // dump the grid at each level of the initial build cascade
   i32 adaptEvery;  // wavelet adaptation cadence in steps (~5 host-device syncs per call)
   i32 dtEvery;     // recompute the global dt every this many steps (the reduction is a hard sync)
+  i32 maxIter;     // stop the march after this many steps (0 = no cap)
+  i32 residEvery;  // steady-residual cadence in steps (0 = never); the reduction is a hard sync
+  real resTol;     // stop the march when R/R0 falls below this (0 = never stop early)
+  real resid;      // last computed RMS residual
+  real residFar;   // RMS over cells > 4h from the immersed body
+  real residMax;   // largest per-cell |L|
+  real residMaxDw; // wall distance (local h) of that cell
+  real resFar;     // exclusion radius (local h) for the wall-free residual
+  real resid0;     // first computed RMS residual (normalizer)
   i32  envCheck;      // --envcheck: per-step envelope check; prints the FIRST out-of-bounds cell + its neighborhood
   i32  envPrints;     // envelope reports emitted (capped)
   void envCheckStep(void);   // run the check and report a hit
