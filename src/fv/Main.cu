@@ -47,6 +47,7 @@
 //   --wthresh X  wavelet detail threshold               (per-case default)
 //   --ma X       Gresho Mach / acConv amplitude / testCase-1 inner pressure
 //   --bc N       BC: 0 slip wall, 1 no-slip, 2 periodic, 3 transmissive,
+//                8 characteristic far field (non-reflecting; external aero)
 //                6 exact-solution Dirichlet (verification cases 16/17)
 //   --recon N    0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola
 //   ---- case 18, canal with a 10% bump (Ni 1982; Ndiaye et al. Sect. 4.2) ----
@@ -182,12 +183,13 @@ int main(int argc, char* argv[]) {
   bool ransWal = (testCase == 12);                         // near-wall equilibrium probe
   bool fptbl   = (testCase == 13);                         // flat-plate turbulent boundary layer
   bool ibPlate = (testCase == 14);                         // SAME plate, but immersed (IB gate)
+  bool circle  = (testCase == 20);                         // subsonic circle: cut-cell verification body
   bool afoil   = (testCase == 15);                         // RAE 2822 airfoil (immersed, level set)
   bool svort   = (testCase == 16);                         // supersonic vortex in an annulus (EXACT, curved wall)
   bool ringleb = (testCase == 17);                         // Ringleb flow (EXACT, curved streamline walls)
   bool canal   = (testCase == 18);                         // transonic canal with a 10% bump (Ni 1982; RCCM paper Sect. 4.2)
   i32 nLvls    = argI("--nlvls", (testCase == 1 ? 4 : (testCase == 5 ? 3 : (sodAmr ? 3 : (acoustic ? 3 : (fptbl ? 3 : (afoil ? 6 : (svort ? 1 : 1))))))));
-  i32 nBlocksX = argI("--nblocks", (testCase == 1 ? 16 : (testCase == 2 ? 40 : (testCase == 3 ? 8 : (testCase == 4 ? 40 : (testCase == 5 ? 10 : (sodAmr ? 16 : (acoustic ? 64 : (acConv ? 8 : (shear ? 8 : ((ransBox||ransShr||ransWal) ? 4 : (afoil ? 24 : (svort ? 32 : (ringleb ? 32 : (canal ? 38 : ((fptbl||ibPlate) ? 64 : 100))))))))))))))));
+  i32 nBlocksX = argI("--nblocks", (testCase == 1 ? 16 : (testCase == 2 ? 40 : (testCase == 3 ? 8 : (testCase == 4 ? 40 : (testCase == 5 ? 10 : (sodAmr ? 16 : (acoustic ? 64 : (acConv ? 8 : (shear ? 8 : ((ransBox||ransShr||ransWal) ? 4 : (afoil ? 24 : (svort ? 32 : (ringleb ? 32 : (canal ? 38 : (circle ? 16 : ((fptbl||ibPlate) ? 64 : 100)))))))))))))))));
   real wThresh = argF("--wthresh", (testCase == 1 ? 0.004 : 0.01));
   bool haveMa  = hasArg("--ma");
   real Ma      = haveMa ? argF("--ma", 0.1) : 0.1;   // Gresho Mach number / acConv amplitude
@@ -261,12 +263,12 @@ int main(int argc, char* argv[]) {
   // the grid for the same reason, Table 4).  The ceiling then lands wherever
   // 1/dx puts it; its fraction is printed.  Inlet M = --canalma (0.675).
   real canalOff = argF("--canaloff", 0.3);
-  real domainLenX = ringleb ? 5.8 : svort ? (svQuarterA ? svLen : 2.0*svRo*1.06) : canal ? 3.0 : (testCase == 2) ? 10.0
+  real domainLenX = ringleb ? 5.8 : svort ? (svQuarterA ? svLen : 2.0*svRo*1.06) : canal ? 3.0 : circle ? argF("--domlen", 20.0) : (testCase == 2) ? 10.0
                   : (afoil ? (domLenXA > 0 ? domLenXA : 24.0)
                   : ((fptbl||ibPlate) ? (domLenXA > 0 ? domLenXA : 1.5) : 1.0));
 
   bool cube   = (testCase == 3);
-  bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv || shear || ransBox || ransShr || ransWal || afoil || svort || ringleb);
+  bool square = (testCase == 1 || testCase == 2 || gresho || sodAmr || acoustic || acConv || shear || ransBox || ransShr || ransWal || afoil || svort || ringleb || circle);
   real canalDx = domainLenX/(nBlocksX*blockSize);
   real canalY0 = (2.0 - canalOff)*canalDx, canalY1 = canalY0 + 1.0;   // floor / ceiling
   i32 nBlocksY = (square || cube) ? nBlocksX : ((fptbl||ibPlate) ? max(1, (i32)lround((domLenYA > 0 ? domLenYA : 0.1)/domainLenX*nBlocksX))
@@ -287,17 +289,17 @@ int main(int argc, char* argv[]) {
   // shorter tEnd to stay inside the domain.
   real sodPin = (testCase == 1) ? (haveMa ? argF("--ma", 1.0) : 1.0) : 0.0;
   real acPeriod = domainLenX / sqrt(gam);   // sound-crossing time (c0=sqrt(gam), p0=rho0=1)
-  real tEnd  = (testCase == 1 && sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin) : ((testCase == 2) ? 1.0 : (testCase == 3 ? 0.15 : (gresho ? 1.0 : (sodAmr ? 0.15 : (acoustic ? 0.35 : (acConv ? 2.0*acPeriod : (shear ? 0.5 : ((ransBox||ransShr||ransWal) ? 1.0 : (afoil ? 40.0 : (svort ? 2.0 : (ringleb ? 2.0 : (canal ? 60.0 : ((fptbl||ibPlate) ? 5.0 : 0.20)))))))))))));
+  real tEnd  = (testCase == 1 && sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin) : ((testCase == 2) ? 1.0 : (testCase == 3 ? 0.15 : (gresho ? 1.0 : (sodAmr ? 0.15 : (acoustic ? 0.35 : (acConv ? 2.0*acPeriod : (shear ? 0.5 : ((ransBox||ransShr||ransWal) ? 1.0 : (afoil ? 40.0 : (svort ? 2.0 : (ringleb ? 2.0 : (canal ? 60.0 : (circle ? 60.0 : ((fptbl||ibPlate) ? 5.0 : 0.20))))))))))))));
   if (tEndArg > 0) tEnd = tEndArg;                   // CLI override (arg 10)
-  real tStep = (testCase == 1) ? ((tEndArg > 0) ? tEnd/50.0 : ((sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin)/10.0 : 0.008)) : (testCase == 2 ? 0.1 : (testCase == 3 ? 0.03 : (gresho ? 0.1 : (sodAmr ? 0.02 : (acoustic ? 0.02 : (acConv ? tEnd : (shear ? tEnd : ((ransBox||ransShr||ransWal) ? tEnd : ((fptbl||ibPlate||afoil||svort||ringleb||canal) ? tEnd/20.0 : 0.01)))))))));
+  real tStep = (testCase == 1) ? ((tEndArg > 0) ? tEnd/50.0 : ((sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin)/10.0 : 0.008)) : (testCase == 2 ? 0.1 : (testCase == 3 ? 0.03 : (gresho ? 0.1 : (sodAmr ? 0.02 : (acoustic ? 0.02 : (acConv ? tEnd : (shear ? tEnd : ((ransBox||ransShr||ransWal) ? tEnd : ((fptbl||ibPlate||afoil||svort||ringleb||canal||circle) ? tEnd/20.0 : 0.01)))))))));
 
   CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls);
   solver->pseudo2D        = (baseGridSize[2] == blockSizeZ) ? 1 : 0;  // collapse z (pseudo-2D)
   solver->cfl             = cfl;
   solver->waveletThresh   = wThresh;
-  solver->icType          = (testCase == 1 || sodAmr) ? (argI("--dgblast", 0) ? 7 : 1) : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : (shear ? 8 : (ransBox ? 9 : (ransShr ? 10 : (ransWal ? 11 : (svort ? 13 : (ringleb ? 14 : (canal ? 15 : ((fptbl||ibPlate||afoil) ? 12 : 0)))))))))))));
+  solver->icType          = (testCase == 1 || sodAmr) ? (argI("--dgblast", 0) ? 7 : 1) : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : (shear ? 8 : (ransBox ? 9 : (ransShr ? 10 : (ransWal ? 11 : (svort ? 13 : (ringleb ? 14 : (canal ? 15 : ((fptbl||ibPlate||afoil||circle) ? 12 : 0)))))))))))));
   // --dgblast 1: DG-matched blast IC (icType 7) for wavedg3d comparison runs
-  solver->bcType          = (bcArg >= 0) ? bcArg : ((svort && svQuarterA) ? 6 : (canal ? 7 : (afoil ? 5 : ((fptbl||ibPlate) ? 4 : ((acConv || shear || ransBox || ransShr || testCase == 1) ? 2 : 3)))));   // periodic for the acoustic/shear waves and circular Sod; else transmissive
+  solver->bcType          = (bcArg >= 0) ? bcArg : ((svort && svQuarterA) ? 6 : (canal ? 7 : (circle ? 8 : (afoil ? 5 : ((fptbl||ibPlate) ? 4 : ((acConv || shear || ransBox || ransShr || testCase == 1) ? 2 : 3))))));   // periodic for the acoustic/shear waves and circular Sod; else transmissive
   solver->vortexAdvect    = (acConv || shear || ransBox || ransShr || ransWal) ? Ma : (testCase == 2 ? advectA : sodPin);  // acConv/shear: wave amplitude; case 2: vortex advection; testCase 1: Sod inner pressure
   // shear: fix the background pressure (c ~ 11.8) so --ma sets ONLY the shear
   // amplitude; the flow Mach number is then ~ma/11.8, low enough that the
@@ -319,7 +321,7 @@ int main(int argc, char* argv[]) {
   // length, and the wall model is applied only for x >= plateX0 with slip
   // upstream, the geometry AND the boundary treatment match case 13 exactly --
   // same problem, two independent wall implementations.
-  solver->immerserdBcType = svort ? 7 : (canal ? 10 : (ibPlate ? argI("--ibtype", 2) : 0));
+  solver->immerserdBcType = svort ? 7 : (canal ? 10 : (circle ? 3 : (ibPlate ? argI("--ibtype", 2) : 0)));
   if (canal) {
     solver->canalY0 = canalY0;  solver->canalY1 = canalY1;
     solver->ibCenter[0] = 1.5;  solver->ibCenter[1] = canalY0 - 1.2;  solver->ibCenter[2] = 0.5;
@@ -487,6 +489,7 @@ int main(int argc, char* argv[]) {
   solver->ibBrinkEps      = argF("--brinkeps", 1e-6);    // volume fraction deep inside the body
   solver->ibBrinkDelta    = argF("--brinkdelta", 0.125); // tanh band half-width, in FINEST cells
   solver->brinkNSeg       = argI("--brinkseg", 4);       // sub-segments per face (stamped once, so free)
+  solver->cutPi           = argI("--cutpi", 0);       // point-implicit small cells (no reconstruction)
   solver->ibRccm          = argI("--ibrccm", 0);       // RCCM cut-cell + reconstructed small cells
   solver->ibDirichlet     = argI("--ibdir", 0);        // immersed boundary carries the exact state (paper Sect. 4.4)
   solver->ibRccmIter      = argI("--rccmiter", 3);
@@ -613,6 +616,20 @@ int main(int argc, char* argv[]) {
     solver->fsV = 0.0;
     solver->fsP = 1.0/(gam*Ma*Ma);
   }
+  if (circle) {
+    // circle of radius --ibrad at the domain centre, freestream along +x at
+    // --ma.  Subsonic (M ~ 0.3) it is the cleanest cut-cell test there is: the
+    // exact answer is fore-aft symmetric with Cp = 1 at both stagnation points
+    // and Cp = -1.25 (incompressible) at the shoulders, and ANY conservation
+    // error shows up as spurious drag.
+    solver->ibCenter[0] = 0.5*domainSize[0];
+    solver->ibCenter[1] = 0.5*domainSize[1];
+    solver->ibCenter[2] = 0.5*domainSize[2];
+    solver->ibRadius    = argF("--ibrad", 0.5);
+    solver->ibChord     = 2.0*solver->ibRadius;
+    solver->fsU = 1.0; solver->fsV = 0.0;
+    solver->fsP = 1.0/(gam*Ma*Ma);
+  }
   if (fptbl || ibPlate) {
     // The freestream runs ALONG the plate, so an inclined plate needs an
     // inclined freestream -- that is what the paper's "30 degrees between the
@@ -630,6 +647,17 @@ int main(int argc, char* argv[]) {
   // zero; break that sharing (--brinkgrad 1) and the leak shows up immediately.
   solver->fsU = argF("--fsu", solver->fsU);
   solver->fsV = argF("--fsv", solver->fsV);
+  // Freestream override for the QUIESCENT well-balancedness test: --fsu 0
+  // --fsv 0 leaves uniform pressure and zero velocity around the body, a state
+  // the discretisation must hold EXACTLY.  On a cut cell that is the statement
+  // sum_f p n_f A_f = 0, i.e. exactly what defines the wall normal.
+  solver->fsU = argF("--fsu", solver->fsU);
+  solver->fsV = argF("--fsv", solver->fsV);
+  // Body-size override, for ANY case with an analytic body: the inviscid
+  // cylinder ships at R = 0.05, which is only a few cells unless the grid is
+  // very fine -- and the point of that test is the surface Cp against
+  // 1 - 4 sin^2(theta), which needs the body resolved, not the box.
+  solver->ibRadius = argF("--ibrad", solver->ibRadius);
   // reference Mach^2 for the preconditioner's beta^2 floor (rho_inf = 1)
   {
     const double u2 = (double)solver->fsU*solver->fsU + (double)solver->fsV*solver->fsV;

@@ -594,7 +594,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, 
 
         if (grid.bcType != 4 || !(ib < 0)) {
           Rho[cIdx]  = Rho[bcIdx];      // Neumann density and energy, except at
-          RhoE[cIdx] = RhoE[bcIdx];     // the bcType 4 Dirichlet faces
+          RhoE[cIdx] = RhoE[bcIdx];     // the bcType 4/8 faces, which set them
         }
 
         if (grid.bcType == 0) {
@@ -770,6 +770,68 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, 
             RhoV[cIdx] = RhoV[bcIdx];
             RhoW[cIdx] = RhoW[bcIdx];
           }
+        }
+        else if (grid.bcType == 8) {
+          // ---- characteristic far field (Riemann invariants) ---------------
+          // Zero-gradient extrapolation (bcType 3) is REFLECTIVE for subsonic
+          // acoustics: a wave reaching the boundary comes back in.  On an
+          // external-aero box that is not a slow leak, it is fatal -- measured
+          // on the M=0.3 circle in a 20-diameter box, the far field sat at
+          // R ~ 3e-2 for 4000 iterations and then blew up, with the residual
+          // maximum 80-160 cells from the body, i.e. AT the boundary.  Both the
+          // cut-cell and the RCCM path died the same way, which is how we know
+          // it was never the body treatment.
+          //
+          // The standard fix: decompose into the two acoustic Riemann
+          // invariants along the OUTWARD normal and take each from the side its
+          // characteristic comes from,
+          //   R+ = u_n + 2c/(g-1)   (from the interior if u_n > -c)
+          //   R- = u_n - 2c/(g-1)   (from the freestream if u_n < c)
+          // then u_n = (R+ + R-)/2 and c = (g-1)(R+ - R-)/4.  Entropy and the
+          // tangential velocity ride the convective characteristic, so they come
+          // from whichever side the flow is entering from.  Supersonic faces
+          // degenerate correctly: all four from upstream.
+          const real nx = xWall ? (ib < 0 ? (real)-1 : (real)1) : (real)0;
+          const real ny = yWall ? (jb < 0 ? (real)-1 : (real)1) : (real)0;
+          const real nz = zWall ? (kb < 0 ? (real)-1 : (real)1) : (real)0;
+          // interior state (the ghost's mirror partner)
+          const real ri = fmax(Rho[bcIdx], (real)1e-30);
+          const real ui = prim ? RhoU[bcIdx] : RhoU[bcIdx]/ri;
+          const real vi = prim ? RhoV[bcIdx] : RhoV[bcIdx]/ri;
+          const real wi = prim ? RhoW[bcIdx] : RhoW[bcIdx]/ri;
+          const real pi_ = prim ? RhoE[bcIdx]
+                                : (gam-(real)1)*(RhoE[bcIdx]
+                                    - (real)0.5*ri*(ui*ui + vi*vi + wi*wi));
+          const real ci = sqrt(fmax(gam*pi_/ri, (real)1e-30));
+          const real uni = ui*nx + vi*ny + wi*nz;
+          // freestream state
+          const real re = (real)1, ue = grid.fsU, ve = grid.fsV, we = (real)0;
+          const real pe = grid.fsP;
+          const real ce = sqrt(fmax(gam*pe/re, (real)1e-30));
+          const real une = ue*nx + ve*ny + we*nz;
+          const real tg = (real)2/(gam - (real)1);
+          // pick each invariant from its own side of the characteristic
+          const real Rp = (uni > -ci) ? (uni + tg*ci) : (une + tg*ce);
+          const real Rm = (une <  ce) ? (une - tg*ce) : (uni - tg*ci);
+          const real unb = (real)0.5*(Rp + Rm);
+          const real cb  = fmax((gam - (real)1)*(real)0.25*(Rp - Rm), (real)1e-30);
+          const bool inflow = (unb <= (real)0);           // outward normal
+          // entropy s = p/rho^gamma and the TANGENTIAL velocity convect
+          const real rs = inflow ? re : ri, ps = inflow ? pe : pi_;
+          const real ut = inflow ? ue : ui, vt = inflow ? ve : vi, wt = inflow ? we : wi;
+          const real ent = ps/pow(rs, gam);
+          const real rb = pow(cb*cb/(gam*ent), (real)1/(gam - (real)1));
+          const real pb = rb*cb*cb/gam;
+          const real unt = ut*nx + vt*ny + wt*nz;          // tangential part kept
+          const real ub = ut + (unb - unt)*nx;
+          const real vb = vt + (unb - unt)*ny;
+          const real wb = wt + (unb - unt)*nz;
+          Rho[cIdx]  = rb;
+          RhoU[cIdx] = prim ? ub : rb*ub;
+          RhoV[cIdx] = prim ? vb : rb*vb;
+          RhoW[cIdx] = prim ? wb : rb*wb;
+          RhoE[cIdx] = prim ? pb : (pb/(gam - (real)1)
+                                    + (real)0.5*rb*(ub*ub + vb*vb + wb*wb));
         }
         else {
           // bcType == 3 : transmissive / outflow (zero gradient)
@@ -2387,7 +2449,10 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
       // The R-Cells are the small ones, and not letting them into the reduction
       // is precisely what removes the small-cell time-step restriction -- they
       // are reconstructed, never advanced, so no CFL applies to them.
-      if (grid.ibRccm && grid.rccmRCell(cIdx)) DeltaT[cIdx] = (real)1e30;
+      // --cutpi: small cells are advanced, not skipped, so they must NOT be
+      // exempted from the step -- the point-implicit stamp is what keeps them
+      // stable, and the global step is set by the uncut cells either way.
+      if (grid.ibRccm && !grid.cutPi && grid.rccmRCell(cIdx)) DeltaT[cIdx] = (real)1e30;
 
       // No phi-ratio dt clause: the pressure-tight form (Reiss 2021, Sec. 2.1)
       // leaves u +- c unchanged, so the plain acoustic CFL above is the whole
@@ -4906,6 +4971,39 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
       atomicAdd(&Rhs[n][d1Idx], - fluxD[n]*ay*wDn);
     }
 
+    // ---- point-implicit small cells (--cutpi) --------------------------------
+    // Stamp the 1/alpha excess of THIS cell's own divergence.  The Jacobian
+    // spectral radius of  (1/alpha - 1) sum_f F_f A_f / dV  is
+    // (|u| + a) (1/alpha - 1) sum_f A_f / dV, and every open face contributes --
+    // the wall segment is NOT special.  A corner sliver of legs `a` has volume
+    // a^2/2, two Cartesian faces of length a and a wall of a*sqrt(2): the
+    // flux-to-volume ratios are 2F/a and 2*sqrt(2)F/a, the same order, so
+    // stamping only the wall flux would leave the CFL limit exactly where it was.
+    // (Directly evidenced next door: --brinkpi 1 stamps one term and buys
+    // nothing, --brinkpi 2 stamps the full sum and retires the restriction.)
+    if (grid.cutPi && grid.ibRccm && grid.immerserdBcType != 0 && grid.rccmLive(cIdx)) {
+      real *CA = grid.getField(F_CUTA);
+      real *AXf = grid.getField(F_CUTAX), *AYf = grid.getField(F_CUTAY);
+      const real aC = fmax(CA[cIdx], grid.ibRccmAlphaMin);
+      if (aC < (real)1 - (real)1e-12) {                 // uncut cells: lambda = 0
+        // this cell's four open faces: its own low faces, the neighbours' lows
+        const i32 cE2 = bEmpty*blockSizeTot;
+        const real apXlo = AXf[cIdx], apYlo = AYf[cIdx];
+        const real apXhi = (r1Idx < cE2) ? AXf[r1Idx] : (real)0;
+        const real apYhi = (u1Idx < cE2) ? AYf[u1Idx] : (real)0;
+        // wall segment from the discrete divergence theorem, as the wall flux does
+        const real awx = (apXhi - apXlo)*dy, awy = (apYhi - apYlo)*dx;
+        const real aWall = sqrt(awx*awx + awy*awy);
+        const real sumA = (apXlo + apXhi)*dy + (apYlo + apYhi)*dx + aWall;
+        const real a2   = gam*P[cIdx]/fmax(Rho[cIdx],(real)1e-30);
+        const real lamC = sqrt(U[cIdx]*U[cIdx] + V[cIdx]*V[cIdx] + W[cIdx]*W[cIdx])
+                        + sqrt(fmax(a2,(real)0));
+        // (1/alpha - 1) sum_f A_f / dV_uncut, i.e. the EXCESS over the uncut cell
+        const real exc = ((real)1/aC - (real)1)*sumA/vol;
+        atomicAdd(&grid.getField(F_LAMM)[cIdx], lamC*exc);
+      }
+    }
+
     if (grid.ibBrink && grid.immerserdBcType != 0) {
       // ---- p grad(phi) in flux-scatter form, POINT-IMPLICIT ----------------
       // The scatter mirrors the flux scatter exactly (same face weights), so a
@@ -5592,7 +5690,8 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
     // from the FVM update -- advancing them is exactly the small-cell blow-up
     // the method exists to avoid.
     if (grid.ibRccm && grid.immerserdBcType != 0)
-      ibSolid = !grid.rccmLive(cIdx) || grid.rccmRCell(cIdx);
+      ibSolid = grid.cutPi ? !grid.rccmLive(cIdx)                  // advance every live cell
+                           : (!grid.rccmLive(cIdx) || grid.rccmRCell(cIdx));
 
     // Covered parents are NOT evolved -- restrictFields overwrites them from
     // their children after every stage, so their only legitimate source is
@@ -5618,7 +5717,7 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
       // CLEARED here (not in the sweep below) because a stale stamp must never
       // survive a stage: the rate is a per-stage quantity.
       real lamM = 0;
-      if (grid.ibBrink) {
+      if (grid.ibBrink || grid.cutPi) {
         lamM = grid.getField(F_LAMM)[cIdx];
         grid.getField(F_LAMM)[cIdx] = 0;
       }
@@ -5679,7 +5778,7 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
       if (LK[cIdx] != 0) LK[cIdx] = 0;
       if (LT[cIdx] != 0) LT[cIdx] = 0;
     }
-    if (grid.ibBrink) {
+    if (grid.ibBrink || grid.cutPi) {
       real *LM = grid.getField(F_LAMM);
       if (LM[cIdx] != 0) LM[cIdx] = 0;      // parents / skipped cells
     }

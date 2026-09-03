@@ -690,6 +690,26 @@ public:
   i32  brinkNSeg;      // sub-segments per face in the stamped porosity quadrature
   __host__ __device__ real brinkPhi(real s, real h);
   __host__ __device__ real brinkPhiFaceAvgSeg(Vec3 p0, Vec3 p1, real h, i32 nseg);
+  // ---- point-implicit cut cells (--cutpi) ----------------------------------
+  // The small-cell problem and the Brinkman porosity stiffness are the SAME
+  // problem: a cell whose update carries a 1/alpha (or 1/phi) amplification of
+  // its own flux divergence.  Split it exactly as --brinkpi 2 does,
+  //   (1/alpha) sum_f F_f A_f / dV = sum_f F_f A_f / dV
+  //                                + (1/alpha - 1) sum_f F_f A_f / dV,
+  // and stamp the second, which is local, on F_LAMM; the update then divides by
+  // (1 + B dt lambda).  Two consequences that matter:
+  //   * fixed points are untouched, so the converged state still satisfies
+  //     sum_f F_f A_f = 0 per cell -- the exactly conservative cut-cell answer.
+  //     That is the whole point: RCCM instead RECONSTRUCTS its small cells and
+  //     is non-conservative because of it (the paper's FRM/FIM/FCM exist to
+  //     repair exactly that).  Here every live cell is advanced by its true flux.
+  //   * no lag: with B dt lambda >> 1 the update is ~ R alpha h/(B(|u|+a)) while
+  //     R itself ~ (|u|+a) dU/(alpha h), so alpha cancels and a sliver relaxes an
+  //     O(1) fraction per stage however small it is.
+  // Only the DIAGONAL is implicit -- neighbour coupling stays explicit, so a
+  // sliver bounded by slivers is outside the argument (the cheap member of the
+  // mixed explicit/implicit cut-cell family, cf. May & Berger).
+  i32 cutPi;           // 1 = point-implicit small cells, advance every live cell
   i32 ibRccmIter;      // Jacobi sweeps of the coupled R-Cell reconstruction
   real ibRccmAlphaMin;
   real ibRccmRelax;    // damped-Jacobi factor for the R-Cell system

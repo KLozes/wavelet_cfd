@@ -452,7 +452,9 @@ real CompressibleSolver::step(real tStep) {
       }
 #endif
       if (ffVortex && stage == 0 && (iter % ffEvery) == 0) updateFarFieldVortex();
-      if (immerserdBcType && ibRccm) reconstructRCells();  // RCCM Eq. (10)
+      // --cutpi advances every live cell instead, so there is nothing to
+      // reconstruct: dropping this is what makes the fixed point conservative.
+      if (immerserdBcType && ibRccm && !cutPi) reconstructRCells();  // RCCM Eq. (10)",
       else if (immerserdBcType && !rans) applyWallGhosts();   // Euler: slip ghosts
       if (shash >= 2 && iter >= shashFrom && iter <= shashTo) stateHash(stage?"ghostS12":"ghost", iter);
       if (rans) {
