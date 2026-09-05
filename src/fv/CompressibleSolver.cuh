@@ -3,6 +3,18 @@
 
 #include "MultiLevelSparseGrid.cuh"
 
+// --leaf: the per-stage kernels stop after the exterior group (blocks are sorted
+// leaf-bearing / exterior / fully covered), so covered parents cost nothing.
+// Identical to START_CELL_LOOP when leafFlux is off.
+#define START_LIVE_CELL_LOOP \
+  i32 cIdx = blockIdx.x * blockDim.x + threadIdx.x; \
+  i32 bIdx = cIdx / blockSizeTot; \
+  const i32 bEndLive = grid.leafFlux ? (grid.nLeafBlocks + grid.nExtBlocks) : grid.hashTable.nKeys; \
+  while (bIdx < bEndLive) { \
+    if (!grid.pseudo2D || (cIdx % blockSizeTot) < blockSize*blockSize) {
+#include "Poly.h"
+#include "SayeQuad.h"
+
 static constexpr real gam = 1.4;
 
 //
@@ -136,10 +148,52 @@ enum CompressibleField {
   // quadrature stored here is whatever --brinkface selects, so raising
   // --brinkseg is now free at run time: it is paid once per adaptation.
   F_BRINKX = 34,
-  F_BRINKY = 35
+  F_BRINKY = 35,
+  // Cut-cell FLUID CENTROID offset (ox, oy), in units of h, relative to the
+  // Cartesian cell centre.  PREPROCESSING: the corner level sets are already
+  // evaluated once per cell in ibStampGeometryKernel to get the apertures, so
+  // the centroid comes out of the same rccmCutGeom call for free.  Before this,
+  // the recon-6 path re-derived it EVERY STAGE via rccmCentroidOff -- 4 level
+  // set evaluations per call, and it is called for the cell, its two low
+  // neighbours and every cut cell in the 8-point gradient stencil, i.e. up to
+  // ~44 evaluations per cell per stage.  For an analytic body that is a cheap
+  // closed form; for the type-6 POLYLINE it is an O(nSegments) loop (133 for
+  // the RAE 2822) and it made the airfoil cost 17 us/cell/iter against 0.55 for
+  // the cylinder -- 32x, and worst exactly where AMR puts its cells.
+  F_CUTCX = 36,
+  F_CUTCY = 37,
+  // Cut-cell WALL NORMAL at the cell, stamped with the rest of the geometry.
+  // wallNormal is an EXACT closest-point search over the body, i.e. another
+  // O(nSegments) loop for a polyline, and the RHS called it twice per cut cell
+  // per stage.  Same preprocessing argument as F_CUTCX/F_CUTCY.
+  F_CUTNX = 38,
+  F_CUTNY = 39,
+  // Tangential centroid of the OPEN part of each LOW face, relative to the face
+  // midpoint, in units of the face length -- the same convention rccmFaceCen
+  // returns.  Stamped so the reconstruction's evaluation point on a cut face
+  // comes from the SAME geometry as alpha and the apertures: under --cutgeom 2
+  // those are curved (Saye) while rccmFaceCen is the LINEAR two-corner formula,
+  // so leaving it in place would evaluate the reconstruction at the wrong point
+  // on an otherwise curved cell.  Also retires the last 3 per-stage level-set
+  // evaluations in recon 6 (the f00/f10/f01 corner triple).
+  F_CUTTX = 40,
+  F_CUTTY = 41,
+  // --p1 (modal P1 DG): per conserved variable v in {rho, rhoU, rhoV, rhoE}
+  // the two slope DOFs  s_x = F_P1S + v,  s_y = F_P1S + P1_NV + v  (CONSERVED
+  // variables, in units of the cell: u_h = q + s_x xi + s_y eta with
+  // xi, eta in [-1/2, 1/2]), their LSRK accumulators F_P1SR + (same offsets),
+  // and F_P1NEW, a marker that is 1 on every cell that existed before the last
+  // adaptation (a 0 after the sort = a block created this cycle, whose slopes
+  // are prolonged from the parent polynomial).  Allocated only under --p1.
+  F_P1S   = 42,
+  F_P1SR  = 50,
+  F_P1NEW = 58
 };
 static constexpr i32 NEVOLVE = 7;                 // evolved DOFs (fields 0..6)
-static constexpr i32 nCompressibleFields = 36;
+static constexpr i32 nCompressibleFields = 42;
+static constexpr i32 nCompressibleFieldsP1 = 59;   // + the --p1 slope banks
+static constexpr i32 P1_NV = 4;                      // slope-carrying variables (rho, rhoU, rhoV, rhoE)
+__host__ __device__ inline i32 p1Var(i32 v) { return v < 3 ? v : 4; }   // conserved field of slope variable v
 
 // ---- RCCM cut-cell geometry (2-D) ------------------------------------------
 // Apertures and volume fraction of a Cartesian cell cut by the level set, from
@@ -154,6 +208,155 @@ static constexpr i32 nCompressibleFields = 36;
 // it is fluid, (b) the crossing point if the edge changes sign.  That single
 // loop IS the case table, and it is exact for the bilinear-free (piecewise
 // linear along edges) model.
+// ---------------------------------------------------------------------------
+//  CURVED cut geometry by MOMENT FITTING (--cutgeom 2).
+//  rccmCutGeom below reconstructs ONE LINEAR interface per cell from the four
+//  corner level-set values.  That is a POLYGONAL body, and Bassi & Rebay's
+//  classic result is that a polygonal wall produces spurious entropy that
+//  corrupts an Euler solution even on very fine grids; the cut-cell quadrature
+//  literature says the same in integral form -- straight-sided cut elements let
+//  the DOMAIN APPROXIMATION error dominate once the wall is strongly curved.
+//  Measured here: the RAE 2822 nose radius is 1.62 cells at nlvls 6 and the cut
+//  cell loses half the lift, while the same scheme beats the sharp IB on a
+//  cylinder resolved to 19 cells of radius.
+//
+//  This builds the Q2 (biquadratic) Lagrange interpolant of phi from a 3x3
+//  sample over the cell and integrates {phi < 0} with Saye's implicit-domain
+//  quadrature (SayeQuad.h, JCP 448:110720), giving alpha and the fluid centroid
+//  to the accuracy of a CURVED interface.  The two low-face apertures come from
+//  the exact negative measure of the 1-D quadratic restriction of the same
+//  polynomial, so faces and volume see one consistent geometry.
+//
+//  The wall segment is still NOT taken from sayeSurface: A_w n = -sum_f A_f n_f
+//  (the discrete divergence theorem) is what makes the update conservative to
+//  machine precision, and the Saye header itself warns that hitting its
+//  subdivision cap breaks the closed-surface identity in opposite directions on
+//  the two sides.  Keeping the GCL form leaves conservation exact by
+//  construction and lets the quadrature improve only alpha and the apertures.
+// ---------------------------------------------------------------------------
+// negative measure of q(t) = c0 + c1 t + c2 t^2 on [0,1], i.e. |{t : q(t) < 0}|
+__host__ __device__ inline real cutNegFrac1D(real c0, real c1, real c2) {
+  const real qa = c0, qb = c0 + c1 + c2;                 // endpoint values
+  if (fabs(c2) < (real)1e-14) {                          // linear
+    if (fabs(c1) < (real)1e-14) return (qa < 0) ? (real)1 : (real)0;
+    const real r = -c0/c1;
+    if (r <= 0) return (qb < 0) ? (real)1 : (real)0;
+    if (r >= 1) return (qa < 0) ? (real)1 : (real)0;
+    return (qa < 0) ? r : (real)1 - r;
+  }
+  const real disc = c1*c1 - (real)4*c2*c0;
+  if (disc <= 0) return (qa < 0 && qb < 0) ? (real)1 : ((qa < 0 || qb < 0) ? (real)0.5 : (real)0);
+  const real sq = sqrt(disc);
+  real r1 = (-c1 - sq)/((real)2*c2), r2 = (-c1 + sq)/((real)2*c2);
+  if (r1 > r2) { const real t = r1; r1 = r2; r2 = t; }
+  // measure of [0,1] where the parabola is negative: between the roots if c2>0,
+  // outside them if c2<0.  Clip to [0,1].
+  const real lo1 = fmax(r1, (real)0), hi1 = fmin(r2, (real)1);
+  const real inside = fmax(hi1 - lo1, (real)0);
+  if (c2 > 0) return inside;
+  return fmax((real)1 - inside, (real)0);
+}
+
+// alpha, low-face apertures and fluid centroid of the CURVED cut, from a Q2
+// interpolant of phi sampled on a 3x3 grid over the cell.  f33[j][i] is phi at
+// reference (i/2, j/2).  Returns false if the quadrature overflowed its arena,
+// in which case the caller falls back to the linear cut.
+// alpha, low-face apertures and fluid centroid of the CURVED cut, from a Q2
+// interpolant of phi sampled on a 3x3 grid over the cell.  f33[j][i] is phi at
+// reference (i/2, j/2).  The caller supplies the quadrature scratch (`buf`,
+// `nbuf` nodes): on the host that is a heap block, which is why this runs there
+// -- as a per-thread device array the arena would reserve its frame for every
+// thread of the stamp kernel and exhaust local memory at launch.
+// Returns false (caller keeps the linear cut) if the quadrature could not
+// produce a rule.  `why`: 0 ok, 1 arena overflow, 2 empty rule.
+__host__ __device__ inline bool cutGeomMoment(const real f33[3][3],
+                                              SayeNode *buf, i32 nbuf,
+                                              real &alpha, real &aXlo, real &aYlo,
+                                              real *cenX, real *cenY,
+                                              real *tanX = nullptr, real *tanY = nullptr,
+                                              i32 *why = nullptr)
+{
+  // monomial coefficients of the 3 Lagrange basis functions on nodes {0,1/2,1}
+  const real L[3][3] = {{1,-3,2},{0,4,-4},{0,-1,2}};     // L[node][power]
+  PolyND phi; phi.zero(2); phi.deg[0] = 2; phi.deg[1] = 2;
+  for (i32 pw = 0; pw < 3; pw++)
+    for (i32 qw = 0; qw < 3; qw++) {
+      real acc = 0;
+      for (i32 jj = 0; jj < 3; jj++)
+        for (i32 ii = 0; ii < 3; ii++) acc += f33[jj][ii]*L[ii][pw]*L[jj][qw];
+      phi.at(pw, qw, 0) = acc;
+    }
+  // Volume AND face apertures from the SAME quadrature.  sayeFace drives the
+  // identical arrangementRule with axis d deactivated, so the faces inherit the
+  // volume rule's subdivision, height-direction choice and sign test.  Computing
+  // the apertures by a separate closed form (the negative measure of the 1-D
+  // quadratic restriction) is exact for that restriction but is a DIFFERENT
+  // integration of the same phi, so the two need not agree and the discrete
+  // divergence theorem then holds only for constants (via the GCL definition of
+  // A_w n), not for linear fields -- which is what second order on a cut cell
+  // rests on.
+  //
+  // buffer layout, all disjoint:  [0, nOut) volume out | [nOut, nOut+nFace) face
+  // out (reused per face) | the rest is arena scratch, reset between calls.
+  const i32 nOut  = nbuf/4;
+  const i32 nFace = nbuf/8;
+  const i32 nScr  = nbuf - nOut - nFace;
+  if (nScr < 64) { if (why) *why = 1; return false; }
+  SayeArena ar; ar.buf = buf + nOut + nFace; ar.cap = nScr; ar.top = 0;
+
+  SayeSet vol; vol.p = buf; vol.n = 0; vol.cap = nOut; vol.ovf = false;
+  // PSEUDO-2D rules: sayeVolume/sayeFace leave the z axis ACTIVE, which for a
+  // dim-2 phi silently corrupts both (unit-tested: a fully-fluid face came back
+  // as aperture 0.16 instead of 1, and a quarter disc's area was 46% low).
+  // sayeSlice2D / sayeEdge1D deactivate z through the same act[] mask and are
+  // exact on those cases.
+  sayeSlice2D(phi, (real)0, &vol, &ar, SayeCfg::def());
+  if (vol.ovf)    { if (why) *why = 1; return false; }
+  if (vol.n == 0) { if (why) *why = 2; return false; }
+
+  real aper[2] = {0, 0}, tanc[2] = {0, 0};
+  for (i32 d = 0; d < 2; d++) {
+    ar.top = 0;                                  // scratch is stack-disciplined
+    SayeSet fs; fs.p = buf + nOut; fs.n = 0; fs.cap = nFace; fs.ovf = false;
+    sayeEdge1D(phi, d, (real)0, (real)0, &fs, &ar, SayeCfg::def());  // LOW face
+    if (fs.ovf) { if (why) *why = 1; return false; }
+    // weights sum to the open fraction; their first moment along the face's own
+    // tangential axis gives the open part's centroid, in rccmFaceCen's units.
+    const i32 t = 1 - d;                         // tangential axis of this face
+    real a = 0, m = 0;
+    for (i32 q = 0; q < fs.n; q++) { a += fs.p[q].w; m += fs.p[q].w*fs.p[q].x[t]; }
+    aper[d] = fmin(fmax(a, (real)0), (real)1);
+    tanc[d] = (a > 0) ? (m/a - (real)0.5) : (real)0;
+  }
+  const real axl = aper[0], ayl = aper[1];
+
+  real w = 0, mx = 0, my = 0;
+  for (i32 q = 0; q < vol.n; q++) {
+    w  += vol.p[q].w;
+    mx += vol.p[q].w*vol.p[q].x[0];
+    my += vol.p[q].w*vol.p[q].x[1];
+  }
+  if (why) *why = 0;
+  alpha = fmin(fmax(w, (real)0), (real)1);
+  aXlo = axl; aYlo = ayl;
+  if (cenX) *cenX = (w > 0) ? mx/w : (real)0.5;
+  if (cenY) *cenY = (w > 0) ? my/w : (real)0.5;
+  if (tanX) *tanX = tanc[0];
+  if (tanY) *tanY = tanc[1];
+  return true;
+}
+
+// Tangential position of the OPEN part of a face's centroid, relative to the
+// face midpoint, in units of the face length.  The face is a segment whose
+// fluid part is one contiguous piece (piecewise-linear phi along the edge), so
+// the open part runs from one end and its centroid is half the aperture in.
+__host__ __device__ inline real rccmFaceCen(real fLo, real fHi) {
+  const bool oLo = fLo < (real)0, oHi = fHi < (real)0;
+  if (oLo == oHi) return (real)0;                     // fully open or fully shut
+  const real a = oLo ? fLo/(fLo - fHi) : fHi/(fHi - fLo);
+  return oLo ? (real)0.5*a - (real)0.5 : (real)0.5 - (real)0.5*a;
+}
+
 __host__ __device__ inline void rccmCutGeom(const real f[4], real &alpha,
                                    real &aXlo, real &aYlo,
                                    real *cenX = nullptr, real *cenY = nullptr)
@@ -198,6 +401,59 @@ __host__ __device__ inline void rccmCutGeom(const real f[4], real &alpha,
   #undef RCCM_EDGE
 }
 
+#include <vector>
+struct ClipRec;                // host clip record (CompressibleSolver.cu)
+// ---- split-cell geometry records (see CompressibleSolver::cutSplit) ----------
+// Offsets are from the CELL CENTRE in units of hR = min(dx,dy) (as F_CUTCX);
+// wall vectors are open-fraction differences, the kernel's nwx/nwy units:
+//   wnx = -(open fraction on the high-x face - on the low-x face), etc.
+struct CutSplitCell {          // one per cell with > 1 fluid piece: its piece 0
+  real a0, cx0, cy0;           // area fraction and centroid of piece 0
+  real wnx0, wny0, wcx0, wcy0; // its wall vector and wall centroid
+  i32  first, n;               // extra pieces: cutPiece[first .. first+n)
+  // INTERNAL face: a slit tip inside the cell is extended along its tangent to
+  // the boundary; that extension is an open flux face between two pieces
+  real iLen;                   // physical length (0: none)
+  real icx, icy;               // centroid offset from the cell centre, units of hR
+  real inx, iny;               // unit normal from piece iPa into piece iPb
+  i32  iPa, iPb;               // the two pieces it separates
+};
+// DOF HANDLES: h >= 0 is a cell index, h < 0 is piece -h-1.  A piece that is not
+// merged is its own DOF (state in cutPieceQ); a merged piece or member cell
+// reads its element's state through the owner handle.  CUT_DEAD = no fluid.
+#define CUT_DEAD (-1000000000)
+__host__ __device__ inline bool cutIsPiece(i32 h) { return h < 0 && h != CUT_DEAD; }
+__host__ __device__ inline i32  cutPieceOf(i32 h) { return -h - 1; }
+__host__ __device__ inline i32  cutHandle(i32 k)  { return -k - 1; }
+struct CutPiece {              // one per EXTRA piece
+  i32  cell, owner;            // host cell; DOF handle of its element's owner (itself if unmerged; CUT_DEAD)
+  real a, cx, cy;              // area fraction, own centroid (units of hR from the cell centre)
+  real ecx, ecy;               // ELEMENT centroid (== cx, cy when unmerged)
+  real wnx, wny, wcx, wcy;
+};
+// ---- --p1 on cut elements (buildP1Cut) ----------------------------------------
+// One P1 polynomial per DOF element (owner cell, merged element or piece) over
+// its OWN polygon: basis {1, (x-gx)/h, (y-gy)/h} centred at the element
+// centroid, so the mean decouples and the slope mass matrix is the 2x2 second-
+// moment matrix of the polygon (stored inverted).  The volume term is a fan of
+// 3-point triangle rules over the clipper's loop polygons (exact for
+// quadratics), the wall is 2 Gauss points per wall edge, and every open face
+// interval is a P1Seg fluxed by p1SegKernel with both sides' own traces.
+struct P1Elem {
+  i32  handle;                  // DOF handle (cell index, or -k-1 for piece k)
+  real gx, gy, h, area;         // centroid (physical), basis scale, fluid area
+  real m11, m12, m22;           // inverse slope mass matrix
+  i32  q0, nq;                  // quadrature points [q0, q0+nq) in p1Qpt
+};
+struct P1Qpt { real x, y, w, nx, ny; };                       // w != 0: volume point; w == 0: wall point, (nx,ny) = outward normal * length
+struct P1Seg { real x0, y0, x1, y1, nx, ny; i32 hA, hB; };   // open face piece; n points from element A into B
+struct CutFaceSeg { real len, cen; i32 pC, pN, ownC, ownN; };   // len: fraction of the face, cen: offset from the face midpoint in face lengths
+struct CutFace {               // one per cell whose LOW-x or LOW-y face is not a single (0,0) segment
+  i32 cell;                    // the cell whose low faces these are
+  i32 nX, nY;                  // segment counts; sx[0]/sy[0] is the (0,0) pair (len 0 if absent)
+  CutFaceSeg sx[4], sy[4];
+};
+
 class CompressibleSolver : public MultiLevelSparseGrid {
 public:
 
@@ -211,6 +467,11 @@ public:
   real *globalScale;    // [3]  domain max of the 3 scales
   real waveletThresh;
 
+  i32 reconFar;         // --reconfar: under recon 6, cells NOT within two cells of a cut/dead/merged
+                        // cell use this 1-D scheme instead of the least-squares gradient (-1 = off)
+  i32 *cutNear = nullptr;   // [stride] 1 = within the two-cell band around the body (stamped)
+  void buildCutNear(void);
+  void leafCensus(void);   // --leaf: block groups, mortars, band cells after a sort
   i32 recon;            // face reconstruction of rho/p/tangential (and FV normal) velocity:
                         // 0 = smooth TVD limiter, 1 = ROUND, 2 = LD-ROUND,
                         // 3 = unlimited 3rd-order parabola (kappa=1/3; smooth tests only),
@@ -303,13 +564,21 @@ public:
   real  ibOrigin[2], ibCosA, ibSinA;
   void  setAirfoil(const real *xy, i32 n);   // host: upload + bbox
   i32 bcType;
+  // bcType 8 (characteristic far field): width, in units of the boundary sound
+  // speed, over which the inflow/outflow branch for ENTROPY and the TANGENTIAL
+  // velocity is blended instead of hard-switched at u_n = 0.  0 = the hard
+  // switch.  On a box whose top/bottom edges run nearly parallel to the flow,
+  // u_n sits at ~1e-4 c for the whole edge, so the branch re-decides every step
+  // and the ghost jumps by the (interior - freestream) difference each time.
+  real ffBlend;
   i32 icType;
 
   i32 iter;
 
-  CompressibleSolver(real *domainSize_, i32 *baseGridSize_, i32 nLvls_) :
-    MultiLevelSparseGrid(domainSize_, baseGridSize_, nLvls_, nCompressibleFields) {
+  CompressibleSolver(real *domainSize_, i32 *baseGridSize_, i32 nLvls_, i32 withP1 = 0) :
+    MultiLevelSparseGrid(domainSize_, baseGridSize_, nLvls_, withP1 ? nCompressibleFieldsP1 : nCompressibleFields) {
       cfl = .5;
+      p1 = 0;
       waveletThresh = .005;
       iter = 0;
       immerserdBcType = 0;
@@ -347,7 +616,7 @@ public:
       ibThermoRec = 0;
       ibWls = 0; ibGMirror = 0; ibGIter = 1; ibGFloor = 0.25; ibGSlip = 0; ibIface = 0;
       ibBrink = 0; ibBrinkEps = 1e-6; ibBrinkDelta = 0.125; brinkNSeg = 4;
-      ibRccm = 0; ibRccmIter = 3; ibRccmAlphaMin = 1e-9; ibRccmPw = 1; ibRccmNeu = 1.0; ibRccmRelax = 0.7; ibDirichlet = 0; svQuarter = 0; canalY0 = 0; canalY1 = 1; canalMa = 0.675; canalPout = canalPin = canalRhoIn = 1; canalUin = 0; gradLim = 1; gradLimK = 5.0; kSensor = 0.05;
+      ibRccm = 0; ibRccmAlphaMin = 1e-9; ibRccmPw = 1; ibDirichlet = 0; svQuarter = 0; canalY0 = 0; canalY1 = 1; canalMa = 0.675; canalPout = canalPin = canalRhoIn = 1; canalUin = 0; gradLim = 1; gradLimK = 5.0; kSensor = 0.05;
       ransA7Tol = 1e-6;
       ibWallMode = 0; ibInfinite = 0; turbModel = 0; nutInf = 0;
       wmX0 = -1;
@@ -437,10 +706,10 @@ public:
   void stampIbGeometry(void);
   void checkCutGeometry(void);
   void reportDeadTaps(void);
+  void reportIbFaceRows(void);
   void checkWellBalanced(void);      // IB: cache F_PHI/F_IBM (once per adaptation; body is static)
   void applyWallGhosts(void);
   void computeShockSensor(void);
-  void reconstructRCells(void);
   void reportGhostQuad(void);      // RANS: overwrite wall ghost rows with the wall-model profile
   void computeRightHandSide(void);
   void stateHash(const char *tag, i32 it);
@@ -497,6 +766,153 @@ public:
   void scanNonFiniteBase(const char *tag, i32 baseOff);
   real computeResidual(void);                  // RMS of dq/dt over ALL live fluid cells
   void snapshotResidualQ(void);                // q snapshot for the dq/dt residual
+  // ---- state redistribution (SRD), Berger & Giuliani JCP 428 (2021) 109820 --
+  // The N=0 (finite-volume) case of src/common/StateRedistribution.h: the
+  // degree-N L2 projection over a merge neighbourhood collapses to a
+  // VOLUME-WEIGHTED AVERAGE, so no cut quadrature and no mass matrix are needed.
+  //   Pi_k u = sum_{j in M_k} w_j u_j / sum_{j in M_k} w_j,   w_j = alpha_j V_j/|C_k|
+  //   (S u)_i = (1/|C_i|) sum_{k : i in M_k} Pi_k u
+  // With that weighting sum_i alpha_i V_i (Su)_i = sum_i alpha_i V_i u_i
+  // EXACTLY, so S is conservative -- which is the whole point: it buys the
+  // sliver its stable step back without the non-conservative per-cell diagonal
+  // that --cutpidamp turns off.
+  // Neighbourhood growth is confined to the 5x5 patch around the seed, so a
+  // member is always within radius 2 of its seed and the |C_i| gather can scan
+  // the same patch -- no atomics, hence deterministic.
+  static constexpr i32 SRD_MAXM = 8;   // max cells in a merge neighbourhood
+  // --srdreach: how many FACE STEPS from the seed a neighbourhood may grow.
+  // 1 = the sliver and its own face neighbours only (3x3 gather); 2 lets a
+  // sliver whose face neighbours are themselves small take a neighbour-of-
+  // neighbour (5x5 gather).  The gather radius must equal the growth radius so
+  // every cell can find every neighbourhood that contains it without atomics.
+  // A neighbourhood that cannot reach volFrac within the reach is used anyway
+  // and counted in the [srd] line's "never reached the target".
+  i32 srdReach;
+  i32   srdOn;         // --srd 1
+  real  srdVolFrac;    // "small" threshold in background volumes (papers: 1/2)
+  i32  *srdM   = nullptr;   // [SRD_MAXM][nBlocksMax*blockSizeTot] neighbourhood lists
+  i32  *srdMn  = nullptr;   // members per neighbourhood (0 = dead, 1 = trivial)
+  i32  *srdC   = nullptr;   // |C_i|
+  real *srdPi  = nullptr;   // [5][...] per-neighbourhood projection of dU (or U*)
+  real *srdPi0 = nullptr;   // [5][...] per-neighbourhood projection of U^n (admissibility fallback)
+  real *srdTh  = nullptr;   // per-neighbourhood fallback weight theta_k in [0,1]
+  // --srdpos 1 (increment mode): ADMISSIBILITY FALLBACK.  The increment form
+  // U^n + S(dU) gives up the one thing the state form had going for it at a
+  // strong transient: S(U^n) resets a sliver to ~its neighbour's state every
+  // step, which is also what keeps it admissible (measured: increment-SRD goes
+  // to negative energy at a wall cell within 9 iterations of an impulsive
+  // M=1.5 start, at first AND second order, at cfl 0.8 AND 0.3, while the
+  // point-implicit survives).  So blend that reset back in ONLY where needed:
+  //   U^{n+1} = U^n + S(dU) + theta_k (S(U^n) - U^n),
+  // theta_k = 1 if the neighbourhood's SEED would be inadmissible (rho or p
+  // below floor) under the pure increment update, else 0.  (S(U^n) - U^n) has
+  // zero alpha-weighted total over each neighbourhood by construction of the
+  // |C| weights, so this is conservative, and a converged admissible state
+  // never triggers it, so the exact steady-state property survives.
+  i32  srdPos;
+  real srdRhoMin, srdPMin;  // admissibility floors
+  size_t srdStride = 0;     // nBlocksMax*blockSizeTot
+  real *srdS  = nullptr;    // per-neighbourhood blend s_k (UM-SRD 6)
+  real *srdU0 = nullptr;    // [5][...] pre-update state, for the UM-SRD indicator
+  // UM-SRD (Karell, arXiv:2605.04863): standard weighted SRD fires every step
+  // even when the finite-volume update is zero, so it keeps replacing cells with
+  // neighbourhood averages and the base scheme's steady state is NOT preserved.
+  // Blend S with the identity through an update-magnitude indicator (their 4-8):
+  //   dUmax = max_{i in M} ||U* - U^n||_2 ,  eta = dUmax/(eps + dUmax) ,
+  //   s = eta^p/(eta^p + tau^p) ,  R = (1-s) Id + s S.
+  // NOTE: their s is PER NEIGHBOURHOOD.  With OVERLAPPING neighbourhoods the
+  // conservation identity only survives if s is constant on each connected
+  // component of the overlap graph, so a per-cell s would leak.  We use one
+  // GLOBAL s (the single-component limit); since the indicator is near-binary by
+  // design this costs nothing, and it keeps sum_i alpha_i V_i U_i exact.
+  real srdTau;  // tau in (6)
+  // eps in (5).  The paper fixes eps = 1e-14 so shut-off happens only at machine
+  // precision, which guarantees the steady state is an exact FIXED POINT but does
+  // nothing on the APPROACH: with dU ~ dt*R, eps must be ~1/tau times the dU you
+  // want to shut off at, or s stays pinned at 1 and you get standard SRD (which
+  // measurably floors the residual here).  Exposed so it can be raised.
+  real srdEps;
+  i32  srdLocal;   // 1 = per-neighbourhood s (paper), 0 = one global s
+  // 1 = apply S after EVERY RK stage; 0 = once per STEP (after the last stage,
+  // with U^n snapshotted at stage 0 so the indicator sees the whole step's
+  // update).  Per-stage lets S fight the stages; per-step lets them settle first.
+  i32  srdPerStage;
+  // --srdincr 1: redistribute the INCREMENT, U^{n+1} = U^n + S(U* - U^n), instead of
+  // the state U^{n+1} = S U*.  S is linear, S(U*) = S(U^n) + S(dU), and it is the
+  // S(U^n) term that perturbs a non-constant steady state (their Prop. 3): it
+  // averages cells that legitimately differ.  Dropping it gives a scheme that
+  //   * vanishes EXACTLY with the update -- the base steady state is a fixed
+  //     point with no indicator, eps or tau,
+  //   * scales smoothly and proportionally with the update in between,
+  //   * is still conservative (S conserves the increment's total, which is the
+  //     explicit scheme's boundary flux), and
+  //   * still stabilises: the sliver's 1/alpha increment is spread over the
+  //     neighbourhood exactly as the state was.
+  // This is the paper's own observation about FLUX redistribution ("naturally
+  // diminishes with small updates"), carried over to SRD's neighbourhoods.
+  i32  srdIncr;
+  i32  srdP;    // p   in (6)
+  void srdSnapshot(void);   // stash U^n before the stage update
+
+  void stampCutGeomCurved(void);   // --cutgeom 2 host pass
+  void stampCutGeomClip(void);     // --cutgeom 3 host pass: clip the cell by the body SEGMENTS
+  void buildClipSegments(void);    // segment list for --cutgeom 3 (polyline as is; analytic body polygonised)
+  double *clipSeg = nullptr;       // host, 2*clipSegN, closed loop
+  i32     clipSegN = 0;
+  bool    clipFluidLeftFwd = true; // walking the loop forward keeps the fluid on the left
+  double  clipArea = 0;            // area enclosed by the loop (exact reference for the fluid area)
+  double  clipBox[4] = {0,0,0,0};  // xmin ymin xmax ymax of the loop
+  void buildSrd(void);      // after the geometry stamp; nLvls == 1 only for now
+  // ---- cell merging (agglomeration) ------------------------------------
+  // Every small cut cell is merged PERMANENTLY with face neighbours until the
+  // element holds >= cutMergeFrac of an uncut cell.  One DOF per element: it
+  // lives in the OWNER cell and is broadcast to the member cells after each
+  // update, so every stencil sees a valid state in every cell.  The RHS of all
+  // members scatters to the owner and is divided by the ELEMENT volume: that is
+  // the small-cell fix, with nothing to redistribute (SRD) or damp (point-
+  // implicit) -- the element is an ordinary control volume.
+  void buildCutMerge(void);          // host pass after every geometry stamp
+  void buildCutSplit(std::vector<ClipRec> &recs);   // piece records + face segments from the clipper loops
+  void cellGeomHost(i32 c, double &px, double &py, double &dx, double &dy);
+  void writeCutWindow(const char *fileName, double xc, double yc, i32 nh);   // --cutdump: cut-cell records around a point
+  // ---- split cells (--cutsplit, needs --cutgeom 3 + --cutmerge) -------------
+  // A cell crossed by more than one wall has several fluid PIECES (the clipper's
+  // loops).  The largest keeps the cell DOF (piece 0); every other piece is
+  // geometry only, attached to a neighbour element on ITS side of the wall.  A
+  // face is then a list of SEGMENTS, one per (piece on this side, piece on the
+  // other side) pair, each with its own owners.  Segment (0,0) rides the
+  // ordinary flux path; the rest, and the extra pieces' walls, are handled by
+  // cutSplitFluxKernel.  This is what lets a body thinner than a cell -- down to
+  // zero thickness -- carry two different states across it.
+  i32   cutSplit = 0;                // --cutsplit
+  i32  *cutSplitId = nullptr;        // [stride] -> CutSplitCell index, -1 if the cell has one piece
+  i32  *cutFaceId  = nullptr;        // [stride] -> CutFace index, -1 if both low faces are plain
+  CutSplitCell *cutSplitCell = nullptr;
+  CutPiece     *cutPiece     = nullptr;
+  CutFace      *cutFace      = nullptr;
+  i32   nCutSplit = 0, nCutPiece = 0, nCutFace = 0;
+  i32   cutSplitCap = 0, cutPieceCap = 0, cutFaceCap = 0;
+  // piece-resident DOFs: conservative state and the LSRK accumulator, [NEVOLVE][cutPieceQCap]
+  real *cutPieceQ = nullptr, *cutPieceS = nullptr, *cutPieceAlphaE = nullptr;
+  i32   cutPieceQCap = 0;
+  // --p1 cut elements: tables (rebuilt with every geometry stamp), the per-cell
+  // irregular flag (the regular P1 kernel skips every face touching one), and
+  // the piece slope DOFs + accumulators [2*P1_NV][cutPieceQCap]
+  i32   *p1ElemOfCell = nullptr, *p1ElemOfPiece = nullptr, *p1Irr = nullptr;
+  P1Elem *p1Elem = nullptr;  P1Qpt *p1Qpt = nullptr;  P1Seg *p1Seg = nullptr;
+  i32   nP1Elem = 0, nP1Qpt = 0, nP1Seg = 0, p1ElemCap = 0, p1QptCap = 0, p1SegCap = 0, p1PieceCap = 0;
+  i32   *p1ElemNbrOff = nullptr, *p1ElemNbr = nullptr, p1NbrCap = 0;   // per element: the handles across its face pieces (limiter)
+  real  *cutPieceSX = nullptr, *cutPieceSR = nullptr;
+  std::vector<ClipRec> *clipRecs = nullptr;   // every clipped cell's loops, kept for buildP1Cut
+  void buildP1Cut(void);
+  i32  *cutOwner  = nullptr;         // [stride] owner cell of this cell's element (self if unmerged)
+  real *cutAlphaE = nullptr;         // [stride] element volume / uncut cell volume
+  i32   cutMerge = 0;                // --cutmerge
+  i32   cutDbg = 0;                  // --cutdbg: scan the first RHS for exploding cells
+  real  cutDbgThr = 1e6;             // --cutdbgthr: |Rhs| threshold of that scan
+  real  cutMergeFrac = 0.5;          // --cutmergefrac
+  real  cutPieceFrac = 0.25;         // --cutpiecefrac: an extra piece keeps its own DOF above this area fraction
+  void applySrd(void);      // after each RK stage update
   real *residQ0 = nullptr;                     // [4][nBlocksMax*blockSizeTot]
   real *residCell = nullptr;                   // per-cell |dq/dt| from the last sample (field dump)
   i32  wallResolutionCheck(bool verbose = true);   // count wall-row blocks NOT at the finest level
@@ -519,7 +935,7 @@ public:
   __device__ Vec5 prim2cons(Vec5 prim);
   __device__ Vec5 cons2prim(Vec5 cons);
   __device__ real lim(real &r);
-  __device__ real tvdRec(real &ul, real &uc, real &ur, real theta = (real)1);
+  __device__ real tvdRec(real &ul, real &uc, real &ur, real theta = (real)1, i32 rc = -1);   // rc: limiter override (-1 = recon)
   // van Leer harmonic limiter, unconditionally.  The paper leaves the mass /
   // momentum / energy MUSCL UNLIMITED but limits the turbulence convection, to
   // stop k~ and tau~ going negative at the boundary-layer edge -- so this is a
@@ -534,6 +950,17 @@ public:
   // Ghost-free immersed boundary: no stencil may read a non-fluid cell, so every
   // difference that would reach into the body is degraded instead.  1 = the
   // paper's formulation (no immersed ghost values at all), 0 = fill them.
+  // --ibface 1 (sharp IB): build the MUSCL stencil from the IB FACE VALUE at its
+  // TRUE wall distance instead of reading a mirror ghost.  For a slip wall the
+  // face state is (rho_c, u_c - (u_c.n)n, p_c), so linearly extrapolating it to
+  // where the stencil expects a neighbour, a distance dx away, gives
+  //     u_nbr = u_c - s (u_c.n) n,     s = dx / d_wall,
+  // with d_wall the distance from the cell centre to the wall ALONG that
+  // stencil direction (= -phi/|n.e|).  The classic mirror ghost is the special
+  // case s = 2, i.e. it ASSUMES the wall bisects the cell; with a level set the
+  // wall sits anywhere in (0, dx) and s = 2 is then simply the wrong slope.
+  // rho and p are Neumann at a slip wall, so their stencil value is unchanged.
+  i32 ibFaceRec;
   i32 ibGhostFree;
   // --wmles 1: wall-modeled implicit LES.  The RANS wall model's MEAN-flow
   // boundary flux (IP sample -> log-law u_tau -> tau_w + pressure) runs with
@@ -552,6 +979,13 @@ public:
   // cell in a fixed expression order: zero atomics, bitwise-reproducible.
   // Resolved OFF when the Brinkman face weights are active (they weight the
   // two sides differently) and on the multiD path.
+  // --p1 1: modal P1 discontinuous Galerkin.  Every cell evolves a mean and two
+  // slopes per conserved variable (F_P1S), so no reconstruction stencil exists:
+  // a face flux is the Riemann flux of the two cells' own polynomial traces at
+  // 2 Gauss points, a level jump is the same thing on the mortar sub-faces (the
+  // coarse trace taken at the physical point), and the volume term is a 2x2
+  // Gauss rule on the cell's own polynomial.  See p1RhsKernel.
+  i32  p1;
   i32  detFlux;
   // --shash 1: XOR state hash of banks 0..4 printed per step (XOR is
   // associative, so the atomic accumulation is itself order-independent);
@@ -665,11 +1099,9 @@ public:
   //   0 < alpha, phi >= 0   R-Cell : small cell, RECONSTRUCTED (Eq. 10) and
   //                         excluded from the dt reduction (Eq. 11)
   __device__ bool rccmLive(i32 cIdx) {
+    // merged: a member sliver is live through its element (alpha_E > 0)
+    if (cutMerge && cutAlphaE) return cutAlphaE[cIdx] > ibRccmAlphaMin;
     return getField(F_CUTA)[cIdx] > ibRccmAlphaMin;
-  }
-  __device__ bool rccmRCell(i32 cIdx) {
-    return getField(F_CUTA)[cIdx] > ibRccmAlphaMin
-        && getField(F_PHI)[cIdx] >= (real)0;
   }
   // ---- Brinkman volume penalization, PRESSURE-TIGHT form -------------------
   // Reiss, "A family of energy stable, skew-symmetric finite difference schemes
@@ -709,21 +1141,35 @@ public:
   // Only the DIAGONAL is implicit -- neighbour coupling stays explicit, so a
   // sliver bounded by slivers is outside the argument (the cheap member of the
   // mixed explicit/implicit cut-cell family, cf. May & Berger).
-  i32 cutPi;           // 1 = point-implicit small cells, advance every live cell
-  i32 ibRccmIter;      // Jacobi sweeps of the coupled R-Cell reconstruction
+  // --cutpidamp 0 turns the point-implicit DIAGONAL off while still advancing
+  // every live cell, i.e. a pure explicit cut-cell scheme.  The diagonal is the
+  // only term in the cut-cell update that does not telescope: the face fluxes
+  // cancel exactly between neighbours (same aperture, each divided by its own
+  // alpha, against a conserved quantity alpha*dV*U), but 1/(1 + B dt lambda) is
+  // PER CELL, so while Rhs != 0 the shared-face contributions no longer cancel.
+  // It vanishes at the fixed point, so it costs nothing at steady state -- but
+  // it is exactly the transient conservation error measured in the closed box.
+  // Off, the scheme is exactly conservative and pays the alpha-limited step.
+  // Cut-cell WALL PRESSURE (--cutpw, was --rccmpw): extrapolate p to the wall face
+  // along the cell's own pressure gradient instead of using the cell average,
+  // which captures the centripetal balance dp/dn = rho u_t^2 kappa on a curved
+  // wall.  Survives the R-cell removal: a wall-flux term, not reconstruction.
+  i32 cutGeom;   // 1 = linear corner cut (default), 2 = curved Q2 moment fitting,
+                 // 3 = exact clipping by the body segments (CutClip.h; thin bodies, split cells)
+  i32 cutSeg;    // --cutgeom 3 on an ANALYTIC body: number of segments it is polygonised with
+  i32 ibRccmPw;
+  // --ibdir 1: the immersed segments carry the exact state (verification cases).
+  i32 ibDirichlet;
+  i32 cutPiDamp;
   real ibRccmAlphaMin;
-  real ibRccmRelax;    // damped-Jacobi factor for the R-Cell system
   i32  gradLim;        // recon 6 limiter: 0 = none, 1 = Barth-Jespersen, 2 = Venkatakrishnan
   real gradLimK;       // Venkatakrishnan threshold: eps^2 = (K h)^3
-  i32 ibRccmPw;        // 1 = gradient-extrapolated wall pressure // alpha below which a cell is treated as fully dead
-  real ibRccmNeu;      // weight of the Neumann (normal-derivative) rows in the R-Cell fit; 0 = off
   // The immersed boundary carries the EXACT solution as a Dirichlet datum
   // (Ndiaye et al. Sect. 4.4: "the analytical solution is imposed as Dirichlet
   // boundary condition on all the boundaries").  Under RCCM the R-Cell fit gets
   // a boundary row for every primitive and the wall segment takes an HLLC flux
   // against the exact state; under the ghost path the ghosts are PRESCRIBED
   // (kind 1) and simply keep the exact initial state.  0 = slip wall.
-  i32 ibDirichlet;
   // Supersonic vortex on the QUARTER annulus of the paper (Fig. 16): centre at
   // the domain corner, inflow/outflow through the straight x = 0 / y = 0 planes
   // as exact Dirichlet domain boundaries (bcType 6).  The closed full annulus

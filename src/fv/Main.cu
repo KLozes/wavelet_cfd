@@ -207,6 +207,7 @@ int main(int argc, char* argv[]) {
   // NOTE: van Leer needs CFL <~ 0.6; it is unstable at 1.2 even for the sharp IB.
   //   0 = smooth TVD, 1 = ROUND, 2 = LD-ROUND, 3 = unlimited parabola, 4 = van Leer
   i32 reconA   = argI("--recon", 4);
+  i32 p1A      = argI("--p1", 0);                    // modal P1 DG (no reconstruction stencil)
   i32 debugA   = argI("--debug", 0);                 // 1 = per-cycle integrity/census diagnostics                 // 0=TVD, 1=ROUND (default), 2=LD-ROUND, 3=unlimited parabola (smooth only)
   real tEndArg = argF("--tend", -1.0);               // tEnd override (-1 = per-testCase default)
   i32 mdFluxA  = argI("--mdflux", 0);                // 1 = multidimensional Osher-type corner flux (first-order states)
@@ -284,6 +285,9 @@ int main(int argc, char* argv[]) {
   // cfl ~ dx^(1/3) keeps dt^3 ~ dx^4, below 4th-order spatial error.
   real cfl  = acConv ? 0.40*cbrt(4.0/nBlocksX) : 0.40;
   if (cflArg > 0) cfl = cflArg;                      // CLI override
+  // P1 DG with the 3-stage RK is stable to CFL ~0.4 (1/(2p+1) of the FV limit);
+  // an explicit --cfl is respected, the case default is capped
+  if (p1A && cflArg <= 0) cfl = fmin(cfl, (real)0.3);
   // testCase 1: --ma sets the circular-Sod inner pressure (1.0 = classic 10:1
   // ratio; 10 = strong 100:1 blast).  The strong blast's faster shock needs a
   // shorter tEnd to stay inside the domain.
@@ -293,12 +297,13 @@ int main(int argc, char* argv[]) {
   if (tEndArg > 0) tEnd = tEndArg;                   // CLI override (arg 10)
   real tStep = (testCase == 1) ? ((tEndArg > 0) ? tEnd/50.0 : ((sodPin > 2.0) ? 0.06*sqrt(10.0/sodPin)/10.0 : 0.008)) : (testCase == 2 ? 0.1 : (testCase == 3 ? 0.03 : (gresho ? 0.1 : (sodAmr ? 0.02 : (acoustic ? 0.02 : (acConv ? tEnd : (shear ? tEnd : ((ransBox||ransShr||ransWal) ? tEnd : ((fptbl||ibPlate||afoil||svort||ringleb||canal||circle) ? tEnd/20.0 : 0.01)))))))));
 
-  CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls);
+  CompressibleSolver *solver = new CompressibleSolver(domainSize, baseGridSize, nLvls, p1A);
   solver->pseudo2D        = (baseGridSize[2] == blockSizeZ) ? 1 : 0;  // collapse z (pseudo-2D)
   solver->cfl             = cfl;
   solver->waveletThresh   = wThresh;
   solver->icType          = (testCase == 1 || sodAmr) ? (argI("--dgblast", 0) ? 7 : 1) : (testCase == 2 ? 2 : (testCase == 3 ? 3 : (gresho ? 4 : (acoustic ? 5 : (acConv ? 6 : (shear ? 8 : (ransBox ? 9 : (ransShr ? 10 : (ransWal ? 11 : (svort ? 13 : (ringleb ? 14 : (canal ? 15 : ((fptbl||ibPlate||afoil||circle) ? 12 : 0)))))))))))));
   // --dgblast 1: DG-matched blast IC (icType 7) for wavedg3d comparison runs
+  solver->ffBlend         = argF("--ffblend", 0.0);   // bcType 8: tanh width for the inflow/outflow branch (0 = hard switch)
   solver->bcType          = (bcArg >= 0) ? bcArg : ((svort && svQuarterA) ? 6 : (canal ? 7 : (circle ? 8 : (afoil ? 5 : ((fptbl||ibPlate) ? 4 : ((acConv || shear || ransBox || ransShr || testCase == 1) ? 2 : 3))))));   // periodic for the acoustic/shear waves and circular Sod; else transmissive
   solver->vortexAdvect    = (acConv || shear || ransBox || ransShr || ransWal) ? Ma : (testCase == 2 ? advectA : sodPin);  // acConv/shear: wave amplitude; case 2: vortex advection; testCase 1: Sod inner pressure
   // shear: fix the background pressure (c ~ 11.8) so --ma sets ONLY the shear
@@ -451,10 +456,22 @@ int main(int argc, char* argv[]) {
   // stress comes from the near-wall gradient the ordinary flux reads off them.
   // Ghost-free is Tamaki's architecture (prescribed FC flux) and the two cannot
   // be mixed -- that mix is what made an earlier attempt return zero flux.
+  solver->cutGeom         = argI("--cutgeom", 1);     // 1 = linear corner cut, 2 = curved Q2 moment fitting, 3 = segment clipping
+  solver->cutSeg          = argI("--cutseg", 4096);   // --cutgeom 3: segments for an analytic body (cylinder)
+  solver->cutDbg          = argI("--cutdbg", 0);
+  solver->cutDbgThr       = argF("--cutdbgthr", 1e6);
+  solver->reconFar        = argI("--reconfar", -1);   // under recon 6: 1-D scheme for cells outside the two-cell band at the body (-1 = off)
+  solver->cutMerge        = argI("--cutmerge", 0);
+  solver->cutSplit        = argI("--cutsplit", 0);    // split cells: extra fluid pieces join neighbour elements (needs cutgeom 3 + cutmerge)    // 1 = merge small cut cells into face neighbours (one DOF per element)
+  solver->cutMergeFrac    = argF("--cutmergefrac", 0.5);  // merge until the element holds this fraction of an uncut cell
+  solver->cutPieceFrac    = argF("--cutpiecefrac", 0.25); // an extra piece (the smaller side of a split cell) keeps its own DOF above this
+  solver->ibRccmPw        = argI("--cutpw", 1);       // wall pressure: 0 = cell average, 1 = central gradient, 2 = + one-sided fallback
+  solver->ibFaceRec       = argI("--ibface", 0);      // MUSCL stencil from the IB face value (sharp IB)
   solver->ibGhostFree     = argI("--ibgf", (ransA && argI("--ibwm",0)==0) ? 1 : 0);
   solver->ibWmles         = argI("--wmles", 0);   // wall-modeled implicit LES (no RANS)
   solver->wmX1            = argF("--wmx1", 1.0e30); // slip tail past this x (outflow corner)
   solver->detFlux         = argI("--detflux", 1);   // deterministic face-flux gather
+  solver->leafFlux        = argI("--leaf", 0);      // leaf-only levels: no ghost rims, idle parents, mortar faces at jumps
   solver->shash           = argI("--shash", 0);     // XOR state-hash per step (2: per phase)
   solver->shashFrom       = argI("--shashfrom", 0);
   solver->shashTo         = argI("--shashto", 1<<30);
@@ -489,13 +506,21 @@ int main(int argc, char* argv[]) {
   solver->ibBrinkEps      = argF("--brinkeps", 1e-6);    // volume fraction deep inside the body
   solver->ibBrinkDelta    = argF("--brinkdelta", 0.125); // tanh band half-width, in FINEST cells
   solver->brinkNSeg       = argI("--brinkseg", 4);       // sub-segments per face (stamped once, so free)
-  solver->cutPi           = argI("--cutpi", 0);       // point-implicit small cells (no reconstruction)
-  solver->ibRccm          = argI("--ibrccm", 0);       // RCCM cut-cell + reconstructed small cells
+  solver->srdOn           = argI("--srd", 0);         // state redistribution (Berger-Giuliani), N=0
+  solver->srdVolFrac      = argF("--srdvolfrac", 0.5);
+  solver->srdTau          = argF("--srdtau", 0.01);  // UM-SRD (6): shut-off sharpness
+  solver->srdP            = argI("--srdp", 2);       // UM-SRD (6): exponent p
+  solver->srdEps          = argF("--srdeps", 1e-14); // UM-SRD (5): eps
+  solver->srdLocal        = argI("--srdlocal", 1);   // 1 = per-neighbourhood s (paper)
+  solver->srdPerStage     = argI("--srdperstage", 1); // 0 = apply S once per STEP, not per stage
+  solver->srdIncr         = argI("--srdincr", 0);     // 1 = redistribute the increment (see header)
+  solver->srdReach        = argI("--srdreach", 1);    // face steps a neighbourhood may grow (1 = 3x3)
+  solver->srdPos          = argI("--srdpos", 1);      // increment mode: admissibility fallback to the state form
+  solver->srdRhoMin       = argF("--srdrhomin", 1e-6);
+  solver->srdPMin         = argF("--srdpmin", 1e-6); // "small" threshold in background volumes
+  solver->cutPiDamp       = argI("--cutpidamp", 1);  // 0 = drop the point-implicit diagonal (exactly conservative, alpha-limited dt)
+  solver->ibRccm          = argI("--cutcell", 0);       // RCCM cut-cell + reconstructed small cells
   solver->ibDirichlet     = argI("--ibdir", 0);        // immersed boundary carries the exact state (paper Sect. 4.4)
-  solver->ibRccmIter      = argI("--rccmiter", 3);
-  solver->ibRccmRelax     = argF("--rccmrelax", 0.7); // damped Jacobi on the R-Cell system
-  solver->ibRccmPw        = argI("--rccmpw", 1);
-  solver->ibRccmNeu       = argF("--rccmneu", 1.0);  // Neumann rows in the R-Cell fit (0 = off)
   solver->gradLim         = argI("--gradlim", 1);      // recon 6: 0 none, 1 Barth-Jespersen, 2 Venkatakrishnan
   solver->gradLimK        = argF("--gradlimk", 5.0);   //   Venkatakrishnan eps^2 = (K h)^3       // gradient-extrapolated wall pressure     // R-Cell reconstruction sweeps
   solver->ibIface         = argI("--ibiface", 0);      // Ali et al. interface-cell mode (1=bilinear, 2=triquadratic)
@@ -665,6 +690,23 @@ int main(int argc, char* argv[]) {
     solver->precondMref2 = (c2 > 0) ? u2/c2 : 0.04;
   }
   solver->rans            = ransA;
+  solver->p1 = p1A;
+  if (solver->p1 && (solver->mdFlux || !solver->pseudo2D || solver->mu > 0 || solver->rans || solver->ibBrink
+                     || (solver->immerserdBcType != 0 && !(solver->ibRccm && solver->cutGeom == 3))
+                     || solver->ibDirichlet || solver->precond || solver->rkScheme != 0 || solver->srdOn)) {
+    // envelope: pseudo-2D Euler, LSRK3; an immersed body only as clipped cut cells (--cutcell 1 --cutgeom 3)
+    printf("[p1] --p1 refused: needs pseudo-2D Euler (immersed body only via --cutcell 1 --cutgeom 3), no multiD/viscous/RANS/precond/SRD, --rk 0; running the FV scheme\n");
+    solver->p1 = 0;
+  }
+  if (solver->p1 && solver->detFlux) solver->detFlux = 0;   // the P1 scatter is atomic (no gather bank yet)
+  if (solver->p1 && solver->cfl > 0.45)
+    printf("[p1] warning: cfl %.2f exceeds the P1-RK3 limit (~0.4)\n", (double)solver->cfl);
+  if (solver->leafFlux && (solver->mdFlux || !solver->pseudo2D || solver->mu > 0 || solver->rans || solver->ibBrink)) {
+    // phase 1 envelope: Euler, pseudo-2D, single GPU (mortar variants of the
+    // viscous / k-tau / Brinkman face terms are not written yet)
+    printf("[leaf] --leaf refused: needs pseudo-2D Euler (no multiD, viscous, RANS or Brinkman); running the overlap scheme\n");
+    solver->leafFlux = 0;
+  }
   solver->kInf            = kinfA;
   // SA mode: rho*nu~ lives in the F_RHOK slot, so the IC and every domain BC
   // (which already set RhoK = kInf) get the right freestream by pointing kInf
@@ -711,7 +753,8 @@ int main(int argc, char* argv[]) {
   // energy are exactly conserved until the shock reaches the (still) boundaries, so
   // their drift is purely the coarse/fine interface flux mismatch.
   double m0 = 0, px0 = 0, e0 = 0;
-  if (sodAmr) {
+  const bool consChk = argI("--cons", 0) != 0;   // report domain conserved totals every output
+  if (sodAmr || consChk) {
     solver->totalConserved(m0, px0, e0);
     printf("[cons] initial mass=%.12e  energy=%.12e\n", m0, e0);
   }
@@ -758,8 +801,8 @@ int main(int argc, char* argv[]) {
                 real(baseGridSize[0]*baseGridSize[1]*baseGridSize[2]/blockSizeTot*powi(powi(2,nLvls-1),2));
     printf("n: %d, t = %f, nblocks = %d, dt = %e, grid = %.1f%% of uniform-fine\n",
            solver->imageCounter, t, solver->hashTable.nKeys, solver->deltaT, comp);
-    if (ibPlate && solver->immerserdBcType == 3)
-      solver->writeIbField("output/cyl_field.dat", 0.25);
+    if (ibPlate && (solver->immerserdBcType == 3 || solver->immerserdBcType == 6))   // circle, or a polyline dropped into the box
+      solver->writeIbField("output/cyl_field.dat", argF("--fieldwin", 0.25));   // --fieldwin: half-width in chords about the body centre (body at x = 0.5 of the 1.5 x 1.0 box, so 1.0 covers it all)
     // annulus: one numbered dump per output so the per-cell residual pattern
     // can be compared between two instants (standing vs travelling)
     if (svort) { static int nSv = 0; char fn[64];
@@ -782,7 +825,7 @@ int main(int argc, char* argv[]) {
                  solver->wallResolutionCheck();
                  solver->printRansExtremes();
                  solver->writeCfProfile("output/fptbl_cf.dat"); }
-    if (sodAmr) {
+    if (sodAmr || consChk) {
       double m, px, e; solver->totalConserved(m, px, e);
       printf("[cons] t=%.3f  dMass/M0=%+.3e  dEnergy/E0=%+.3e\n", t, (m-m0)/m0, (e-e0)/e0);
     }
@@ -795,6 +838,7 @@ int main(int argc, char* argv[]) {
   // adaptation (tGrid: restrict+forward/inverse wavelet+adaptGrid+sortBlocks, every
   // 4th iter) vs solver (tSolver: deltaT + 3 RK stages, every iter)
   double tG = solver->tGrid, tS = solver->tSolver;
+  if (solver->ibFaceRec && solver->dbgChecks) solver->reportIbFaceRows();
   printf("[timing] adaptation = %.0f ms, solver = %.0f ms  ->  adaptation is %.1f%% of step() time\n",
          tG, tS, (tG + tS > 0) ? 100.0*tG/(tG + tS) : 0.0);
   double tFwd = solver->tForwardUs/1000.0, tSrt = solver->tSortUs/1000.0;
@@ -829,7 +873,37 @@ int main(int argc, char* argv[]) {
     solver->computeAcousticL2Error();
   }
   solver->printDiagnostics();
-  if (solver->ibRccm) { solver->reportDeadTaps(); solver->checkCutGeometry(); solver->checkWellBalanced(); }
+  if (solver->ibRccm) { solver->reportDeadTaps(); solver->checkCutGeometry(); }
+  // the window dump must see the SOLUTION: checkWellBalanced overwrites the fields with its uniform state
+  if (solver->ibRccm && argI("--cutdump", 0) && solver->ibPolyN > 2) {
+    // cut-cell records around the polyline's extreme-x points (LE / TE of a plate or airfoil)
+    i32 iMin = 0, iMax = 0;
+    for (i32 k = 1; k < solver->ibPolyN; k++) {
+      if (solver->ibPoly[2*k] < solver->ibPoly[2*iMin]) iMin = k;
+      if (solver->ibPoly[2*k] > solver->ibPoly[2*iMax]) iMax = k;
+    }
+    const i32 nh = argI("--cutdump", 0);
+    solver->writeCutWindow("output/cut_window_te.dat", solver->ibPoly[2*iMax], solver->ibPoly[2*iMax+1], nh);
+    solver->writeCutWindow("output/cut_window_le.dat", solver->ibPoly[2*iMin], solver->ibPoly[2*iMin+1], nh);
+    // mid-chord windows on the upper and lower surfaces: the highest / lowest
+    // polyline vertex within 5% chord of mid-chord
+    const real xMid = 0.5*(solver->ibPoly[2*iMin] + solver->ibPoly[2*iMax]);
+    const real cLen = solver->ibPoly[2*iMax] - solver->ibPoly[2*iMin];
+    i32 iUp = -1, iLo = -1;
+    for (i32 k = 0; k < solver->ibPolyN; k++) {
+      if (fabs(solver->ibPoly[2*k] - xMid) > 0.05*cLen) continue;
+      if (iUp < 0 || solver->ibPoly[2*k+1] > solver->ibPoly[2*iUp+1]) iUp = k;
+      if (iLo < 0 || solver->ibPoly[2*k+1] < solver->ibPoly[2*iLo+1]) iLo = k;
+    }
+    if (iUp >= 0) solver->writeCutWindow("output/cut_window_up.dat", solver->ibPoly[2*iUp], solver->ibPoly[2*iUp+1], nh);
+    if (iLo >= 0) solver->writeCutWindow("output/cut_window_lo.dat", solver->ibPoly[2*iLo], solver->ibPoly[2*iLo+1], nh);
+    // the body polyline as placed in the box, for drawing
+    if (FILE *fp = fopen("output/cut_window_poly.dat", "w")) {
+      for (i32 k = 0; k < solver->ibPolyN; k++) fprintf(fp, "%.10f %.10f\n", (double)solver->ibPoly[2*k], (double)solver->ibPoly[2*k+1]);
+      fclose(fp);
+    }
+  }
+  if (solver->ibRccm) solver->checkWellBalanced();
   if (paintOn) solver->paintPressure("output/pressure_final.png");
   if (detailA) {   // wavelet-detail indicator maps (white = refine trigger)
     solver->paintDetail("output/detail_max.png", 0);

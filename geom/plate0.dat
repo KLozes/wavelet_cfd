@@ -1,0 +1,5 @@
+# TRUE zero-thickness plate: the loop goes out along the plate and back (duplicate points are skipped by the clipper)
+0 0
+1 0
+1 0
+0 0

@@ -1,0 +1,3 @@
+# CutClip.h unit tests (host only)
+#   g++ -O2 -std=c++17 -I ../../src/fv -o cliptest cliptest.cpp && ./cliptest    # bodies vs raster reference, degeneracies, random sweep
+#   g++ -O2 -std=c++17 -I ../../src/fv -o cliptest0 cliptest0.cpp && ./cliptest0  # zero-thickness slits

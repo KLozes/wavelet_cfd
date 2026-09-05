@@ -12,6 +12,10 @@ __global__ void buildSortKeysKernel(MultiLevelSparseGrid &grid);   // sortCurve:
 __global__ void updatePrntIndicesKernel(MultiLevelSparseGrid &grid);
 
 __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid);
+__global__ void countSortGroupsKernel(MultiLevelSparseGrid &grid, i32 *cnt);   // --leaf: [0] leaf-bearing, [1] exterior
+__global__ void updateChldIndicesKernel(MultiLevelSparseGrid &grid);   // --leaf: child block slots
+__global__ void resetLeafFacesKernel(MultiLevelSparseGrid &grid);      // --leaf: cellMortar = -1 on every live block
+__global__ void buildMortarsKernel(MultiLevelSparseGrid &grid);        // --leaf: mortar faces at level jumps
 
 __global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid);
 

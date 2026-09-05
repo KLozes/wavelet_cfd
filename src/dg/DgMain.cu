@@ -206,10 +206,6 @@ int main(int argc, char* argv[]) {
   solver->cutHv       = argF("--cuthv", 0.0);  // modal hyper-viscosity on cut elems
   solver->cutWallRiem = argI("--cutwall", 0);  // 1 = mirror-state Riemann wall
   solver->cutFsp      = argI("--cutfsp", 0);    // transparent-wall free-stream gate
-  solver->cutEs       = argI("--cutes", 0);     // entropy-stable cut RHS (arXiv:2412.13002)
-  solver->esDbg       = (getenv("ES_CLOSED")    ? 1 : 0)
-                      | (getenv("ES_NODEPOSIT") ? 2 : 0)
-                      | (getenv("ES_NOMETRIC")  ? 4 : 0);
   solver->cutDbgMask  = argI("--cutmask", 15);  // term mask (debug bisection)
   solver->cutEta      = argF("--cuteta", 0.05); // modal-decay trouble threshold
   i32 cutProbe        = argI("--cutprobe", 0);  // isolate cut RHS terms and exit

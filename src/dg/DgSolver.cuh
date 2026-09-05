@@ -316,39 +316,6 @@ public:
   real *cutFacA = nullptr;      // [6*nCutElem] fluid area of each cut face --
                                 // ~1 selects the conforming full-face path
 
-  // ---- ENTROPY-STABLE cut operators (--cutes), Taylor & Chan arXiv:2412.13002 -
-  // Built once on the host from the same CutElemOps the baseline path uses, then
-  // uploaded.  The surface rule IS the runtime interface rule -- the tensor GLL
-  // nodes on any fully-fluid face, the Saye rule on a partial one, the Saye wall
-  // rule -- because the flux-differenced surface term only telescopes against the
-  // volume term if the two use the same rule, and because a shared face must be
-  // integrated identically by both sides or the coupling stops conserving.
-  i32   cutEs   = 0;            // --cutes: 1 = entropy-stable cut RHS
-  i32   esDbg   = 0;            // ES_CLOSED|ES_NODEPOSIT|ES_NOMETRIC bisection
-  i32  *esQOff  = nullptr;      // [nCutElem+1] volume-point CSR offsets
-  i32  *esFOff  = nullptr;      // [nCutElem+1] surface-point CSR offsets
-  real *esVq    = nullptr;      // [esQOff[n]*CUT_NBMAX] psi~ at volume points
-  real *esDVq   = nullptr;      // [3*esQOff[n]*CUT_NBMAX] d psi~/dx_d there
-  real *esVf    = nullptr;      // [esFOff[n]*CUT_NBMAX] psi~ at surface points
-  real *esWq    = nullptr;      // [esQOff[n]] volume weights (reference measure)
-  real *esWf    = nullptr;      // [esFOff[n]] surface weights
-  real *esNrm   = nullptr;      // [3*esFOff[n]] outward normal at surface points
-  real *esQ     = nullptr;      // [3*sum(nq^2)] Q_d = W dVq_d Pq  (dense, per elem)
-  i32  *esQ2Off = nullptr;      // [nCutElem+1] offsets into esQ (units of nq^2)
-  real *esEmat  = nullptr;      // [sum(nf*nq)] E = Vf Pq
-  i32  *esEOff  = nullptr;      // [nCutElem+1] offsets into esEmat
-  i32  *esOwner = nullptr;      // [esFOff[n]] 0..5 = cut face, 6 = wall
-  i32  *esNode  = nullptr;      // [esFOff[n]] neighbour tensor-node index on a
-                                // full-face GLL point, else -1
-  real *esXf    = nullptr;      // [3*esFOff[n]] surface point reference coords
-  real *esVtil  = nullptr;      // [nCutElem*CUT_NBMAX*5] entropy-variable modal
-                                // coefficients, PUBLISHED so that a cut element
-                                // reading a cut neighbour's trace sees the same
-                                // entropy-projected state that neighbour uses.
-                                // Both sides of a shared face must evaluate the
-                                // SAME pair or the single-valued-flux property
-                                // -- and with it conservation -- is lost.
-  double esGcl  = 0;            // worst Eq-47 residual over the elements
 
   i32  cutZ2d = 0;     // --cutz2d: zero z-dependent cut modes in a pseudo-2D run
   i32  cutPos = 1;     // --cutpos: Zhang-Shu positivity limiter on cut elements
@@ -697,7 +664,6 @@ public:
                                                  // own polynomial (see DgCutBuild.cu)
   double dgResidualNorm(void);                   // ||dU/dt||_2 / ||U||_2 over the
                                                  // fluid, the steady-state monitor
-  void buildCutEs(const void *opsVec);            // ES operators from CutElemOps
   void dgCutConserved(double &mass, double &momx, double &energy);
                                                  // totals over the CUT band only,
                                                  // integrated over the FLUID region

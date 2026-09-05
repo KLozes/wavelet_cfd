@@ -52,8 +52,6 @@ __global__ void dgDpGammaKernel(DgSolver &grid);   // DP-SBP upwind parameters -
 __global__ void dgLamKernel(DgSolver &grid);
 __global__ void dgSnapshotQ0Kernel(DgSolver &grid);
 __global__ void dgSortFieldDataKernel(DgSolver &grid);
-__global__ void dgEsProjectKernel(DgSolver &grid);  // entropy projection, published
-__global__ void dgRhsCutEsKernel(DgSolver &grid);   // entropy-stable cut RHS (--cutes)   // entropy-stable cut RHS (--cutes)
 __global__ void dgPressureToScratchKernel(DgSolver &grid);
 __global__ void dgBrinkPhiToScratchKernel(DgSolver &grid);        // stage phi(x) for a paint
 __global__ void dgComputeImageDataKernel(DgSolver &grid, i32 f);   // LGL -> uniform-pixel interp

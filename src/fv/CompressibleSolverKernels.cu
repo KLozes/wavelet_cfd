@@ -472,6 +472,9 @@ __device__ inline void ffVortexState(CompressibleSolver &grid, real x, real y,
   p = grid.fsP*pow(r, gam);
 }
 
+// --leaf: a PARENT partner of a boundary cell gets its children's average (defined with the cut helpers)
+__device__ inline void leafMaterialise(CompressibleSolver &grid, i32 c);
+
 __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, i32 prim) {
   // operates on fields fOff+0..4 = (Rho, RhoU, RhoV, RhoW, RhoE).  The same
   // operation (copy density+energy, reflect normal momentum) is valid whether
@@ -493,6 +496,9 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, 
     grid.decode(loc, lvl, ib, jb, kb);
 
     if (grid.isExteriorBlock(lvl, ib, jb, kb)) {
+      i32 p1Src = -1;   // --p1: the image cell whose slopes this ghost copies (-1 = zero slopes)
+      i32 p1Mirror = -1; bool p1FlipU = false, p1FlipV = false;   // --p1: mirror-wall ghost polynomial
+      i32 p1Copy = -1;                                                // --p1: interior partner of a copied ghost
       i32 gridSize[3] = {grid.baseGridSize[0]*powi(2, lvl)/blockSize,
                          grid.baseGridSize[1]*powi(2, lvl)/blockSize,
                          grid.baseGridSize[2]*powi(2, lvl)/blockSizeZ};
@@ -530,7 +536,9 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, 
           i32 ox = cx%blockSize, oy = cy%blockSize, oz = cz%blockSize;
           if (dGap == 0) {          // same level: exact periodic copy (as before)
             i32 bcIdx = imgBlock*blockSizeTot + ox + oy*blockSize + oz*blockSize*blockSize;
+            if (grid.leafFlux && grid.cFlagsList[bcIdx] == PARENT) leafMaterialise(grid, bcIdx);
             for (i32 f = 0; f < NEVOLVE; f++) F[f][cIdx] = F[f][bcIdx];
+            p1Src = bcIdx;
           }
           else {
             // coarser ancestor: monotone (tri)linear interpolation toward the
@@ -587,6 +595,9 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, 
         if (kb < 0)            kbc = blockSize;
         if (kb >= gridSize[2]) kbc = -1;
         i32 bcIdx = grid.getNbrIdx(bIdx, ibc, jbc, kbc);
+        if (grid.leafFlux && bcIdx < bEmpty*blockSizeTot && grid.cFlagsList[bcIdx] == PARENT)
+          leafMaterialise(grid, bcIdx);   // idle parent: give it its children's average first
+        if (bcIdx < bEmpty*blockSizeTot) p1Copy = bcIdx;
 
         bool xWall = (ib < 0 || ib >= gridSize[0]);
         bool yWall = (jb < 0 || jb >= gridSize[1]);
@@ -602,6 +613,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, 
           RhoU[cIdx] = (xWall ? -1.0 : 1.0) * RhoU[bcIdx];
           RhoV[cIdx] = (yWall ? -1.0 : 1.0) * RhoV[bcIdx];
           RhoW[cIdx] = (zWall ? -1.0 : 1.0) * RhoW[bcIdx];
+          p1Mirror = bcIdx; p1FlipU = xWall; p1FlipV = yWall;
         }
         else if (grid.bcType == 1) {
           // No-slip wall: MIRROR every velocity component, so the face value
@@ -615,6 +627,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, 
           RhoU[cIdx] = -RhoU[bcIdx];
           RhoV[cIdx] = -RhoV[bcIdx];
           RhoW[cIdx] = -RhoW[bcIdx];
+          p1Mirror = bcIdx; p1FlipU = true; p1FlipV = true;
         }
         else if (grid.bcType == 4) {
           // ---- flat-plate boundary layer: a different role per face ----------
@@ -664,6 +677,7 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, 
             RhoW[cIdx] = RhoW[bcIdx];
             RhoK[cIdx] = RhoK[bcIdx];
             RhoT[cIdx] = RhoT[bcIdx];
+            p1Mirror = bcIdx; p1FlipV = true;
           }
           else {                            // x-max outflow, and z in pseudo-2D
             RhoU[cIdx] = RhoU[bcIdx];
@@ -815,11 +829,22 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, 
           const real Rm = (une <  ce) ? (une - tg*ce) : (uni - tg*ci);
           const real unb = (real)0.5*(Rp + Rm);
           const real cb  = fmax((gam - (real)1)*(real)0.25*(Rp - Rm), (real)1e-30);
-          const bool inflow = (unb <= (real)0);           // outward normal
-          // entropy s = p/rho^gamma and the TANGENTIAL velocity convect
-          const real rs = inflow ? re : ri, ps = inflow ? pe : pi_;
-          const real ut = inflow ? ue : ui, vt = inflow ? ve : vi, wt = inflow ? we : wi;
-          const real ent = ps/pow(rs, gam);
+          // entropy s = p/rho^gamma and the TANGENTIAL velocity convect, so
+          // they come from the side the flow enters from.  wI = weight on the
+          // INTERIOR state.  The hard switch (ffBlend 0) is discontinuous in
+          // u_n, which matters wherever the boundary is nearly parallel to the
+          // flow: there u_n ~ 0, the branch flips back and forth, and the ghost
+          // moves by the full interior-freestream difference each flip.  A
+          // tanh blend of width ffBlend*c makes the ghost a continuous function
+          // of the state; it degenerates to the exact upwind choice as soon as
+          // |u_n| > a few ffBlend*c, so inlet and outlet faces are untouched.
+          const real wI = (grid.ffBlend > (real)0)
+                        ? (real)0.5*((real)1 + tanh(unb/(grid.ffBlend*cb)))
+                        : ((unb > (real)0) ? (real)1 : (real)0);
+          const real ent = wI*(pi_/pow(ri, gam)) + ((real)1 - wI)*(pe/pow(re, gam));
+          const real ut = wI*ui + ((real)1 - wI)*ue;
+          const real vt = wI*vi + ((real)1 - wI)*ve;
+          const real wt = wI*wi + ((real)1 - wI)*we;
           const real rb = pow(cb*cb/(gam*ent), (real)1/(gam - (real)1));
           const real pb = rb*cb*cb/gam;
           const real unt = ut*nx + vt*ny + wt*nz;          // tangential part kept
@@ -832,6 +857,27 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, 
           RhoW[cIdx] = prim ? wb : rb*wb;
           RhoE[cIdx] = prim ? pb : (pb/(gam - (real)1)
                                     + (real)0.5*rb*(ub*ub + vb*vb + wb*wb));
+        }
+        else if (grid.bcType == 9) {
+          // ---- freestream exterior state, all the upwinding left to HLLC ---
+          // The boundary face already runs the SAME approximate Riemann solver
+          // as every interior face; the only question a far-field BC answers is
+          // what state sits on the outside.  Hand it the freestream and there is
+          // no branch anywhere: HLLC is continuous where its own wave speeds
+          // cross zero (at S_M = 0 the two star fluxes coincide -- mass and
+          // energy flux vanish and the momentum flux is p* n), so nothing can
+          // chatter as u_n passes through zero.
+          // The cost is that a fixed exterior state over-specifies a SUBSONIC
+          // outflow -- four conditions where only the back pressure is well
+          // posed -- so the boundary pulls the solution toward the freestream.
+          // HLLC weights by wave speed rather than imposing it hard, but on a
+          // box this close to the body that is still blockage.
+          const real r = (real)1, u = grid.fsU, v = grid.fsV, p = grid.fsP;
+          Rho[cIdx]  = r;
+          RhoU[cIdx] = prim ? u : r*u;
+          RhoV[cIdx] = prim ? v : r*v;
+          RhoW[cIdx] = (real)0;
+          RhoE[cIdx] = prim ? p : (p/(gam - (real)1) + (real)0.5*r*(u*u + v*v));
         }
         else {
           // bcType == 3 : transmissive / outflow (zero gradient)
@@ -849,6 +895,13 @@ __global__ void setBoundaryConditionsKernel(CompressibleSolver &grid, i32 fOff, 
           RhoT[cIdx] = RhoT[bcIdx];
         }
       }
+      // --p1 imposes every physical boundary condition WEAKLY at the boundary
+      // face (p1BoundaryState in p1RhsKernel); the exterior ghost carries a
+      // polynomial only as the same-level PERIODIC image, else it is inert
+      if (grid.p1 && fOff == 0)
+        for (i32 s = 0; s < 2*P1_NV; s++)
+          grid.getField(F_P1S + s)[cIdx] = (p1Src >= 0) ? grid.getField(F_P1S + s)[p1Src] : (real)0;
+      (void)p1Mirror; (void)p1FlipU; (void)p1FlipV; (void)p1Copy;
     }
 
   END_CELL_LOOP
@@ -863,7 +916,7 @@ __global__ void conservativeToPrimitiveKernel(CompressibleSolver &grid) {
   real *RhoK = grid.getField(F_RHOK);
   real *RhoT = grid.getField(F_RHOTAU);
 
-  START_CELL_LOOP
+  START_CELL_LOOP   // ALL blocks: idle parents must keep the leaves' form (the wavelet prolongs from them)
 
     real r = Rho[cIdx];
     Vec5 q = grid.cons2prim(Vec5(r, RhoU[cIdx], RhoV[cIdx], RhoW[cIdx], RhoE[cIdx]));
@@ -890,7 +943,7 @@ __global__ void primitiveToConservativeKernel(CompressibleSolver &grid) {
   real *K   = grid.getField(F_RHOK);
   real *Tau = grid.getField(F_RHOTAU);
 
-  START_CELL_LOOP
+  START_CELL_LOOP   // ALL blocks: idle parents must keep the leaves' form (the wavelet prolongs from them)
 
     real r = Rho[cIdx];
     Vec5 q = grid.prim2cons(Vec5(r, U[cIdx], V[cIdx], W[cIdx], P[cIdx]));
@@ -2445,14 +2498,33 @@ __global__ void computeDeltaTKernel(CompressibleSolver &grid) {
         if (grid.rans) lam = fmax(lam, vel);
       }
       DeltaT[cIdx] = dx / (lam + 1e-32);
-      // RCCM Eq. (11): the step is taken over the NON-reconstructed cells only.
-      // The R-Cells are the small ones, and not letting them into the reduction
-      // is precisely what removes the small-cell time-step restriction -- they
-      // are reconstructed, never advanced, so no CFL applies to them.
-      // --cutpi: small cells are advanced, not skipped, so they must NOT be
-      // exempted from the step -- the point-implicit stamp is what keeps them
-      // stable, and the global step is set by the uncut cells either way.
-      if (grid.ibRccm && !grid.cutPi && grid.rccmRCell(cIdx)) DeltaT[cIdx] = (real)1e30;
+      // --p1 on a cut element: the slope mode across a THIN element has the mass
+      // sqrt(12 lambda_min(M)/A) -- its thickness -- instead of h, and the
+      // explicit step must resolve that.  The inverse mass matrix is stored:
+      // lambda_min(M) = 1/lambda_max(M^-1).  Pieces of a split cell fold their
+      // own thickness into the host cell's entry.
+      if (grid.p1 && grid.p1ElemOfCell) {
+        auto thick = [&](i32 e) -> real {
+          const P1Elem &E = grid.p1Elem[e];
+          const real tr = E.m11 + E.m22, det = E.m11*E.m22 - E.m12*E.m12;
+          const real disc = sqrt(fmax(tr*tr - (real)4*det, (real)0));
+          const real lmax = (real)0.5*(tr + disc);                     // of M^-1 (units 1/h^2... times h^2 below)
+          return E.h*sqrt((real)12/fmax(lmax*E.area, (real)1e-300)); }; // = sqrt(12 lambda_min(M_phi) h^2 / A)
+        real t = dx;
+        const i32 e = grid.p1ElemOfCell[cIdx];
+        if (e >= 0) t = fmin(t, thick(e));
+        if (grid.cutSplit && grid.cutSplitId && grid.p1ElemOfPiece) {
+          const i32 sp = grid.cutSplitId[cIdx];
+          if (sp >= 0) for (i32 p = 0; p < grid.cutSplitCell[sp].n; p++) {
+            const i32 ep = grid.p1ElemOfPiece[grid.cutSplitCell[sp].first + p];
+            if (ep >= 0) t = fmin(t, thick(ep));
+          }
+        }
+        DeltaT[cIdx] = fmin(DeltaT[cIdx], t / (lam + (real)1e-32));
+      }
+      // Every live cut cell is advanced by its true flux, so none is exempt from
+      // the step.  What keeps a sliver stable is --srd (state redistribution) or
+      // the --cutpidamp diagonal; the global step is set by the uncut cells.
 
       // No phi-ratio dt clause: the pressure-tight form (Reiss 2021, Sec. 2.1)
       // leaves u +- c unchanged, so the plain acoustic CFL above is the whole
@@ -3345,6 +3417,9 @@ __global__ void zeroAccumulatorKernel(CompressibleSolver &grid) {
   START_CELL_LOOP
     for (i32 f = 0; f < NEVOLVE; f++)
       grid.getField(F_RHS + f)[cIdx] = 0;
+    if (grid.p1)
+      for (i32 s = 0; s < 2*P1_NV; s++)
+        grid.getField(F_P1SR + s)[cIdx] = 0;
   END_CELL_LOOP
 }
 
@@ -3390,6 +3465,14 @@ __global__ void ibStampGeometryKernel(CompressibleSolver &grid) {
           grid.brinkPhiFaceAvgSeg(Vec3(pos[0]-hx, yd, pos[2]),
                                   Vec3(pos[0]+hx, yd, pos[2]), hb, grid.brinkNSeg);
       }
+      // wall normal: stamped for EVERY immersed body, not just the cut cell -- the
+      // sharp IB's --ibface stencil wants it too, and for a polyline it is an
+      // O(nSegments) closest-point search, i.e. preprocessing, never per stage.
+      if (grid.immerserdBcType != 0) {
+        Vec3 nw0 = grid.wallNormal(pos, fmin(grid.getDx(lvl), grid.getDy(lvl)));
+        grid.getField(F_CUTNX)[cIdx] = nw0[0];
+        grid.getField(F_CUTNY)[cIdx] = nw0[1];
+      }
       if (grid.ibRccm) {
         const real dx = grid.getDx(lvl), dy = grid.getDy(lvl);
         real f[4];
@@ -3397,8 +3480,23 @@ __global__ void ibStampGeometryKernel(CompressibleSolver &grid) {
         f[1] = grid.getBoundaryLevelSet(Vec3(pos[0]+(real)0.5*dx, pos[1]-(real)0.5*dy, pos[2]));
         f[2] = grid.getBoundaryLevelSet(Vec3(pos[0]+(real)0.5*dx, pos[1]+(real)0.5*dy, pos[2]));
         f[3] = grid.getBoundaryLevelSet(Vec3(pos[0]-(real)0.5*dx, pos[1]+(real)0.5*dy, pos[2]));
-        real al, ax, ay;
-        rccmCutGeom(f, al, ax, ay);
+        real al, ax, ay, cx = (real)0.5, cy = (real)0.5;
+        rccmCutGeom(f, al, ax, ay, &cx, &cy);
+        // --cutgeom 2 overwrites alpha / apertures / centroid for CUT cells in a
+        // HOST pass right after this kernel (stampCutGeomCurved).  The curved
+        // quadrature needs a ~10 KB node arena, which as a per-thread local array
+        // would reserve that frame for EVERY thread of this kernel and exhaust
+        // local memory at launch -- and it is preprocessing anyway.
+        // same convention as rccmCentroidOff: offset in units of h
+        {
+          const real hR = fmin(dx, dy);
+          grid.getField(F_CUTCX)[cIdx] = (cx - (real)0.5)*dx/hR;
+          grid.getField(F_CUTCY)[cIdx] = (cy - (real)0.5)*dy/hR;
+        }
+        // open-face tangential centroids, linear model (overwritten by the
+        // host pass under --cutgeom 2, from the same quadrature as the apertures)
+        grid.getField(F_CUTTX)[cIdx] = rccmFaceCen(f[0], f[3]);   // low-x face: corners (0,0),(0,1)
+        grid.getField(F_CUTTY)[cIdx] = rccmFaceCen(f[0], f[1]);   // low-y face: corners (0,0),(1,0)
         grid.getField(F_CUTA)[cIdx]  = al;
         grid.getField(F_CUTAX)[cIdx] = ax;
         grid.getField(F_CUTAY)[cIdx] = ay;
@@ -3537,17 +3635,6 @@ __device__ inline void rccmCentroidOff(CompressibleSolver &grid, Vec3 cp,
   oy = (cy - (real)0.5)*dy/h;
 }
 
-// Tangential position of the OPEN part of a face's centroid, relative to the
-// face midpoint, in units of the face length.  The face is a segment whose
-// fluid part is one contiguous piece (piecewise-linear phi along the edge), so
-// the open part runs from one end and its centroid is half the aperture in.
-__device__ inline real rccmFaceCen(real fLo, real fHi) {
-  const bool oLo = fLo < (real)0, oHi = fHi < (real)0;
-  if (oLo == oHi) return (real)0;                     // fully open or fully shut
-  const real a = oLo ? fLo/(fLo - fHi) : fHi/(fHi - fLo);
-  return oLo ? (real)0.5*a - (real)0.5 : (real)0.5 - (real)0.5*a;
-}
-
 // Central-difference gradient of one field over LIVE neighbours.
 __device__ inline void rccmGrad(CompressibleSolver &grid, const real *F, i32 bIdx,
                                 i32 i, i32 j, i32 k, real dx, real dy,
@@ -3607,6 +3694,155 @@ __device__ inline void rccmShiftFace(CompressibleSolver &grid, real *Fs[4],
 //   * evaluation from the cell centroid to the OPEN FACE centroid.
 // Gradients are recomputed per thread rather than stored: 8 extra fields would
 // be ~0.5 GB here, and the kernel is launch-bound rather than flop-bound.
+// ---- DOF handles (see CUT_DEAD / cutIsPiece in the header) -------------------
+// A handle h >= 0 is a cell (state in the fields), h < 0 a piece (state in
+// cutPieceQ, conservative).  Everything the cut path scatters to or taps from
+// goes through these, so a piece is a first-class control volume.
+__device__ __forceinline__ real *cutRhsPtr(CompressibleSolver &grid, i32 h, i32 n) {
+  return cutIsPiece(h) ? &grid.cutPieceS[(size_t)n*grid.cutPieceQCap + cutPieceOf(h)]
+                       : &grid.getField(F_RHS + n)[h];
+}
+__device__ __forceinline__ real cutAlphaOf(CompressibleSolver &grid, i32 h) {
+  if (cutIsPiece(h)) return grid.cutPieceAlphaE[cutPieceOf(h)];
+  if (!grid.ibRccm || grid.immerserdBcType == 0) return (real)1;        // no cut geometry stamped
+  return (grid.cutMerge && grid.cutAlphaE) ? grid.cutAlphaE[h] : grid.getField(F_CUTA)[h];
+}
+
+// ---- --leaf: stencil taps across a level jump, through the mortars -----------
+// The neighbour (i+di, j+dj) of cell (bIdx, i, j) is missing (coarser across)
+// or PARENT (finer across).  Returns 0..2 far-side cell indices: the coarse
+// cell, or the two fine cells of the mortar (one, the nearer, for a diagonal).
+__device__ inline i32 leafResolve(CompressibleSolver &grid, i32 bIdx, i32 i, i32 j, i32 k,
+                                  i32 di, i32 dj, i32 out[2]) {
+  const i32 cE = bEmpty*blockSizeTot;
+  i32 n = 0;
+  auto viaCell = [&](i32 cell, i32 d, i32 pick) -> bool {
+    if (cell < 0 || cell >= cE) return false;
+    const i32 mi = grid.cellMortar[(size_t)cell*4 + d];
+    if (mi < 0) return false;
+    const MultiLevelSparseGrid::Mortar &M = grid.mortarList[mi];
+    if (M.coarse == cell) {                       // this side is coarse: the fine cells across
+      if (pick < 0) { out[n++] = M.fine[0]; out[n++] = M.fine[1]; }
+      else out[n++] = M.fine[pick];
+    } else out[n++] = M.coarse;                   // this side is fine: the coarse cell across
+    return true;
+  };
+  const i32 self = grid.getNbrIdx(bIdx, i, j, k);
+  if (dj == 0) { viaCell(self, di < 0 ? 0 : 1, -1); return n; }
+  if (di == 0) { viaCell(self, dj < 0 ? 2 : 3, -1); return n; }
+  // diagonal: through the tangential neighbour's x-face, else the other one's y-face
+  if (viaCell(grid.getNbrIdx(bIdx, i, j+dj, k), di < 0 ? 0 : 1, dj < 0 ? 1 : 0)) return n;
+  viaCell(grid.getNbrIdx(bIdx, i+di, j, k), dj < 0 ? 2 : 3, di < 0 ? 1 : 0);
+  return n;
+}
+
+// --leaf: a PARENT partner of a boundary cell gets its children's average so the
+// boundary fill reads a live value (parents are idle between adaptations)
+__device__ inline void leafMaterialise(CompressibleSolver &grid, i32 c) {
+  const i32 b = c/blockSizeTot, cc = c%blockSizeTot;
+  const i32 ci = cc%blockSize, cj = (cc/blockSize)%blockSize;
+  const i32 o = (ci >= blockSize/2 ? 1 : 0) | (cj >= blockSize/2 ? 2 : 0);
+  const i32 cb = grid.chldIdxList[(size_t)b*8 + o];
+  if (cb == bEmpty) return;
+  const i32 fi = 2*(ci % (blockSize/2)), fj = 2*(cj % (blockSize/2));
+  const i32 c00 = cb*blockSizeTot + fi + fj*blockSize;
+  for (i32 f = 0; f < NEVOLVE; f++) {
+    real *q = grid.getField(f);
+    q[c] = (q[c00] + q[c00 + 1] + q[c00 + blockSize] + q[c00 + blockSize + 1])*(real)0.25;
+  }
+}
+// primitive f (0 rho, 1 u, 2 v, 3 p) of a handle; fields hold primitives during the RHS
+__device__ __forceinline__ real cutTap(CompressibleSolver &grid, real *Fs[4], i32 h, i32 f) {
+  if (!cutIsPiece(h)) return Fs[f][h];
+  const i32 k = cutPieceOf(h); const size_t cap = grid.cutPieceQCap;
+  const real r = fmax(grid.cutPieceQ[k], (real)1e-30);
+  const real u = grid.cutPieceQ[cap + k]/r, v = grid.cutPieceQ[2*cap + k]/r, w = grid.cutPieceQ[3*cap + k]/r;
+  if (f == 0) return r;
+  if (f == 1) return u;
+  if (f == 2) return v;
+  return (gam - (real)1)*(grid.cutPieceQ[4*cap + k] - (real)0.5*r*(u*u + v*v + w*w));
+}
+// absolute ELEMENT centroid of a handle, and its cell size
+__device__ inline void cutHandlePos(CompressibleSolver &grid, i32 h, real &x, real &y, real &dxo, real &dyo) {
+  const i32 c = cutIsPiece(h) ? grid.cutPiece[cutPieceOf(h)].cell : h;
+  const i32 ob = c/blockSizeTot, occ = c%blockSizeTot;
+  i32 ol, oib, ojb, okb; grid.decode(grid.bLocList[ob], ol, oib, ojb, okb);
+  dxo = grid.getDx(ol); dyo = grid.getDy(ol); const real oh = fmin(dxo, dyo);
+  Vec3 op = grid.getCellPos(ol, oib, ojb, okb, occ%blockSize, (occ/blockSize)%blockSize, 0);
+  if (cutIsPiece(h)) { const CutPiece &P = grid.cutPiece[cutPieceOf(h)]; x = op[0] + P.ecx*oh; y = op[1] + P.ecy*oh; }
+  else { x = op[0] + grid.getField(F_CUTCX)[c]*oh; y = op[1] + grid.getField(F_CUTCY)[c]*oh; }
+}
+// limited least-squares gradient of a PIECE DOF over the DOFs across its open
+// faces (face table) and its tip face partner.  Fewer than 3 taps or a poorly
+// conditioned stencil -> no gradient (first order locally, never a blow-up).
+__device__ inline void cutPieceGrad(CompressibleSolver &grid, real *Fs[4], i32 k, real g[4][2], real lim[4]) {
+  const CutPiece &P = grid.cutPiece[k]; const i32 c = P.cell; const i32 h0 = cutHandle(k);
+  const i32 sp = grid.cutSplitId[c]; const CutSplitCell &Sc = grid.cutSplitCell[sp];
+  const i32 p = k - Sc.first + 1;
+  real x0, y0, dx, dy; cutHandlePos(grid, h0, x0, y0, dx, dy); const real h = fmin(dx, dy);
+  real q0[4], qmn[4], qmx[4];
+  for (i32 f = 0; f < 4; f++) { q0[f] = cutTap(grid, Fs, h0, f); qmn[f] = q0[f]; qmx[f] = q0[f]; }
+  real Sxx = 0, Sxy = 0, Syy = 0, Sxf[4] = {0,0,0,0}, Syf[4] = {0,0,0,0}, nx[10], ny[10]; i32 nn = 0;
+  auto addTap = [&](i32 th) {
+    if (nn >= 10 || th == CUT_DEAD || th == h0) return;
+    real tx, ty, tdx, tdy; cutHandlePos(grid, th, tx, ty, tdx, tdy);
+    const real rx = tx - x0, ry = ty - y0, w = (real)1/fmax(rx*rx + ry*ry, (real)1e-30);
+    Sxx += w*rx*rx; Sxy += w*rx*ry; Syy += w*ry*ry;
+    for (i32 f = 0; f < 4; f++) {
+      const real qv = cutTap(grid, Fs, th, f), d = qv - q0[f];
+      Sxf[f] += w*rx*d; Syf[f] += w*ry*d;
+      qmn[f] = fmin(qmn[f], qv); qmx[f] = fmax(qmx[f], qv);
+    }
+    nx[nn] = rx; ny[nn] = ry; nn++;
+  };
+  const i32 b = c/blockSizeTot, cc = c%blockSizeTot, i = cc%blockSize, j = (cc/blockSize)%blockSize;
+  const i32 cE = bEmpty*blockSizeTot;
+  const i32 fo[4] = { c, grid.getNbrIdx(b, i+1, j, 0), c, grid.getNbrIdx(b, i, j+1, 0) };
+  const i32 dr[4] = {0, 0, 1, 1}; const bool own[4] = {true, false, true, false};
+  for (i32 q = 0; q < 4; q++) {
+    const i32 ow = fo[q]; if (ow < 0 || ow >= cE) continue;
+    const i32 fid = grid.cutFaceId[ow]; if (fid < 0) continue;
+    const CutFace &F = grid.cutFace[fid];
+    const i32 nS = dr[q] ? F.nY : F.nX; const CutFaceSeg *sg = dr[q] ? F.sy : F.sx;
+    for (i32 s2 = 0; s2 < nS; s2++) {
+      if (sg[s2].len <= 0) continue;
+      if ((own[q] ? sg[s2].pC : sg[s2].pN) != p) continue;
+      addTap(own[q] ? sg[s2].ownN : sg[s2].ownC);
+    }
+  }
+  if (Sc.iLen > (real)0) {
+    auto hp = [&](i32 pp) -> i32 { return pp == 0 ? grid.cutOwner[c] : grid.cutPiece[Sc.first + pp - 1].owner; };
+    if (Sc.iPa == p) addTap(hp(Sc.iPb)); else if (Sc.iPb == p) addTap(hp(Sc.iPa));
+  }
+  const real det = Sxx*Syy - Sxy*Sxy;
+  for (i32 f = 0; f < 4; f++) {
+    if (nn >= 3 && det > (real)1e-6*Sxx*Syy) {
+      g[f][0] = ( Syy*Sxf[f] - Sxy*Syf[f])/det;
+      g[f][1] = (-Sxy*Sxf[f] + Sxx*Syf[f])/det;
+    } else { g[f][0] = 0; g[f][1] = 0; }
+    real phi = (grid.gradLim < 0) ? (real)0 : (real)1;
+    if (grid.gradLim == 1) {
+      for (i32 t = 0; t < nn; t++) {
+        const real d = g[f][0]*nx[t] + g[f][1]*ny[t];
+        if (d > (real)1e-30)       phi = fmin(phi, (qmx[f] - q0[f])/d);
+        else if (d < (real)-1e-30) phi = fmin(phi, (qmn[f] - q0[f])/d);
+      }
+    } else if (grid.gradLim == 2) {
+      const real kh = grid.gradLimK*h, sc = fmax(fabs(q0[f]), (real)1e-30), e2 = kh*kh*kh*sc*sc;
+      for (i32 t = 0; t < nn; t++) {
+        const real dm = g[f][0]*nx[t] + g[f][1]*ny[t];
+        if (fabs(dm) <= (real)1e-30) continue;
+        const real dp = (dm > 0) ? (qmx[f] - q0[f]) : (qmn[f] - q0[f]);
+        const real ph = ((dp*dp + e2) + (real)2*dm*dp)/(dp*dp + (real)2*dm*dm + dm*dp + e2);
+        phi = fmin(phi, ph);
+      }
+    }
+    lim[f] = fmax(phi, (real)0);
+  }
+}
+
+__device__ unsigned long long g_ibFaceRows = 0;   // --ibface: wall rows actually added
+
 __device__ inline void rccmGradLimited(CompressibleSolver &grid, real *Fs[4],
                                        i32 bIdx, i32 i, i32 j, i32 k,
                                        Vec3 cpos, real dx, real dy, real h,
@@ -3614,40 +3850,151 @@ __device__ inline void rccmGradLimited(CompressibleSolver &grid, real *Fs[4],
                                        real g[4][2], real lim[4])
 {
   const i32 cE = bEmpty*blockSizeTot;
-  const i32 cIdx0 = grid.getNbrIdx(bIdx, i, j, k);
+  i32 cIdx0 = grid.getNbrIdx(bIdx, i, j, k);
+  if (grid.cutMerge && cIdx0 < cE) {
+    // A MEMBER of a merged element reconstructs with its OWNER's stencil.  The
+    // element has one state at one centroid, so the members are not stencil
+    // rows for each other -- and a sliver left with only its far-side taps has
+    // a near-collinear stencil whose off-line gradient the limiter never sees
+    // (measured: 2nd order blew up at iter 20 on the cylinder, 1st order
+    // converged 14 orders).  The owner's 8-neighbourhood is well conditioned.
+    const i32 o = grid.cutOwner[cIdx0];
+    if (cutIsPiece(o)) { cutPieceGrad(grid, Fs, cutPieceOf(o), g, lim); return; }   // element owned by a piece
+    if (o != cIdx0) {
+      bIdx = o/blockSizeTot;
+      const i32 cc = o%blockSizeTot;
+      i = cc%blockSize; j = (cc/blockSize)%blockSize;
+      cIdx0 = o;
+      ocx = grid.getField(F_CUTCX)[o]; ocy = grid.getField(F_CUTCY)[o];
+      i32 ol, oib, ojb, okb; grid.decode(grid.bLocList[bIdx], ol, oib, ojb, okb);
+      cpos = grid.getCellPos(ol, oib, ojb, okb, i, j, k);
+    }
+  }
   real Sxx = 0, Sxy = 0, Syy = 0;
   real Sxf[4] = {0,0,0,0}, Syf[4] = {0,0,0,0};
   real qmn[4], qmx[4], q0[4];
   for (i32 f = 0; f < 4; f++) { q0[f] = Fs[f][cIdx0]; qmn[f] = q0[f]; qmx[f] = q0[f]; }
   // neighbour offsets and their centroids
-  real nx[8], ny[8], dq[8][4]; i32 nn = 0;
+  real nx[16], ny[16], dq[16][4]; i32 nn = 0;
+  i32 used[16];
   for (i32 dj = -1; dj <= 1; dj++)
     for (i32 di = -1; di <= 1; di++) {
       if (di == 0 && dj == 0) continue;
-      const i32 m = grid.getNbrIdx(bIdx, i+di, j+dj, k);
-      if (m >= cE) continue;
+      const i32 m0 = grid.getNbrIdx(bIdx, i+di, j+dj, k);
+      // --leaf: a missing or covered neighbour is resolved through the mortar to
+      // the cell(s) across the jump, tapped at their own element centroids
+      i32 cand[2] = {m0, -1}; i32 nCand = 1; bool leafAbs = false;
+      if (grid.leafFlux && grid.cellMortar && (m0 >= cE || grid.cFlagsList[m0] == PARENT)) {
+        nCand = leafResolve(grid, bIdx, i, j, k, di, dj, cand);
+        leafAbs = true;
+        if (nCand == 0) continue;
+      }
+      for (i32 qq = 0; qq < nCand; qq++) {
+      const i32 m = cand[qq];
+      if (m >= cE || m < 0) continue;
+      if (nn >= 16) continue;
+      if (leafAbs) {                                 // de-duplicate (two offsets can reach one coarse cell)
+        bool dup = (m == cIdx0);
+        for (i32 u = 0; u < nn && !dup; u++) dup = (used[u] == m);
+        if (dup) continue;
+        if (grid.getField(F_RHO)[m] <= (real)0) continue;   // an unfilled exterior corner
+      }
       if (grid.ibRccm && !grid.rccmLive(m)) {
         if (grid.dbgChecks) atomicAdd(&g_rcDeadGrad, 1ull);
         continue;
       }
+      // a member of the SAME merged element carries this very state at this
+      // very centroid: zero separation, zero information -- not a stencil row
+      if (grid.cutMerge && grid.cutOwner[m] == grid.cutOwner[cIdx0]) continue;
+      // --cutsplit: across a thin wall the neighbour CELL's DOF may be the other
+      // side's state.  Through the face table, tap the piece of m that faces OUR
+      // piece 0 -- its owner's state at its element centroid -- and skip m if no
+      // piece of it does.  Diagonal taps next to a split cell are dropped: no
+      // face tells which side they are on.
+      i32 tap = m; bool tapAbs = false; real tpx = 0, tpy = 0;
+      if (grid.cutSplit && grid.cutFaceId && grid.cutSplitId) {
+        const i32 spM = grid.cutSplitId[m], sp0 = grid.cutSplitId[cIdx0];
+        if (di != 0 && dj != 0) { if (spM >= 0 || sp0 >= 0) continue; }
+        else if (spM >= 0 || sp0 >= 0) {
+          const bool weOwn = (di < 0 || dj < 0);            // m on our LOW side: our low face
+          const i32 ownerCell = weOwn ? cIdx0 : m;
+          const i32 fid = grid.cutFaceId[ownerCell];
+          const i32 dir = (di != 0) ? 0 : 1;
+          const i32 nS = fid < 0 ? 0 : (dir == 0 ? grid.cutFace[fid].nX : grid.cutFace[fid].nY);
+          if (nS > 0) {
+            const CutFaceSeg *sg = dir == 0 ? grid.cutFace[fid].sx : grid.cutFace[fid].sy;
+            i32 found = -1;
+            for (i32 s2 = 0; s2 < nS; s2++) {
+              if (sg[s2].len <= 0) continue;
+              if ((weOwn ? sg[s2].pC : sg[s2].pN) == 0) { found = s2; break; }
+            }
+            if (found < 0) continue;
+            const i32 theirs = weOwn ? sg[found].pN : sg[found].pC;
+            if (theirs != 0) {
+              const i32 own = weOwn ? sg[found].ownN : sg[found].ownC;   // a DOF handle
+              if (own == CUT_DEAD) continue;
+              if (grid.cutMerge && own == grid.cutOwner[cIdx0]) continue;
+              tap = own; tapAbs = true;
+              real tdx, tdy; cutHandlePos(grid, own, tpx, tpy, tdx, tdy);
+            }
+          }
+        }
+      }
       real onx = 0, ony = 0;
-      if (grid.ibRccm && grid.getField(F_CUTA)[m] < (real)1 - (real)1e-12)
-        rccmCentroidOff(grid, Vec3(cpos[0] + (real)di*dx, cpos[1] + (real)dj*dy, cpos[2]),
-                        dx, dy, h, onx, ony);
-      const real rx = (real)di*dx + (onx - ocx)*h;
-      const real ry = (real)dj*dy + (ony - ocy)*h;
+      if (grid.ibRccm) {
+        onx = grid.getField(F_CUTCX)[m];   // PREPROCESSED (see F_CUTCX); 0 on an uncut,
+        ony = grid.getField(F_CUTCY)[m];   // unmerged cell, the ELEMENT centroid if merged
+      }
+      real rx = (real)di*dx + (onx - ocx)*h;
+      real ry = (real)dj*dy + (ony - ocy)*h;
+      if (leafAbs && !tapAbs) {                    // across a jump: the far cell's own centroid, absolute
+        real tdx, tdy; cutHandlePos(grid, tap, tpx, tpy, tdx, tdy); tapAbs = true;
+      }
+      if (tapAbs) { rx = tpx - (cpos[0] + ocx*h); ry = tpy - (cpos[1] + ocy*h); }
+      used[nn] = m;
       const real w  = (real)1/(rx*rx + ry*ry);
       Sxx += w*rx*rx; Sxy += w*rx*ry; Syy += w*ry*ry;
       for (i32 f = 0; f < 4; f++) {
-        const real d = Fs[f][m] - q0[f];
+        const real qv = cutTap(grid, Fs, tap, f);
+        const real d = qv - q0[f];
         Sxf[f] += w*rx*d; Syf[f] += w*ry*d;
-        qmn[f] = fmin(qmn[f], Fs[f][m]);
-        qmx[f] = fmax(qmx[f], Fs[f][m]);
+        qmn[f] = fmin(qmn[f], qv);
+        qmx[f] = fmax(qmx[f], qv);
+        dq[nn][f] = d;
       }
       nx[nn] = rx; ny[nn] = ry;
-      for (i32 f = 0; f < 4; f++) dq[nn][f] = Fs[f][m] - q0[f];
       nn++;
+      }   // candidates
     }
+  // ---- --ibface: the IB FACE as a stencil row ------------------------------
+  // The wall is a KNOWN state at a KNOWN place: the foot point x_w = x_c - phi n
+  // (phi < 0 in the fluid), carrying the slip-wall face state.  Adding it as a
+  // least-squares row IS the reconstruction using the face value itself -- no
+  // ghost, and no assumption about where the wall sits inside the cell (the
+  // mirror ghost asserts it bisects the gap).  rho and p are Neumann there, so
+  // only the normal velocity constrains the fit, which is what the wall imposes.
+  // nWall counts toward the nn >= 2 rank test below.
+  if (grid.ibFaceRec && !grid.ibRccm && grid.immerserdBcType != 0
+      && grid.getField(F_IBM)[cIdx0] > (real)0.5) {
+    const real dwv = -grid.getField(F_PHI)[cIdx0];          // > 0 in the fluid
+    if (dwv > (real)0 && dwv < (real)2*h) {
+      const real nxw = grid.getField(F_CUTNX)[cIdx0];
+      const real nyw = grid.getField(F_CUTNY)[cIdx0];
+      const real rx = dwv*nxw, ry = dwv*nyw;                // x_w - x_c
+      const real w  = (real)1/fmax(rx*rx + ry*ry, (real)1e-30);
+      const real un = q0[1]*nxw + q0[2]*nyw;                // Fs = {Rho,U,V,P}
+      const real dW[4] = {0, -un*nxw, -un*nyw, 0};          // q_wall - q_c
+      Sxx += w*rx*rx; Sxy += w*rx*ry; Syy += w*ry*ry;
+      for (i32 f = 0; f < 4; f++) {
+        Sxf[f] += w*rx*dW[f]; Syf[f] += w*ry*dW[f];
+        const real qw = q0[f] + dW[f];
+        qmn[f] = fmin(qmn[f], qw); qmx[f] = fmax(qmx[f], qw);
+      }
+      nn++;
+      if (grid.dbgChecks) atomicAdd(&g_ibFaceRows, 1ull);
+    }
+  }
+
   const real det = Sxx*Syy - Sxy*Sxy;
   for (i32 f = 0; f < 4; f++) {
     if (nn >= 2 && fabs(det) > (real)1e-30) {
@@ -3693,246 +4040,6 @@ __device__ inline void rccmGradLimited(CompressibleSolver &grid, real *Fs[4],
     lim[f] = fmin(fmax(phi, (real)0), (real)1);
   }
 }
-
-// ---- RCCM reconstruction of the R-Cells (Ndiaye et al. Sect. 2.3.2) --------
-//
-// Each primitive phi is fitted with a LINEAR function about the R-Cell centre
-//     phi = a + b (x - x0) + c (y - y0)                            (their Eq. 8)
-// from a stencil of solved neighbours plus points ON the boundary carrying the
-// boundary condition.  The fitted value at the centre, a, is the new R-Cell
-// value (Eq. 10).
-//
-// Stencil (their Fig. 3): the face+diagonal neighbours that are LIVE, each at
-// its own centre, plus the R-Cell's own wall foot point.  The paper notes an
-// R-Cell's stencil may contain other R-Cells, so the systems couple and are
-// assembled globally; each pass of this kernel is one Jacobi sweep of that
-// system, and the driver runs --rccmiter of them.
-//
-// Boundary condition, inviscid wall: the NORMAL velocity vanishes there, while
-// rho, p and the tangential velocity have no Dirichlet data.  So the wall point
-// enters the fit only for u_n (value 0, weighted like any other row) and the
-// scalars are fitted from the fluid rows alone -- which is the "Neumann" half of
-// the paper's Sect. 2.5 discussion, imposed by leaving the wall out of the fit
-// rather than by asserting a gradient.
-//
-// The 3x3 normal equations are solved by Cramer; a degenerate stencil (fewer
-// than 3 usable rows, or a near-singular fit) falls back to inverse-distance
-// weighting, which is monotone and always available.
-__global__ void rccmReconstructKernel(CompressibleSolver &grid) {
-  real *Rho = grid.getField(F_RHO);
-  real *U   = grid.getField(F_RHOU);
-  real *V   = grid.getField(F_RHOV);
-  real *W   = grid.getField(F_RHOW);
-  real *P   = grid.getField(F_RHOE);
-
-  START_CELL_LOOP
-    GET_CELL_INDICES
-    u64 loc = grid.bLocList[bIdx];
-    i32 lvl, ib, jb, kb;
-    grid.decode(loc, lvl, ib, jb, kb);
-    // Exterior (domain-ghost) blocks are the domain BC's, not the body's: a
-    // bcType 6 exact-Dirichlet ghost that happens to be a small cut cell must
-    // keep its prescribed state, not a reconstruction of it.
-    if (loc != kEmpty && !grid.isExteriorBlock(lvl, ib, jb, kb) && grid.rccmRCell(cIdx)) {
-      const real dx = grid.getDx(lvl), dy = grid.getDy(lvl);
-      const real h  = fmin(dx, dy);
-      Vec3 pc = grid.getCellPos(lvl, ib, jb, kb, i, j, k);
-      const i32 cE = bEmpty*blockSizeTot;
-      // Reconstruct at the FLUID CENTROID, not the Cartesian centre (their
-      // Sect. 2.3.3).  For an R-Cell the Cartesian centre is inside the solid,
-      // so a fit evaluated there is an extrapolation ACROSS the wall -- which
-      // showed up as tangential momentum being destroyed at the wall, in uncut
-      // cells too, once that state entered the R-Cell/NR-Cell face fluxes.
-      real o0x = 0, o0y = 0;
-      rccmCentroidOff(grid, pc, dx, dy, h, o0x, o0y);
-      Vec3 p0(pc[0] + o0x*h, pc[1] + o0y*h, pc[2]);
-      // Wall frame at the centroid; the foot point is where the normal meets
-      // the wall, which is also the boundary-face centre the paper uses.
-      Vec3 n = grid.wallNormal(p0, h);
-      const real phi = grid.getBoundaryLevelSet(p0);
-      const real tx = -n[1], ty = n[0];             // unit tangent (2-D)
-
-      // Fit rho, p, u_n, u_t.  Working in the WALL FRAME is what lets the
-      // boundary condition enter as a row of the fit (the paper's "points on
-      // the boundary" carrying the BC) instead of being imposed afterwards:
-      // for an inviscid wall the datum is u_n = 0 AT THE FOOT POINT, and there
-      // is no Dirichlet datum for rho, p or u_t, so only the u_n system gets a
-      // boundary row.  Imposing u_n = 0 at the R-Cell CENTRE instead -- which
-      // is what the first cut of this kernel did -- asserts the wall condition
-      // at a point inside the solid, a different (and wrong) condition.
-      real M[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
-      real Mn[3][3] = {{0,0,0},{0,0,0},{0,0,0}};    // u_n system (extra BC row)
-      real rhsF[4][3] = {{0,0,0},{0,0,0},{0,0,0},{0,0,0}};   // rho,p,u_t,u_n
-      real wsum = 0, fb[4] = {0,0,0,0};
-      real qmn[4] = { (real)1e30, (real)1e30, (real)1e30, (real)1e30};
-      real qmx[4] = {(real)-1e30,(real)-1e30,(real)-1e30,(real)-1e30};
-      i32 nrow = 0;
-      for (i32 dj = -1; dj <= 1; dj++)
-        for (i32 di = -1; di <= 1; di++) {
-          if (di == 0 && dj == 0) continue;
-          const i32 m = grid.getNbrIdx(bIdx, i+di, j+dj, k);
-          if (m >= cE || !grid.rccmLive(m)) continue;
-          // row position = the NEIGHBOUR's centroid, relative to ours: a cut
-          // neighbour's average does not live at its Cartesian centre either
-          real onx = 0, ony = 0;
-          if (grid.getField(F_CUTA)[m] < (real)1 - (real)1e-12)
-            rccmCentroidOff(grid, Vec3(pc[0] + (real)di*dx, pc[1] + (real)dj*dy, pc[2]),
-                            dx, dy, h, onx, ony);
-          const real xi  = (real)di*dx/h + onx - o0x;
-          const real eta = (real)dj*dy/h + ony - o0y;
-          // A tap that is itself an R-Cell is an UNKNOWN of the same system, not
-          // data.  Weighting it like a solved cell is what makes the Jacobi
-          // iteration of the paper's global system diverge where R-Cells
-          // cluster (measured at N=64: 10 sweeps -> max|u| = 3e23, while the
-          // paper's direct solve has no such failure mode).  Halving those rows
-          // shrinks the iteration matrix; the fixed point is unchanged, since
-          // at convergence every row is consistent anyway.
-          const real wR  = grid.rccmRCell(m) ? (real)0.5 : (real)1;
-          const real wgt = wR/(xi*xi + eta*eta);
-          const real un = U[m]*n[0] + V[m]*n[1];
-          const real ut = U[m]*tx   + V[m]*ty;
-          const real q[4] = {Rho[m], P[m], ut, un};
-          M[0][0] += wgt;        M[0][1] += wgt*xi;      M[0][2] += wgt*eta;
-          M[1][1] += wgt*xi*xi;  M[1][2] += wgt*xi*eta;  M[2][2] += wgt*eta*eta;
-          for (i32 f = 0; f < 4; f++) {
-            rhsF[f][0] += wgt*q[f];
-            rhsF[f][1] += wgt*q[f]*xi;
-            rhsF[f][2] += wgt*q[f]*eta;
-            fb[f] += wgt*q[f];
-            qmn[f] = fmin(qmn[f], q[f]);
-            qmx[f] = fmax(qmx[f], q[f]);
-          }
-          wsum += wgt; nrow++;
-        }
-      M[1][0] = M[0][1]; M[2][0] = M[0][2]; M[2][1] = M[1][2];
-      for (i32 a = 0; a < 3; a++)
-        for (i32 b = 0; b < 3; b++) Mn[a][b] = M[a][b];
-      // boundary row for u_n: value 0 at the foot, weighted like a near tap
-      {
-        const real xf = phi*n[0]/h, ef = phi*n[1]/h;
-        const real wB = (real)4;                 // BC is data, not a suggestion
-        Mn[0][0] += wB;       Mn[0][1] += wB*xf;      Mn[0][2] += wB*ef;
-        Mn[1][0] += wB*xf;    Mn[1][1] += wB*xf*xf;   Mn[1][2] += wB*xf*ef;
-        Mn[2][0] += wB*ef;    Mn[2][1] += wB*xf*ef;   Mn[2][2] += wB*ef*ef;
-        // rhs contribution is zero (u_n = 0), so rhsF[3] is unchanged
-      }
-      // Dirichlet boundary (--ibdir 1): the exact state is known AT the foot
-      // point, so every primitive gets a boundary row -- the paper's "Dirichlet
-      // boundary condition" datum in its Sect. 2.3.2 stencil.  M then carries
-      // the same geometric row Mn already has, and u_n takes the exact value
-      // instead of 0.
-      real unB = 0;                                // u_n datum at the foot
-      if (grid.ibDirichlet) {
-        real rD, uD, vD, pD;
-        if (grid.exactState(p0[0] + phi*n[0], p0[1] + phi*n[1], rD, uD, vD, pD)) {
-          const real qD[4] = {rD, pD, uD*tx + vD*ty, uD*n[0] + vD*n[1]};
-          const real xf = phi*n[0]/h, ef = phi*n[1]/h;
-          const real wB = (real)4;
-          M[0][0] += wB;       M[0][1] += wB*xf;      M[0][2] += wB*ef;
-          M[1][0] += wB*xf;    M[1][1] += wB*xf*xf;   M[1][2] += wB*xf*ef;
-          M[2][0] += wB*ef;    M[2][1] += wB*xf*ef;   M[2][2] += wB*ef*ef;
-          for (i32 f = 0; f < 4; f++) {
-            rhsF[f][0] += wB*qD[f];
-            rhsF[f][1] += wB*qD[f]*xf;
-            rhsF[f][2] += wB*qD[f]*ef;
-            qmn[f] = fmin(qmn[f], qD[f]);
-            qmx[f] = fmax(qmx[f], qD[f]);
-            if (f < 3) fb[f] += wB*qD[f];
-          }
-          wsum += wB;
-          unB = qD[3];
-        }
-      }
-      // Neumann rows for rho, p, u_t (the paper's Sect. 2.3.2: "for points on
-      // a boundary with a Neumann boundary condition ... the information is
-      // the derivative of the primitive variable along the normal").  Leaving
-      // the wall out of the scalar fits is NOT the same thing: along a wall
-      // that runs parallel to the grid the R-Cells form a row whose only data
-      // in the normal direction are (a) one row of NR-Cells and (b) each
-      // other.  A plane through both rows fits exactly for ANY value of the
-      // R-Cell row, so the normal slope -- and with it the R-Cell value -- is
-      // a free mode of the Jacobi iteration (eigenvalue 1).  Measured on the
-      // canal floor (76x32, alpha = 0.3): the R-Cell row drifted to a stagnant
-      // layer, p -> p0 and u -> 0 under a stream that kept moving, and the
-      // mass flow decayed 0.61 -> 0.38.  The row (0, n_x, n_y) . (a,b,c) =
-      // h dphi/dn closes the system; any positive weight selects the same
-      // fixed point in the degenerate case, and the weight only sets how fast
-      // the sweep contracts there (1 -> factor ~0.4 per sweep).  The data are
-      // the inviscid wall relations rather than plain zero-slope, so a curved
-      // wall is not biased:  dp/dn = rho u_t^2 kappa  (centripetal balance),
-      // drho/dn = dp/dn / c^2  (isentropic),  du_t/dn = -kappa u_t
-      // (irrotational).  All three are invariant under n -> -n, and kappa =
-      // div n is taken from the tangential difference of the wall normal at
-      // the foot.  Not used under --ibdir 1, where every primitive already has
-      // its Dirichlet row.
-      if (!grid.ibDirichlet && grid.ibRccmNeu > (real)0 && wsum > (real)0) {
-        const real wN = grid.ibRccmNeu;
-        Vec3 xf(p0[0] + phi*n[0], p0[1] + phi*n[1], p0[2]);
-        const real dl = (real)0.5*h;
-        Vec3 nP = grid.wallNormal(Vec3(xf[0] + dl*tx, xf[1] + dl*ty, xf[2]), h);
-        Vec3 nM = grid.wallNormal(Vec3(xf[0] - dl*tx, xf[1] - dl*ty, xf[2]), h);
-        const real kap = ((nP[0] - nM[0])*tx + (nP[1] - nM[1])*ty)/((real)2*dl);
-        const real rm = fb[0]/wsum, pm = fb[1]/wsum, um = fb[2]/wsum;
-        const real dpn = rm*um*um*kap;
-        const real gN[3] = { dpn*rm/(gam*pm), dpn, -kap*um };   // rho, p, u_t
-        M[1][1] += wN*n[0]*n[0];  M[1][2] += wN*n[0]*n[1];
-        M[2][1] += wN*n[0]*n[1];  M[2][2] += wN*n[1]*n[1];
-        for (i32 f = 0; f < 3; f++) {
-          rhsF[f][1] += wN*n[0]*gN[f]*h;
-          rhsF[f][2] += wN*n[1]*gN[f]*h;
-        }
-      }
-
-      #define RCCM_DET(A) ((A)[0][0]*((A)[1][1]*(A)[2][2]-(A)[1][2]*(A)[2][1]) \
-                         - (A)[0][1]*((A)[1][0]*(A)[2][2]-(A)[1][2]*(A)[2][0]) \
-                         + (A)[0][2]*((A)[1][0]*(A)[2][1]-(A)[1][1]*(A)[2][0]))
-      #define RCCM_SOLVE0(A, R) ((R)[0]*((A)[1][1]*(A)[2][2]-(A)[1][2]*(A)[2][1]) \
-                               - (A)[0][1]*((R)[1]*(A)[2][2]-(A)[1][2]*(R)[2])    \
-                               + (A)[0][2]*((R)[1]*(A)[2][1]-(A)[1][1]*(R)[2]))
-      real out[4];
-      bool ok = false;
-      if (nrow >= 3) {
-        const real det  = RCCM_DET(M);
-        const real detN = RCCM_DET(Mn);
-        const real tol  = (real)1e-8*wsum*wsum*wsum;
-        if (fabs(det) > tol && fabs(detN) > tol) {
-          for (i32 f = 0; f < 3; f++) out[f] = RCCM_SOLVE0(M, rhsF[f])/det;
-          out[3] = RCCM_SOLVE0(Mn, rhsF[3])/detN;      // u_n, with the wall row
-          ok = (out[0] > (real)0) && (out[1] > (real)0);
-        }
-      }
-      #undef RCCM_DET
-      #undef RCCM_SOLVE0
-      // Keep the reconstruction inside the convex hull of its own stencil.  A
-      // one-sided stencil lets the linear fit EXTRAPOLATE past its data, and
-      // chaining those through the R-Cell coupling is what diverges (10 sweeps
-      // -> 1e34 even damped).  Clamping makes the sweep non-expansive in the
-      // max norm, so the iteration is a contraction; where the fit is already
-      // sane -- the common case -- the clamp never binds and nothing is lost.
-      // u_n additionally admits its wall value 0, which is genuine data.
-      if (ok) {
-        qmn[3] = fmin(qmn[3], unB); qmx[3] = fmax(qmx[3], unB);
-        for (i32 f = 0; f < 4; f++) out[f] = fmin(fmax(out[f], qmn[f]), qmx[f]);
-      }
-      if (!ok && wsum > (real)0) {                 // inverse-distance fallback
-        for (i32 f = 0; f < 3; f++) out[f] = fb[f]/wsum;
-        out[3] = unB;                              // boundary value for u_n
-        ok = (out[0] > (real)0) && (out[1] > (real)0);
-      }
-      if (ok) {
-        // Damped Jacobi: the fixed point is identical, but the iteration is
-        // stable where the plain sweep is not.
-        const real w = grid.ibRccmRelax, w1 = (real)1 - w;
-        Rho[cIdx] = w1*Rho[cIdx] + w*out[0];
-        P[cIdx]   = w1*P[cIdx]   + w*out[1];
-        U[cIdx]   = w1*U[cIdx]   + w*(out[2]*tx + out[3]*n[0]);
-        V[cIdx]   = w1*V[cIdx]   + w*(out[2]*ty + out[3]*n[1]);
-        W[cIdx]   = 0;
-      }
-    }
-  END_CELL_LOOP
-}
-
 __global__ void ibIfaceKernel(CompressibleSolver &grid) {
   real *Rho = grid.getField(F_RHO);
   real *U   = grid.getField(F_RHOU);
@@ -4422,7 +4529,7 @@ __global__ void wallGhostKernel(CompressibleSolver &grid) {
 // exists there; the atomic path never received that face either (level seams
 // are reconciled by restriction), so contribute exactly nothing.
 __global__ void stateHashKernel(CompressibleSolver &grid) {
-  START_CELL_LOOP
+  START_LIVE_CELL_LOOP
     GET_CELL_INDICES
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb, kb;
@@ -4445,7 +4552,7 @@ __global__ void gatherFaceFluxKernel(CompressibleSolver &grid) {
   const real *FF = grid.ffBuf;
   const u64 NN = grid.ffN;
   const i32 cE = bEmpty*blockSizeTot;
-  START_CELL_LOOP
+  START_LIVE_CELL_LOOP
     GET_CELL_INDICES
     u64 loc = grid.bLocList[bIdx];
     i32 lvl, ib, jb, kb;
@@ -4458,8 +4565,8 @@ __global__ void gatherFaceFluxKernel(CompressibleSolver &grid) {
       const i32 f1 = grid.pseudo2D ? cE : grid.getNbrIdx(bIdx, i, j, k+1);
       for (i32 n = 0; n < 5; n++) {
         real acc = FF[(u64)n*NN + (u64)cIdx] + FF[(u64)(5+n)*NN + (u64)cIdx];
-        if (r1 < cE) acc -= FF[(u64)n*NN + (u64)r1];
-        if (u1 < cE) acc -= FF[(u64)(5+n)*NN + (u64)u1];
+        if (r1 < cE && (!grid.leafFlux || grid.cFlagsList[r1] != PARENT)) acc -= FF[(u64)n*NN + (u64)r1];
+        if (u1 < cE && (!grid.leafFlux || grid.cFlagsList[u1] != PARENT)) acc -= FF[(u64)(5+n)*NN + (u64)u1];
         if (!grid.pseudo2D) {
           acc += FF[(u64)(10+n)*NN + (u64)cIdx];
           if (f1 < cE) acc -= FF[(u64)(10+n)*NN + (u64)f1];
@@ -4502,7 +4609,7 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
   real *RhsRhoW = grid.getField(F_RHS + 3);
   real *RhsRhoE = grid.getField(F_RHS + 4);
 
-  START_CELL_LOOP
+  START_LIVE_CELL_LOOP
     GET_CELL_INDICES
 
     u64 loc = grid.bLocList[bIdx];
@@ -4576,46 +4683,96 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     // are the two states of THIS cell's minus-x face (l1|c), so both take the
     // same face theta; likewise qD/qU (minus-y) and qB/qF (minus-z).
     real thX = 1, thY = 1, thZ = 1;
-    if (grid.recon == 5) {
+    // --reconfar: outside the two-cell band at the body the ordinary 1-D scheme
+    // does the reconstruction; inside it (and everywhere when off) it is recon.
+    i32 rcCell = (grid.recon == 6 && grid.reconFar >= 0 && grid.cutNear && !grid.cutNear[cIdx])
+               ? grid.reconFar : grid.recon;
+    // --leaf: a cell whose stencil crosses a level jump reconstructs with the
+    // least-squares gradient (its 1-D taps would read the missing neighbour)
+    if (grid.leafFlux && grid.cutNear && grid.cutNear[cIdx]) rcCell = 6;
+    if (rcCell == 5) {
       const real *Th = grid.getField(F_RHOK);
       thX = fmax(Th[cIdx], Th[l1R]);
       thY = fmax(Th[cIdx], Th[d1R]);
       thZ = (blockSizeZ == 1 || grid.pseudo2D) ? thX : fmax(Th[cIdx], Th[b1R]);
     }
-    qL[0] = grid.tvdRec(Rho[l2R], Rho[l1R], Rho[cIdx], thX);
-    qR[0] = grid.tvdRec(Rho[r1R], Rho[cIdx],  Rho[l1R], thX);
-    qD[0] = grid.tvdRec(Rho[d2R], Rho[d1R], Rho[cIdx], thY);
-    qU[0] = grid.tvdRec(Rho[u1R], Rho[cIdx],  Rho[d1R], thY);
-    qB[0] = grid.tvdRec(Rho[b2R], Rho[b1R], Rho[cIdx], thZ);
-    qF[0] = grid.tvdRec(Rho[f1R], Rho[cIdx],  Rho[b1R], thZ);
+    // ---- --ibface: MUSCL stencil from the IB FACE VALUE (sharp IB) ----------
+    // Replaces the mirror GHOST on a wall-adjacent side.  Slip wall: the face
+    // state is (rho_c, u_c - (u_c.n) n, p_c); extrapolating it linearly out to
+    // where the stencil wants a neighbour (a distance dx away) gives
+    //     u_nbr = u_c - s (u_c.n) n,   s = dx / d_wall,
+    // d_wall being the distance to the wall ALONG that direction, -phi/|n.e|.
+    // The mirror ghost is exactly s = 2, i.e. it ASSUMES the wall bisects the
+    // cell; with a level set it does not, and s = 2 is then the wrong slope.
+    // rho and p are Neumann at a slip wall, so they keep the cell value.
+    real vL1[5] = {Rho[l1R], U[l1R], V[l1R], W[l1R], P[l1R]};
+    real vR1[5] = {Rho[r1R], U[r1R], V[r1R], W[r1R], P[r1R]};
+    real vD1[5] = {Rho[d1R], U[d1R], V[d1R], W[d1R], P[d1R]};
+    real vU1[5] = {Rho[u1R], U[u1R], V[u1R], W[u1R], P[u1R]};
+    if (grid.ibFaceRec && grid.immerserdBcType != 0 && !grid.ibRccm) {
+      const real hmF   = fmin(dx, dy);
+      const real *IbmF = grid.getField(F_IBM);
+      const i32   cEf  = bEmpty*blockSizeTot;
+      const real  nxw  = grid.getField(F_CUTNX)[cIdx];
+      const real  nyw  = grid.getField(F_CUTNY)[cIdx];
+      const real  dwn  = fmax(-grid.getField(F_PHI)[cIdx], (real)0.02*hmF);  // normal distance
+      const real  unC  = U[cIdx]*nxw + V[cIdx]*nyw;
+      // only for a cell that is itself fluid; a solid cell has no face state
+      if (IbmF[cIdx] > (real)0.5) {
+        #define IBF_SOLID(IDX, PX, PY, HH) \
+          (((IDX) < cEf) ? (IbmF[IDX] <= (real)0.5) \
+                         : !grid.isFluidCell(Vec3((PX),(PY),cpos[2]), (HH)))
+        #define IBF_FILL(VARR, HDIR, EDOT)                                        \
+          {                                                                       \
+            const real dAl = fmin(HDIR, dwn/fmax(fabs(EDOT), (real)0.3));         \
+            const real sF  = fmin(fmax(HDIR/fmax(dAl,(real)1e-30),(real)1),(real)4); \
+            VARR[0] = Rho[cIdx];  VARR[4] = P[cIdx];                              \
+            VARR[1] = U[cIdx] - sF*unC*nxw;                                       \
+            VARR[2] = V[cIdx] - sF*unC*nyw;                                       \
+            VARR[3] = W[cIdx];                                                    \
+          }
+        if (IBF_SOLID(l1Idx, cpos[0]-dx, cpos[1], dx)) IBF_FILL(vL1, dx, nxw)
+        if (IBF_SOLID(r1Idx, cpos[0]+dx, cpos[1], dx)) IBF_FILL(vR1, dx, nxw)
+        if (IBF_SOLID(d1Idx, cpos[0], cpos[1]-dy, dy)) IBF_FILL(vD1, dy, nyw)
+        if (IBF_SOLID(u1Idx, cpos[0], cpos[1]+dy, dy)) IBF_FILL(vU1, dy, nyw)
+        #undef IBF_SOLID
+        #undef IBF_FILL
+      }
+    }
+    qL[0] = grid.tvdRec(Rho[l2R], vL1[0], Rho[cIdx], thX, rcCell);
+    qR[0] = grid.tvdRec(vR1[0], Rho[cIdx],  vL1[0], thX, rcCell);
+    qD[0] = grid.tvdRec(Rho[d2R], vD1[0], Rho[cIdx], thY, rcCell);
+    qU[0] = grid.tvdRec(vU1[0], Rho[cIdx],  vD1[0], thY, rcCell);
+    qB[0] = grid.tvdRec(Rho[b2R], Rho[b1R], Rho[cIdx], thZ, rcCell);
+    qF[0] = grid.tvdRec(Rho[f1R], Rho[cIdx],  Rho[b1R], thZ, rcCell);
 
-    qL[1] = grid.tvdRec(U[l2R], U[l1R], U[cIdx], thX);
-    qR[1] = grid.tvdRec(U[r1R], U[cIdx],  U[l1R], thX);
-    qD[1] = grid.tvdRec(U[d2R], U[d1R], U[cIdx], thY);
-    qU[1] = grid.tvdRec(U[u1R], U[cIdx],  U[d1R], thY);
-    qB[1] = grid.tvdRec(U[b2R], U[b1R], U[cIdx], thZ);
-    qF[1] = grid.tvdRec(U[f1R], U[cIdx],  U[b1R], thZ);
+    qL[1] = grid.tvdRec(U[l2R], vL1[1], U[cIdx], thX, rcCell);
+    qR[1] = grid.tvdRec(vR1[1], U[cIdx],  vL1[1], thX, rcCell);
+    qD[1] = grid.tvdRec(U[d2R], vD1[1], U[cIdx], thY, rcCell);
+    qU[1] = grid.tvdRec(vU1[1], U[cIdx],  vD1[1], thY, rcCell);
+    qB[1] = grid.tvdRec(U[b2R], U[b1R], U[cIdx], thZ, rcCell);
+    qF[1] = grid.tvdRec(U[f1R], U[cIdx],  U[b1R], thZ, rcCell);
 
-    qL[2] = grid.tvdRec(V[l2R], V[l1R], V[cIdx], thX);
-    qR[2] = grid.tvdRec(V[r1R], V[cIdx],  V[l1R], thX);
-    qD[2] = grid.tvdRec(V[d2R], V[d1R], V[cIdx], thY);
-    qU[2] = grid.tvdRec(V[u1R], V[cIdx],  V[d1R], thY);
-    qB[2] = grid.tvdRec(V[b2R], V[b1R], V[cIdx], thZ);
-    qF[2] = grid.tvdRec(V[f1R], V[cIdx],  V[b1R], thZ);
+    qL[2] = grid.tvdRec(V[l2R], vL1[2], V[cIdx], thX, rcCell);
+    qR[2] = grid.tvdRec(vR1[2], V[cIdx],  vL1[2], thX, rcCell);
+    qD[2] = grid.tvdRec(V[d2R], vD1[2], V[cIdx], thY, rcCell);
+    qU[2] = grid.tvdRec(vU1[2], V[cIdx],  vD1[2], thY, rcCell);
+    qB[2] = grid.tvdRec(V[b2R], V[b1R], V[cIdx], thZ, rcCell);
+    qF[2] = grid.tvdRec(V[f1R], V[cIdx],  V[b1R], thZ, rcCell);
 
-    qL[3] = grid.tvdRec(W[l2R], W[l1R], W[cIdx], thX);
-    qR[3] = grid.tvdRec(W[r1R], W[cIdx],  W[l1R], thX);
-    qD[3] = grid.tvdRec(W[d2R], W[d1R], W[cIdx], thY);
-    qU[3] = grid.tvdRec(W[u1R], W[cIdx],  W[d1R], thY);
-    qB[3] = grid.tvdRec(W[b2R], W[b1R], W[cIdx], thZ);
-    qF[3] = grid.tvdRec(W[f1R], W[cIdx],  W[b1R], thZ);
+    qL[3] = grid.tvdRec(W[l2R], vL1[3], W[cIdx], thX, rcCell);
+    qR[3] = grid.tvdRec(vR1[3], W[cIdx],  vL1[3], thX, rcCell);
+    qD[3] = grid.tvdRec(W[d2R], vD1[3], W[cIdx], thY, rcCell);
+    qU[3] = grid.tvdRec(vU1[3], W[cIdx],  vD1[3], thY, rcCell);
+    qB[3] = grid.tvdRec(W[b2R], W[b1R], W[cIdx], thZ, rcCell);
+    qF[3] = grid.tvdRec(W[f1R], W[cIdx],  W[b1R], thZ, rcCell);
 
-    qL[4] = grid.tvdRec(P[l2R], P[l1R], P[cIdx], thX);
-    qR[4] = grid.tvdRec(P[r1R], P[cIdx],  P[l1R], thX);
-    qD[4] = grid.tvdRec(P[d2R], P[d1R], P[cIdx], thY);
-    qU[4] = grid.tvdRec(P[u1R], P[cIdx],  P[d1R], thY);
-    qB[4] = grid.tvdRec(P[b2R], P[b1R], P[cIdx], thZ);
-    qF[4] = grid.tvdRec(P[f1R], P[cIdx],  P[b1R], thZ);
+    qL[4] = grid.tvdRec(P[l2R], vL1[4], P[cIdx], thX, rcCell);
+    qR[4] = grid.tvdRec(vR1[4], P[cIdx],  vL1[4], thX, rcCell);
+    qD[4] = grid.tvdRec(P[d2R], vD1[4], P[cIdx], thY, rcCell);
+    qU[4] = grid.tvdRec(vU1[4], P[cIdx],  vD1[4], thY, rcCell);
+    qB[4] = grid.tvdRec(P[b2R], P[b1R], P[cIdx], thZ, rcCell);
+    qF[4] = grid.tvdRec(P[f1R], P[cIdx],  P[b1R], thZ, rcCell);
 
     // ---- gradient MUSCL (--recon 6): centroid -> open-face centroid ---------
     // Replaces the 1-D limited slopes entirely: one limited least-squares
@@ -4624,7 +4781,7 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     // calls for -- the earlier fix-up (an unlimited central-difference shift
     // bolted onto a limited 1-D slope) was inconsistent between the value and
     // its correction, and left nothing to stop an overshoot at a cut face.
-    if (grid.recon == 6) {
+    if (rcCell == 6) {
       real *Fs[4] = {Rho, U, V, P};
       const real hR = fmin(dx, dy);
       const real hx = (real)0.5*dx, hy = (real)0.5*dy;
@@ -4632,14 +4789,22 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
       real ocx = 0, ocy = 0, olx = 0, oly = 0, odx = 0, ody = 0;
       real tX = 0, tY = 0;
       if (grid.ibRccm) {
-        f00 = grid.getBoundaryLevelSet(Vec3(cpos[0]-hx, cpos[1]-hy, cpos[2]));
-        f10 = grid.getBoundaryLevelSet(Vec3(cpos[0]+hx, cpos[1]-hy, cpos[2]));
-        f01 = grid.getBoundaryLevelSet(Vec3(cpos[0]-hx, cpos[1]+hy, cpos[2]));
-        tX = rccmFaceCen(f00, f01);
-        tY = rccmFaceCen(f00, f10);
-        rccmCentroidOff(grid, cpos, dx, dy, hR, ocx, ocy);
-        rccmCentroidOff(grid, Vec3(cpos[0]-dx, cpos[1], cpos[2]), dx, dy, hR, olx, oly);
-        rccmCentroidOff(grid, Vec3(cpos[0], cpos[1]-dy, cpos[2]), dx, dy, hR, odx, ody);
+        // PREPROCESSED (F_CUTTX/F_CUTTY): the open-face centroids come from the
+        // same geometry as alpha and the apertures -- curved under --cutgeom 2 --
+        // instead of being re-derived here from three level-set evaluations.
+        tX = grid.getField(F_CUTTX)[cIdx];
+        tY = grid.getField(F_CUTTY)[cIdx];
+        if (grid.cutSplit && grid.cutFaceId && grid.cutFaceId[cIdx] >= 0) {
+          // --cutsplit: this path carries the (piece 0, piece 0) segment only
+          const CutFace &Fc = grid.cutFace[grid.cutFaceId[cIdx]];
+          if (Fc.nX) tX = Fc.sx[0].cen;
+          if (Fc.nY) tY = Fc.sy[0].cen;
+        }
+        // PREPROCESSED: stamped once per geometry, not re-derived per stage.
+        ocx = grid.getField(F_CUTCX)[cIdx];  ocy = grid.getField(F_CUTCY)[cIdx];
+        const i32 cEg = bEmpty*blockSizeTot;
+        if (l1Idx < cEg) { olx = grid.getField(F_CUTCX)[l1Idx]; oly = grid.getField(F_CUTCY)[l1Idx]; }
+        if (d1Idx < cEg) { odx = grid.getField(F_CUTCX)[d1Idx]; ody = grid.getField(F_CUTCY)[d1Idx]; }
       }
       real gC[4][2], lC[4], gL[4][2], lL[4], gD[4][2], lD[4];
       rccmGradLimited(grid, Fs, bIdx, i,   j,   k, cpos, dx, dy, hR, ocx, ocy, gC, lC);
@@ -4943,17 +5108,46 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     // scatter already divides each face by the receiving cell (that structure
     // outlived the Brinkman weights it was built for), so the aperture goes in
     // as A_f/alpha_recv and nothing else in the flux path changes.
+    i32 tC = cIdx, tL = l1Idx, tD = d1Idx;        // scatter targets (owners under --cutmerge)
     if (grid.ibRccm) {
-      real *CA = grid.getField(F_CUTA);
+      real *CA = grid.cutMerge ? grid.cutAlphaE : grid.getField(F_CUTA);   // element volume when merged
       real *AXf = grid.getField(F_CUTAX), *AYf = grid.getField(F_CUTAY);
       const real aC = fmax(CA[cIdx], grid.ibRccmAlphaMin);
       const real aL = fmax(CA[l1Idx], grid.ibRccmAlphaMin);
       const real aD = fmax(CA[d1Idx], grid.ibRccmAlphaMin);
-      const real apX = AXf[cIdx], apY = AYf[cIdx];   // this cell's LOW faces
+      real apX = AXf[cIdx], apY = AYf[cIdx];   // this cell's LOW faces
+      if (grid.cutSplit && grid.cutFaceId && grid.cutFaceId[cIdx] >= 0) {
+        // --cutsplit: only the (piece 0, piece 0) segment rides this path; the
+        // other segments and the extra pieces' walls are cutSplitFluxKernel's
+        const CutFace &Fc = grid.cutFace[grid.cutFaceId[cIdx]];
+        if (Fc.nX) apX = Fc.sx[0].len;
+        if (Fc.nY) apY = Fc.sy[0].len;
+      }
       wLc = apX/aC;  wLn = apX/aL;
       wDc = apY/aC;  wDn = apY/aD;
+      if (grid.cutMerge) {
+        // Merged element: every member's face flux lands on the OWNER, divided
+        // by the element volume.  A face between two members of the same
+        // element is internal -- its two contributions would only cancel to
+        // roundoff under atomics, so it is skipped outright.
+        tC = grid.cutOwner[cIdx]; tL = grid.cutOwner[l1Idx]; tD = grid.cutOwner[d1Idx];
+        if (tL == tC) { wLc = 0; wLn = 0; }
+        if (tD == tC) { wDc = 0; wDn = 0; }
+      }
     }
 
+    // --leaf: a face across a level jump belongs to the mortar (coarser across:
+    // the neighbour is missing; finer across: the neighbour is a PARENT), and a
+    // covered PARENT cell inside a mixed block owns nothing
+    bool skipL = false, skipD = false;
+    if (grid.leafFlux) {
+      const i32 cEl = bEmpty*blockSizeTot;
+      const bool covered = grid.cFlagsList[cIdx] == PARENT;
+      skipL = covered || l1Idx >= cEl || grid.cFlagsList[l1Idx] == PARENT;
+      skipD = covered || d1Idx >= cEl || grid.cFlagsList[d1Idx] == PARENT;
+      if (skipL) { wLc = 0; wLn = 0; }
+      if (skipD) { wDc = 0; wDn = 0; }
+    }
     real *Rhs[5] = {RhsRho, RhsRhoU, RhsRhoV, RhsRhoW, RhsRhoE};
     if (grid.detFlux) {
       // deterministic path: store this thread's two faces; gatherFaceFluxKernel
@@ -4961,14 +5155,14 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
       // flag is resolved off under Brinkman), so only the area factor rides in.
       real *FF = grid.ffBuf; const u64 NN = grid.ffN;
       for (i32 n = 0; n < 5; n++) {
-        FF[(u64)n*NN + (u64)cIdx]       = fluxL[n]*ax;
-        FF[(u64)(5+n)*NN + (u64)cIdx]   = fluxD[n]*ay;
+        FF[(u64)n*NN + (u64)cIdx]       = skipL ? (real)0 : fluxL[n]*ax;
+        FF[(u64)(5+n)*NN + (u64)cIdx]   = skipD ? (real)0 : fluxD[n]*ay;
       }
     } else
     for (i32 n = 0; n < 5; n++) {
-      atomicAdd(&Rhs[n][cIdx],    fluxL[n]*ax*wLc + fluxD[n]*ay*wDc);
-      atomicAdd(&Rhs[n][l1Idx], - fluxL[n]*ax*wLn);
-      atomicAdd(&Rhs[n][d1Idx], - fluxD[n]*ay*wDn);
+      atomicAdd(cutRhsPtr(grid, tC, n),   fluxL[n]*ax*wLc + fluxD[n]*ay*wDc);
+      atomicAdd(cutRhsPtr(grid, tL, n), - fluxL[n]*ax*wLn);
+      atomicAdd(cutRhsPtr(grid, tD, n), - fluxD[n]*ay*wDn);
     }
 
     // ---- point-implicit small cells (--cutpi) --------------------------------
@@ -4981,7 +5175,7 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
     // stamping only the wall flux would leave the CFL limit exactly where it was.
     // (Directly evidenced next door: --brinkpi 1 stamps one term and buys
     // nothing, --brinkpi 2 stamps the full sum and retires the restriction.)
-    if (grid.cutPi && grid.ibRccm && grid.immerserdBcType != 0 && grid.rccmLive(cIdx)) {
+    if (grid.cutPiDamp && grid.ibRccm && grid.immerserdBcType != 0 && grid.rccmLive(cIdx)) {
       real *CA = grid.getField(F_CUTA);
       real *AXf = grid.getField(F_CUTAX), *AYf = grid.getField(F_CUTAY);
       const real aC = fmax(CA[cIdx], grid.ibRccmAlphaMin);
@@ -5051,107 +5245,7 @@ __global__ void computeRightHandSideKernel(CompressibleSolver &grid) {
       }
     }
 
-    // ---- RCCM wall face ----------------------------------------------------
-    // The cut cell's remaining face is the wall segment.  Its area-normal is
-    // NOT stored: the discrete divergence theorem fixes it exactly,
-    //     A_w n_w = -sum_f A_f n_f  =  -( (aXhi-aXlo) dy , (aYhi-aYlo) dx ),
-    // which is what makes the update conservative to machine precision (a
-    // stored normal from a separate geometric fit would not close).  For an
-    // inviscid slip wall the flux is pressure only.
-    if (grid.ibRccm && grid.rccmLive(cIdx)) {
-      real *CA = grid.getField(F_CUTA);
-      real *AXf = grid.getField(F_CUTAX), *AYf = grid.getField(F_CUTAY);
-      const real aC = fmax(CA[cIdx], grid.ibRccmAlphaMin);
-      if (CA[cIdx] < (real)1 - (real)1e-12) {
-        const i32 cE = bEmpty*blockSizeTot;
-        const i32 xp = grid.getNbrIdx(bIdx, i+1, j, k);
-        const i32 yp = grid.getNbrIdx(bIdx, i, j+1, k);
-        const real axHi = (xp < cE) ? AXf[xp] : AXf[cIdx];
-        const real ayHi = (yp < cE) ? AYf[yp] : AYf[cIdx];
-        const real nwx = -(axHi - AXf[cIdx]);      // already area/dy
-        const real nwy = -(ayHi - AYf[cIdx]);
-        // Wall pressure.  The cell AVERAGE is only first order at the wall, and
-        // on a curved wall the normal pressure gradient is not small -- it is
-        // the centripetal balance dp/dn = rho u_t^2 kappa that turns the flow.
-        // Extrapolate to the wall face along the cell's own pressure gradient
-        // (central differences over live neighbours), which captures that term
-        // without needing the curvature explicitly and is the ordinary
-        // cut-cell treatment.  --rccmpw 0 restores the cell-average pressure.
-        real pw = P[cIdx];
-        if (grid.ibRccmPw) {
-          const i32 xm = grid.getNbrIdx(bIdx, i-1, j, k);
-          const i32 ym = grid.getNbrIdx(bIdx, i, j-1, k);
-          real gpx = 0, gpy = 0;
-          if (xp < cE && xm < cE && grid.rccmLive(xp) && grid.rccmLive(xm))
-            gpx = (P[xp] - P[xm])/((real)2*dx);
-          if (yp < cE && ym < cE && grid.rccmLive(yp) && grid.rccmLive(ym))
-            gpy = (P[yp] - P[ym])/((real)2*dy);
-          Vec3 nb = grid.wallNormal(cpos, fmin(dx, dy));
-          const real ph = grid.getField(F_PHI)[cIdx];        // < 0 in the fluid
-          const real dpw = gpx*ph*nb[0] + gpy*ph*nb[1];      // x_w - x_c = phi n
-          // never let the extrapolation invert the pressure
-          pw = fmax(P[cIdx] + dpw, (real)0.2*P[cIdx]);
-        }
-        real rD, uD, vD, pD;
-        if (grid.ibDirichlet) {
-          // ---- Dirichlet boundary (--ibdir 1) --------------------------------
-          // The exact state is known on the segment, so the wall is an ordinary
-          // Riemann face against that state -- ghost = Dirichlet datum, which is
-          // what a Dirichlet condition means in a Roe/HLLC FV code and what the
-          // paper's Sect. 4.4 imposes on the arcs.  Evaluate the datum at the
-          // segment MIDPOINT: the two edge crossings of the corner level sets
-          // (a saddle-cut cell, 0 or 4 crossings, falls back to the foot of the
-          // cell centre).
-          const real hx = (real)0.5*dx, hy = (real)0.5*dy;
-          const real fc[4] = {
-            grid.getBoundaryLevelSet(Vec3(cpos[0]-hx, cpos[1]-hy, cpos[2])),
-            grid.getBoundaryLevelSet(Vec3(cpos[0]+hx, cpos[1]-hy, cpos[2])),
-            grid.getBoundaryLevelSet(Vec3(cpos[0]+hx, cpos[1]+hy, cpos[2])),
-            grid.getBoundaryLevelSet(Vec3(cpos[0]-hx, cpos[1]+hy, cpos[2]))};
-          const real ccx[4] = {-hx, hx, hx, -hx}, ccy[4] = {-hy, -hy, hy, hy};
-          real mx = 0, my = 0; i32 nc = 0;
-          for (i32 e = 0; e < 4; e++) {
-            const i32 a = e, b = (e + 1) & 3;
-            if ((fc[a] < (real)0) != (fc[b] < (real)0)) {
-              const real t = fc[a]/(fc[a] - fc[b]);
-              mx += ccx[a] + t*(ccx[b] - ccx[a]);
-              my += ccy[a] + t*(ccy[b] - ccy[a]); nc++;
-            }
-          }
-          Vec3 pw3;
-          if (nc == 2) pw3 = Vec3(cpos[0] + (real)0.5*mx, cpos[1] + (real)0.5*my, cpos[2]);
-          else {
-            Vec3 nb = grid.wallNormal(cpos, fmin(dx, dy));
-            const real ph = grid.getField(F_PHI)[cIdx];
-            pw3 = Vec3(cpos[0] + ph*nb[0], cpos[1] + ph*nb[1], cpos[2]);
-          }
-          if (grid.exactState(pw3[0], pw3[1], rD, uD, vD, pD)) {
-            // unit outward (fluid -> solid) normal and |A_w|/dV of the segment
-            const real anx = nwx*ax, any = nwy*ay;          // A_w n_w / dV_uncut
-            const real am  = sqrt(anx*anx + any*any);
-            if (am > (real)1e-30) {
-              const Vec3 nu(anx/am, any/am, 0);
-              const real rC = Rho[cIdx], uC = U[cIdx], vC = V[cIdx], wC = W[cIdx];
-              const real pC = P[cIdx];
-              Vec5 qLw(rC, rC*uC, rC*vC, rC*wC,
-                       pC/(gam-(real)1) + (real)0.5*rC*(uC*uC + vC*vC + wC*wC));
-              Vec5 qRw(rD, rD*uD, rD*vD, (real)0,
-                       pD/(gam-(real)1) + (real)0.5*rD*(uD*uD + vD*vD));
-              Vec5 Fw = grid.hllcFlux(qLw, qRw, nu);
-              atomicAdd(&RhsRho [cIdx], -Fw[0]*am/aC);
-              atomicAdd(&RhsRhoU[cIdx], -Fw[1]*am/aC);
-              atomicAdd(&RhsRhoV[cIdx], -Fw[2]*am/aC);
-              atomicAdd(&RhsRhoE[cIdx], -Fw[4]*am/aC);
-              pw = (real)-1;                                 // handled
-            }
-          }
-        }
-        if (pw >= (real)0) {
-          atomicAdd(&RhsRhoU[cIdx], -pw*nwx*ax/aC);
-          atomicAdd(&RhsRhoV[cIdx], -pw*nwy*ay/aC);
-        }
-      }
-    }
+    // (the cut cell's WALL flux lives in cutCellKernel now: no cut branch here)
 
     // k~ / tau~ transport: same mass flux as the mean flow, van Leer limited
     // states, plus the two diffusion forms.  fluxL[0] / fluxD[0] ARE the HLLC
@@ -5669,7 +5763,7 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
   }
   const real dtG = grid.deltaT;
 
-  START_CELL_LOOP
+  START_LIVE_CELL_LOOP
 
     // Local time stepping: this cell's own step, rescaled by the same factor the
     // host applied when clamping the global step onto an output time.
@@ -5690,8 +5784,10 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
     // from the FVM update -- advancing them is exactly the small-cell blow-up
     // the method exists to avoid.
     if (grid.ibRccm && grid.immerserdBcType != 0)
-      ibSolid = grid.cutPi ? !grid.rccmLive(cIdx)                  // advance every live cell
-                           : (!grid.rccmLive(cIdx) || grid.rccmRCell(cIdx));
+      ibSolid = !grid.rccmLive(cIdx);      // advance every live cell
+    // merged element: only the OWNER holds the DOF; members are refreshed from
+    // it by cutBroadcastKernel right after this kernel
+    if (grid.cutMerge && grid.cutOwner[cIdx] != cIdx) ibSolid = true;
 
     // Covered parents are NOT evolved -- restrictFields overwrites them from
     // their children after every stage, so their only legitimate source is
@@ -5717,7 +5813,7 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
       // CLEARED here (not in the sweep below) because a stale stamp must never
       // survive a stage: the rate is a per-stage quantity.
       real lamM = 0;
-      if (grid.ibBrink || grid.cutPi) {
+      if (grid.cutPiDamp) {
         lamM = grid.getField(F_LAMM)[cIdx];
         grid.getField(F_LAMM)[cIdx] = 0;
       }
@@ -5760,6 +5856,11 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
         }
       }
 
+      // --p1: the slope DOFs take the same LSRK stage (rkScheme 0 only)
+      if (grid.p1)
+        for (i32 s = 0; s < 2*P1_NV; s++)
+          grid.getField(F_P1S + s)[cIdx] += Bw[stage]*dt*grid.getField(F_P1SR + s)[cIdx];
+
       // pseudo2D: z-momentum is never evolved
       if (grid.pseudo2D) {
         grid.getField(F_RHOW)[cIdx] = 0;
@@ -5771,6 +5872,9 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
     // between-step roles -- wavelet snapshot / sort buffer / Hancock predictor)
     for (i32 f = 0; f < NEVOLVE; f++)
       grid.getField(F_RHS + f)[cIdx] *= Anext[stage];
+    if (grid.p1)
+      for (i32 s = 0; s < 2*P1_NV; s++)
+        grid.getField(F_P1SR + s)[cIdx] *= Anext[stage];
     // consume the wall-flux relaxation rates: they are per-stage quantities,
     // and this also clears stamps on cells that skipped the update (parents)
     if (grid.rans && grid.wallPointImplicit) {
@@ -5778,7 +5882,7 @@ __global__ void updateFieldsKernel(CompressibleSolver &grid, i32 stage) {
       if (LK[cIdx] != 0) LK[cIdx] = 0;
       if (LT[cIdx] != 0) LT[cIdx] = 0;
     }
-    if (grid.ibBrink || grid.cutPi) {
+    if (grid.cutPiDamp) {
       real *LM = grid.getField(F_LAMM);
       if (LM[cIdx] != 0) LM[cIdx] = 0;      // parents / skipped cells
     }
@@ -6366,8 +6470,11 @@ __global__ void waveletThresholdingKernel(CompressibleSolver &grid) {
         i32 sc = (f == F_RHO) ? 0 : (f <= F_RHOW ? 1 : 2);
         real mag = fmax(grid.globalScale[sc], (real)1e-32);
 
-        if (abs(Q[cIdx]/mag) > grid.waveletThresh || abs(ls) < dx) {
-          if (lvl < grid.nLvls-1 && (abs(Q[cIdx]/mag) > grid.waveletThresh*2 || abs(ls) < dx)) {
+        // --leaf: a former rim cell is a leaf but its detail must not drive the
+        // grid (the overlap scheme zeroed it); its parent is kept by its block
+        const real det = (grid.leafFlux && grid.rimList && grid.rimList[cIdx]) ? (real)0 : abs(Q[cIdx]/mag);
+        if (det > grid.waveletThresh || abs(ls) < dx) {
+          if (lvl < grid.nLvls-1 && (det > grid.waveletThresh*2 || abs(ls) < dx)) {
             i32 bSize = blockSize/2;
             i32 cx = 2*ib+i/bSize, cy = 2*jb+j/bSize;
             i32 cz = grid.pseudo2D ? kb : (2*kb + k/bSize);
@@ -6494,6 +6601,18 @@ __global__ void interpolateFieldsKernel(CompressibleSolver &grid, i32 lvlOnly) {
       // cells cannot overshoot, so no spurious pressure is injected).
       for (i32 f = 0; f < NEVOLVE; f++)
         grid.getField(f)[cIdx] = trilinearGhost(grid, grid.getField(f), prntIdx, ip, jp, kp, xs, ys, zs);
+      // --p1: the ghost polynomial is the parent's restricted to this child
+      // (mean q + s_x xi0 + s_y eta0 with xi0 = xs/4, slopes halved) -- exact
+      // for a linear field and conservative over the four children
+      if (grid.p1) {
+        const i32 p = grid.getNbrIdx(prntIdx, ip, jp, kp);
+        for (i32 v = 0; v < P1_NV; v++) {
+          real *SX = grid.getField(F_P1S + v), *SY = grid.getField(F_P1S + P1_NV + v);
+          grid.getField(p1Var(v))[cIdx] = grid.getField(p1Var(v))[p] + (real)0.25*(xs*SX[p] + ys*SY[p]);
+          SX[cIdx] = (real)0.5*SX[p];
+          SY[cIdx] = (real)0.5*SY[p];
+        }
+      }
     }
 
   END_CELL_LOOP
@@ -6531,6 +6650,17 @@ __global__ void restrictFieldsKernel(CompressibleSolver &grid, i32 lvlOnly) {
           real *q = grid.getField(f);
           q[pIdx] = (q[c00] + q[c10] + q[c01] + q[c11]) / 4.0;
         }
+        // --p1: the parent slope is the L2 projection of the children's
+        // polynomials: s = 3/4 (sum of the two means on the + side - the two on
+        // the - side) + 1/8 (sum of the four children's slopes); exact for a
+        // linear field (means a + b xi0 with xi0 = +-1/4, children slopes b/2).
+        if (grid.p1)
+          for (i32 v = 0; v < P1_NV; v++) {
+            real *q  = grid.getField(p1Var(v));
+            real *SX = grid.getField(F_P1S + v), *SY = grid.getField(F_P1S + P1_NV + v);
+            SX[pIdx] = (real)0.75*((q[c10] + q[c11]) - (q[c00] + q[c01])) + (real)0.125*(SX[c00] + SX[c10] + SX[c01] + SX[c11]);
+            SY[pIdx] = (real)0.75*((q[c01] + q[c11]) - (q[c00] + q[c10])) + (real)0.125*(SY[c00] + SY[c10] + SY[c01] + SY[c11]);
+          }
       }
       else {
         // average the 8 children
@@ -6647,6 +6777,7 @@ __global__ void residualNormKernel(CompressibleSolver &grid, real *q0, real dtGl
     // blocks, coarse/fine GHOST cells, and cells inside the body.
     const bool live = grid.isInteriorBlock(lvl, ib, jb, kb)
                    && grid.cFlagsList[cIdx] != GHOST
+                   && (!grid.leafFlux || grid.cFlagsList[cIdx] == ACTIVE)
                    && (!grid.immerserdBcType || Ibm[cIdx] != (real)0);
     if (live) {
       // dq/dt is the residual of the WHOLE update, however it is composed --
@@ -6686,6 +6817,570 @@ __global__ void residualNormKernel(CompressibleSolver &grid, real *q0, real dtGl
   END_CELL_LOOP
 }
 
+
+// ---------------------------------------------------------------------------
+//  STATE REDISTRIBUTION, N = 0 (finite volume).
+//  Berger & Giuliani JCP 428 (2021) 109820.  The degree-N machinery lives in
+//  src/common/StateRedistribution.h, but for CELL AVERAGES the weighted L2
+//  projection over a merge neighbourhood IS a volume-weighted mean, so neither
+//  the cut quadrature nor the mass matrix is needed:
+//      Pi_k u  = sum_{j in M_k} w_j u_j / sum_{j in M_k} w_j,  w_j = alpha_j/|C_j|
+//      (S u)_i = (1/|C_i|) sum_{k : i in M_k} Pi_k u
+//  which gives sum_i alpha_i V_i (Su)_i = sum_i alpha_i V_i u_i exactly, i.e. S
+//  is CONSERVATIVE -- the point of using it instead of the per-cell diagonal.
+//  Growth is confined to the 5x5 patch about the seed, so a member is always
+//  within radius 2 of its seed and the |C_i| / averaging gathers can scan the
+//  same patch rather than scattering with atomics: deterministic by construction.
+//  V is taken uniform, so this is restricted to nLvls == 1 (checked on the host).
+// ---------------------------------------------------------------------------
+__device__ unsigned long long g_srdShort = 0;   // neighbourhoods that never reached volFrac
+
+__device__ __forceinline__ bool srdLive(CompressibleSolver &grid, i32 m, i32 cE) {
+  // ACTIVE only.  On a multi-level grid a lookup from a fine block into a coarser
+  // region comes back as that block's own GHOST cell (interpolated from the coarse
+  // parent, not an independent DOF), and PARENT cells are covered by finer ones.
+  // Excluding both confines every merge neighbourhood to a SINGLE LEVEL, which is
+  // exactly the condition that makes the alpha-only weights right: the cell volume
+  // is then a common factor of Pi_k's numerator and denominator and cancels, while
+  // the conservation identity (which needs alpha_j V_j / |C_j|) still telescopes
+  // because each neighbourhood is internally uniform in V.
+  return m < cE && grid.cFlagsList[m] == ACTIVE
+      && grid.getField(F_CUTA)[m] > grid.ibRccmAlphaMin;
+}
+
+__device__ __forceinline__ bool srdInM(CompressibleSolver &grid, i32 kk, i32 target) {
+  const i32 nk = grid.srdMn[kk];
+  for (i32 q = 0; q < nk; q++)
+    if (grid.srdM[(size_t)q*grid.srdStride + kk] == target) return true;
+  return false;
+}
+
+__global__ void srdBuildKernel(CompressibleSolver &grid) {
+  real *CA = grid.getField(F_CUTA);
+  const i32 cE = bEmpty*blockSizeTot;
+  const i32 R  = grid.srdReach, W = 2*R + 1, NP = W*W, C0 = R*W + R;   // patch geometry
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    grid.srdMn[cIdx] = 0;
+    grid.srdC [cIdx] = 1;
+    if (srdLive(grid, cIdx, cE)) {
+      grid.srdM[cIdx] = cIdx;                    // slot 0 is always the seed
+      const real a0 = CA[cIdx];
+      if (a0 >= grid.srdVolFrac) {
+        grid.srdMn[cIdx] = 1;                    // healthy: M_k = {k}
+      } else {
+        i32  pid[25]; real pa[25]; bool inM[25];   // sized for reach <= 2
+        for (i32 dj = -R; dj <= R; dj++)
+          for (i32 di = -R; di <= R; di++) {
+            const i32 t = (dj+R)*W + (di+R);
+            const i32 m = grid.getNbrIdx(bIdx, i+di, j+dj, k);
+            pid[t] = m; inM[t] = false;
+            pa[t]  = srdLive(grid, m, cE) ? CA[m] : (real)-1;
+          }
+        inM[C0] = true;                          // the seed itself
+        real vol = a0; i32 n = 1;
+        while (vol < grid.srdVolFrac && n < CompressibleSolver::SRD_MAXM) {
+          i32 bt = -1; real ba = 0;              // greedy by volume, face-adjacent only
+          for (i32 t = 0; t < NP; t++) {
+            if (!inM[t]) continue;
+            const i32 tdi = t%W, tdj = t/W;
+            const i32 adj[4] = { (tdi>0)? t-1 : -1, (tdi<W-1)? t+1 : -1,
+                                 (tdj>0)? t-W : -1, (tdj<W-1)? t+W : -1 };
+            for (i32 q = 0; q < 4; q++) {
+              const i32 u = adj[q];
+              if (u >= 0 && !inM[u] && pa[u] > ba) { ba = pa[u]; bt = u; }
+            }
+          }
+          if (bt < 0) break;                     // nothing left to absorb
+          inM[bt] = true; vol += ba;
+          grid.srdM[(size_t)n*grid.srdStride + cIdx] = pid[bt];
+          n++;
+        }
+        grid.srdMn[cIdx] = n;
+        if (vol < grid.srdVolFrac) atomicAdd(&g_srdShort, 1ull);
+      }
+    }
+  END_CELL_LOOP
+}
+
+__global__ void srdCountKernel(CompressibleSolver &grid) {
+  const i32 cE = bEmpty*blockSizeTot;
+  const i32 R  = grid.srdReach;
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    if (srdLive(grid, cIdx, cE)) {
+      i32 c = 0;
+      for (i32 dj = -R; dj <= R; dj++)
+        for (i32 di = -R; di <= R; di++) {
+          const i32 kk = grid.getNbrIdx(bIdx, i+di, j+dj, k);
+          if (srdLive(grid, kk, cE) && srdInM(grid, kk, cIdx)) c++;
+        }
+      grid.srdC[cIdx] = (c > 0) ? c : 1;
+    }
+  END_CELL_LOOP
+}
+
+__global__ void srdProjectKernel(CompressibleSolver &grid) {
+  real *CA = grid.getField(F_CUTA);
+  const i32 cE = bEmpty*blockSizeTot;
+  START_CELL_LOOP
+    if (srdLive(grid, cIdx, cE)) {
+      const i32 n = grid.srdMn[cIdx];
+      double num[5] = {0,0,0,0,0}, den = 0;
+      for (i32 q = 0; q < n; q++) {
+        const i32 m = grid.srdM[(size_t)q*grid.srdStride + cIdx];
+        const double w = (double)CA[m] / (double)max(1, grid.srdC[m]);
+        den += w;
+        for (i32 f = 0; f < 5; f++) {
+          double v = (double)grid.getField(f)[m];
+          if (grid.srdIncr) v -= (double)grid.srdU0[(size_t)f*grid.srdStride + m];   // project dU
+          num[f] += w*v;
+        }
+      }
+      for (i32 f = 0; f < 5; f++)
+        grid.srdPi[(size_t)f*grid.srdStride + cIdx] =
+          (den > 0) ? (real)(num[f]/den) : grid.getField(f)[cIdx];
+      if (grid.srdIncr && grid.srdPos) {
+        // projection of U^n over the same neighbourhood, same weights
+        double num0[5] = {0,0,0,0,0};
+        for (i32 q = 0; q < n; q++) {
+          const i32 m = grid.srdM[(size_t)q*grid.srdStride + cIdx];
+          const double w = (double)CA[m] / (double)max(1, grid.srdC[m]);
+          for (i32 f = 0; f < 5; f++) num0[f] += w*(double)grid.srdU0[(size_t)f*grid.srdStride + m];
+        }
+        for (i32 f = 0; f < 5; f++)
+          grid.srdPi0[(size_t)f*grid.srdStride + cIdx] =
+            (den > 0) ? (real)(num0[f]/den) : grid.srdU0[(size_t)f*grid.srdStride + cIdx];
+        // theta_k: would the SEED be inadmissible under U^n + Pi_k(dU)?  The seed
+        // sits in exactly one non-trivial neighbourhood (its own), so for it
+        // (S dU) = Pi_k(dU) exactly and this test is the true increment result.
+        real th = 0;
+        if (n > 1 && den > 0) {
+          const double r  = (double)grid.srdU0[cIdx] + num[0]/den;
+          const double mx = (double)grid.srdU0[(size_t)1*grid.srdStride + cIdx] + num[1]/den;
+          const double my = (double)grid.srdU0[(size_t)2*grid.srdStride + cIdx] + num[2]/den;
+          const double mz = (double)grid.srdU0[(size_t)3*grid.srdStride + cIdx] + num[3]/den;
+          const double E  = (double)grid.srdU0[(size_t)4*grid.srdStride + cIdx] + num[4]/den;
+          const double pr = (gam - 1.0)*(E - 0.5*(mx*mx + my*my + mz*mz)/fmax(r, 1e-300));
+          if (!(r > (double)grid.srdRhoMin) || !(pr > (double)grid.srdPMin)) th = 1;
+        }
+        grid.srdTh[cIdx] = th;
+      }
+    }
+  END_CELL_LOOP
+}
+
+// The state of a DOF handle, reconstructed from its element centroid with its
+// limited gradient, evaluated at (xq, yq).
+__device__ inline void cutOwnerState(CompressibleSolver &grid, real *Fs[4], i32 own,
+                                     real xq, real yq, Vec5 &q) {
+  real g[4][2], lim[4], x0, y0, dxo, dyo;
+  cutHandlePos(grid, own, x0, y0, dxo, dyo);
+  if (cutIsPiece(own)) cutPieceGrad(grid, Fs, cutPieceOf(own), g, lim);
+  else {
+    const i32 ob = own/blockSizeTot, occ = own%blockSizeTot;
+    const i32 oi = occ%blockSize, oj = (occ/blockSize)%blockSize;
+    i32 ol, oib, ojb, okb; grid.decode(grid.bLocList[ob], ol, oib, ojb, okb);
+    Vec3 op = grid.getCellPos(ol, oib, ojb, okb, oi, oj, 0);
+    rccmGradLimited(grid, Fs, ob, oi, oj, 0, op, dxo, dyo, fmin(dxo, dyo),
+                    grid.getField(F_CUTCX)[own], grid.getField(F_CUTCY)[own], g, lim);
+  }
+  const real ddx = xq - x0, ddy = yq - y0;
+  const i32 slot[4] = {0, 1, 2, 4};
+  for (i32 f = 0; f < 4; f++) q[slot[f]] = cutTap(grid, Fs, own, f) + lim[f]*(g[f][0]*ddx + g[f][1]*ddy);
+  q[3] = cutIsPiece(own) ? grid.cutPieceQ[3*(size_t)grid.cutPieceQCap + cutPieceOf(own)]/fmax(q[0], (real)1e-30)
+                         : grid.getField(F_RHOW)[own];
+  q[0] = fmax(q[0], (real)1e-12); q[4] = fmax(q[4], (real)1e-12);
+}
+
+// ---- the CUT-CELL kernel -----------------------------------------------------
+// Everything a cut cell needs beyond the axis-aligned face fluxes of the main
+// kernel, so that kernel stays branch-free: the wall flux of every cut cell
+// (piece 0 of a split cell), and under --cutsplit the face segments beyond the
+// (piece 0, piece 0) pair, the extra pieces' walls and the slit-tip internal
+// faces.  All scatters go through DOF handles into the same accumulator.
+__global__ void cutCellKernel(CompressibleSolver &grid) {
+  real *Rho = grid.getField(F_RHO), *U = grid.getField(F_RHOU);
+  real *V   = grid.getField(F_RHOV), *W = grid.getField(F_RHOW), *P = grid.getField(F_RHOE);
+  real *Fs[4] = {Rho, U, V, P};
+  START_LIVE_CELL_LOOP
+    GET_CELL_INDICES
+    if (grid.cFlagsList[cIdx] == ACTIVE) {
+      u64 loc = grid.bLocList[bIdx]; i32 lvl, ib, jb, kb; grid.decode(loc, lvl, ib, jb, kb);
+      const real dx = grid.getDx(lvl), dy = grid.getDy(lvl);
+      const real ax = (real)1/dx, ay = (real)1/dy, hR = fmin(dx, dy);
+      Vec3 cpos = grid.getCellPos(lvl, ib, jb, kb, i, j, k);
+    // ---- RCCM wall face ----------------------------------------------------
+      // The cut cell's remaining face is the wall segment.  Its area-normal is
+      // NOT stored: the discrete divergence theorem fixes it exactly,
+      //     A_w n_w = -sum_f A_f n_f  =  -( (aXhi-aXlo) dy , (aYhi-aYlo) dx ),
+      // which is what makes the update conservative to machine precision (a
+      // stored normal from a separate geometric fit would not close).  For an
+      // inviscid slip wall the flux is pressure only.
+      if (grid.ibRccm && grid.rccmLive(cIdx)) {
+        real *CA = grid.getField(F_CUTA);
+        real *AXf = grid.getField(F_CUTAX), *AYf = grid.getField(F_CUTAY);
+        const real aC = fmax(grid.cutMerge ? grid.cutAlphaE[cIdx] : CA[cIdx], grid.ibRccmAlphaMin);
+        const i32  wT = grid.cutMerge ? grid.cutOwner[cIdx] : cIdx;   // wall flux lands on the owner
+        const i32 spId = (grid.cutSplit && grid.cutSplitId) ? grid.cutSplitId[cIdx] : -1;
+        // A ZERO-THICKNESS body leaves alpha = 1 exactly: the cell is all fluid and
+        // still has a wall through it.  A split cell always takes the wall path.
+        if (CA[cIdx] < (real)1 - (real)1e-12 || spId >= 0) {
+          const i32 cE = bEmpty*blockSizeTot;
+          const i32 xp = grid.getNbrIdx(bIdx, i+1, j, k);
+          const i32 yp = grid.getNbrIdx(bIdx, i, j+1, k);
+          const real axHi = (xp < cE) ? AXf[xp] : AXf[cIdx];
+          const real ayHi = (yp < cE) ? AYf[yp] : AYf[cIdx];
+          real nwx = -(axHi - AXf[cIdx]);      // already area/dy
+          real nwy = -(ayHi - AYf[cIdx]);
+          if (spId >= 0) {                     // split cell: piece 0's own wall, not the union's
+            nwx = grid.cutSplitCell[spId].wnx0; nwy = grid.cutSplitCell[spId].wny0;
+          }
+          // Wall pressure.  The cell AVERAGE is only first order at the wall, and
+          // on a curved wall the normal pressure gradient is not small -- it is
+          // the centripetal balance dp/dn = rho u_t^2 kappa that turns the flow.
+          // Extrapolate to the wall face along the cell's own pressure gradient
+          // (central differences over live neighbours), which captures that term
+          // without needing the curvature explicitly and is the ordinary
+          // cut-cell treatment.  --rccmpw 0 restores the cell-average pressure.
+          real pw = P[cIdx];
+          if (grid.ibRccmPw) {
+            const i32 xm = grid.getNbrIdx(bIdx, i-1, j, k);
+            const i32 ym = grid.getNbrIdx(bIdx, i, j-1, k);
+            real gpx = 0, gpy = 0;
+            // The central difference needs BOTH neighbours live.  At a wall cell the
+            // neighbour on the WALL SIDE is dead by definition, and that side is the
+            // NORMAL direction -- so the component this zeroes is exactly the one
+            // dpw = gp.(phi n) is dominated by, i.e. the centripetal term
+            // dp/dn = rho u_t^2 kappa that this extrapolation exists to capture.
+            // p_w then collapses to p_c (first order) at precisely the cells that
+            // set the lift.  --cutpw 2 falls back to a ONE-SIDED difference there.
+            const bool xpL = (xp < cE) && grid.rccmLive(xp);
+            const bool xmL = (xm < cE) && grid.rccmLive(xm);
+            const bool ypL = (yp < cE) && grid.rccmLive(yp);
+            const bool ymL = (ym < cE) && grid.rccmLive(ym);
+            if (xpL && xmL)                  gpx = (P[xp] - P[xm])/((real)2*dx);
+            else if (grid.ibRccmPw >= 2 && xpL) gpx = (P[xp] - P[cIdx])/dx;
+            else if (grid.ibRccmPw >= 2 && xmL) gpx = (P[cIdx] - P[xm])/dx;
+            if (ypL && ymL)                  gpy = (P[yp] - P[ym])/((real)2*dy);
+            else if (grid.ibRccmPw >= 2 && ypL) gpy = (P[yp] - P[cIdx])/dy;
+            else if (grid.ibRccmPw >= 2 && ymL) gpy = (P[cIdx] - P[ym])/dy;
+            Vec3 nb(grid.getField(F_CUTNX)[cIdx], grid.getField(F_CUTNY)[cIdx], (real)0);  // PREPROCESSED
+            const real ph = grid.getField(F_PHI)[cIdx];        // < 0 in the fluid
+            const real dpw = gpx*ph*nb[0] + gpy*ph*nb[1];      // x_w - x_c = phi n
+            // never let the extrapolation invert the pressure
+            pw = fmax(P[cIdx] + dpw, (real)0.2*P[cIdx]);
+          }
+          if (spId >= 0) {
+            // split cell: the wall pressure from the ELEMENT's limited gradient at
+            // piece 0's wall centroid.  F_PHI / F_CUTNX point at the NEAREST wall,
+            // which for a thin body may be the other side.
+            real *Fs4[4] = {Rho, U, V, P}; real gW[4][2], lW[4];
+            const real hR2 = fmin(dx, dy);
+            const real ocx2 = grid.getField(F_CUTCX)[cIdx], ocy2 = grid.getField(F_CUTCY)[cIdx];
+            rccmGradLimited(grid, Fs4, bIdx, i, j, k, cpos, dx, dy, hR2, ocx2, ocy2, gW, lW);
+            const CutSplitCell &Sc = grid.cutSplitCell[spId];
+            const real ddx = (Sc.wcx0 - ocx2)*hR2, ddy = (Sc.wcy0 - ocy2)*hR2;
+            pw = fmax(P[cIdx] + lW[3]*(gW[3][0]*ddx + gW[3][1]*ddy), (real)0.2*P[cIdx]);
+          }
+          real rD, uD, vD, pD;
+          if (grid.ibDirichlet) {
+            // ---- Dirichlet boundary (--ibdir 1) --------------------------------
+            // The exact state is known on the segment, so the wall is an ordinary
+            // Riemann face against that state -- ghost = Dirichlet datum, which is
+            // what a Dirichlet condition means in a Roe/HLLC FV code and what the
+            // paper's Sect. 4.4 imposes on the arcs.  Evaluate the datum at the
+            // segment MIDPOINT: the two edge crossings of the corner level sets
+            // (a saddle-cut cell, 0 or 4 crossings, falls back to the foot of the
+            // cell centre).
+            const real hx = (real)0.5*dx, hy = (real)0.5*dy;
+            const real fc[4] = {
+              grid.getBoundaryLevelSet(Vec3(cpos[0]-hx, cpos[1]-hy, cpos[2])),
+              grid.getBoundaryLevelSet(Vec3(cpos[0]+hx, cpos[1]-hy, cpos[2])),
+              grid.getBoundaryLevelSet(Vec3(cpos[0]+hx, cpos[1]+hy, cpos[2])),
+              grid.getBoundaryLevelSet(Vec3(cpos[0]-hx, cpos[1]+hy, cpos[2]))};
+            const real ccx[4] = {-hx, hx, hx, -hx}, ccy[4] = {-hy, -hy, hy, hy};
+            real mx = 0, my = 0; i32 nc = 0;
+            for (i32 e = 0; e < 4; e++) {
+              const i32 a = e, b = (e + 1) & 3;
+              if ((fc[a] < (real)0) != (fc[b] < (real)0)) {
+                const real t = fc[a]/(fc[a] - fc[b]);
+                mx += ccx[a] + t*(ccx[b] - ccx[a]);
+                my += ccy[a] + t*(ccy[b] - ccy[a]); nc++;
+              }
+            }
+            Vec3 pw3;
+            if (nc == 2) pw3 = Vec3(cpos[0] + (real)0.5*mx, cpos[1] + (real)0.5*my, cpos[2]);
+            else {
+              Vec3 nb(grid.getField(F_CUTNX)[cIdx], grid.getField(F_CUTNY)[cIdx], (real)0);  // PREPROCESSED
+              const real ph = grid.getField(F_PHI)[cIdx];
+              pw3 = Vec3(cpos[0] + ph*nb[0], cpos[1] + ph*nb[1], cpos[2]);
+            }
+            if (grid.exactState(pw3[0], pw3[1], rD, uD, vD, pD)) {
+              // unit outward (fluid -> solid) normal and |A_w|/dV of the segment
+              const real anx = nwx*ax, any = nwy*ay;          // A_w n_w / dV_uncut
+              const real am  = sqrt(anx*anx + any*any);
+              if (am > (real)1e-30) {
+                const Vec3 nu(anx/am, any/am, 0);
+                const real rC = Rho[cIdx], uC = U[cIdx], vC = V[cIdx], wC = W[cIdx];
+                const real pC = P[cIdx];
+                Vec5 qLw(rC, rC*uC, rC*vC, rC*wC,
+                         pC/(gam-(real)1) + (real)0.5*rC*(uC*uC + vC*vC + wC*wC));
+                Vec5 qRw(rD, rD*uD, rD*vD, (real)0,
+                         pD/(gam-(real)1) + (real)0.5*rD*(uD*uD + vD*vD));
+                Vec5 Fw = grid.hllcFlux(qLw, qRw, nu);
+                atomicAdd(cutRhsPtr(grid, wT, 0), -Fw[0]*am/aC);
+                atomicAdd(cutRhsPtr(grid, wT, 1), -Fw[1]*am/aC);
+                atomicAdd(cutRhsPtr(grid, wT, 2), -Fw[2]*am/aC);
+                atomicAdd(cutRhsPtr(grid, wT, 4), -Fw[4]*am/aC);
+                pw = (real)-1;                                 // handled
+              }
+            }
+          }
+          if (pw >= (real)0) {
+            atomicAdd(cutRhsPtr(grid, wT, 1), -pw*nwx*ax/aC);
+            atomicAdd(cutRhsPtr(grid, wT, 2), -pw*nwy*ay/aC);
+          }
+        }
+      }
+
+
+      const i32 fid = grid.cutFaceId ? grid.cutFaceId[cIdx] : -1;
+      const i32 sid = grid.cutSplitId ? grid.cutSplitId[cIdx] : -1;
+      if (fid >= 0) {
+        const CutFace &F = grid.cutFace[fid];
+        for (i32 dir = 0; dir < 2; dir++) {
+          const i32 nS = (dir == 0) ? F.nX : F.nY;
+          const CutFaceSeg *sg = (dir == 0) ? F.sx : F.sy;
+          for (i32 s2 = 1; s2 < nS; s2++) {
+            const CutFaceSeg &S = sg[s2];
+            if (S.len <= 0 || S.ownC == CUT_DEAD || S.ownN == CUT_DEAD || S.ownC == S.ownN) continue;
+            const real xq = (dir == 0) ? cpos[0] - (real)0.5*dx : cpos[0] + S.cen*dx;
+            const real yq = (dir == 0) ? cpos[1] + S.cen*dy : cpos[1] - (real)0.5*dy;
+            Vec5 qC, qN;
+            cutOwnerState(grid, Fs, S.ownC, xq, yq, qC);
+            cutOwnerState(grid, Fs, S.ownN, xq, yq, qN);
+            const Vec3 nrm = (dir == 0) ? Vec3(1,0,0) : Vec3(0,1,0);
+            Vec5 Fl = grid.hllcFlux(grid.prim2cons(qN), grid.prim2cons(qC), nrm);
+            const real fac = S.len*((dir == 0) ? ax : ay);
+            const real wC = fac/fmax(cutAlphaOf(grid, S.ownC), grid.ibRccmAlphaMin);
+            const real wN = fac/fmax(cutAlphaOf(grid, S.ownN), grid.ibRccmAlphaMin);
+            for (i32 n = 0; n < 5; n++) {
+              atomicAdd(cutRhsPtr(grid, S.ownC, n),  Fl[n]*wC);
+              atomicAdd(cutRhsPtr(grid, S.ownN, n), -Fl[n]*wN);
+            }
+          }
+        }
+      }
+      if (sid >= 0) {
+        const CutSplitCell &Sc = grid.cutSplitCell[sid];
+        auto ownerOfPiece = [&](i32 p) -> i32 {
+          return p == 0 ? grid.cutOwner[cIdx] : grid.cutPiece[Sc.first + p - 1].owner; };
+        if (Sc.iLen > (real)0 && Sc.iPa >= 0) {
+          // INTERNAL face: the slit-tip extension between pieces iPa and iPb
+          const i32 oA = ownerOfPiece(Sc.iPa), oB = ownerOfPiece(Sc.iPb);
+          if (oA != CUT_DEAD && oB != CUT_DEAD && oA != oB) {
+            const real xq = cpos[0] + Sc.icx*hR, yq = cpos[1] + Sc.icy*hR;
+            Vec5 qA, qB;
+            cutOwnerState(grid, Fs, oA, xq, yq, qA);
+            cutOwnerState(grid, Fs, oB, xq, yq, qB);
+            const Vec3 nrm(Sc.inx, Sc.iny, (real)0);              // from A into B
+            Vec5 Fl = grid.hllcFlux(grid.prim2cons(qA), grid.prim2cons(qB), nrm);
+            const real fac = Sc.iLen/(dx*dy);                       // area / cell volume (dz cancels)
+            const real wA = fac/fmax(cutAlphaOf(grid, oA), grid.ibRccmAlphaMin);
+            const real wB = fac/fmax(cutAlphaOf(grid, oB), grid.ibRccmAlphaMin);
+            for (i32 n = 0; n < 5; n++) {
+              atomicAdd(cutRhsPtr(grid, oB, n),  Fl[n]*wB);
+              atomicAdd(cutRhsPtr(grid, oA, n), -Fl[n]*wA);
+            }
+          }
+        }
+        for (i32 p = 0; p < Sc.n; p++) {
+          const CutPiece &Pc = grid.cutPiece[Sc.first + p];
+          if (Pc.owner == CUT_DEAD) continue;
+          const real xw = cpos[0] + Pc.wcx*hR, yw = cpos[1] + Pc.wcy*hR;
+          Vec5 qw; cutOwnerState(grid, Fs, Pc.owner, xw, yw, qw);
+          const real pw = fmax(qw[4], (real)0.2*cutTap(grid, Fs, Pc.owner, 3));
+          const real aE = fmax(cutAlphaOf(grid, Pc.owner), grid.ibRccmAlphaMin);
+          atomicAdd(cutRhsPtr(grid, Pc.owner, 1), -pw*Pc.wnx*ax/aE);
+          atomicAdd(cutRhsPtr(grid, Pc.owner, 2), -pw*Pc.wny*ay/aE);
+        }
+      }
+    }
+  END_CELL_LOOP
+}
+
+// piece-resident DOFs: the same low-storage RK stage as updateFieldsKernel
+// (LSRK3 only; the accumulator pre-scale keeps the bank clean between steps)
+__global__ void cutPieceUpdateKernel(CompressibleSolver &grid, i32 stage) {
+  const real Bw[3]    = {(real)(1.0/3.0), (real)(15.0/16.0), (real)(8.0/15.0)};
+  const real Anext[3] = {(real)(-5.0/9.0), (real)(-153.0/128.0), 0};
+  const i32 k = blockIdx.x*blockDim.x + threadIdx.x;
+  if (k >= grid.nCutPiece) return;
+  const CutPiece &P = grid.cutPiece[k]; const size_t cap = grid.cutPieceQCap;
+  if (P.owner == cutHandle(k)) {                       // its own DOF
+    const real dt = grid.lts ? grid.getField(F_DTL)[P.cell]*grid.dtScale : grid.deltaT;
+    for (i32 n = 0; n < 5; n++) grid.cutPieceQ[n*cap + k] += Bw[stage]*dt*grid.cutPieceS[n*cap + k];
+    if (grid.pseudo2D) grid.cutPieceQ[3*cap + k] = 0;
+    if (grid.p1 && grid.cutPieceSX)
+      for (i32 s = 0; s < 2*P1_NV; s++) grid.cutPieceSX[s*cap + k] += Bw[stage]*dt*grid.cutPieceSR[s*cap + k];
+  }
+  for (i32 n = 0; n < NEVOLVE; n++) grid.cutPieceS[n*cap + k] *= Anext[stage];
+  if (grid.p1 && grid.cutPieceSR)
+    for (i32 s = 0; s < 2*P1_NV; s++) grid.cutPieceSR[s*cap + k] *= Anext[stage];
+}
+
+// --leaf: the level-jump faces.  One thread per mortar: the coarse cell and
+// each fine cell are reconstructed (owner state + limited gradient) at the two
+// sub-face centroids, one HLLC per sub-face, and each side receives the flux
+// with ITS OWN area/volume factor (fine 1/h_f, coarse 1/(2 h_c) per sub-face in
+// pseudo-2D) -- the interface is conservative to roundoff.
+__global__ void mortarFluxKernel(CompressibleSolver &grid) {
+  const i32 m = blockIdx.x*blockDim.x + threadIdx.x;
+  if (m >= grid.nMortars) return;
+  const MultiLevelSparseGrid::Mortar &M = grid.mortarList[m];
+  real *Fs[4] = { grid.getField(F_RHO), grid.getField(F_RHOU), grid.getField(F_RHOV), grid.getField(F_RHOE) };
+  const bool merged = grid.cutMerge && grid.cutOwner;
+  const i32 ownC = merged ? grid.cutOwner[M.coarse] : M.coarse;
+  i32 lc, cib, cjb, ckb; grid.decode(grid.bLocList[M.coarse/blockSizeTot], lc, cib, cjb, ckb);
+  i32 lf, fib, fjb, fkb; grid.decode(grid.bLocList[M.fine[0]/blockSizeTot], lf, fib, fjb, fkb);
+  const real hc = grid.getDx(lc), hf = grid.getDx(lf);
+  const Vec3 nrm = (M.dir == 0) ? Vec3(1,0,0) : Vec3(0,1,0);
+  const real amin = grid.ibRccmAlphaMin;
+  const real wC = ((real)1/((real)2*hc))/fmax(cutAlphaOf(grid, ownC), amin);
+  if (grid.ibRccm && !grid.rccmLive(M.coarse)) return;      // a dead (solid) coarse cell: no fluid face
+  for (i32 q = 0; q < 2; q++) {
+    const i32 fc = M.fine[q];
+    if (grid.cFlagsList[fc] != ACTIVE) continue;
+    if (grid.ibRccm && !grid.rccmLive(fc)) continue;         // dead fine cell
+    const i32 ownF = merged ? grid.cutOwner[fc] : fc;
+    if (ownF == ownC) continue;
+    Vec5 qC, qF;
+    cutOwnerState(grid, Fs, ownC, M.cen[q][0], M.cen[q][1], qC);
+    cutOwnerState(grid, Fs, ownF, M.cen[q][0], M.cen[q][1], qF);
+    Vec5 Fl = (M.side == 0) ? grid.hllcFlux(grid.prim2cons(qC), grid.prim2cons(qF), nrm)
+                            : grid.hllcFlux(grid.prim2cons(qF), grid.prim2cons(qC), nrm);
+    const real wF = ((real)1/hf)/fmax(cutAlphaOf(grid, ownF), amin);
+    for (i32 n = 0; n < 5; n++) {
+      if (M.side == 0) { atomicAdd(cutRhsPtr(grid, ownF, n),  Fl[n]*wF); atomicAdd(cutRhsPtr(grid, ownC, n), -Fl[n]*wC); }
+      else             { atomicAdd(cutRhsPtr(grid, ownC, n),  Fl[n]*wC); atomicAdd(cutRhsPtr(grid, ownF, n), -Fl[n]*wF); }
+    }
+  }
+}
+
+// --cutmerge: members take the owner's evolved state (all evolved DOFs), so the
+// next stage's stencils read one value per element wherever they tap it.
+__global__ void cutBroadcastKernel(CompressibleSolver &grid) {
+  START_CELL_LOOP
+    const i32 o = grid.cutOwner[cIdx];
+    if (o != cIdx) {
+      if (cutIsPiece(o)) {
+        const i32 k = cutPieceOf(o); const size_t cap = grid.cutPieceQCap;
+        for (i32 f = 0; f < NEVOLVE; f++) grid.getField(f)[cIdx] = grid.cutPieceQ[f*cap + k];
+        if (grid.p1 && grid.cutPieceSX) for (i32 s = 0; s < 2*P1_NV; s++) grid.getField(F_P1S + s)[cIdx] = grid.cutPieceSX[s*cap + k];
+      } else {
+        for (i32 f = 0; f < NEVOLVE; f++) grid.getField(f)[cIdx] = grid.getField(f)[o];
+        if (grid.p1) for (i32 s = 0; s < 2*P1_NV; s++) grid.getField(F_P1S + s)[cIdx] = grid.getField(F_P1S + s)[o];
+      }
+    }
+  END_CELL_LOOP
+}
+
+__global__ void srdSnapKernel(CompressibleSolver &grid) {
+  const i32 cE = bEmpty*blockSizeTot;
+  START_CELL_LOOP
+    if (srdLive(grid, cIdx, cE))
+      for (i32 f = 0; f < 5; f++)
+        grid.srdU0[(size_t)f*grid.srdStride + cIdx] = grid.getField(f)[cIdx];
+  END_CELL_LOOP
+}
+
+// dUmax = max ||U* - U^n||_2 over cells that belong to a NON-TRIVIAL
+// neighbourhood -- those are the only cells S can move.
+__device__ double g_srdDU = 0;
+// PER-NEIGHBOURHOOD indicator, faithful to UM-SRD (4)-(6):
+//   dUmax_k = max_{i in M_k} ||U*_i - U^n_i||_2,  eta_k = dUmax_k/(eps + dUmax_k),
+//   s_k = eta_k^p/(eta_k^p + tau^p).
+// A neighbourhood whose cells have all gone quiet shuts itself off even while
+// the rest of the wall is still moving -- which a single global s cannot do.
+__global__ void srdIndicatorKernel(CompressibleSolver &grid) {
+  const i32 cE = bEmpty*blockSizeTot;
+  START_CELL_LOOP
+    if (srdLive(grid, cIdx, cE)) {
+      const i32 n = grid.srdMn[cIdx];
+      double dmax = 0;
+      for (i32 q = 0; q < n; q++) {
+        const i32 m = grid.srdM[(size_t)q*grid.srdStride + cIdx];
+        double s2 = 0;
+        for (i32 f = 0; f < 5; f++) {
+          const double d = (double)grid.getField(f)[m]
+                         - (double)grid.srdU0[(size_t)f*grid.srdStride + m];
+          s2 += d*d;
+        }
+        const double d = sqrt(s2);
+        if (d > dmax) dmax = d;
+      }
+      const double eta = dmax/((double)grid.srdEps + dmax);
+      double ep = 1, tp = 1;
+      for (i32 q = 0; q < grid.srdP; q++) { ep *= eta; tp *= (double)grid.srdTau; }
+      grid.srdS[cIdx] = (real)((ep + tp > 0) ? ep/(ep + tp) : 0.0);
+    }
+  END_CELL_LOOP
+}
+
+__global__ void srdAverageKernel(CompressibleSolver &grid, real sBlend) {
+  const i32 cE = bEmpty*blockSizeTot;
+  const i32 R  = grid.srdReach;
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    if (srdLive(grid, cIdx, cE)) {
+      double acc[5] = {0,0,0,0,0}, acc0[5] = {0,0,0,0,0}; double thMax = 0;
+      const bool pos = grid.srdIncr && grid.srdPos;
+      for (i32 dj = -R; dj <= R; dj++)
+        for (i32 di = -R; di <= R; di++) {
+          const i32 kk = grid.getNbrIdx(bIdx, i+di, j+dj, k);
+          if (srdLive(grid, kk, cE) && srdInM(grid, kk, cIdx)) {
+            for (i32 f = 0; f < 5; f++)
+              acc[f] += (double)grid.srdPi[(size_t)f*grid.srdStride + kk];
+            if (pos) {
+              for (i32 f = 0; f < 5; f++)
+                acc0[f] += (double)grid.srdPi0[(size_t)f*grid.srdStride + kk];
+              thMax = fmax(thMax, (double)grid.srdTh[kk]);
+            }
+          }
+        }
+      const double ci = (double)max(1, grid.srdC[cIdx]);
+      // UM-SRD blend: R = (1-s) Id + s S.  s = 0 leaves U* untouched, which is
+      // what makes the base scheme's steady state an exact fixed point.
+      // s for THIS cell is the max over the neighbourhoods it belongs to (a cell
+      // that any active neighbourhood still needs must stay stabilised).
+      double sb = (double)sBlend;
+      if (sBlend < (real)0) {
+        sb = 0;
+        for (i32 dj = -R; dj <= R; dj++)
+          for (i32 di = -R; di <= R; di++) {
+            const i32 kk = grid.getNbrIdx(bIdx, i+di, j+dj, k);
+            if (srdLive(grid, kk, cE) && srdInM(grid, kk, cIdx))
+              sb = fmax(sb, (double)grid.srdS[kk]);
+          }
+      }
+      if (grid.srdIncr) {
+        // U^{n+1} = U^n + S(dU) [+ theta (S(U^n) - U^n) where a sliver would go bad]
+        for (i32 f = 0; f < 5; f++) {
+          const double u0 = (double)grid.srdU0[(size_t)f*grid.srdStride + cIdx];
+          double v = u0 + acc[f]/ci;
+          if (pos && thMax > 0) v += thMax*(acc0[f]/ci - u0);
+          grid.getField(f)[cIdx] = (real)v;
+        }
+      } else
+      for (i32 f = 0; f < 5; f++) {
+        const double uStar = (double)grid.getField(f)[cIdx];
+        grid.getField(f)[cIdx] = (real)((1.0 - sb)*uStar + sb*(acc[f]/ci));
+      }
+    }
+  END_CELL_LOOP
+}
+
 // Snapshot q for the dq/dt residual.  Taken AFTER adaptation (sortBlocks
 // renumbers blocks) and before the RK stages, so indices match at compare time.
 __global__ void residualSnapshotKernel(CompressibleSolver &grid, real *q0) {
@@ -6697,3 +7392,576 @@ __global__ void residualSnapshotKernel(CompressibleSolver &grid, real *q0) {
   END_CELL_LOOP
 }
 
+
+// =============================================================================
+// --p1: modal P1 discontinuous Galerkin (pseudo-2D Euler)
+//
+// Every cell carries, per conserved variable, the mean q (the FV storage) and
+// two slope DOFs (F_P1S):
+//     u_h(x,y) = q + s_x xi + s_y eta,   xi = (x-x_c)/dx,  eta = (y-y_c)/dy
+// on [-1/2,1/2]^2.  The basis {1, xi, eta} is orthogonal on the box, so the mass
+// matrix is diag(1, 1/12, 1/12) dx dy and the semi-discrete equations are
+//     dq/dt  =  1/(dx dy)  [            - sum_faces  L sum_g w_g  F_g.n           ]
+//     ds/dt  = 12/(dx dy)  [ int F.grad(phi) dV  - sum_faces  L sum_g w_g (F_g.n) phi_g ]
+// with 2 Gauss points per face piece and a 2x2 Gauss rule for the volume term.
+// A face PIECE of length L on the side of a cell with outward normal n, whose
+// Riemann fluxes F_g (along +e_dir) sit at points with weights w_g (sum 1) and
+// basis values (xi_g, eta_g) in the cell's OWN coordinates, contributes
+//     mean:  fac sum w_g F_g,   s_x: 12 fac sum w_g F_g xi_g,   s_y: same with eta_g,
+//     fac = -(n.e_dir) L / (dx dy).
+// That one formula (p1Scatter) serves the regular faces (L = dy or dx, both
+// cells), the mortar sub-faces of a level jump (L = h_fine on BOTH sides; the
+// coarse cell's xi, eta are taken at the physical point) and, later, the
+// clipped face segments and wall segments of a cut cell.  No reconstruction
+// stencil exists anywhere, so a jump needs no band and no least squares.
+//
+// Free-stream check of the slope equation: for a constant state the two
+// x-faces give -6 F/dx each (xi = -1/2 on the low face with fac = +1/dx, +1/2
+// on the high face with fac = -1/dx) and the volume term gives +12 F/dx, so
+// ds/dt = 0 exactly.
+// =============================================================================
+
+struct P1Poly { real q[5]; real sx[5]; real sy[5]; };
+
+// load a cell polynomial.  The mean bank holds PRIMITIVES during the RHS
+// (conservativeToPrimitive precedes it), so the mean is converted back; the
+// slopes are stored in CONSERVED variables.  rhoW carries no slope (pseudo-2D).
+__device__ inline void p1Load(CompressibleSolver &grid, i32 c, P1Poly &P) {
+  Vec5 qc = grid.prim2cons(Vec5(grid.getField(F_RHO)[c], grid.getField(F_RHOU)[c],
+                                grid.getField(F_RHOV)[c], grid.getField(F_RHOW)[c], grid.getField(F_RHOE)[c]));
+  for (i32 f = 0; f < 5; f++) { P.q[f] = qc[f]; P.sx[f] = 0; P.sy[f] = 0; }
+  for (i32 v = 0; v < P1_NV; v++) {
+    const i32 f = p1Var(v);
+    P.sx[f] = grid.getField(F_P1S + v)[c];
+    P.sy[f] = grid.getField(F_P1S + P1_NV + v)[c];
+  }
+}
+
+// polynomial trace at local (xi, eta); falls back to the mean when the point
+// state is not physical (rho or p <= 0), which an unlimited slope can produce
+__device__ inline Vec5 p1Trace(const P1Poly &P, real xi, real eta) {
+  Vec5 q;
+  for (i32 f = 0; f < 5; f++) q[f] = P.q[f] + P.sx[f]*xi + P.sy[f]*eta;
+  const real ke = (real)0.5*(q[1]*q[1] + q[2]*q[2] + q[3]*q[3])/fmax(q[0], (real)1e-300);
+  if (!(q[0] > (real)0) || !(q[4] - ke > (real)0))
+    for (i32 f = 0; f < 5; f++) q[f] = P.q[f];
+  return q;
+}
+
+// physical Euler flux along +x (dir 0) or +y (dir 1)
+__device__ inline Vec5 p1EulerFlux(Vec5 q, i32 dir) {
+  const real r = fmax(q[0], (real)1e-300), u = q[1]/r, v = q[2]/r, w = q[3]/r;
+  const real p = (gam - (real)1)*(q[4] - (real)0.5*r*(u*u + v*v + w*w));
+  const real un = (dir == 0) ? u : v;
+  return Vec5(r*un, q[1]*un + (dir == 0 ? p : (real)0), q[2]*un + (dir == 1 ? p : (real)0),
+              q[3]*un, (q[4] + p)*un);
+}
+
+// one face piece into a cell's mean + slope accumulators (see the header note)
+__device__ inline void p1Scatter(CompressibleSolver &grid, i32 c, real fac, const Vec5 *Fg,
+                                 const real *wg, const real *xig, const real *etag, i32 ng) {
+  for (i32 f = 0; f < 5; f++) {
+    real m = 0, mx = 0, my = 0;
+    for (i32 g = 0; g < ng; g++) {
+      const real F = wg[g]*Fg[g].data[f];
+      m += F;  mx += F*xig[g];  my += F*etag[g];
+    }
+    atomicAdd(&grid.getField(F_RHS + f)[c], fac*m);
+    if (f == F_RHOW) continue;
+    const i32 v = (f < 3) ? f : 3;
+    atomicAdd(&grid.getField(F_P1SR + v)[c],         (real)12*fac*mx);
+    atomicAdd(&grid.getField(F_P1SR + P1_NV + v)[c], (real)12*fac*my);
+  }
+}
+
+static constexpr real P1_G1 = (real)0.28867513459481287;   // Gauss point 1/(2 sqrt 3) on [-1/2, 1/2]
+
+// ---- --p1 domain boundaries WITHOUT ghost cells --------------------------------
+// A DG scheme imposes its boundary conditions weakly: the flux through a face on
+// the domain boundary is the Riemann flux of the interior TRACE against a
+// boundary state built from that trace and the boundary type.  side: 0 x-min,
+// 1 x-max, 2 y-min, 3 y-max (outward normal of the domain).  Returns false for
+// a type that keeps the ghost path (periodic images; the inlet/outlet types 6, 7).
+__device__ inline bool p1BoundaryState(CompressibleSolver &grid, i32 side, Vec5 qIn, real x, real y, Vec5 &qB) {
+  const real nx = (side == 0) ? (real)-1 : (side == 1) ? (real)1 : (real)0;
+  const real ny = (side == 2) ? (real)-1 : (side == 3) ? (real)1 : (real)0;
+  const real ri = fmax(qIn[0], (real)1e-30), ui = qIn[1]/ri, vi = qIn[2]/ri, wi = qIn[3]/ri;
+  const real pi_ = (gam - (real)1)*(qIn[4] - (real)0.5*ri*(ui*ui + vi*vi + wi*wi));
+  auto cons = [&](real r, real u, real v, real w, real p) {
+    qB = Vec5(r, r*u, r*v, r*w, p/(gam - (real)1) + (real)0.5*r*(u*u + v*v + w*w)); };
+  auto mirror = [&](bool allComponents) {
+    const real un = ui*nx + vi*ny;
+    if (allComponents) cons(ri, -ui, -vi, -wi, pi_);
+    else cons(ri, ui - (real)2*un*nx, vi - (real)2*un*ny, wi, pi_); };
+  switch (grid.bcType) {
+    case 0: mirror(false); return true;                                   // slip walls
+    case 1: mirror(true);  return true;                                   // no-slip walls
+    case 3: qB = qIn;      return true;                                   // transmissive
+    case 4:                                                               // flat plate box
+      if (side == 0) { cons((real)1, grid.fsU, grid.fsV, (real)0, grid.fsP); return true; }   // inflow
+      if (side == 2) { mirror(false); return true; }                                       // y-min slip wall
+      cons(ri, ui, vi, wi, grid.fsP); return true;                                         // far field / outflow: back pressure
+    case 5: {                                                             // point-vortex far field
+      real rF, uF, vF, pF; ffVortexState(grid, x, y, rF, uF, vF, pF);
+      if (grid.fsU*nx + grid.fsV*ny < (real)0) cons(rF, uF, vF, (real)0, pF);   // inflow
+      else cons(ri, ui, vi, wi, pF);                                              // outflow: vortex-corrected back pressure
+      return true; }
+    case 8: {                                                             // Riemann-invariant far field
+      const real ci = sqrt(fmax(gam*pi_/ri, (real)1e-30));
+      const real uni = ui*nx + vi*ny;
+      const real re = (real)1, ue = grid.fsU, ve = grid.fsV, pe = grid.fsP;
+      const real ce = sqrt(fmax(gam*pe/re, (real)1e-30));
+      const real une = ue*nx + ve*ny;
+      const real tg = (real)2/(gam - (real)1);
+      const real Rp = (uni > -ci) ? (uni + tg*ci) : (une + tg*ce);
+      const real Rm = (une <  ce) ? (une - tg*ce) : (uni - tg*ci);
+      const real unb = (real)0.5*(Rp + Rm);
+      const real cb  = fmax((gam - (real)1)*(real)0.25*(Rp - Rm), (real)1e-30);
+      const real wI = (grid.ffBlend > (real)0) ? (real)0.5*((real)1 + tanh(unb/(grid.ffBlend*cb))) : ((unb > (real)0) ? (real)1 : (real)0);
+      const real ent = wI*(pi_/pow(ri, gam)) + ((real)1 - wI)*(pe/pow(re, gam));
+      const real ut = wI*ui + ((real)1 - wI)*ue, vt = wI*vi + ((real)1 - wI)*ve;
+      const real rb = pow(cb*cb/(gam*ent), (real)1/(gam - (real)1)), pb = rb*cb*cb/gam;
+      const real unt = ut*nx + vt*ny;
+      cons(rb, ut + (unb - unt)*nx, vt + (unb - unt)*ny, (real)0, pb); return true; }
+    case 9: cons((real)1, grid.fsU, grid.fsV, (real)0, grid.fsP); return true;   // freestream
+    default: return false;
+  }
+}
+// which domain boundary a cell of an EXTERIOR block sits beyond (-1: interior block)
+__device__ inline bool p1ExtBlock(CompressibleSolver &grid, i32 c) {
+  i32 lvl, ib, jb, kb; grid.decode(grid.bLocList[c/blockSizeTot], lvl, ib, jb, kb);
+  return grid.isExteriorBlock(lvl, ib, jb, kb);
+}
+
+__global__ void p1RhsKernel(CompressibleSolver &grid) {
+  const i32 cE = bEmpty*blockSizeTot;
+  const real w2[2] = {(real)0.5, (real)0.5};
+  START_LIVE_CELL_LOOP
+    GET_CELL_INDICES
+    const u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      i32 lvl, ib, jb, kb;
+      grid.decode(loc, lvl, ib, jb, kb);
+      const real dx = grid.getDx(lvl), dy = grid.getDy(lvl);
+      // --leaf: an idle parent owns nothing, and a face against a parent is a
+      // level jump that p1MortarKernel fluxes on the fine sub-faces
+      const bool covered = grid.leafFlux && grid.cFlagsList[cIdx] == PARENT;
+      // cut geometry: a cell whose faces live in the P1 cut tables (clipped,
+      // dead, merged) is fluxed by p1SegKernel / p1ElemKernel instead
+      const bool irrC = grid.p1Irr && grid.p1Irr[cIdx];
+      P1Poly Pc;
+      p1Load(grid, cIdx, Pc);
+
+      const bool extC = p1ExtBlock(grid, cIdx);
+      Vec3 cpos = grid.getCellPos(lvl, ib, jb, kb, i, j, k);
+      // low-x face: this cell owns it, the left neighbour receives the same flux.
+      // A face between an interior cell and an EXTERIOR block is a domain
+      // boundary: the flux is the Riemann flux of the interior trace against the
+      // weak boundary state, scattered to the interior side only (no ghost).
+      const i32 l1 = grid.getNbrIdx(bIdx, i-1, j, k);
+      if (l1 < cE && !covered && !irrC && !(grid.p1Irr && grid.p1Irr[l1]) && !(grid.leafFlux && grid.cFlagsList[l1] == PARENT)) {
+        const bool extL = p1ExtBlock(grid, l1);
+        const real eta[2] = {-P1_G1, P1_G1};
+        const real xiC[2] = {(real)-0.5, (real)-0.5}, xiL[2] = {(real)0.5, (real)0.5};
+        Vec5 Fg[2]; bool weak = false;
+        if (extC != extL) {                        // domain boundary face (x-min if l1 is exterior, else x-max)
+          const i32 side = extL ? 0 : 1, in = extL ? cIdx : l1;
+          P1Poly Pin; if (in == cIdx) Pin = Pc; else p1Load(grid, in, Pin);
+          const real xf = cpos[0] - (real)0.5*dx;
+          weak = true;
+          for (i32 g = 0; g < 2 && weak; g++) {
+            Vec5 qIn = p1Trace(Pin, extL ? (real)-0.5 : (real)0.5, eta[g]), qB;
+            if (!p1BoundaryState(grid, side, qIn, xf, cpos[1] + eta[g]*dy, qB)) { weak = false; break; }
+            Fg[g] = extL ? grid.hllcFlux(qB, qIn, Vec3(1,0,0)) : grid.hllcFlux(qIn, qB, Vec3(1,0,0));
+          }
+          if (weak) { if (extL) p1Scatter(grid, cIdx, (real)1/dx, Fg, w2, xiC, eta, 2); else p1Scatter(grid, l1, (real)-1/dx, Fg, w2, xiL, eta, 2); }
+        }
+        if (!weak && !(extC && extL)) {            // interior face (or a boundary type that keeps its ghost)
+          P1Poly Pl;
+          p1Load(grid, l1, Pl);
+          for (i32 g = 0; g < 2; g++)
+            Fg[g] = grid.hllcFlux(p1Trace(Pl, (real)0.5, eta[g]), p1Trace(Pc, (real)-0.5, eta[g]), Vec3(1,0,0));
+          p1Scatter(grid, cIdx, (real)1/dx,  Fg, w2, xiC, eta, 2);
+          p1Scatter(grid, l1,   (real)-1/dx, Fg, w2, xiL, eta, 2);
+        }
+      }
+      // low-y face
+      const i32 d1 = grid.getNbrIdx(bIdx, i, j-1, k);
+      if (d1 < cE && !covered && !irrC && !(grid.p1Irr && grid.p1Irr[d1]) && !(grid.leafFlux && grid.cFlagsList[d1] == PARENT)) {
+        const bool extD = p1ExtBlock(grid, d1);
+        const real xi[2] = {-P1_G1, P1_G1};
+        const real etC[2] = {(real)-0.5, (real)-0.5}, etD[2] = {(real)0.5, (real)0.5};
+        Vec5 Fg[2]; bool weak = false;
+        if (extC != extD) {                        // domain boundary face (y-min if d1 is exterior, else y-max)
+          const i32 side = extD ? 2 : 3, in = extD ? cIdx : d1;
+          P1Poly Pin; if (in == cIdx) Pin = Pc; else p1Load(grid, in, Pin);
+          const real yf = cpos[1] - (real)0.5*dy;
+          weak = true;
+          for (i32 g = 0; g < 2 && weak; g++) {
+            Vec5 qIn = p1Trace(Pin, xi[g], extD ? (real)-0.5 : (real)0.5), qB;
+            if (!p1BoundaryState(grid, side, qIn, cpos[0] + xi[g]*dx, yf, qB)) { weak = false; break; }
+            Fg[g] = extD ? grid.hllcFlux(qB, qIn, Vec3(0,1,0)) : grid.hllcFlux(qIn, qB, Vec3(0,1,0));
+          }
+          if (weak) { if (extD) p1Scatter(grid, cIdx, (real)1/dy, Fg, w2, xi, etC, 2); else p1Scatter(grid, d1, (real)-1/dy, Fg, w2, xi, etD, 2); }
+        }
+        if (!weak && !(extC && extD)) {
+          P1Poly Pd;
+          p1Load(grid, d1, Pd);
+          for (i32 g = 0; g < 2; g++)
+            Fg[g] = grid.hllcFlux(p1Trace(Pd, xi[g], (real)0.5), p1Trace(Pc, xi[g], (real)-0.5), Vec3(0,1,0));
+          p1Scatter(grid, cIdx, (real)1/dy,  Fg, w2, xi, etC, 2);
+          p1Scatter(grid, d1,   (real)-1/dy, Fg, w2, xi, etD, 2);
+        }
+      }
+      // volume term 12/(dx dy) int F.grad(phi) dV on the cell's own polynomial:
+      // grad(xi) = (1/dx, 0) -> 12 <F_x>/dx, grad(eta) -> 12 <G_y>/dy, 2x2 Gauss
+      if (!covered && !irrC) {
+        real Fx[5] = {0,0,0,0,0}, Gy[5] = {0,0,0,0,0};
+        for (i32 gx = 0; gx < 2; gx++)
+          for (i32 gy = 0; gy < 2; gy++) {
+            Vec5 q = p1Trace(Pc, gx ? P1_G1 : -P1_G1, gy ? P1_G1 : -P1_G1);
+            Vec5 F = p1EulerFlux(q, 0), G = p1EulerFlux(q, 1);
+            for (i32 f = 0; f < 5; f++) { Fx[f] += (real)0.25*F[f]; Gy[f] += (real)0.25*G[f]; }
+          }
+        for (i32 v = 0; v < P1_NV; v++) {
+          const i32 f = p1Var(v);
+          atomicAdd(&grid.getField(F_P1SR + v)[cIdx],         (real)12*Fx[f]/dx);
+          atomicAdd(&grid.getField(F_P1SR + P1_NV + v)[cIdx], (real)12*Gy[f]/dy);
+        }
+      }
+    }
+  END_CELL_LOOP
+}
+
+// --leaf level jumps: one thread per mortar, 2 sub-faces x 2 Gauss points.  Each
+// side evaluates its OWN polynomial at the physical point, so the coupling is
+// stencil-free and conservative (the same flux enters both sides).
+__global__ void p1MortarKernel(CompressibleSolver &grid) {
+  const i32 m = blockIdx.x*blockDim.x + threadIdx.x;
+  if (m >= grid.nMortars) return;
+  const MultiLevelSparseGrid::Mortar &M = grid.mortarList[m];
+  const i32 cE = bEmpty*blockSizeTot;
+  const real w2[2] = {(real)0.5, (real)0.5};
+  const i32 c = M.coarse;
+  if (c < 0 || c >= cE || grid.cFlagsList[c] != ACTIVE) return;
+  if (grid.p1Irr && grid.p1Irr[c]) return;          // cut geometry never touches a jump (refined to the finest level)
+  i32 lc, cib, cjb, ckb;
+  grid.decode(grid.bLocList[c/blockSizeTot], lc, cib, cjb, ckb);
+  const i32 cc = c % blockSizeTot;
+  Vec3 xc = grid.getCellPos(lc, cib, cjb, ckb, cc % blockSize, (cc/blockSize) % blockSize, cc/(blockSize*blockSize));
+  const real hc = grid.getDx(lc);
+  P1Poly Pc;
+  p1Load(grid, c, Pc);
+  const Vec3 nrm = (M.dir == 0) ? Vec3(1,0,0) : Vec3(0,1,0);
+  for (i32 q = 0; q < 2; q++) {
+    const i32 fc = M.fine[q];
+    if (fc < 0 || fc >= cE || grid.cFlagsList[fc] != ACTIVE) continue;
+    i32 lf, fib, fjb, fkb;
+    grid.decode(grid.bLocList[fc/blockSizeTot], lf, fib, fjb, fkb);
+    const i32 fcc = fc % blockSizeTot;
+    Vec3 xf = grid.getCellPos(lf, fib, fjb, fkb, fcc % blockSize, (fcc/blockSize) % blockSize, fcc/(blockSize*blockSize));
+    const real hf = grid.getDx(lf);
+    P1Poly Pf;
+    p1Load(grid, fc, Pf);
+    real xiF[2], etF[2], xiC[2], etC[2];
+    Vec5 Fg[2];
+    for (i32 g = 0; g < 2; g++) {
+      const real s  = (g ? P1_G1 : -P1_G1)*hf;          // tangential offset along the sub-face
+      const real px = M.cen[q][0] + (M.dir == 0 ? (real)0 : s);
+      const real py = M.cen[q][1] + (M.dir == 0 ? s : (real)0);
+      xiF[g] = (px - xf[0])/hf;  etF[g] = (py - xf[1])/hf;
+      xiC[g] = (px - xc[0])/hc;  etC[g] = (py - xc[1])/hc;
+      Vec5 qF = p1Trace(Pf, xiF[g], etF[g]), qC = p1Trace(Pc, xiC[g], etC[g]);
+      Fg[g] = (M.side == 0) ? grid.hllcFlux(qC, qF, nrm) : grid.hllcFlux(qF, qC, nrm);
+    }
+    // side 0: the coarse cell is on the LOW side, so the sub-face is the fine
+    // cell's low face (outward -e: fac = +L/(hf hf) = 1/hf) and the coarse
+    // cell's high face (fac = -hf/(hc hc)); side 1 mirrors both
+    const real sgn = (M.side == 0) ? (real)1 : (real)-1;
+    p1Scatter(grid, fc, sgn/hf,          Fg, w2, xiF, etF, 2);
+    p1Scatter(grid, c, -sgn*hf/(hc*hc),  Fg, w2, xiC, etC, 2);
+  }
+}
+
+// slope limiter after every stage (gradLim 1 = Barth-Jespersen, 2 =
+// Venkatakrishnan with eps^2 = (K h)^3), per conserved variable, against the
+// face-neighbour MEANS; the polynomial is checked at the four face midpoints.
+// A jump tap goes through the mortar: the coarse cell, or both fine cells.
+__global__ void p1LimitKernel(CompressibleSolver &grid) {
+  const i32 cE = bEmpty*blockSizeTot;
+  START_LIVE_CELL_LOOP
+    GET_CELL_INDICES
+    const u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty && grid.cFlagsList[cIdx] == ACTIVE && !(grid.p1Irr && grid.p1Irr[cIdx])) {
+      i32 lvl, ib, jb, kb;
+      grid.decode(loc, lvl, ib, jb, kb);
+      if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
+        const real h = fmin(grid.getDx(lvl), grid.getDy(lvl));
+        i32 taps[8]; i32 nt = 0;
+        const i32 di[4] = {-1, 1, 0, 0}, dj[4] = {0, 0, -1, 1};
+        for (i32 d = 0; d < 4; d++) {
+          const i32 n = grid.getNbrIdx(bIdx, i+di[d], j+dj[d], k);
+          if (n < cE && !(grid.leafFlux && grid.cFlagsList[n] == PARENT)) { taps[nt++] = n; continue; }
+          if (grid.leafFlux && grid.cellMortar) {
+            const i32 mm = grid.cellMortar[(size_t)cIdx*4 + d];
+            if (mm >= 0) {
+              const MultiLevelSparseGrid::Mortar &M = grid.mortarList[mm];
+              if (M.coarse == cIdx) {
+                for (i32 q = 0; q < 2; q++)
+                  if (M.fine[q] >= 0 && M.fine[q] < cE && grid.cFlagsList[M.fine[q]] == ACTIVE) taps[nt++] = M.fine[q];
+              } else if (M.coarse >= 0 && M.coarse < cE) taps[nt++] = M.coarse;
+            }
+          }
+        }
+        const real eps2 = (grid.gradLim == 2) ? pow(grid.gradLimK*h, (real)3) : (real)0;
+        for (i32 v = 0; v < P1_NV; v++) {
+          real *Q  = grid.getField(p1Var(v));
+          real *SX = grid.getField(F_P1S + v), *SY = grid.getField(F_P1S + P1_NV + v);
+          const real qc = Q[cIdx];
+          real qmin = qc, qmax = qc;
+          for (i32 t = 0; t < nt; t++) { qmin = fmin(qmin, Q[taps[t]]); qmax = fmax(qmax, Q[taps[t]]); }
+          const real sx = SX[cIdx], sy = SY[cIdx];
+          const real dmax = qmax - qc, dmin = qmin - qc;
+          const real dpts[4] = {-(real)0.5*sx, (real)0.5*sx, -(real)0.5*sy, (real)0.5*sy};
+          real a = 1;
+          for (i32 p = 0; p < 4; p++) {
+            const real d = dpts[p];
+            if (fabs(d) < (real)1e-300) continue;
+            const real D = (d > 0) ? dmax : dmin;
+            real psi;
+            if (grid.gradLim == 2) {
+              const real D2 = D*D, d2 = d*d;
+              psi = (D2 + eps2 + (real)2*d*D) / (D2 + (real)2*d2 + d*D + eps2 + (real)1e-300);
+            } else {
+              psi = fmin((real)1, D/d);
+            }
+            a = fmin(a, fmax(psi, (real)0));
+          }
+          SX[cIdx] = a*sx;
+          SY[cIdx] = a*sy;
+          // (zeroing the LSRK slope accumulator where the limiter acts was tried
+          // against the plate's leading-edge limit cycle: no effect, removed)
+        }
+      }
+    }
+  END_CELL_LOOP
+}
+
+// initial slopes: central differences of the conserved means (a 2nd-order
+// projection of the initial field); a missing tap gives a zero slope
+__global__ void p1InitSlopesKernel(CompressibleSolver &grid) {
+  const i32 cE = bEmpty*blockSizeTot;
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    const i32 l1 = grid.getNbrIdx(bIdx, i-1, j, k), r1 = grid.getNbrIdx(bIdx, i+1, j, k);
+    const i32 d1 = grid.getNbrIdx(bIdx, i, j-1, k), u1 = grid.getNbrIdx(bIdx, i, j+1, k);
+    for (i32 v = 0; v < P1_NV; v++) {
+      real *Q = grid.getField(p1Var(v));
+      grid.getField(F_P1S + v)[cIdx]         = (l1 < cE && r1 < cE) ? (real)0.5*(Q[r1] - Q[l1]) : (real)0;
+      grid.getField(F_P1S + P1_NV + v)[cIdx] = (d1 < cE && u1 < cE) ? (real)0.5*(Q[u1] - Q[d1]) : (real)0;
+    }
+    grid.getField(F_P1NEW)[cIdx] = 1;
+  END_CELL_LOOP
+}
+
+// mark every existing cell before an adaptation; a 0 after the sort is a block
+// created this cycle
+__global__ void p1MarkKernel(CompressibleSolver &grid) {
+  START_CELL_LOOP
+    grid.getField(F_P1NEW)[cIdx] = 1;
+  END_CELL_LOOP
+}
+
+// slopes of the blocks created this cycle: the parent polynomial restricted to
+// the child (slopes halved; the mean was predicted by the inverse wavelet).
+// Called level by level, coarse to fine, so a new parent is filled first.
+__global__ void p1ProlongNewKernel(CompressibleSolver &grid, i32 lvlOnly) {
+  START_CELL_LOOP
+    GET_CELL_INDICES
+    const u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      i32 lvl, ib, jb, kb;
+      grid.decode(loc, lvl, ib, jb, kb);
+      real *Mk = grid.getField(F_P1NEW);
+      if (lvl == lvlOnly && Mk[cIdx] == (real)0) {
+        const i32 prntIdx = grid.prntIdxList[bIdx];
+        if (prntIdx != bEmpty && grid.isInteriorBlock(lvl, ib, jb, kb)) {
+          const i32 ip = i/2 + ib%2 * blockSize/2, jp = j/2 + jb%2 * blockSize/2;
+          const i32 kp = grid.pseudo2D ? k : (k/2 + kb%2 * blockSize/2);
+          const i32 p = grid.getNbrIdx(prntIdx, ip, jp, kp);
+          if (p < bEmpty*blockSizeTot)
+            for (i32 s = 0; s < 2*P1_NV; s++)
+              grid.getField(F_P1S + s)[cIdx] = (real)0.5*grid.getField(F_P1S + s)[p];
+        }
+        Mk[cIdx] = 1;
+      }
+    }
+  END_CELL_LOOP
+}
+
+// =============================================================================
+// --p1 on cut elements (tables from CompressibleSolver::buildP1Cut)
+// =============================================================================
+struct P1Geo { real gx, gy, h, area, m11, m12, m22; };
+
+__device__ inline i32 p1ElemIdx(CompressibleSolver &grid, i32 h) {
+  if (!grid.p1ElemOfCell) return -1;
+  return cutIsPiece(h) ? (grid.p1ElemOfPiece ? grid.p1ElemOfPiece[cutPieceOf(h)] : -1) : grid.p1ElemOfCell[h];
+}
+// basis geometry of a handle: its P1Elem, or the regular cell (centre, h,
+// diagonal mass matrix -- identical to the regular kernel on square cells)
+__device__ inline void p1GeoOf(CompressibleSolver &grid, i32 h, P1Geo &G) {
+  const i32 e = p1ElemIdx(grid, h);
+  if (e >= 0) {
+    const P1Elem &E = grid.p1Elem[e];
+    G.gx = E.gx; G.gy = E.gy; G.h = E.h; G.area = E.area; G.m11 = E.m11; G.m12 = E.m12; G.m22 = E.m22;
+    return;
+  }
+  const i32 c = cutIsPiece(h) ? grid.cutPiece[cutPieceOf(h)].cell : h;
+  const i32 b = c/blockSizeTot, cc = c%blockSizeTot;
+  i32 lvl, ib, jb, kb; grid.decode(grid.bLocList[b], lvl, ib, jb, kb);
+  Vec3 p = grid.getCellPos(lvl, ib, jb, kb, cc%blockSize, (cc/blockSize)%blockSize, 0);
+  const real dx = grid.getDx(lvl), dy = grid.getDy(lvl);
+  G.gx = p[0]; G.gy = p[1]; G.h = fmin(dx, dy); G.area = dx*dy; G.m11 = G.m22 = (real)12/(dx*dy); G.m12 = 0;
+}
+// polynomial of a handle (piece DOFs are conserved already)
+__device__ inline void p1LoadH(CompressibleSolver &grid, i32 h, P1Poly &P) {
+  if (!cutIsPiece(h)) { p1Load(grid, h, P); return; }
+  const i32 k = cutPieceOf(h); const size_t cap = grid.cutPieceQCap;
+  for (i32 f = 0; f < 5; f++) { P.q[f] = grid.cutPieceQ[(size_t)f*cap + k]; P.sx[f] = 0; P.sy[f] = 0; }
+  for (i32 v = 0; v < P1_NV; v++) {
+    const i32 f = p1Var(v);
+    P.sx[f] = grid.cutPieceSX[(size_t)v*cap + k];
+    P.sy[f] = grid.cutPieceSX[(size_t)(P1_NV + v)*cap + k];
+  }
+}
+__device__ __forceinline__ real *p1SlopePtr(CompressibleSolver &grid, i32 h, i32 s) {
+  return cutIsPiece(h) ? &grid.cutPieceSR[(size_t)s*grid.cutPieceQCap + cutPieceOf(h)]
+                       : &grid.getField(F_P1SR + s)[h];
+}
+__device__ __forceinline__ real p1Pressure(Vec5 q) {
+  const real r = fmax(q[0], (real)1e-300);
+  return (gam - (real)1)*(q[4] - (real)0.5*(q[1]*q[1] + q[2]*q[2] + q[3]*q[3])/r);
+}
+// one face piece into an element through its handle.  sgnLen = +L when the
+// flux along n ENTERS the element, -L when it leaves; phi at the physical
+// points relative to the element's own centroid; the inverse mass matrix
+// mixes the two slope rows (linear, so each contributor applies it itself).
+__device__ inline void p1ScatterH(CompressibleSolver &grid, i32 h, const P1Geo &G, real sgnLen,
+                                  const Vec5 *Fg, const real *wg, const real *xg, const real *yg, i32 ng) {
+  for (i32 f = 0; f < 5; f++) {
+    real m = 0, mx = 0, my = 0;
+    for (i32 g = 0; g < ng; g++) {
+      const real F = wg[g]*Fg[g].data[f];
+      m += F;  mx += F*(xg[g] - G.gx)/G.h;  my += F*(yg[g] - G.gy)/G.h;
+    }
+    atomicAdd(cutRhsPtr(grid, h, f), sgnLen*m/G.area);
+    if (f == F_RHOW) continue;
+    const i32 v = (f < 3) ? f : 3;
+    const real r1 = sgnLen*mx, r2 = sgnLen*my;
+    atomicAdd(p1SlopePtr(grid, h, v),         G.m11*r1 + G.m12*r2);
+    atomicAdd(p1SlopePtr(grid, h, P1_NV + v), G.m12*r1 + G.m22*r2);
+  }
+}
+
+// open face pieces between two elements: 2 Gauss points, each side's own trace
+__global__ void p1SegKernel(CompressibleSolver &grid) {
+  const i32 s = blockIdx.x*blockDim.x + threadIdx.x;
+  if (s >= grid.nP1Seg) return;
+  const P1Seg &S = grid.p1Seg[s];
+  P1Geo GA, GB; p1GeoOf(grid, S.hA, GA); p1GeoOf(grid, S.hB, GB);
+  P1Poly PA, PB; p1LoadH(grid, S.hA, PA); p1LoadH(grid, S.hB, PB);
+  const real ex = S.x1 - S.x0, ey = S.y1 - S.y0, len = sqrt(ex*ex + ey*ey);
+  const real w2[2] = {(real)0.5, (real)0.5};
+  real xg[2], yg[2]; Vec5 Fg[2];
+  const Vec3 nrm(S.nx, S.ny, (real)0);
+  for (i32 g = 0; g < 2; g++) {
+    const real sg = (real)0.5 + (g ? P1_G1 : -P1_G1);
+    xg[g] = S.x0 + sg*ex; yg[g] = S.y0 + sg*ey;
+    Vec5 qA = p1Trace(PA, (xg[g] - GA.gx)/GA.h, (yg[g] - GA.gy)/GA.h);
+    Vec5 qB = p1Trace(PB, (xg[g] - GB.gx)/GB.h, (yg[g] - GB.gy)/GB.h);
+    Fg[g] = grid.hllcFlux(qA, qB, nrm);
+  }
+  p1ScatterH(grid, S.hA, GA, -len, Fg, w2, xg, yg, 2);
+  p1ScatterH(grid, S.hB, GB,  len, Fg, w2, xg, yg, 2);
+}
+
+// every cut element: the volume rule on its own polynomial and the wall
+// pressure integral over its wall edges (slip wall: F.n = p n)
+__global__ void p1ElemKernel(CompressibleSolver &grid) {
+  const i32 e = blockIdx.x*blockDim.x + threadIdx.x;
+  if (e >= grid.nP1Elem) return;
+  const P1Elem &E = grid.p1Elem[e];
+  const i32 h = E.handle;
+  P1Geo G; G.gx = E.gx; G.gy = E.gy; G.h = E.h; G.area = E.area; G.m11 = E.m11; G.m12 = E.m12; G.m22 = E.m22;
+  P1Poly P; p1LoadH(grid, h, P);
+  real r1[5] = {0,0,0,0,0}, r2[5] = {0,0,0,0,0}, m[5] = {0,0,0,0,0};
+  for (i32 q = E.q0; q < E.q0 + E.nq; q++) {
+    const P1Qpt &Q = grid.p1Qpt[q];
+    const real xi = (Q.x - G.gx)/G.h, eta = (Q.y - G.gy)/G.h;
+    Vec5 u = p1Trace(P, xi, eta);
+    if (Q.w != (real)0) {                       // volume point: int F.grad(phi), grad(phi1) = (1/h, 0)
+      Vec5 F = p1EulerFlux(u, 0), Gf = p1EulerFlux(u, 1);
+      for (i32 f = 0; f < 5; f++) { r1[f] += Q.w*F[f]/G.h; r2[f] += Q.w*Gf[f]/G.h; }
+    } else {                                    // wall point: -(F.n) phi with F.n = p (nx, ny) * length
+      const real p = p1Pressure(u);
+      m[1]  -= p*Q.nx;      m[2]  -= p*Q.ny;
+      r1[1] -= p*Q.nx*xi;   r2[1] -= p*Q.nx*eta;
+      r1[2] -= p*Q.ny*xi;   r2[2] -= p*Q.ny*eta;
+    }
+  }
+  for (i32 f = 0; f < 5; f++) if (m[f] != (real)0) atomicAdd(cutRhsPtr(grid, h, f), m[f]/G.area);
+  for (i32 v = 0; v < P1_NV; v++) {
+    const i32 f = p1Var(v);
+    atomicAdd(p1SlopePtr(grid, h, v),         G.m11*r1[f] + G.m12*r2[f]);
+    atomicAdd(p1SlopePtr(grid, h, P1_NV + v), G.m12*r1[f] + G.m22*r2[f]);
+  }
+}
+
+// slope limiter on the cut elements: Barth-Jespersen / Venkatakrishnan (the
+// same gradLim switch) per conserved variable against the MEANS of the
+// elements across its face pieces, the polynomial checked at the element's
+// own polygon vertices (the extrema of a linear function).  Cell means are
+// conserved here (after the update); piece means always are.
+__device__ i32 g_p1LimPieces = 1;   // debug: 0 = the cut limiter leaves piece DOFs alone
+__global__ void p1LimitCutKernel(CompressibleSolver &grid) {
+  const i32 e = blockIdx.x*blockDim.x + threadIdx.x;
+  if (e >= grid.nP1Elem) return;
+  const P1Elem &E = grid.p1Elem[e];
+  const i32 h = E.handle;
+  if (cutIsPiece(h) && !g_p1LimPieces) return;
+  const real eps2 = (grid.gradLim == 2) ? pow(grid.gradLimK*E.h, (real)3) : (real)0;
+  auto meanOf = [&](i32 hh, i32 f) -> real {
+    return cutIsPiece(hh) ? grid.cutPieceQ[(size_t)f*grid.cutPieceQCap + cutPieceOf(hh)] : grid.getField(f)[hh]; };
+  for (i32 v = 0; v < P1_NV; v++) {
+    const i32 f = p1Var(v);
+    const real qc = meanOf(h, f);
+    real qmin = qc, qmax = qc;
+    for (i32 n = grid.p1ElemNbrOff[e]; n < grid.p1ElemNbrOff[e+1]; n++) {
+      const i32 hn = grid.p1ElemNbr[n];
+      if (hn == CUT_DEAD) continue;
+      const real qn = meanOf(hn, f);
+      qmin = fmin(qmin, qn); qmax = fmax(qmax, qn);
+    }
+    real *SX = cutIsPiece(h) ? &grid.cutPieceSX[(size_t)v*grid.cutPieceQCap + cutPieceOf(h)] : &grid.getField(F_P1S + v)[h];
+    real *SY = cutIsPiece(h) ? &grid.cutPieceSX[(size_t)(P1_NV + v)*grid.cutPieceQCap + cutPieceOf(h)] : &grid.getField(F_P1S + P1_NV + v)[h];
+    const real sx = *SX, sy = *SY;
+    const real dmax = qmax - qc, dmin = qmin - qc;
+    real a = 1;
+    for (i32 q = E.q0; q < E.q0 + E.nq; q++) {
+      const P1Qpt &Q = grid.p1Qpt[q];
+      if (Q.w != (real)0 || Q.nx != (real)0 || Q.ny != (real)0) continue;   // vertices only
+      const real d = sx*(Q.x - E.gx)/E.h + sy*(Q.y - E.gy)/E.h;
+      if (fabs(d) < (real)1e-300) continue;
+      const real D = (d > 0) ? dmax : dmin;
+      real psi;
+      if (grid.gradLim == 2) { const real D2 = D*D, d2 = d*d; psi = (D2 + eps2 + (real)2*d*D)/(D2 + (real)2*d2 + d*D + eps2 + (real)1e-300); }
+      else psi = fmin((real)1, D/d);
+      a = fmin(a, fmax(psi, (real)0));
+    }
+    if (grid.cutDbg && cutIsPiece(h) && grid.iter < 2 && v == 0)
+      printf("[p1lim] iter %d piece %d elem %d: rho mean %.6f nbrs [%.6f, %.6f] (%d nbrs) slopes (%.3e, %.3e) -> a = %.3f  h %.4f area %.3e nq %d\n",
+             grid.iter, cutPieceOf(h), e, (double)qc, (double)qmin, (double)qmax, grid.p1ElemNbrOff[e+1]-grid.p1ElemNbrOff[e], (double)sx, (double)sy, (double)a, (double)E.h, (double)E.area, E.nq);
+    *SX = a*sx; *SY = a*sy;
+  }
+}

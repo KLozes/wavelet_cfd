@@ -92,7 +92,6 @@ __global__ void wallGhostKernel(CompressibleSolver &grid);
 __global__ void ibGhostKernel(CompressibleSolver &grid);
 __global__ void ibIfaceKernel(CompressibleSolver &grid);
 __global__ void shockSensorKernel(CompressibleSolver &grid);
-__global__ void rccmReconstructKernel(CompressibleSolver &grid);
 __global__ void zeroTrashBlockKernel(CompressibleSolver &grid, i32 f);
 __global__ void zeroScalesKernel(CompressibleSolver &grid);
 __global__ void zeroFlagsKernel(CompressibleSolver &grid);
@@ -105,5 +104,16 @@ __global__ void ransShearProbeKernel(CompressibleSolver &grid, real u0, real ky)
 __global__ void ransWallProbeKernel(CompressibleSolver &grid, real uTau, real ypMin, i32 comp);
 
 __global__ void ransDecayErrorKernel(CompressibleSolver &grid, real kEx, real tEx, i32 mode);
+
+// --p1: modal P1 DG
+__global__ void p1RhsKernel(CompressibleSolver &grid);
+__global__ void p1MortarKernel(CompressibleSolver &grid);
+__global__ void p1LimitKernel(CompressibleSolver &grid);
+__global__ void p1InitSlopesKernel(CompressibleSolver &grid);
+__global__ void p1MarkKernel(CompressibleSolver &grid);
+__global__ void p1ProlongNewKernel(CompressibleSolver &grid, i32 lvlOnly);
+__global__ void p1SegKernel(CompressibleSolver &grid);    // --p1 cut: open face pieces between elements
+__global__ void p1ElemKernel(CompressibleSolver &grid);   // --p1 cut: volume rule + wall of every cut element
+__global__ void p1LimitCutKernel(CompressibleSolver &grid);   // --p1 cut: slope limiter on the cut elements
 
 #endif

@@ -1,0 +1,5 @@
+# zero-thickness flat plate, unit chord, closed loop ccw (solid inside), thickness 1e-9
+0 0
+1 0
+1 1e-9
+0 1e-9

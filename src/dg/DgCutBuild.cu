@@ -357,9 +357,6 @@ void DgSolver::buildCutElems(void) {
           (real)E.Mchol[(size_t)i*nbE + j];
   }
 
-  // ---- entropy-stable operators, if asked for ----------------------------
-  buildCutEs(&ops);
-
   // ---- the cut path REPLACES the IB machinery ----------------------------
   // Cut elements integrate as ordinary fluid (the wall lives in their flux
   // terms), solid blocks are dead, and the FRIB/ghost/donor machinery must not

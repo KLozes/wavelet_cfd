@@ -50,6 +50,38 @@ public:
   // exterior ring and flagActiveCells marks every interior cell ACTIVE (the
   // GHOST/PARENT machinery is meaningless without overlapping levels).
   i32 leafMode = 0;
+  // leafFlux (--leaf, the FV solver): NO interior ghost rims and NO per-stage
+  // restriction/interpolation.  Every interior cell is a leaf unless a finer
+  // block covers it (PARENT); parents stay allocated but idle (restricted only
+  // at adaptation).  A level jump is represented by MORTAR faces: one record per
+  // coarse face at a jump, holding the coarse cell, its two fine cells and the
+  // sub-face centroids.  The mortar kernel computes the sub-face fluxes and
+  // scatters them to both sides (conservative), and a cell whose same-level
+  // neighbour is missing resolves that stencil tap through the mortar.  Blocks
+  // are sorted leaf-bearing first so the per-stage kernels can stop early.
+  i32 leafFlux = 0;
+  i32 nLeafBlocks = 0, nExtBlocks = 0;   // sort groups: [0,nLeaf) leaf-bearing interior, then exterior, then fully covered
+  struct Mortar {
+    i32 coarse;      // coarse cell index
+    i32 fine[2];     // the two fine cells sharing the coarse face (pseudo-2D)
+    i32 dir;         // 0 = x-face, 1 = y-face
+    i32 side;        // 0 = the coarse cell is on the LOW side of the fine cells, 1 = high side
+    real cen[2][2];  // sub-face centroids (physical), one per fine cell
+  };
+  Mortar *mortarList = nullptr;   // [mortarCap]
+  i32    *mortarCnt  = nullptr;   // [1] managed counter
+  i32     nMortars = 0, mortarCap = 0;
+  // per CELL face (d = 0 low-x, 1 high-x, 2 low-y, 3 high-y): the mortar index
+  // or -1.  Per cell rather than per block face because a mixed block (only
+  // some children present) has jump faces inside it: the coarse cells next to
+  // the covered quadrant.  Both the fine cells and the coarse cell of a mortar
+  // register it, so either side finds the other through it.
+  i32 *cellMortar = nullptr;      // [4*blockSizeTot*nBlocksMax]
+  // the former ghost rim (outer 2 cells of a block with a missing same-level
+  // neighbour): leaves now, but they must not DRIVE refinement, or the rings
+  // refine themselves outward cycle after cycle (measured: 1152 -> 7878 blocks)
+  i32 *rimList = nullptr;         // [blockSizeTot*nBlocksMax], 1 = rim cell
+  void allocLeafTables(void);
   // memory-layout sort order: 0 = location code (level-major, row-major k,j,i --
   // x-neighbors adjacent, y/z a row/plane apart); 1 = level-major space-filling
   // curve (Hilbert in pseudo2D, Morton in 3D -- neighbors in ALL directions and

@@ -7,8 +7,10 @@
 #include <thrust/extrema.h>
 #include <unordered_set>
 #include <unordered_map>
+#include <functional>
 
 #include "CompressibleSolver.cuh"
+#include "CutClip.h"
 #include <thrust/inner_product.h>
 #include <thrust/transform.h>
 #include "KtauSst.h"
@@ -52,6 +54,7 @@ void CompressibleSolver::initialize(void) {
 #endif
   zeroAccumulator();   // the cascade dirtied the shared bank (LSRK needs 0)
   stampIbGeometry();   // geometry cache for the final grid topology
+  if (p1) p1InitSlopesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // central-difference slopes of the IC
   // (cudaMemAdvise pinning of this object was tried 2026-08-26 and MEASURED
   // WORSE: 138 -> 176 s.  Remote host access every step costs more than the
   // page migration it replaces.  Do not re-add without measuring.)
@@ -311,6 +314,9 @@ void CompressibleSolver::zeroAccumulator(void) {
   // path.  Zero it explicitly.
   for (i32 f = 0; f < NEVOLVE; f++)
     zeroTrashBlockKernel<<<1, blockSizeTot>>>(*this, F_RHS + f);
+  if (p1)
+    for (i32 s = 0; s < 2*P1_NV; s++)
+      zeroTrashBlockKernel<<<1, blockSizeTot>>>(*this, F_P1SR + s);
 }
 
 
@@ -340,6 +346,7 @@ real CompressibleSolver::step(real tStep) {
         rebalancePartition();
       haloExchange(0, NEVOLVE);   // fill last cycle's ghosts before the detail computation
 #endif
+      if (p1) p1MarkKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // existing cells: marker 1
       restrictFields();
       if (dbgChecks >= 2) scanNonFinite("restrictFields");
       if (dbgChecks) { cudaDeviceSynchronize(); sub.tick(); }
@@ -363,6 +370,8 @@ real CompressibleSolver::step(real tStep) {
       if (dbgChecks) { cudaDeviceSynchronize(); sub.tick(); }
       sortBlocks();
       if (dbgChecks >= 2) scanNonFinite("sortBlocks");
+      if (p1)   // blocks created this cycle: slopes from the parent polynomial, coarse to fine
+        for (i32 L = 1; L < nLvls; L++) p1ProlongNewKernel<<<cudaGridSize, cudaBlockSize>>>(*this, L);
       if (dbgChecks) { cudaDeviceSynchronize(); sub.tock(); tSortUs += sub.duration().count(); }
 #ifdef USE_MGPU
       rebuildGhosts();            // prune the stale ghosts, recreate the 2-ring from neighbors
@@ -415,7 +424,12 @@ real CompressibleSolver::step(real tStep) {
       deltaT = tStep - t;
     }
 
-    const bool residSample = (residEvery > 0 && iter % residEvery == 0);
+    // Also sample on the LAST iteration of this call: the field dumps that
+    // follow read residCell by block index, and adaptation (sortBlocks) has
+    // renumbered the blocks any number of times since the last cadence sample,
+    // so a stale sample paints the residual on the wrong cells.
+    const bool lastOfCall  = (t + deltaT >= tStep);
+    const bool residSample = (residEvery > 0 && (iter % residEvery == 0 || lastOfCall));
     if (residSample) snapshotResidualQ();
 
     if (mdFlux == 2) {
@@ -454,8 +468,14 @@ real CompressibleSolver::step(real tStep) {
       if (ffVortex && stage == 0 && (iter % ffEvery) == 0) updateFarFieldVortex();
       // --cutpi advances every live cell instead, so there is nothing to
       // reconstruct: dropping this is what makes the fixed point conservative.
-      if (immerserdBcType && ibRccm && !cutPi) reconstructRCells();  // RCCM Eq. (10)",
-      else if (immerserdBcType && !rans) applyWallGhosts();   // Euler: slip ghosts
+      // A CUT-CELL scheme has no ghost states: every face flux is built from the
+      // stored apertures and the wall flux from the discrete-GCL normal, and the
+      // dead-cell stencil guards (inboard remap for tvdRec, dead-tap skips in the
+      // recon-6 gradient) are already unconditional under ibRccm.  Ghost-filling
+      // under --cutpi OVERWROTE live cut cells after they had been advanced by
+      // their true flux, which is exactly the conservation leak that shows up in
+      // the closed-box test.  Never ghost-fill when the cut geometry is active.
+      else if (immerserdBcType && !ibRccm && !rans) applyWallGhosts();   // Euler: slip ghosts
       if (shash >= 2 && iter >= shashFrom && iter <= shashTo) stateHash(stage?"ghostS12":"ghost", iter);
       if (rans) {
         if (wallGeom || immerserdBcType) applyWallGhosts();
@@ -468,12 +488,17 @@ real CompressibleSolver::step(real tStep) {
       computeRightHandSide();
       if (shash >= 2 && iter >= shashFrom && iter <= shashTo) stateHash(stage?"rhsS12":"rhs", iter);
       primitiveToConservative();
+      if (srdOn && (srdPerStage || stage == 0)) srdSnapshot();   // U^n for the UM-SRD indicator
       updateFields(stage);
+      if (srdOn && (srdPerStage || stage == nRkStages-1))
+        applySrd();            // state redistribution: conservative sliver fix
       setBoundaryConditions();
       if (shash >= 2 && iter >= shashFrom && iter <= shashTo) stateHash(stage?"updS12":"upd", iter);
 
 
-      if (nLvls > 1) {
+      // --leaf: no interior ghost rims and idle parents -- nothing to restrict or
+      // interpolate per stage; the level jumps were fluxed by mortarFluxKernel
+      if (nLvls > 1 && !leafFlux) {
         restrictFields();
 #ifdef USE_MGPU
         haloExchange(0, NEVOLVE);   // refresh ghosts after the coarse/fine reconstruction
@@ -488,7 +513,7 @@ real CompressibleSolver::step(real tStep) {
         // and the error grows with every extra level -- which is why nLvls 6 was
         // stable and nLvls 7 was not.  Re-impose the immersed ghosts here, at
         // the level they belong to, before the state is used again.
-        if (immerserdBcType) applyWallGhosts();
+        if (immerserdBcType && !ibRccm) applyWallGhosts();
       }
     }
     cudaDeviceSynchronize();
@@ -525,6 +550,13 @@ real CompressibleSolver::step(real tStep) {
 void CompressibleSolver::sortFieldData(void) {
   copyToOldFieldsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
   sortFieldDataKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  // --p1: the slope DOFs and the new-block marker are block payload too
+  if (p1)
+    for (i32 s = 0; s <= 2*P1_NV; s++) {
+      const i32 f = (s < 2*P1_NV) ? F_P1S + s : F_P1NEW;
+      copyFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, f, F_SCRATCH);
+      gatherSortedFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, F_SCRATCH, f);
+    }
   // The geometry cache is block payload: carry it through the sort with the
   // flow variables (staged through F_SCRATCH -- the F_OLD bank has exactly
   // NEVOLVE slots).  Same-stream launches, so no explicit sync is needed
@@ -535,7 +567,7 @@ void CompressibleSolver::sortFieldData(void) {
     copyFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, F_IBM, F_SCRATCH);
     gatherSortedFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, F_SCRATCH, F_IBM);
     if (ibRccm)
-      for (i32 f : {F_CUTA, F_CUTAX, F_CUTAY}) {
+      for (i32 f : {F_CUTA, F_CUTAX, F_CUTAY, F_CUTCX, F_CUTCY, F_CUTNX, F_CUTNY, F_CUTTX, F_CUTTY}) {
         copyFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, f, F_SCRATCH);
         gatherSortedFieldKernel<<<cudaGridSize, cudaBlockSize>>>(*this, F_SCRATCH, f);
       }
@@ -557,12 +589,30 @@ void CompressibleSolver::setBoundaryConditions(i32 fOff, i32 prim) {
   setBoundaryConditionsKernel<<<cudaGridSize, cudaBlockSize>>>(*this, fOff, prim);
 }
 
+static i32 g_convDbg = 0;
+static void convCoverage(CompressibleSolver &S, const char *tag) {
+  cudaDeviceSynchronize();
+  real *Pp = S.getField(F_RHOE); i32 nPrim = 0, nCons = 0, nOther = 0, firstPrim = -1, lastPrim = -1, firstCons = -1, lastCons = -1;
+  for (i32 b = 0; b < S.hashTable.nKeys; b++) { if (S.bLocList[b] == kEmpty) continue;
+    i32 lvl, ib, jb, kb; S.decode(S.bLocList[b], lvl, ib, jb, kb); if (!S.isInteriorBlock(lvl, ib, jb, kb)) continue;
+    for (i32 cc = 0; cc < blockSize*blockSize; cc++) { const i32 c = b*blockSizeTot + cc; if (S.cFlagsList[c] != ACTIVE) continue;
+      const double v = Pp[c];
+      if (fabs(v - 7.9365079365) < 1e-4) { nPrim++; if (firstPrim < 0) firstPrim = b; lastPrim = b; }
+      else if (fabs(v - 20.3412698413) < 1e-3) { nCons++; if (firstCons < 0) firstCons = b; lastCons = b; }
+      else nOther++; } }
+  printf("[convdbg] %-14s prim %5d (blocks %d..%d)  cons %5d (blocks %d..%d)  other %d   nLeaf %d nExt %d\n", tag, nPrim, firstPrim, lastPrim, nCons, firstCons, lastCons, nOther, S.nLeafBlocks, S.nExtBlocks);
+}
+
 void CompressibleSolver::conservativeToPrimitive(void) {
+  if (cutDbg && g_convDbg < 6) convCoverage(*this, "before c2p");
   conservativeToPrimitiveKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  if (cutDbg && g_convDbg < 6) { convCoverage(*this, "after c2p"); g_convDbg++; }
 }
 
 void CompressibleSolver::primitiveToConservative(void) {
+  if (cutDbg && g_convDbg < 6) convCoverage(*this, "before p2c");
   primitiveToConservativeKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  if (cutDbg && g_convDbg < 6) { convCoverage(*this, "after p2c"); g_convDbg++; }
 }
 
 void CompressibleSolver::forwardWaveletTransform(void) {
@@ -882,6 +932,82 @@ extern __device__ double             g_resMaxPhi;
 // RMS of L(q) over live fluid cells.  Call ONLY right after
 // computeRightHandSide() on stage 0, where the accumulator is exactly L(q^n).
 // Snapshot q before the stages; the compare happens after them.
+__global__ void srdBuildKernel(CompressibleSolver &grid);
+__global__ void srdCountKernel(CompressibleSolver &grid);
+__global__ void srdProjectKernel(CompressibleSolver &grid);
+__global__ void srdAverageKernel(CompressibleSolver &grid, real sBlend);
+__global__ void srdSnapKernel(CompressibleSolver &grid);
+__global__ void srdIndicatorKernel(CompressibleSolver &grid);
+__global__ void cutBroadcastKernel(CompressibleSolver &grid);
+__global__ void cutCellKernel(CompressibleSolver &grid);
+__global__ void mortarFluxKernel(CompressibleSolver &grid);
+__global__ void cutPieceUpdateKernel(CompressibleSolver &grid, i32 stage);
+extern __device__ double g_srdDU;
+extern __device__ unsigned long long g_srdShort;
+
+// Build the merge neighbourhoods.  Cheap and geometry-only, so it is called
+// once after the geometry stamp (and would be re-called at the adaptation
+// cadence, alongside stampIbGeometry, once AMR is supported).
+void CompressibleSolver::buildSrd(void) {
+  if (!srdOn) return;
+  // Multi-level is supported: srdLive takes ACTIVE cells only, so a neighbourhood
+  // never spans a level jump (see the kernel).  A sliver whose only same-level
+  // neighbours are themselves small will simply come up short of volFrac and be
+  // counted in "never reached the target" below rather than silently merging
+  // across levels.  Neighbourhoods are rebuilt here, i.e. at every geometry stamp,
+  // which is also every adaptation cycle.
+  srdStride = (size_t)nBlocksMax*(size_t)blockSizeTot;
+  if (!srdM) {
+    cudaMallocManaged(&srdM,  (size_t)SRD_MAXM*srdStride*sizeof(i32));
+    cudaMallocManaged(&srdMn, srdStride*sizeof(i32));
+    cudaMallocManaged(&srdC,  srdStride*sizeof(i32));
+    cudaMallocManaged(&srdPi, (size_t)5*srdStride*sizeof(real));
+    cudaMallocManaged(&srdU0, (size_t)5*srdStride*sizeof(real));
+    cudaMallocManaged(&srdS,  srdStride*sizeof(real));
+    cudaMallocManaged(&srdPi0,(size_t)5*srdStride*sizeof(real));
+    cudaMallocManaged(&srdTh, srdStride*sizeof(real));
+  }
+  unsigned long long z = 0;
+  cudaMemcpyToSymbol(g_srdShort, &z, sizeof(z));
+  srdBuildKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  srdCountKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  cudaMemcpyFromSymbol(&z, g_srdShort, sizeof(z));
+  // census: how many cells were merged at all, and the neighbourhood sizes
+  i32 nSmall = 0, nMax = 0; double mSum = 0;
+  for (size_t c = 0; c < (size_t)hashTable.nKeys*blockSizeTot; c++) {
+    const i32 n = srdMn[c];
+    if (n > 1) { nSmall++; mSum += n; if (n > nMax) nMax = n; }
+  }
+  printf("[srd] reach %d, volFrac %.2f: %d cells merged (mean |M| %.2f, max %d), %llu never reached the target\n",
+         srdReach, (double)srdVolFrac, nSmall, nSmall ? mSum/nSmall : 0.0, nMax, z);
+}
+
+void CompressibleSolver::srdSnapshot(void) {
+  if (!srdOn || !srdU0) return;
+  srdSnapKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+}
+
+// S applied to the updated state, after every RK stage.
+void CompressibleSolver::applySrd(void) {
+  if (!srdOn || !srdM) return;
+  // UM-SRD indicator.  srdLocal 1 = per-neighbourhood s (the paper); the average
+  // kernel then takes s per cell as the max over the neighbourhoods containing it,
+  // signalled by passing sBlend < 0.  srdLocal 0 = one global s (exactly
+  // conservative under overlap; see the header).
+  real sB = (real)-1;
+  srdIndicatorKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  if (!srdLocal) {
+    cudaDeviceSynchronize();
+    double dmax = 0;
+    for (size_t c = 0; c < (size_t)hashTable.nKeys*blockSizeTot; c++)
+      if (srdMn[c] > 1 && (double)srdS[c] > dmax) dmax = (double)srdS[c];
+    sB = (real)dmax;
+  }
+  srdProjectKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  srdAverageKernel<<<cudaGridSize, cudaBlockSize>>>(*this, sB);
+}
+
 void CompressibleSolver::snapshotResidualQ(void) {
   if (!residQ0) cudaMallocManaged(&residQ0, (size_t)4*(size_t)nBlocksMax*(size_t)blockSizeTot*sizeof(real));
   if (!residCell) {
@@ -1765,6 +1891,7 @@ void CompressibleSolver::writeCfProfile(const char *fileName) {
 //   sum_f p n_f A_f + p n_w A_w = p (sum_f n_f A_f + n_w A_w) = 0
 // by the discrete divergence theorem.  Any nonzero residual localises the term
 // that does not close, which no amount of reasoning about the algebra can.
+static inline i32 hostNbrIdx(const i32 *nbrIdxList, i32 bIdx, i32 i, i32 j);   // defined with the merge code below
 void CompressibleSolver::checkWellBalanced(void) {
   cudaDeviceSynchronize();
   real *Rho=getField(F_RHO), *U=getField(F_RHOU), *V=getField(F_RHOV),
@@ -1775,9 +1902,34 @@ void CompressibleSolver::checkWellBalanced(void) {
   cudaDeviceSynchronize();
   for (i32 f = 0; f < NEVOLVE; f++)
     cudaMemset(getField(F_RHS+f), 0, (size_t)hashTable.nKeys*blockSizeTot*sizeof(real));
+  if (p1) {   // uniform state: zero slopes everywhere (cells and pieces), clean slope accumulators
+    for (i32 s = 0; s < 2*P1_NV; s++) {
+      cudaMemset(getField(F_P1S+s),  0, (size_t)hashTable.nKeys*blockSizeTot*sizeof(real));
+      cudaMemset(getField(F_P1SR+s), 0, (size_t)hashTable.nKeys*blockSizeTot*sizeof(real));
+    }
+    if (cutPieceSX) { cudaMemset(cutPieceSX, 0, (size_t)2*P1_NV*cutPieceQCap*sizeof(real)); cudaMemset(cutPieceSR, 0, (size_t)2*P1_NV*cutPieceQCap*sizeof(real)); }
+    if (cutPieceQ) for (i32 k = 0; k < nCutPiece; k++) { cutPieceQ[k] = 1; cutPieceQ[cutPieceQCap+k] = 0; cutPieceQ[2*(size_t)cutPieceQCap+k] = 0; cutPieceQ[3*(size_t)cutPieceQCap+k] = 0; cutPieceQ[4*(size_t)cutPieceQCap+k] = (real)(1.0/(gam-1.0)); }
+    if (cutPieceS) cudaMemset(cutPieceS, 0, (size_t)NEVOLVE*cutPieceQCap*sizeof(real));
+  }
   cudaDeviceSynchronize();
   computeRightHandSide();
   cudaDeviceSynchronize();
+  if (p1) {
+    double ms = 0, mp = 0;
+    const i32 cEwb = bEmpty*blockSizeTot;
+    for (i32 c = 0; c < hashTable.nKeys*blockSizeTot; c++) {
+      if (cFlagsList[c] != ACTIVE || !(getField(F_CUTA)[c] > (real)ibRccmAlphaMin)) continue;
+      // the domain boundary imposes the freestream WEAKLY, so a cell on it sees a
+      // real flux against this rest state: judge the cut geometry on interior cells
+      { const i32 b = c/blockSizeTot, cc = c%blockSizeTot, i = cc%blockSize, j = (cc/blockSize)%blockSize; bool edge = false;
+        const i32 nb[4] = { hostNbrIdx(nbrIdxList, b, i-1, j), hostNbrIdx(nbrIdxList, b, i+1, j), hostNbrIdx(nbrIdxList, b, i, j-1), hostNbrIdx(nbrIdxList, b, i, j+1) };
+        for (i32 q = 0; q < 4; q++) { if (nb[q] < 0 || nb[q] >= cEwb) { edge = true; break; } i32 l, ib, jb, kb; decode(bLocList[nb[q]/blockSizeTot], l, ib, jb, kb); if (!isInteriorBlock(l, ib, jb, kb)) { edge = true; break; } }
+        if (edge) continue; }
+      for (i32 s = 0; s < 2*P1_NV; s++) ms = fmax(ms, fabs((double)getField(F_P1SR+s)[c]));
+    }
+    if (cutPieceSR) for (i32 k = 0; k < nCutPiece; k++) for (i32 s = 0; s < 2*P1_NV; s++) mp = fmax(mp, fabs((double)cutPieceSR[(size_t)s*cutPieceQCap + k]));
+    printf("  [p1] max |slope Rhs| over live cells = %.3e, over pieces = %.3e  (%d cut elements, %d quadrature points, %d face pieces)\n", ms, mp, nP1Elem, nP1Qpt, nP1Seg);
+  }
   double mx[3] = {0,0,0}; i32 nbad = 0; double worstA = 1; i32 worstCut = -1;
   real *A = getField(F_CUTA);
   for (i32 bIdx = 0; bIdx < hashTable.nKeys; bIdx++) {
@@ -1787,6 +1939,12 @@ void CompressibleSolver::checkWellBalanced(void) {
       if (cFlagsList[cIdx] != ACTIVE) continue;
       if (!(A[cIdx] > (real)ibRccmAlphaMin)) continue;          // dead
       if (getField(F_PHI)[cIdx] >= (real)0) continue;           // R-Cell
+      if (p1) {   // --p1 imposes the freestream weakly at the domain boundary: skip the cells on it
+        const i32 i = c%blockSize, j = (c/blockSize)%blockSize; bool edge = false;
+        const i32 nb[4] = { hostNbrIdx(nbrIdxList, bIdx, i-1, j), hostNbrIdx(nbrIdxList, bIdx, i+1, j), hostNbrIdx(nbrIdxList, bIdx, i, j-1), hostNbrIdx(nbrIdxList, bIdx, i, j+1) };
+        for (i32 q = 0; q < 4 && !edge; q++) { if (nb[q] < 0 || nb[q] >= bEmpty*blockSizeTot) { edge = true; break; } i32 l, ib, jb, kb; decode(bLocList[nb[q]/blockSizeTot], l, ib, jb, kb); if (!isInteriorBlock(l, ib, jb, kb)) edge = true; }
+        if (edge) continue;
+      }
       const double ru = fabs((double)getField(F_RHS+F_RHOU)[cIdx]);
       const double rv = fabs((double)getField(F_RHS+F_RHOV)[cIdx]);
       const double rr = fabs((double)getField(F_RHS+F_RHO)[cIdx]);
@@ -1806,7 +1964,14 @@ void CompressibleSolver::checkWellBalanced(void) {
 
 extern __device__ unsigned long long g_rcDeadFace;
 extern __device__ unsigned long long g_rcDeadGrad;
+extern __device__ unsigned long long g_ibFaceRows;
 extern __device__ unsigned long long g_rcLiveFace;
+
+void CompressibleSolver::reportIbFaceRows(void) {
+  unsigned long long fr = 0;
+  cudaMemcpyFromSymbol(&fr, g_ibFaceRows, sizeof(fr));
+  printf("[ibface] wall rows added to the gradient fit: %llu\n", fr);
+}
 
 void CompressibleSolver::reportDeadTaps(void) {
   unsigned long long df=0, dg=0, lf=0;
@@ -1822,6 +1987,7 @@ void CompressibleSolver::reportDeadTaps(void) {
 
 void CompressibleSolver::checkCutGeometry(void) {
   cudaDeviceSynchronize();
+  const i32 cE = bEmpty*blockSizeTot;
   double area = 0, wallLen = 0, gclMax = 0, stampErr = 0;
   i32 nCut = 0, nR = 0;
   real *A = getField(F_CUTA), *AX = getField(F_CUTAX), *AY = getField(F_CUTAY);
@@ -1868,17 +2034,1017 @@ void CompressibleSolver::checkCutGeometry(void) {
       }
     }
   }
+  if (cutSplit && cutSplitCell && nCutSplit > 0) {
+    // --cutsplit diagnostic: the two states across a thin wall, per split cell
+    real *Rho = getField(F_RHO), *RhoU = getField(F_RHOU), *RhoV = getField(F_RHOV), *RhoE = getField(F_RHOE);
+    auto pres = [&](i32 h) {
+      if (h == CUT_DEAD) return -1.0;
+      double r, ru, rv, rE;
+      if (cutIsPiece(h)) { const i32 k = cutPieceOf(h); const size_t cap = cutPieceQCap;
+        r = cutPieceQ[k]; ru = cutPieceQ[cap+k]; rv = cutPieceQ[2*cap+k]; rE = cutPieceQ[4*cap+k]; }
+      else { r = Rho[h]; ru = RhoU[h]; rv = RhoV[h]; rE = RhoE[h]; }
+      const double u = ru/r, v = rv/r;
+      return (double)(gam - (real)1)*(rE - 0.5*r*(u*u + v*v)); };
+    printf("---- split cells (x, piece-0 side by cy0, p_dof, p_piece1, owner handle, dp) ----\n");
+    i32 shown = 0;
+    for (i32 k = 0; k < nCutSplit; k++) {
+      const CutSplitCell &S = cutSplitCell[k];
+      const CutPiece &P = cutPiece[S.first];
+      const i32 c = P.cell;
+      if (c >= cE || cFlagsList[c] != ACTIVE) continue;
+      double px, py, dx, dy; cellGeomHost(c, px, py, dx, dy);
+      const double p0 = pres(cutOwner ? cutOwner[c] : c), p1 = pres(P.owner);
+      double ox = 0, oy = 0; if (P.owner != CUT_DEAD) { double odx, ody; cellGeomHost(cutIsPiece(P.owner) ? cutPiece[cutPieceOf(P.owner)].cell : P.owner, ox, oy, odx, ody); }
+      shown++;
+      printf("  x=%.4f y=%.4f  p0side=%s a0=%.3f  p0=%.5f  p1=%.5f (owner %d at y=%.4f, a1=%.3f)  dp(below-above)=%+.5f\n",
+               px, py, S.cy0 > 0 ? "above" : "below", (double)S.a0, p0, p1, P.owner, oy, (double)P.a,
+               S.cy0 > 0 ? p1 - p0 : p0 - p1);
+    }
+  }
   printf("---- RCCM cut geometry ----\n");
   printf("  fluid area   = %.10f\n", area);
+  {
+    const double domA = (double)domainSize[0]*(double)domainSize[1];
+    if (clipSegN > 0)
+      printf("  exact (segments) = %.10f   err = %.3e\n", domA - clipArea, area - (domA - clipArea));
+    if (immerserdBcType == 3) {
+      const double ex = domA - M_PI*(double)ibRadius*(double)ibRadius;
+      printf("  exact (circle)   = %.10f   err = %.3e\n", ex, area - ex);
+    }
+    if (immerserdBcType == 6 && ibPolyN > 2) {
+      double A2 = 0;
+      for (i32 e = 0; e < ibPolyN; e++) {
+        const i32 f = (e + 1 == ibPolyN) ? 0 : e + 1;
+        A2 += (double)ibPoly[2*e]*(double)ibPoly[2*f+1] - (double)ibPoly[2*f]*(double)ibPoly[2*e+1];
+      }
+      const double ex = domA - 0.5*fabs(A2);
+      printf("  exact (polyline) = %.10f   err = %.3e\n", ex, area - ex);
+    }
+  }
   printf("  wall length  = %.10f\n", wallLen);
   printf("  cut cells    = %d  (R-Cells, centre outside: %d)\n", nCut, nR);
   printf("  max |A_w n|  = %.3e   stored-vs-exact aperture err = %.2e\n", gclMax, stampErr);
   printf("---------------------------\n");
 }
 
+// --cutgeom 2: replace the LINEAR corner cut with the CURVED Q2 moment-fitted
+// geometry on every cut cell.  Runs on the HOST, once per geometry stamp: the
+// Saye arena is ~10 KB, which as a per-thread device array would reserve that
+// frame for every thread of the stamp kernel and exhaust local memory at launch.
+// Only alpha / the two low-face apertures / the fluid centroid are replaced --
+// the wall segment stays A_w n = -sum_f A_f n_f, so conservation is untouched.
+void CompressibleSolver::stampCutGeomCurved(void) {
+  if (cutGeom != 2 || !ibRccm || immerserdBcType == 0) return;
+  cudaDeviceSynchronize();
+  real *A = getField(F_CUTA), *AX = getField(F_CUTAX), *AY = getField(F_CUTAY);
+  real *CX = getField(F_CUTCX), *CY = getField(F_CUTCY);
+  real *TX = getField(F_CUTTX), *TY = getField(F_CUTTY);
+  i32 nCut = 0, nFail = 0, nOvf = 0, nEmpty = 0;
+  const i32 NBUF = 262144;                      // heap arena: ~15 MB, host only, once per stamp
+  SayeNode *sbuf = (SayeNode*)malloc((size_t)NBUF*sizeof(SayeNode));
+  if (!sbuf) { printf("[cutgeom] arena alloc failed; keeping the linear cut\n"); return; }
+  for (i32 b = 0; b < hashTable.nKeys; b++) {
+    u64 loc = bLocList[b]; if (loc == kEmpty) continue;
+    i32 lvl, ib, jb, kb; decode(loc, lvl, ib, jb, kb);
+    const real dxL = domainSize[0]/(baseGridSize[0]*powi(2,lvl));
+    const real dyL = domainSize[1]/(baseGridSize[1]*powi(2,lvl));
+    const real hR  = fmin(dxL, dyL);
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      const i32 ii = c%blockSize, jj = (c/blockSize)%blockSize, kk = c/blockSize/blockSize;
+      if (kk != 0) continue;
+      const size_t m = (size_t)b*blockSizeTot + c;
+      const real a0 = A[m];
+      if (!(a0 > (real)0) || a0 >= (real)1 - (real)1e-12) continue;   // uncut or dead
+      const real px = (ib*blockSize+ii+(real)0.5)*dxL;
+      const real py = (jb*blockSize+jj+(real)0.5)*dyL;
+      real f33[3][3];
+      for (i32 sj = 0; sj < 3; sj++)
+        for (i32 si = 0; si < 3; si++)
+          f33[sj][si] = getBoundaryLevelSet(
+              Vec3(px + ((real)0.5*si - (real)0.5)*dxL,
+                   py + ((real)0.5*sj - (real)0.5)*dyL, (real)0));
+      real al, ax, ay, cx = (real)0.5, cy = (real)0.5, tx = 0, ty = 0;
+      i32 why = 0;
+      if (cutGeomMoment(f33, sbuf, NBUF, al, ax, ay, &cx, &cy, &tx, &ty, &why)) {
+        A[m] = al; AX[m] = ax; AY[m] = ay; TX[m] = tx; TY[m] = ty;
+        CX[m] = (cx - (real)0.5)*dxL/hR;
+        CY[m] = (cy - (real)0.5)*dyL/hR;
+        nCut++;
+      } else { nFail++; if (why == 1) nOvf++; else nEmpty++; }
+    }
+  }
+  free(sbuf);
+  printf("[cutgeom] curved Q2 moment fitting on %d cut cells (%d fell back: %d arena overflow, %d empty rule)\n",
+         nCut, nFail, nOvf, nEmpty);
+}
+
+// --cutgeom 3: the cell geometry from the body SEGMENTS themselves (CutClip.h).
+// No level set is involved: the polyline is clipped to the cell box and the
+// fluid loops are walked, which is exact for the polyline as given (so it is at
+// least as accurate as --cutgeom 2, whose Q2 fit approximates this same
+// polyline), and it is the only route that sees a body thinner than the cell:
+// a cell crossed twice comes back with two fluid loops.  Under the current
+// one-DOF-per-cell scheme those loops are merged (area-weighted) into the nine
+// stamped fields; the split-cell/agglomeration layer will keep them apart.
+struct ClipRec { i32 cell; double px, py, dx, dy; ClipResult R; };
+
+void CompressibleSolver::buildClipSegments(void) {
+  if (clipSegN > 0) return;
+  std::vector<double> xy;
+  bool fluidInside = false;
+  if (immerserdBcType == 6 && ibPolyN > 2) {
+    xy.resize((size_t)2*ibPolyN);
+    for (i32 i = 0; i < 2*ibPolyN; i++) xy[i] = (double)ibPoly[i];
+    fluidInside = ibPolyFluidInside != 0;
+  } else if (immerserdBcType == 3) {
+    const i32 N = cutSeg < 8 ? 8 : cutSeg;
+    xy.resize((size_t)2*N);
+    for (i32 k = 0; k < N; k++) {
+      const double th = 2.0*M_PI*(double)k/(double)N;
+      xy[2*k]   = (double)ibCenter[0] + (double)ibRadius*cos(th);
+      xy[2*k+1] = (double)ibCenter[1] + (double)ibRadius*sin(th);
+    }
+  } else {
+    printf("[cutclip] body type %d has no segment geometry; --cutgeom 3 keeps the linear cut\n",
+           immerserdBcType);
+    return;
+  }
+  const i32 n = (i32)(xy.size()/2);
+  double A2 = 0;
+  clipBox[0] = clipBox[2] = xy[0]; clipBox[1] = clipBox[3] = xy[1];
+  for (i32 e = 0; e < n; e++) {
+    const i32 f = (e + 1 == n) ? 0 : e + 1;
+    A2 += xy[2*e]*xy[2*f+1] - xy[2*f]*xy[2*e+1];
+    clipBox[0] = fmin(clipBox[0], xy[2*e]); clipBox[2] = fmax(clipBox[2], xy[2*e]);
+    clipBox[1] = fmin(clipBox[1], xy[2*e+1]); clipBox[3] = fmax(clipBox[3], xy[2*e+1]);
+  }
+  const bool ccw = A2 > 0;
+  clipFluidLeftFwd = (ccw == fluidInside);
+  clipArea = 0.5*fabs(A2);
+  clipSeg = (double*)malloc((size_t)2*n*sizeof(double));
+  for (i32 i = 0; i < 2*n; i++) clipSeg[i] = xy[i];
+  clipSegN = n;
+  printf("[cutclip] %d segments (%s, %s inside), enclosed area %.12f\n", n,
+         ccw ? "ccw" : "cw", fluidInside ? "fluid" : "solid", clipArea);
+}
+
+void CompressibleSolver::stampCutGeomClip(void) {
+  if (cutGeom != 3 || !ibRccm || immerserdBcType == 0) return;
+  buildClipSegments();
+  if (clipSegN == 0) return;
+  cudaDeviceSynchronize();
+  real *A = getField(F_CUTA), *AX = getField(F_CUTAX), *AY = getField(F_CUTAY);
+  real *CX = getField(F_CUTCX), *CY = getField(F_CUTCY);
+  real *TX = getField(F_CUTTX), *TY = getField(F_CUTTY);
+  i32 nCell = 0, nSplit = 0, nHole = 0, nOvf = 0, nBad = 0, nChanged = 0;
+  double dAlphaMax = 0;
+  ClipResult R;
+  std::vector<ClipRec> recs;               // --cutsplit: every clipped cell, for the piece/face tables
+  for (i32 b = 0; b < hashTable.nKeys; b++) {
+    u64 loc = bLocList[b]; if (loc == kEmpty) continue;
+    i32 lvl, ib, jb, kb; decode(loc, lvl, ib, jb, kb);
+    const double dxL = (double)domainSize[0]/(baseGridSize[0]*powi(2,lvl));
+    const double dyL = (double)domainSize[1]/(baseGridSize[1]*powi(2,lvl));
+    const double hR  = fmin(dxL, dyL);
+    for (i32 c = 0; c < blockSizeTot; c++) {
+      const i32 ii = c%blockSize, jj = (c/blockSize)%blockSize, kk = c/blockSize/blockSize;
+      if (kk != 0) continue;
+      const size_t m = (size_t)b*blockSizeTot + c;
+      cutclip::Box B;
+      B.x0 = (ib*blockSize+ii)*dxL;  B.x1 = B.x0 + dxL;
+      B.y0 = (jb*blockSize+jj)*dyL;  B.y1 = B.y0 + dyL;
+      B.dx = dxL; B.dy = dyL; B.P = 2*(dxL + dyL);
+      // cheap reject: the cell box does not meet the body box (closed)
+      if (B.x1 < clipBox[0] || B.x0 > clipBox[2] || B.y1 < clipBox[1] || B.y0 > clipBox[3]) continue;
+      cutclip::clipCell(B, clipSeg, clipSegN, clipFluidLeftFwd, R);
+      if (R.overflow) { nOvf++; continue; }
+      if (R.bad)      { nBad++; continue; }
+      const double px = 0.5*(B.x0 + B.x1), py = 0.5*(B.y0 + B.y1), cellA = dxL*dyL;
+      double area, mx, my, fl0 = 0, fm0 = 0, fl2 = 0, fm2 = 0;
+      if (R.nLoop == 0) {
+        if (R.nHole == 0) {
+          // the body does not cross this cell: whole cell is fluid or solid
+          const bool solid = getBoundaryLevelSet(Vec3((real)px, (real)py, (real)0)) > (real)0;
+          area = solid ? 0 : cellA; mx = area*px; my = area*py;
+          fl0 = solid ? 0 : dyL; fm0 = fl0*py;
+          fl2 = solid ? 0 : dxL; fm2 = fl2*px;
+        } else {
+          nHole++;
+          area = cellA - R.holeArea; mx = cellA*px - R.holeMx; my = cellA*py - R.holeMy;
+          fl0 = dyL; fm0 = fl0*py; fl2 = dxL; fm2 = fl2*px;
+        }
+      } else {
+        nCell++; if (R.nLoop > 1) nSplit++;
+        if (cutSplit || p1) recs.push_back({(i32)m, px, py, dxL, dyL, R});
+        area = mx = my = 0;
+        for (i32 l = 0; l < R.nLoop; l++) {
+          const ClipLoop &L = R.loop[l];
+          area += L.area; mx += L.mx; my += L.my;
+          fl0 += L.faceLen[0]; fm0 += L.faceMom[0];
+          fl2 += L.faceLen[2]; fm2 += L.faceMom[2];
+        }
+      }
+      const double al = fmin(fmax(area/cellA, 0.0), 1.0);
+      dAlphaMax = fmax(dAlphaMax, fabs(al - (double)A[m]));
+      if (fabs(al - (double)A[m]) > 1e-12) nChanged++;
+      A[m]  = (real)al;
+      AX[m] = (real)fmin(fmax(fl0/dyL, 0.0), 1.0);
+      AY[m] = (real)fmin(fmax(fl2/dxL, 0.0), 1.0);
+      CX[m] = (real)((area > 0 ? mx/area - px : 0.0)/hR);
+      CY[m] = (real)((area > 0 ? my/area - py : 0.0)/hR);
+      TX[m] = (real)(fl0 > 0 ? (fm0/fl0 - py)/dyL : 0.0);
+      TY[m] = (real)(fl2 > 0 ? (fm2/fl2 - px)/dxL : 0.0);
+    }
+  }
+  printf("[cutclip] segment clipping: %d cells crossed by the body (%d split into >1 fluid loop, "
+         "%d holes), %d overflow, %d bad; alpha changed on %d cells, max |dalpha| vs linear = %.3e\n",
+         nCell, nSplit, nHole, nOvf, nBad, nChanged, dAlphaMax);
+  if (cutSplit) buildCutSplit(recs);
+  if (p1) { if (!clipRecs) clipRecs = new std::vector<ClipRec>(); clipRecs->swap(recs); }
+}
+
+// host mirror of getNbrIdx for the k = 0 plane (the merge runs on the host)
+static inline i32 hostNbrIdx(const i32 *nbrIdxList, i32 bIdx, i32 i, i32 j) {
+  i += blockSize; j += blockSize;
+  const i32 ib = i/blockSize, jb = j/blockSize;
+  const i32 nb = (ib == 1 && jb == 1) ? bIdx : nbrIdxList[27*bIdx + ib + 3*jb + 9];
+  return blockSizeTot*nb + (i%blockSize) + (j%blockSize)*blockSize;
+}
+
+// --cutmerge: permanent agglomeration of small cut cells.  Union-find over the
+// ACTIVE cells: every element below cutMergeFrac joins the LARGEST element
+// face-adjacent to any of its members (ties to the lower index), repeated until
+// nothing is small or nothing can move.  Same level only -- a cross-level lookup
+// lands in a non-ACTIVE ghost cell, which is excluded -- so V is a common factor
+// and the element volume is simply the alpha sum.  Then every member gets the
+// element's alpha and the element's centroid (relative to its own centre), so
+// the reconstruction of every face of the element extrapolates from the point
+// the element average actually lives at.
+void CompressibleSolver::buildCutMerge(void) {
+  if (!cutMerge || !ibRccm || immerserdBcType == 0) return;
+  cudaDeviceSynchronize();
+  const size_t stride = (size_t)nBlocksMax*(size_t)blockSizeTot;
+  if (!cutOwner) {
+    cudaMallocManaged(&cutOwner,  stride*sizeof(i32));
+    cudaMallocManaged(&cutAlphaE, stride*sizeof(real));
+  }
+  real *A = getField(F_CUTA), *CX = getField(F_CUTCX), *CY = getField(F_CUTCY);
+  const i32 nC = hashTable.nKeys*blockSizeTot;
+  const i32 cE = bEmpty*blockSizeTot;
+  const i32 nP = (cutSplit && cutPiece) ? nCutPiece : 0;
+  const i32 nN = nC + nP;                       // NODES: every cell (its piece 0), then the extra pieces
+  for (size_t c = 0; c < stride; c++) { cutOwner[c] = (i32)c; cutAlphaE[c] = (c < (size_t)nC) ? A[c] : (real)0; }
+  auto splitOf  = [&](i32 c) -> i32 { return (cutSplit && cutSplitId) ? cutSplitId[c] : -1; };
+  auto nodeCell = [&](i32 n) -> i32 { return n < nC ? n : cutPiece[n-nC].cell; };
+  auto nodeVol  = [&](i32 n) -> double {
+    if (n >= nC) return (double)cutPiece[n-nC].a;
+    const i32 sp = splitOf(n); return sp >= 0 ? (double)cutSplitCell[sp].a0 : (double)A[n]; };
+  auto cellOk   = [&](i32 m) { return m >= 0 && m < nC && m < cE && cFlagsList[m] == ACTIVE; };
+  auto nodeLive = [&](i32 n) { return cellOk(nodeCell(n)) && nodeVol(n) > 0; };
+  auto pieceNode = [&](i32 c, i32 p) -> i32 {
+    if (p == 0) return c;
+    const i32 sp = splitOf(c); return (sp < 0 || p > cutSplitCell[sp].n) ? -1 : nC + cutSplitCell[sp].first + p - 1; };
+  auto nodePiece = [&](i32 n) -> i32 {
+    if (n < nC) return 0;
+    const i32 sp = splitOf(cutPiece[n-nC].cell); return n - nC - cutSplitCell[sp].first + 1; };
+  // face-adjacent nodes of a node: through the segment table where a face has
+  // one, else piece 0 <-> piece 0 across the plain face
+  // fn(neighbour node, shared open face length as a fraction of the face)
+  real *AXf = getField(F_CUTAX), *AYf = getField(F_CUTAY);
+  auto forEachNbr = [&](i32 node, const std::function<void(i32, double)> &fn) {
+    const i32 c = nodeCell(node), p = nodePiece(node);
+    const i32 b = c/blockSizeTot, cc = c%blockSizeTot, i = cc%blockSize, j = (cc/blockSize)%blockSize;
+    const i32 l1 = hostNbrIdx(nbrIdxList, b, i-1, j), r1 = hostNbrIdx(nbrIdxList, b, i+1, j);
+    const i32 d1 = hostNbrIdx(nbrIdxList, b, i, j-1), u1 = hostNbrIdx(nbrIdxList, b, i, j+1);
+    struct Fc { i32 owner, other, dir; bool cIsOwner; };
+    const Fc fc[4] = { {c, l1, 0, true}, {r1, c, 0, false}, {c, d1, 1, true}, {u1, c, 1, false} };
+    for (i32 q = 0; q < 4; q++) {
+      const Fc &f = fc[q];
+      if (f.owner < 0 || f.owner >= cE || f.other < 0 || f.other >= cE) continue;
+      const i32 id = (cutSplit && cutFaceId) ? cutFaceId[f.owner] : -1;
+      const i32 nS = id < 0 ? 0 : (f.dir == 0 ? cutFace[id].nX : cutFace[id].nY);
+      if (nS == 0) {
+        if (p == 0) {
+          const i32 nb = f.cIsOwner ? f.other : f.owner;
+          const double len = (f.dir == 0) ? (double)AXf[f.owner] : (double)AYf[f.owner];   // the face's open fraction
+          if (nodeLive(nb) && len > 0) fn(nb, len);
+        }
+        continue;
+      }
+      const CutFaceSeg *sg = (f.dir == 0) ? cutFace[id].sx : cutFace[id].sy;
+      for (i32 s2 = 0; s2 < nS; s2++) {
+        if (sg[s2].len <= 0) continue;
+        const i32 mine = f.cIsOwner ? sg[s2].pC : sg[s2].pN;
+        if (mine != p) continue;
+        const i32 nbCell = f.cIsOwner ? f.other : f.owner, nbP = f.cIsOwner ? sg[s2].pN : sg[s2].pC;
+        const i32 nb = pieceNode(nbCell, nbP);
+        if (nb >= 0 && nodeLive(nb)) fn(nb, (double)sg[s2].len);
+      }
+    }
+  };
+  std::vector<i32> root(nN), best(nN); std::vector<double> elemA(nN), bestLen(nN);
+  for (i32 n = 0; n < nN; n++) { root[n] = n; elemA[n] = nodeLive(n) ? nodeVol(n) : 0; }
+  auto findRoot = [&](i32 c) { while (root[c] != c) c = root[c]; return c; };
+  const double frac = (double)cutMergeFrac;
+  i32 rounds = 0;
+  for (rounds = 0; rounds < 32; rounds++) {
+    for (i32 n = 0; n < nN; n++) { best[n] = -1; bestLen[n] = -1; }
+    // an element (a cell or a piece, each its own DOF) must move if it is below
+    // the target.  Target: the neighbour across the LARGEST shared open face (the
+    // usual cut-cell merging rule -- it keeps a sliver with the cell it is best
+    // connected to, and stops the last upper sliver of a thin body joining the
+    // TIP cell across a partial face instead of the fully open cell above it);
+    // element volume, then the lower index, only break ties.
+    // a piece-rooted element (no cell in it yet) has its own, lower target: the
+    // smaller side of a split cell is at most half a cell, and it should keep its
+    // DOF unless it is genuinely small
+    auto target = [&](i32 r) { return r >= nC ? (double)cutPieceFrac : frac; };
+    for (i32 n = 0; n < nN; n++) {
+      if (!nodeLive(n)) continue;
+      const i32 r = findRoot(n);
+      if (elemA[r] >= target(r)) continue;
+      forEachNbr(n, [&](i32 m, double len) {
+        const i32 rm = findRoot(m);
+        if (rm == r) return;
+        const bool better = best[r] < 0 || len > bestLen[r] + 1e-12 ||
+          (fabs(len - bestLen[r]) <= 1e-12 && (elemA[rm] > elemA[best[r]] || (elemA[rm] == elemA[best[r]] && rm < best[r])));
+        if (better) { best[r] = rm; bestLen[r] = len; }
+      });
+    }
+    i32 nMerged = 0;
+    for (i32 r = 0; r < nN; r++) {
+      if (root[r] != r || best[r] < 0) continue;
+      if (elemA[r] >= target(r)) continue;
+      const i32 ra = findRoot(r), rb = findRoot(best[r]);
+      if (ra == rb) continue;
+      root[ra] = rb; nMerged++;
+    }
+    for (i32 n = 0; n < nN; n++) elemA[n] = 0;
+    for (i32 n = 0; n < nN; n++) if (nodeLive(n)) elemA[findRoot(n)] += nodeVol(n);
+    if (nMerged == 0) break;
+  }
+  // owner of every element: its largest node, cell or piece (ties: lowest node index)
+  std::vector<i32> ownerOf(nN, -1); std::vector<double> ownerVol(nN, -1.0);
+  for (i32 n = 0; n < nN; n++) {
+    if (!nodeLive(n)) continue;
+    const i32 r = findRoot(n); const double v = nodeVol(n);
+    if (v > ownerVol[r] || (v == ownerVol[r] && n < ownerOf[r])) { ownerVol[r] = v; ownerOf[r] = n; }
+  }
+  auto handleOfNode = [&](i32 n) -> i32 { return n < 0 ? CUT_DEAD : (n < nC ? n : cutHandle(n - nC)); };
+  // element centroids over all member nodes
+  std::vector<double> cxE(nN, 0.0), cyE(nN, 0.0); std::vector<i32> nMem(nN, 0);
+  for (i32 n = 0; n < nN; n++) {
+    if (!nodeLive(n)) continue;
+    const i32 r = findRoot(n), c = nodeCell(n);
+    double px, py, dx, dy; cellGeomHost(c, px, py, dx, dy); const double hR = fmin(dx, dy);
+    const double cx = (n < nC) ? (double)CX[c] : (double)cutPiece[n-nC].cx;
+    const double cy = (n < nC) ? (double)CY[c] : (double)cutPiece[n-nC].cy;
+    cxE[r] += nodeVol(n)*(px + cx*hR); cyE[r] += nodeVol(n)*(py + cy*hR); nMem[r]++;
+  }
+  i32 nMergedCells = 0, nMergedElem = 0, maxMem = 0, nBlocked = 0, nDeadPiece = 0, nPieceDof = 0, nPieceOwner = 0; double minAE = 1e30;
+  for (i32 c = 0; c < nC; c++) {
+    if (!nodeLive(c)) continue;
+    const i32 r = findRoot(c), o = ownerOf[r];
+    cutOwner[c] = (o >= 0) ? handleOfNode(o) : c; cutAlphaE[c] = (real)elemA[r];
+    if (nMem[r] > 1) {
+      double px, py, dx, dy; cellGeomHost(c, px, py, dx, dy); const double hR = fmin(dx, dy);
+      CX[c] = (real)((cxE[r]/elemA[r] - px)/hR); CY[c] = (real)((cyE[r]/elemA[r] - py)/hR);
+      nMergedCells++;
+    }
+    if (o == c) {
+      if (nMem[r] > 1) { nMergedElem++; if (nMem[r] > maxMem) maxMem = nMem[r]; }
+      if (elemA[r] < minAE) minAE = elemA[r];
+      if (elemA[r] < frac) nBlocked++;
+    }
+  }
+  for (i32 k = 0; k < nP; k++) {
+    const i32 n = nC + k;
+    CutPiece &Pk = cutPiece[k];
+    if (!nodeLive(n)) { Pk.owner = CUT_DEAD; nDeadPiece++; if (cutPieceAlphaE) cutPieceAlphaE[k] = 0; continue; }
+    const i32 r = findRoot(n), o = ownerOf[r];
+    Pk.owner = handleOfNode(o);
+    if (cutPieceAlphaE) cutPieceAlphaE[k] = (real)elemA[r];
+    double px, py, dx, dy; cellGeomHost(Pk.cell, px, py, dx, dy); const double hR = fmin(dx, dy);
+    if (nMem[r] > 1) { Pk.ecx = (real)((cxE[r]/elemA[r] - px)/hR); Pk.ecy = (real)((cyE[r]/elemA[r] - py)/hR); }
+    else { Pk.ecx = Pk.cx; Pk.ecy = Pk.cy; }
+    if (o == n) { nPieceDof++; if (nMem[r] > 1) nPieceOwner++; if (elemA[r] < minAE) minAE = elemA[r]; if (nMem[r] > 1) { nMergedElem++; if (nMem[r] > maxMem) maxMem = nMem[r]; } }
+  }
+  if (cutSplit && cutFace) {
+    auto ownerHandleOfNode = [&](i32 n) -> i32 { return (n >= 0 && nodeLive(n)) ? handleOfNode(ownerOf[findRoot(n)]) : CUT_DEAD; };
+    for (i32 f = 0; f < nCutFace; f++) {
+      CutFace &F = cutFace[f];
+      const i32 c = F.cell, b = c/blockSizeTot, cc = c%blockSizeTot, i = cc%blockSize, j = (cc/blockSize)%blockSize;
+      const i32 l1 = hostNbrIdx(nbrIdxList, b, i-1, j), d1 = hostNbrIdx(nbrIdxList, b, i, j-1);
+      for (i32 s2 = 0; s2 < F.nX; s2++) { F.sx[s2].ownC = ownerHandleOfNode(pieceNode(c, F.sx[s2].pC)); F.sx[s2].ownN = (l1 < cE) ? ownerHandleOfNode(pieceNode(l1, F.sx[s2].pN)) : CUT_DEAD; }
+      for (i32 s2 = 0; s2 < F.nY; s2++) { F.sy[s2].ownC = ownerHandleOfNode(pieceNode(c, F.sy[s2].pC)); F.sy[s2].ownN = (d1 < cE) ? ownerHandleOfNode(pieceNode(d1, F.sy[s2].pN)) : CUT_DEAD; }
+    }
+  }
+  printf("[cutmerge] frac %.2f (pieces %.2f): %d cells in %d merged elements (max %d nodes), %d rounds, "
+         "min alpha_E %.3e, %d elements still below the target; %d extra pieces: %d own DOFs (%d of them element owners), %d dead\n",
+         frac, (double)cutPieceFrac, nMergedCells, nMergedElem, maxMem, rounds, minAE, nBlocked, nP, nPieceDof, nPieceOwner, nDeadPiece);
+}
+
+// ---- split cells: piece records and face segments (--cutsplit) --------------
+//
+// Built on the host from the clipper's loops, once per geometry stamp.  The
+// LARGEST loop of a cell is piece 0 and keeps the cell's DOF; every other loop
+// is an extra piece (CutPiece) that buildCutMerge attaches to a neighbour
+// element on its own side of the wall.  A face whose open part is not one
+// single (piece 0 <-> piece 0) interval gets a CutFace entry under the cell
+// whose LOW face it is: the segments are the (pC, pN) groups of the elementary
+// sub-intervals, classified by midpoint against BOTH cells' loops -- both cells
+// clipped the same segments, so the endpoints agree to roundoff.
+
+void CompressibleSolver::cellGeomHost(i32 c, double &px, double &py, double &dx, double &dy) {
+  const i32 b = c/blockSizeTot, cc = c%blockSizeTot;
+  i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
+  dx = (double)domainSize[0]/(baseGridSize[0]*powi(2,lvl));
+  dy = (double)domainSize[1]/(baseGridSize[1]*powi(2,lvl));
+  px = (ib*blockSize + cc%blockSize + 0.5)*dx;
+  py = (jb*blockSize + (cc/blockSize)%blockSize + 0.5)*dy;
+}
+
+void CompressibleSolver::buildCutSplit(std::vector<ClipRec> &recs) {
+  const size_t stride = (size_t)nBlocksMax*(size_t)blockSizeTot;
+  if (!cutSplitId) { cudaMallocManaged(&cutSplitId, stride*sizeof(i32)); cudaMallocManaged(&cutFaceId, stride*sizeof(i32)); }
+  for (size_t c = 0; c < stride; c++) { cutSplitId[c] = -1; cutFaceId[c] = -1; }
+  nCutSplit = nCutPiece = nCutFace = 0;
+  i32 nIntFace = 0;
+  auto growSplit = [&]() { if (nCutSplit + 1 > cutSplitCap) { i32 nc = cutSplitCap ? 2*cutSplitCap : 256; CutSplitCell *n; cudaMallocManaged(&n, (size_t)nc*sizeof(CutSplitCell)); if (cutSplitCell) { memcpy(n, cutSplitCell, (size_t)nCutSplit*sizeof(CutSplitCell)); cudaFree(cutSplitCell); } cutSplitCell = n; cutSplitCap = nc; } };
+  auto growPiece = [&]() { if (nCutPiece + 1 > cutPieceCap) { i32 nc = cutPieceCap ? 2*cutPieceCap : 512; CutPiece *n; cudaMallocManaged(&n, (size_t)nc*sizeof(CutPiece)); if (cutPiece) { memcpy(n, cutPiece, (size_t)nCutPiece*sizeof(CutPiece)); cudaFree(cutPiece); } cutPiece = n; cutPieceCap = nc; } };
+  auto growFace  = [&]() { if (nCutFace + 1 > cutFaceCap) { i32 nc = cutFaceCap ? 2*cutFaceCap : 512; CutFace *n; cudaMallocManaged(&n, (size_t)nc*sizeof(CutFace)); if (cutFace) { memcpy(n, cutFace, (size_t)nCutFace*sizeof(CutFace)); cudaFree(cutFace); } cutFace = n; cutFaceCap = nc; } };
+  real *A = getField(F_CUTA), *CX = getField(F_CUTCX), *CY = getField(F_CUTCY);
+  const i32 cE = bEmpty*blockSizeTot, nC = hashTable.nKeys*blockSizeTot;
+  std::unordered_map<i32, i32> recOf;
+  std::vector<std::vector<i32>> order(recs.size());
+  for (size_t k = 0; k < recs.size(); k++) {
+    const ClipRec &r = recs[k]; recOf[r.cell] = (i32)k;
+    order[k].resize(r.R.nLoop);
+    for (i32 l = 0; l < r.R.nLoop; l++) order[k][l] = l;
+    std::sort(order[k].begin(), order[k].end(), [&](i32 a, i32 b){ return r.R.loop[a].area > r.R.loop[b].area; });
+    if (r.R.nLoop <= 1) continue;
+    const double cellA = r.dx*r.dy, hR = fmin(r.dx, r.dy);
+    growSplit();
+    CutSplitCell &S = cutSplitCell[nCutSplit];
+    auto fill = [&](const ClipLoop &L, real &a, real &cx, real &cy, real &wnx, real &wny, real &wcx, real &wcy) {
+      a  = (real)(L.area/cellA);
+      cx = (real)((L.mx/L.area - r.px)/hR); cy = (real)((L.my/L.area - r.py)/hR);
+      // the WALL edges' own outward normal sum (exact for the polygon); equals
+      // -(faces + internal face) by the per-piece GCL
+      wnx = (real)(L.wallVx/r.dy);
+      wny = (real)(L.wallVy/r.dx);
+      if (L.wallLen > 0) { wcx = (real)((L.wallMx/L.wallLen - r.px)/hR); wcy = (real)((L.wallMy/L.wallLen - r.py)/hR); }
+      else { wcx = cx; wcy = cy; }
+    };
+    fill(r.R.loop[order[k][0]], S.a0, S.cx0, S.cy0, S.wnx0, S.wny0, S.wcx0, S.wcy0);
+    S.first = nCutPiece; S.n = r.R.nLoop - 1;
+    // internal face: the two loops that carry an extension (normal from the
+    // lower-piece-index one into the other)
+    S.iLen = 0; S.icx = S.icy = S.inx = S.iny = 0; S.iPa = S.iPb = -1;
+    for (i32 pa = 0; pa < r.R.nLoop && S.iPa < 0; pa++) {
+      const ClipLoop &La = r.R.loop[order[k][pa]];
+      if (La.intLen <= 0) continue;
+      for (i32 pb = pa + 1; pb < r.R.nLoop; pb++) {
+        const ClipLoop &Lb = r.R.loop[order[k][pb]];
+        if (Lb.intLen <= 0) continue;
+        S.iPa = pa; S.iPb = pb; S.iLen = (real)La.intLen;
+        S.icx = (real)((La.intMx/La.intLen - r.px)/hR); S.icy = (real)((La.intMy/La.intLen - r.py)/hR);
+        const double nl = sqrt(La.intNx*La.intNx + La.intNy*La.intNy);
+        S.inx = (real)(nl > 0 ? La.intNx/nl : 0); S.iny = (real)(nl > 0 ? La.intNy/nl : 0);
+        nIntFace++;
+        break;
+      }
+    }
+    for (i32 p = 1; p < r.R.nLoop; p++) {
+      growPiece();
+      CutPiece &P = cutPiece[nCutPiece++];
+      P.cell = r.cell; P.owner = CUT_DEAD;
+      fill(r.R.loop[order[k][p]], P.a, P.cx, P.cy, P.wnx, P.wny, P.wcx, P.wcy);
+      P.ecx = P.cx; P.ecy = P.cy;
+    }
+    cutSplitId[r.cell] = nCutSplit++;
+    CX[r.cell] = S.cx0; CY[r.cell] = S.cy0;      // the DOF piece's centroid, not the union's
+  }
+  // ---- faces ----------------------------------------------------------------
+  struct Iv { double lo, hi; i32 piece; };
+  // open intervals of `cell` on its face f (0 lo-x 1 hi-x 2 lo-y 3 hi-y); false if no such cell
+  auto intervals = [&](i32 cell, i32 f, std::vector<Iv> &out) -> bool {
+    out.clear();
+    if (cell < 0 || cell >= nC || cell >= cE) return false;
+    auto it = recOf.find(cell);
+    if (it == recOf.end()) { if (A[cell] > (real)0) out.push_back({-1e300, 1e300, 0}); return true; }
+    const ClipRec &r = recs[it->second];
+    if (r.R.nLoop == 0) { if (A[cell] > (real)0) out.push_back({-1e300, 1e300, 0}); return true; }   // hole-only cell
+    for (i32 pi = 0; pi < r.R.nLoop; pi++) {
+      const ClipLoop &L = r.R.loop[order[it->second][pi]];
+      for (i32 q = 0; q < L.nIv[f]; q++) out.push_back({L.iv[f][q][0], L.iv[f][q][1], pi});
+    }
+    return true;
+  };
+  std::unordered_set<i64> done;
+  i32 nDrop = 0, nOvf = 0, nSegTot = 0;
+  auto doFace = [&](i32 ownerCell, i32 dir, i32 otherCell) {
+    if (ownerCell < 0 || ownerCell >= nC || ownerCell >= cE) return;
+    const i64 key = (i64)ownerCell*2 + dir;
+    if (!done.insert(key).second) return;
+    std::vector<Iv> ivA, ivB;
+    if (!intervals(ownerCell, dir == 0 ? 0 : 2, ivA)) return;
+    if (!intervals(otherCell, dir == 0 ? 1 : 3, ivB)) return;
+    if (ivA.empty() || ivB.empty()) return;                      // closed face
+    double px, py, dx, dy; cellGeomHost(ownerCell, px, py, dx, dy);
+    const double fLo = (dir == 0) ? py - 0.5*dy : px - 0.5*dx;
+    const double fHi = (dir == 0) ? py + 0.5*dy : px + 0.5*dx;
+    const double fLen = fHi - fLo, fMid = 0.5*(fLo + fHi), tol = 1e-12*fLen;
+    std::vector<double> pts = {fLo, fHi};
+    for (auto &v : ivA) { pts.push_back(fmin(fmax(v.lo, fLo), fHi)); pts.push_back(fmin(fmax(v.hi, fLo), fHi)); }
+    for (auto &v : ivB) { pts.push_back(fmin(fmax(v.lo, fLo), fHi)); pts.push_back(fmin(fmax(v.hi, fLo), fHi)); }
+    std::sort(pts.begin(), pts.end());
+    struct G { i32 pA, pB; double len, mom; };
+    std::vector<G> groups;
+    auto pieceAt = [&](const std::vector<Iv> &iv, double s) { for (auto &v : iv) if (s >= v.lo - tol && s <= v.hi + tol) return v.piece; return -1; };
+    for (size_t q = 0; q + 1 < pts.size(); q++) {
+      const double s0 = pts[q], s1 = pts[q+1];
+      if (s1 - s0 <= tol) continue;
+      const double mid = 0.5*(s0 + s1);
+      const i32 pA = pieceAt(ivA, mid), pB = pieceAt(ivB, mid);
+      if (pA < 0 || pB < 0) { if (pA >= 0 || pB >= 0) nDrop++; continue; }
+      bool found = false;
+      for (auto &g : groups) if (g.pA == pA && g.pB == pB) { g.len += s1 - s0; g.mom += (s1 - s0)*mid; found = true; break; }
+      if (!found) groups.push_back({pA, pB, s1 - s0, (s1 - s0)*mid});
+    }
+    if (groups.empty()) return;
+    if (groups.size() == 1 && groups[0].pA == 0 && groups[0].pB == 0) return;   // plain face
+    i32 id = cutFaceId[ownerCell];
+    if (id < 0) { growFace(); id = nCutFace++; CutFace &F = cutFace[id]; F.nX = F.nY = 0; F.cell = ownerCell; cutFaceId[ownerCell] = id; }
+    CutFace &F = cutFace[id];
+    CutFaceSeg *sg = (dir == 0) ? F.sx : F.sy;
+    i32 &n = (dir == 0) ? F.nX : F.nY;
+    sg[0] = {0, 0, 0, 0, -1, -1}; n = 1;
+    for (auto &g : groups) {
+      const real len = (real)(g.len/fLen), cen = (real)((g.mom/g.len - fMid)/fLen);
+      if (g.pA == 0 && g.pB == 0) { sg[0].len = len; sg[0].cen = cen; }
+      else if (n < 4) { sg[n++] = {len, cen, g.pA, g.pB, -1, -1}; }
+      else nOvf++;
+    }
+    nSegTot += n;
+  };
+  for (auto &r : recs) {
+    const i32 b = r.cell/blockSizeTot, cc = r.cell%blockSizeTot;
+    const i32 i = cc%blockSize, j = (cc/blockSize)%blockSize;
+    doFace(r.cell, 0, hostNbrIdx(nbrIdxList, b, i-1, j));
+    doFace(r.cell, 1, hostNbrIdx(nbrIdxList, b, i, j-1));
+    doFace(hostNbrIdx(nbrIdxList, b, i+1, j), 0, r.cell);
+    doFace(hostNbrIdx(nbrIdxList, b, i, j+1), 1, r.cell);
+  }
+  // piece-resident DOFs: (re)allocate with the piece capacity and seed every
+  // piece with its cell's state.  (A re-stamp after adaptation re-seeds from
+  // the cell: piece states do not yet survive a sort.)
+  if (nCutPiece > 0) {
+    if (cutPieceQCap < cutPieceCap) {
+      if (cutPieceQ) { cudaFree(cutPieceQ); cudaFree(cutPieceS); cudaFree(cutPieceAlphaE); }
+      cutPieceQCap = cutPieceCap;
+      cudaMallocManaged(&cutPieceQ, (size_t)NEVOLVE*cutPieceQCap*sizeof(real));
+      cudaMallocManaged(&cutPieceS, (size_t)NEVOLVE*cutPieceQCap*sizeof(real));
+      cudaMallocManaged(&cutPieceAlphaE, (size_t)cutPieceQCap*sizeof(real));
+      if (p1) {
+        if (cutPieceSX) { cudaFree(cutPieceSX); cudaFree(cutPieceSR); }
+        cudaMallocManaged(&cutPieceSX, (size_t)2*P1_NV*cutPieceQCap*sizeof(real));
+        cudaMallocManaged(&cutPieceSR, (size_t)2*P1_NV*cutPieceQCap*sizeof(real));
+      }
+    }
+    if (p1 && cutPieceSX)
+      for (i32 k = 0; k < nCutPiece; k++)
+        for (i32 s = 0; s < 2*P1_NV; s++) { cutPieceSX[(size_t)s*cutPieceQCap + k] = 0; cutPieceSR[(size_t)s*cutPieceQCap + k] = 0; }
+    for (i32 k = 0; k < nCutPiece; k++)
+      for (i32 f = 0; f < NEVOLVE; f++) {
+        cutPieceQ[(size_t)f*cutPieceQCap + k] = getField(f)[cutPiece[k].cell];
+        cutPieceS[(size_t)f*cutPieceQCap + k] = 0;
+      }
+  }
+  i32 nAct = 0; for (i32 k = 0; k < nCutSplit; k++) { const i32 c = cutPiece[cutSplitCell[k].first].cell; if (c < cE && cFlagsList[c] == ACTIVE) nAct++; }
+  printf("[cutsplit] %d split cells (%d ACTIVE, %d with an internal tip face), %d extra pieces, %d cells with segmented faces (%d segments), %d one-sided slivers dropped, %d overflow\n",
+         nCutSplit, nAct, nIntFace, nCutPiece, nCutFace, nSegTot, nDrop, nOvf);
+}
+
+// ---- --p1 cut elements --------------------------------------------------------
+// Built on the host after the merge (it needs the owners), once per geometry
+// stamp, from the clipper's loop polygons.  Every DOF element with cut geometry
+// -- a clipped cell, a merged element (owner cell or piece with its members),
+// an uncut cell that absorbed a sliver -- gets a P1Elem: the union of its
+// loops' polygons gives the centroid, the fluid area and the second moments
+// (the slope mass matrix, stored inverted), a fan of 3-point triangle rules
+// from each loop's centroid gives the volume rule (exact for quadratics), and
+// every wall edge gets 2 Gauss points carrying its outward normal * length.
+// Every open face interval of a clipped cell becomes a P1Seg between the two
+// elements on its sides (a high face only when the neighbour is not clipped:
+// it emits that face as its low face); the plain faces of an uncut owner and
+// the slit-tip internal faces are segments too.  The per-cell flag p1Irr marks
+// every cell whose faces live in this table, so the regular kernel skips them.
+void CompressibleSolver::buildP1Cut(void) {
+  if (!p1 || !ibRccm || immerserdBcType == 0 || cutGeom != 3 || !clipRecs) return;
+  cudaDeviceSynchronize();
+  const size_t stride = (size_t)nBlocksMax*(size_t)blockSizeTot;
+  if (!p1ElemOfCell) { cudaMallocManaged(&p1ElemOfCell, stride*sizeof(i32)); cudaMallocManaged(&p1Irr, stride*sizeof(i32)); }
+  for (size_t c = 0; c < stride; c++) { p1ElemOfCell[c] = -1; p1Irr[c] = 0; }
+  if (cutPieceCap > p1PieceCap) {
+    if (p1ElemOfPiece) cudaFree(p1ElemOfPiece);
+    cudaMallocManaged(&p1ElemOfPiece, (size_t)cutPieceCap*sizeof(i32)); p1PieceCap = cutPieceCap;
+  }
+  for (i32 k = 0; k < p1PieceCap; k++) p1ElemOfPiece[k] = -1;
+  const std::vector<ClipRec> &recs = *clipRecs;
+  real *A = getField(F_CUTA);
+  const i32 nC = hashTable.nKeys*blockSizeTot, cE = bEmpty*blockSizeTot;
+  std::unordered_map<i32, i32> recOf;
+  std::vector<std::vector<i32>> order(recs.size());
+  for (size_t k = 0; k < recs.size(); k++) {
+    const ClipRec &r = recs[k]; recOf[r.cell] = (i32)k;
+    order[k].resize(r.R.nLoop);
+    for (i32 l = 0; l < r.R.nLoop; l++) order[k][l] = l;
+    std::sort(order[k].begin(), order[k].end(), [&](i32 a, i32 b){ return r.R.loop[a].area > r.R.loop[b].area; });
+  }
+  auto ownerCell = [&](i32 c) -> i32 { return (cutMerge && cutOwner) ? cutOwner[c] : c; };
+  auto handleOf  = [&](i32 c, i32 p) -> i32 {          // DOF handle of (cell, piece rank)
+    if (p == 0) return ownerCell(c);
+    const i32 sp = (cutSplit && cutSplitId) ? cutSplitId[c] : -1;
+    if (sp < 0 || p > cutSplitCell[sp].n) return CUT_DEAD;
+    return cutPiece[cutSplitCell[sp].first + p - 1].owner; };
+  auto cellOfHandle = [&](i32 h) -> i32 { return cutIsPiece(h) ? cutPiece[cutPieceOf(h)].cell : h; };
+  auto liveCell = [&](i32 c) { return c >= 0 && c < nC && c < cE && cFlagsList[c] == ACTIVE; };
+  // ---- irregular cells --------------------------------------------------------
+  std::vector<char> hasMember(nC, 0);
+  if (cutMerge && cutOwner)
+    for (i32 c = 0; c < nC; c++) { const i32 o = cutOwner[c]; if (o != c && o >= 0 && o < nC) hasMember[o] = 1; }
+  if (cutSplit && cutPiece)      // a cell that absorbed a split-cell piece owns cut geometry too
+    for (i32 k = 0; k < nCutPiece; k++) { const i32 o = cutPiece[k].owner; if (o >= 0 && o < nC) hasMember[o] = 1; }
+  for (i32 c = 0; c < nC && c < cE; c++) {
+    const bool inRec  = recOf.count(c) > 0;
+    const bool dead   = !(A[c] > (real)0);
+    const bool member = cutOwner ? (cutOwner[c] != c) : false;
+    if (inRec || dead || member || hasMember[c]) p1Irr[c] = 1;
+  }
+  // ---- element polygons -----------------------------------------------------
+  struct Poly { std::vector<double> x, y; std::vector<signed char> k; double area = 0, mx = 0, my = 0; };
+  std::vector<i32> elemHandle; std::unordered_map<i32, i32> elemOf; std::vector<std::vector<Poly>> elemLoops;
+  auto elemFor = [&](i32 h) -> i32 {
+    auto it = elemOf.find(h); if (it != elemOf.end()) return it->second;
+    const i32 e = (i32)elemHandle.size(); elemHandle.push_back(h); elemOf[h] = e; elemLoops.emplace_back(); return e; };
+  auto polyBox = [&](i32 c, Poly &P) {
+    double px, py, dx, dy; cellGeomHost(c, px, py, dx, dy);
+    P.x = {px-0.5*dx, px+0.5*dx, px+0.5*dx, px-0.5*dx}; P.y = {py-0.5*dy, py-0.5*dy, py+0.5*dy, py+0.5*dy}; P.k = {1,1,1,1}; };
+  i32 nOvfLoop = 0, nHoleCell = 0, nBadM = 0;
+  for (i32 c = 0; c < nC && c < cE; c++) {
+    if (!liveCell(c) || !p1Irr[c] || !(A[c] > (real)0)) continue;
+    auto it = recOf.find(c);
+    if (it == recOf.end()) {                       // uncut owner of a merged element: the full box
+      const i32 h = ownerCell(c); if (h == CUT_DEAD) continue;
+      Poly P; polyBox(c, P); elemLoops[elemFor(h)].push_back(P); continue;
+    }
+    const ClipRec &r = recs[it->second];
+    if (r.R.nLoop == 0) {                          // hole-only cell: the box (the hole is ignored by the slope rule)
+      nHoleCell++; const i32 h = ownerCell(c); if (h == CUT_DEAD) continue;
+      Poly P; polyBox(c, P); elemLoops[elemFor(h)].push_back(P); continue;
+    }
+    for (i32 p = 0; p < r.R.nLoop; p++) {
+      const ClipLoop &L = r.R.loop[order[it->second][p]];
+      const i32 h = handleOf(c, p); if (h == CUT_DEAD) continue;
+      if (L.vOvf || L.nv < 3) { nOvfLoop++; continue; }
+      Poly P; P.x.assign(L.vx, L.vx + L.nv); P.y.assign(L.vy, L.vy + L.nv); P.k.assign(L.ek, L.ek + L.nv);
+      elemLoops[elemFor(h)].push_back(P);
+    }
+  }
+  // ---- per element: area, centroid, second moments, quadrature -----------------
+  nP1Elem = (i32)elemHandle.size();
+  if (nP1Elem > p1ElemCap) { if (p1Elem) cudaFree(p1Elem); p1ElemCap = 256; while (p1ElemCap < nP1Elem) p1ElemCap *= 2; cudaMallocManaged(&p1Elem, (size_t)p1ElemCap*sizeof(P1Elem)); }
+  std::vector<P1Qpt> qpts;
+  const double G1 = 0.28867513459481287;
+  double aErrMax = 0;
+  for (i32 e = 0; e < nP1Elem; e++) {
+    P1Elem &E = p1Elem[e]; E.handle = elemHandle[e];
+    double area = 0, mx = 0, my = 0, ixx = 0, iyy = 0, ixy = 0;
+    for (auto &P : elemLoops[e]) {
+      const size_t n = P.x.size(); double a = 0, m1 = 0, m2 = 0;
+      for (size_t v = 0; v < n; v++) {
+        const size_t w = (v + 1) % n;
+        const double xa = P.x[v], ya = P.y[v], xb = P.x[w], yb = P.y[w], cr = xa*yb - xb*ya;
+        a += 0.5*cr; m1 += (xa + xb)*cr/6.0; m2 += (ya + yb)*cr/6.0;
+        ixx += (xa*xa + xa*xb + xb*xb)*cr/12.0;
+        iyy += (ya*ya + ya*yb + yb*yb)*cr/12.0;
+        ixy += (xa*yb + 2.0*xa*ya + 2.0*xb*yb + xb*ya)*cr/24.0;
+      }
+      P.area = a; P.mx = m1; P.my = m2; area += a; mx += m1; my += m2;
+    }
+    const double gx = mx/area, gy = my/area;
+    const double Ixx = ixx - area*gx*gx, Iyy = iyy - area*gy*gy, Ixy = ixy - area*gx*gy;
+    double px, py, dx, dy; cellGeomHost(cellOfHandle(E.handle), px, py, dx, dy); const double h = fmin(dx, dy);
+    const double M11 = Ixx/(h*h), M22 = Iyy/(h*h), M12 = Ixy/(h*h), det = M11*M22 - M12*M12;
+    E.gx = (real)gx; E.gy = (real)gy; E.h = (real)h; E.area = (real)area;
+    if (area > 0 && det > 1e-12*(M11*M22 + 1e-300)) { E.m11 = (real)(M22/det); E.m22 = (real)(M11/det); E.m12 = (real)(-M12/det); }
+    else { E.m11 = E.m22 = (real)(12.0/(dx*dy)); E.m12 = 0; nBadM++; }
+    // consistency: the polygon area must be the stamped element volume
+    const double aStamp = cutIsPiece(E.handle) ? (double)cutPieceAlphaE[cutPieceOf(E.handle)]*dx*dy : (double)(cutAlphaE ? cutAlphaE[E.handle] : A[E.handle])*dx*dy;
+    if (fabs(area - aStamp)/(dx*dy) > fmax(aErrMax, 1e-8) && cutDbg) {
+      printf("[p1cut] element %d handle %d cell %d: polygon area %.6f cells vs stamped %.6f, %zu loops:\n", e, E.handle, cellOfHandle(E.handle), area/(dx*dy), aStamp/(dx*dy), elemLoops[e].size());
+      for (auto &P : elemLoops[e]) { printf("   loop area %.6f:", P.area/(dx*dy)); for (size_t v = 0; v < P.x.size(); v++) printf(" (%.4f,%.4f)k%d", (P.x[v]-px)/dx, (P.y[v]-py)/dy, (i32)P.k[v]); printf("\n"); }
+    }
+    aErrMax = fmax(aErrMax, fabs(area - aStamp)/(dx*dy));
+    E.q0 = (i32)qpts.size();
+    for (auto &P : elemLoops[e]) {
+      const size_t n = P.x.size(); const double ax = P.mx/P.area, ay = P.my/P.area;   // apex: the loop centroid
+      for (size_t v = 0; v < n; v++) {
+        const size_t w = (v + 1) % n;
+        const double xa = P.x[v], ya = P.y[v], xb = P.x[w], yb = P.y[w];
+        const double t = 0.5*((xa - ax)*(yb - ay) - (xb - ax)*(ya - ay));
+        if (t != 0) {
+          qpts.push_back({(real)(0.5*(ax + xa)), (real)(0.5*(ay + ya)), (real)(t/3.0), 0, 0});
+          qpts.push_back({(real)(0.5*(xa + xb)), (real)(0.5*(ya + yb)), (real)(t/3.0), 0, 0});
+          qpts.push_back({(real)(0.5*(xb + ax)), (real)(0.5*(yb + ay)), (real)(t/3.0), 0, 0});
+        }
+        qpts.push_back({(real)xa, (real)ya, 0, 0, 0});   // polygon vertex: a limiter CHECK point (w = 0, n = 0: inert in the RHS)
+        if (P.k[v] == 0) {                       // wall edge: 2 Gauss points, outward normal (ey,-ex) * half length
+          const double ex = xb - xa, ey = yb - ya;
+          for (i32 g = 0; g < 2; g++) {
+            const double sg = 0.5 + (g ? G1 : -G1);
+            qpts.push_back({(real)(xa + sg*ex), (real)(ya + sg*ey), 0, (real)(0.5*ey), (real)(-0.5*ex)});
+          }
+        }
+      }
+    }
+    E.nq = (i32)qpts.size() - E.q0;
+    if (cutIsPiece(E.handle)) p1ElemOfPiece[cutPieceOf(E.handle)] = e; else p1ElemOfCell[E.handle] = e;
+  }
+  // ---- face segments ---------------------------------------------------------
+  std::vector<P1Seg> segs; i32 nDrop = 0;
+  auto pieceAtFace = [&](i32 n, i32 f, double mid, i32 &pOut) -> bool {
+    auto it = recOf.find(n);
+    if (it == recOf.end() || recs[it->second].R.nLoop == 0) { pOut = 0; return A[n] > (real)0; }
+    const ClipRec &r = recs[it->second]; const double tol = 1e-12*(r.dx + r.dy);
+    for (i32 q = 0; q < r.R.nLoop; q++) {
+      const ClipLoop &L = r.R.loop[order[it->second][q]];
+      for (i32 v = 0; v < L.nIv[f]; v++)
+        if (mid >= L.iv[f][v][0] - tol && mid <= L.iv[f][v][1] + tol) { pOut = q; return true; }
+    }
+    return false; };
+  auto emit = [&](i32 hLow, i32 hHigh, i32 dir, double xf, double lo, double hi) {
+    if (hLow == CUT_DEAD || hHigh == CUT_DEAD || hLow == hHigh || hi - lo <= 0) return;
+    P1Seg S;
+    if (dir == 0) { S.x0 = S.x1 = (real)xf; S.y0 = (real)lo; S.y1 = (real)hi; S.nx = 1; S.ny = 0; }
+    else          { S.y0 = S.y1 = (real)xf; S.x0 = (real)lo; S.x1 = (real)hi; S.nx = 0; S.ny = 1; }
+    S.hA = hLow; S.hB = hHigh; segs.push_back(S); };
+  for (auto &r : recs) {
+    const i32 c = r.cell; if (c < 0 || c >= cE) continue;
+    const i32 b = c/blockSizeTot, cc = c%blockSizeTot, i = cc%blockSize, j = (cc/blockSize)%blockSize;
+    const i32 nb[4] = { hostNbrIdx(nbrIdxList, b, i-1, j), hostNbrIdx(nbrIdxList, b, i+1, j),
+                        hostNbrIdx(nbrIdxList, b, i, j-1), hostNbrIdx(nbrIdxList, b, i, j+1) };
+    const i32 rk = recOf[c];
+    for (i32 f = 0; f < 4; f++) {
+      const i32 n = nb[f]; if (n < 0 || n >= cE) continue;
+      if ((f == 1 || f == 3) && recOf.count(n)) continue;          // the clipped neighbour emits it as its low face
+      if (cFlagsList[c] != ACTIVE && cFlagsList[n] != ACTIVE) continue;
+      const i32 fo = f ^ 1, dir = (f <= 1) ? 0 : 1;
+      const double xf = (f == 0) ? r.px - 0.5*r.dx : (f == 1) ? r.px + 0.5*r.dx : (f == 2) ? r.py - 0.5*r.dy : r.py + 0.5*r.dy;
+      for (i32 p = 0; p < r.R.nLoop; p++) {
+        const ClipLoop &L = r.R.loop[order[rk][p]];
+        for (i32 v = 0; v < L.nIv[f]; v++) {
+          const double lo = L.iv[f][v][0], hi = L.iv[f][v][1], mid = 0.5*(lo + hi);
+          i32 pn; if (!pieceAtFace(n, fo, mid, pn)) { nDrop++; continue; }
+          const i32 hc = handleOf(c, p), hn = handleOf(n, pn);
+          if (f == 0 || f == 2) emit(hn, hc, dir, xf, lo, hi); else emit(hc, hn, dir, xf, lo, hi);
+        }
+      }
+    }
+  }
+  // uncut owners of merged elements: their plain faces (a clipped neighbour emitted its own)
+  for (i32 c = 0; c < nC && c < cE; c++) {
+    if (!liveCell(c) || !p1Irr[c] || recOf.count(c) || !(A[c] > (real)0)) continue;
+    const i32 b = c/blockSizeTot, cc = c%blockSizeTot, i = cc%blockSize, j = (cc/blockSize)%blockSize;
+    const i32 nb[4] = { hostNbrIdx(nbrIdxList, b, i-1, j), hostNbrIdx(nbrIdxList, b, i+1, j),
+                        hostNbrIdx(nbrIdxList, b, i, j-1), hostNbrIdx(nbrIdxList, b, i, j+1) };
+    double px, py, dx, dy; cellGeomHost(c, px, py, dx, dy);
+    for (i32 f = 0; f < 4; f++) {
+      const i32 n = nb[f]; if (n < 0 || n >= cE || recOf.count(n) || !(A[n] > (real)0)) continue;
+      if (p1Irr[n] && n < c) continue;                              // the lower-index irregular cell emits
+      const i32 dir = (f <= 1) ? 0 : 1;
+      const double xf = (f == 0) ? px - 0.5*dx : (f == 1) ? px + 0.5*dx : (f == 2) ? py - 0.5*dy : py + 0.5*dy;
+      const double lo = (dir == 0) ? py - 0.5*dy : px - 0.5*dx, hi = (dir == 0) ? py + 0.5*dy : px + 0.5*dx;
+      const i32 hc = ownerCell(c), hn = ownerCell(n);
+      if (f == 0 || f == 2) emit(hn, hc, dir, xf, lo, hi); else emit(hc, hn, dir, xf, lo, hi);
+    }
+  }
+  // slit-tip internal faces
+  i32 nTip = 0;
+  if (cutSplit && cutSplitCell)
+    for (i32 sp = 0; sp < nCutSplit; sp++) {
+      const CutSplitCell &Sc = cutSplitCell[sp];
+      if (Sc.iLen <= (real)0 || Sc.iPa < 0) continue;
+      const i32 c = cutPiece[Sc.first].cell; if (!liveCell(c)) continue;
+      double px, py, dx, dy; cellGeomHost(c, px, py, dx, dy); const double hR = fmin(dx, dy);
+      const double cx = px + Sc.icx*hR, cy = py + Sc.icy*hR, tx = -Sc.iny, ty = Sc.inx, L = Sc.iLen;
+      const i32 hA = handleOf(c, Sc.iPa), hB = handleOf(c, Sc.iPb);
+      if (hA == CUT_DEAD || hB == CUT_DEAD || hA == hB) continue;
+      P1Seg S; S.x0 = (real)(cx - 0.5*L*tx); S.y0 = (real)(cy - 0.5*L*ty); S.x1 = (real)(cx + 0.5*L*tx); S.y1 = (real)(cy + 0.5*L*ty);
+      S.nx = Sc.inx; S.ny = Sc.iny; S.hA = hA; S.hB = hB; segs.push_back(S); nTip++;
+    }
+  // ---- consistency: every element's open boundary must be covered by face pieces ----
+  // (open cell-boundary edges of its loops, kind 1, plus its share of the internal faces)
+  {
+    std::vector<double> openLen(nP1Elem, 0.0), segLen(nP1Elem, 0.0);
+    for (i32 e = 0; e < nP1Elem; e++)
+      for (auto &P : elemLoops[e]) { const size_t n = P.x.size();
+        for (size_t v = 0; v < n; v++) { if (P.k[v] != 1) continue; const size_t w = (v+1)%n;
+          openLen[e] += sqrt((P.x[w]-P.x[v])*(P.x[w]-P.x[v]) + (P.y[w]-P.y[v])*(P.y[w]-P.y[v])); } }
+    // an uncut owner's box edges against a MEMBER of its own element are internal, not open:
+    // subtract them (they were counted as kind 1 by polyBox)
+    for (auto &Sg : segs) { const double L = sqrt((double)(Sg.x1-Sg.x0)*(Sg.x1-Sg.x0) + (double)(Sg.y1-Sg.y0)*(Sg.y1-Sg.y0));
+      auto it = elemOf.find(Sg.hA); if (it != elemOf.end()) segLen[it->second] += L;
+      it = elemOf.find(Sg.hB); if (it != elemOf.end()) segLen[it->second] += L; }
+    double worst = 0; i32 we = -1;
+    for (i32 e = 0; e < nP1Elem; e++) { const double d = fabs(openLen[e] - segLen[e])/fmax(p1Elem[e].h, 1e-300); if (d > worst) { worst = d; we = e; } }
+    printf("[p1cut] open-boundary coverage: worst |open - pieces| = %.3e h (element %d, handle %d: open %.4f h, pieces %.4f h)\n",
+           worst, we, we >= 0 ? p1Elem[we].handle : -1, we >= 0 ? openLen[we]/p1Elem[we].h : 0.0, we >= 0 ? segLen[we]/p1Elem[we].h : 0.0);
+  }
+  // ---- element adjacency through the face pieces (limiter) ----------------------
+  {
+    std::vector<std::vector<i32>> nb(nP1Elem);
+    for (auto &Sg : segs) {
+      auto ia = elemOf.find(Sg.hA), ib2 = elemOf.find(Sg.hB);
+      if (ia != elemOf.end()) nb[ia->second].push_back(Sg.hB);
+      if (ib2 != elemOf.end()) nb[ib2->second].push_back(Sg.hA);
+    }
+    i32 tot = 0; for (auto &v : nb) tot += (i32)v.size();
+    if (nP1Elem + 1 > p1ElemCap + 1 || !p1ElemNbrOff) { if (p1ElemNbrOff) cudaFree(p1ElemNbrOff); cudaMallocManaged(&p1ElemNbrOff, (size_t)(p1ElemCap + 1)*sizeof(i32)); }
+    if (tot > p1NbrCap) { if (p1ElemNbr) cudaFree(p1ElemNbr); p1NbrCap = 1024; while (p1NbrCap < tot) p1NbrCap *= 2; cudaMallocManaged(&p1ElemNbr, (size_t)p1NbrCap*sizeof(i32)); }
+    i32 o = 0;
+    for (i32 e = 0; e < nP1Elem; e++) { p1ElemNbrOff[e] = o; for (i32 h : nb[e]) p1ElemNbr[o++] = h; }
+    p1ElemNbrOff[nP1Elem] = o;
+  }
+  // ---- upload -------------------------------------------------------------------
+  nP1Seg = (i32)segs.size();
+  if (nP1Seg > p1SegCap) { if (p1Seg) cudaFree(p1Seg); p1SegCap = 1024; while (p1SegCap < nP1Seg) p1SegCap *= 2; cudaMallocManaged(&p1Seg, (size_t)p1SegCap*sizeof(P1Seg)); }
+  for (i32 s = 0; s < nP1Seg; s++) p1Seg[s] = segs[s];
+  nP1Qpt = (i32)qpts.size();
+  if (nP1Qpt > p1QptCap) { if (p1Qpt) cudaFree(p1Qpt); p1QptCap = 4096; while (p1QptCap < nP1Qpt) p1QptCap *= 2; cudaMallocManaged(&p1Qpt, (size_t)p1QptCap*sizeof(P1Qpt)); }
+  for (i32 q = 0; q < nP1Qpt; q++) p1Qpt[q] = qpts[q];
+  i32 nIrr = 0; for (i32 c = 0; c < nC && c < cE; c++) nIrr += p1Irr[c] != 0;
+  {   // element thickness census: sqrt(12 lambda_min(M)/A), the length the explicit step must resolve
+    double tmin = 1e30, amin = 0; i32 emin = -1, nThin = 0;
+    for (i32 e = 0; e < nP1Elem; e++) {
+      const P1Elem &E = p1Elem[e];
+      const double tr = E.m11 + E.m22, det = E.m11*E.m22 - E.m12*E.m12, disc = sqrt(fmax(tr*tr - 4.0*det, 0.0));
+      const double t = E.h*sqrt(12.0/fmax(0.5*(tr + disc)*E.area, 1e-300))/E.h;   // in cells
+      if (t < 0.5) nThin++;
+      if (t < tmin) { tmin = t; emin = e; amin = E.area/(E.h*E.h); }
+    }
+    printf("[p1cut] element thickness (cells): min %.4f (element %d, handle %d, area %.4f cells), %d elements thinner than 0.5\n",
+           tmin, emin, emin >= 0 ? p1Elem[emin].handle : -1, amin, nThin);
+  }
+  printf("[p1cut] %d cut elements (%d quadrature points), %d face pieces (%d tip faces), %d irregular cells; "
+         "max |polygon area - stamped| = %.2e cells; %d loops overflowed, %d hole-only cells, %d singular mass matrices, %d slivers dropped\n",
+         nP1Elem, nP1Qpt, nP1Seg, nTip, nIrr, aErrMax, nOvfLoop, nHoleCell, nBadM, nDrop);
+}
+
+// --cutdump N: every ACTIVE cell within N cells of (xc, yc): geometry, merge
+// ownership, split pieces with their owners, face segments, and the pressure
+// of each DOF involved.  Fields are CONSERVATIVE at the end of a run.
+void CompressibleSolver::writeCutWindow(const char *fileName, double xc, double yc, i32 nh) {
+  cudaDeviceSynchronize();
+  FILE *fp = fopen(fileName, "w");
+  if (!fp) { printf("[cutdump] cannot open %s\n", fileName); return; }
+  real *A = getField(F_CUTA), *AX = getField(F_CUTAX), *AY = getField(F_CUTAY);
+  real *CX = getField(F_CUTCX), *CY = getField(F_CUTCY);
+  real *Rho = getField(F_RHO), *RhoU = getField(F_RHOU), *RhoV = getField(F_RHOV), *RhoE = getField(F_RHOE);
+  auto pres = [&](i32 h) {
+    if (h == CUT_DEAD) return -1.0;
+    double r, ru, rv, rE;
+    if (cutIsPiece(h)) { const i32 k = cutPieceOf(h); const size_t cap = cutPieceQCap;
+      r = cutPieceQ[k]; ru = cutPieceQ[cap+k]; rv = cutPieceQ[2*cap+k]; rE = cutPieceQ[4*cap+k]; }
+    else { r = Rho[h]; ru = RhoU[h]; rv = RhoV[h]; rE = RhoE[h]; }
+    const double u = ru/r, v = rv/r;
+    return (double)(gam - (real)1)*(rE - 0.5*r*(u*u + v*v)); };
+  const i32 cE = bEmpty*blockSizeTot;
+  fprintf(fp, "# window centre %.6f %.6f, half-width %d cells; owner < 0 is a piece handle (-k-1)\n", xc, yc, nh);
+  fprintf(fp, "# CELL c x y dx dy alpha aXlo aYlo cx cy owner alphaE p flag\n");
+  fprintf(fp, "# SPLIT c a0 cx0 cy0 wnx0 wny0 wcx0 wcy0 nExtra iLen icx icy inx iny iPa iPb\n");
+  fprintf(fp, "# PIECE c k a cx cy wnx wny wcx wcy owner p_owner handle\n");
+  fprintf(fp, "# FACE c dir s len cen pC pN ownC ownN\n");
+  i32 n = 0;
+  for (i32 b = 0; b < hashTable.nKeys; b++) {
+    if (bLocList[b] == kEmpty) continue;
+    for (i32 cc = 0; cc < blockSizeTot; cc++) {
+      const i32 c = b*blockSizeTot + cc;
+      if (cc/blockSize/blockSize != 0 || c >= cE || cFlagsList[c] != ACTIVE) continue;
+      double px, py, dx, dy; cellGeomHost(c, px, py, dx, dy);
+      if (fabs(px - xc) > (nh + 0.5)*dx || fabs(py - yc) > (nh + 0.5)*dy) continue;
+      n++;
+      const i32 own = cutOwner ? cutOwner[c] : c;
+      fprintf(fp, "CELL %d %.8f %.8f %.8f %.8f %.8e %.8e %.8e %.6f %.6f %d %.6f %.8f %d\n",
+              c, px, py, dx, dy, (double)A[c], (double)AX[c], (double)AY[c], (double)CX[c], (double)CY[c],
+              own, cutAlphaE ? (double)cutAlphaE[c] : (double)A[c], pres(own), (i32)cFlagsList[c]);
+      const i32 sp = (cutSplit && cutSplitId) ? cutSplitId[c] : -1;
+      if (sp >= 0) {
+        const CutSplitCell &S = cutSplitCell[sp];
+        fprintf(fp, "SPLIT %d %.8e %.6f %.6f %.6f %.6f %.6f %.6f %d %.8e %.6f %.6f %.6f %.6f %d %d\n", c, (double)S.a0, (double)S.cx0, (double)S.cy0,
+                (double)S.wnx0, (double)S.wny0, (double)S.wcx0, (double)S.wcy0, S.n,
+                (double)S.iLen, (double)S.icx, (double)S.icy, (double)S.inx, (double)S.iny, S.iPa, S.iPb);
+        for (i32 k = 0; k < S.n; k++) {
+          const CutPiece &P = cutPiece[S.first + k];
+          fprintf(fp, "PIECE %d %d %.8e %.6f %.6f %.6f %.6f %.6f %.6f %d %.8f %d\n", c, k + 1, (double)P.a, (double)P.cx, (double)P.cy,
+                  (double)P.wnx, (double)P.wny, (double)P.wcx, (double)P.wcy, P.owner, pres(P.owner), cutHandle(S.first + k));
+        }
+      }
+      const i32 fid = (cutSplit && cutFaceId) ? cutFaceId[c] : -1;
+      if (fid >= 0) {
+        const CutFace &F = cutFace[fid];
+        for (i32 s2 = 0; s2 < F.nX; s2++) fprintf(fp, "FACE %d 0 %d %.8e %.6f %d %d %d %d\n", c, s2, (double)F.sx[s2].len, (double)F.sx[s2].cen, F.sx[s2].pC, F.sx[s2].pN, F.sx[s2].ownC, F.sx[s2].ownN);
+        for (i32 s2 = 0; s2 < F.nY; s2++) fprintf(fp, "FACE %d 1 %d %.8e %.6f %d %d %d %d\n", c, s2, (double)F.sy[s2].len, (double)F.sy[s2].cen, F.sy[s2].pC, F.sy[s2].pN, F.sy[s2].ownC, F.sy[s2].ownN);
+      }
+    }
+  }
+  fclose(fp);
+  printf("[cutdump] %d cells around (%.4f, %.4f) -> %s\n", n, xc, yc, fileName);
+}
+
+// --reconfar: the two-cell band around the body where the 1-D MUSCL stencil
+// would tap a shifted centroid, a dead cell or a merged member.  Everything
+// outside it reconstructs with the ordinary 1-D scheme (reconFar).
+void CompressibleSolver::buildCutNear(void) {
+  // the band of cells whose stencil is irregular: near a cut/dead/merged cell
+  // (--reconfar) and, under --leaf, next to a level jump (a missing same-level
+  // tap or a covered PARENT tap).  Band cells take the least-squares gradient.
+  const bool wantCut = ibRccm && immerserdBcType != 0 && reconFar >= 0;
+  if (!wantCut && !leafFlux) return;
+  cudaDeviceSynchronize();
+  const size_t stride = (size_t)nBlocksMax*(size_t)blockSizeTot;
+  if (!cutNear) cudaMallocManaged(&cutNear, stride*sizeof(i32));
+  real *A = getField(F_CUTA);
+  const i32 nC = hashTable.nKeys*blockSizeTot, cE = bEmpty*blockSizeTot;
+  const bool cutOn = ibRccm && immerserdBcType != 0;
+  auto irregular = [&](i32 m) {
+    if (leafFlux && (m < 0 || m >= nC || m >= cE)) return true;         // missing same-level tap: a coarser neighbour
+    if (m < 0 || m >= nC || m >= cE) return false;
+    if (leafFlux && cFlagsList[m] == PARENT) return true;               // a finer neighbour
+    if (!cutOn) return false;
+    if (A[m] < (real)1 - (real)1e-12) return true;                       // cut or dead
+    if (cutSplit && cutSplitId && cutSplitId[m] >= 0) return true;       // split (alpha may be 1)
+    if (cutMerge && cutOwner && cutOwner[m] != m) return true;           // merged member
+    if (cutMerge && cutAlphaE && cutAlphaE[m] != A[m]) return true;      // element owner (centroid shifted)
+    return false;
+  };
+  i32 nNear = 0;
+  for (size_t c = 0; c < stride; c++) cutNear[c] = 1;
+  for (i32 b = 0; b < hashTable.nKeys; b++) {
+    if (bLocList[b] == kEmpty) continue;
+    for (i32 cc = 0; cc < blockSizeTot; cc++) {
+      const i32 c = b*blockSizeTot + cc;
+      if (cc/blockSize/blockSize != 0) continue;
+      const i32 i = cc%blockSize, j = (cc/blockSize)%blockSize;
+      bool near = false;
+      // covered PARENT cells are never evolved (restriction overwrites them), so
+      // their reconstruction is dead work: give them the cheap scheme
+      if (c < cE && cFlagsList[c] == PARENT) { cutNear[c] = 0; continue; }
+      for (i32 dj = -2; dj <= 2 && !near; dj++)
+        for (i32 di = -2; di <= 2 && !near; di++)
+          if (irregular(hostNbrIdx(nbrIdxList, b, i+di, j+dj))) near = true;
+      cutNear[c] = near ? 1 : 0;
+      if (near && c < cE && cFlagsList[c] == ACTIVE) nNear++;
+    }
+  }
+  if (reconFar >= 0)
+    printf("[reconfar] %d: %d ACTIVE cells keep the least-squares gradient (two-cell band), the rest use the 1-D scheme\n", reconFar, nNear);
+  else
+    printf("[leaf] %d ACTIVE cells in the level-jump band (least-squares reconstruction)\n", nNear);
+}
+
+// --leaf: what the sort produced
+void CompressibleSolver::leafCensus(void) {
+  if (!leafFlux) return;
+  cudaDeviceSynchronize();
+  i32 nBand = 0;
+  if (cutNear) for (i32 c = 0; c < nLeafBlocks*blockSizeTot; c++) nBand += (cutNear[c] != 0 && cFlagsList[c] == ACTIVE);
+  printf("[leaf] blocks: %d leaf-bearing + %d exterior live, %d fully covered idle (of %d); %d mortar faces; %d band cells\n",
+         nLeafBlocks, nExtBlocks, hashTable.nKeys - nLeafBlocks - nExtBlocks, hashTable.nKeys, nMortars, nBand);
+  if (dbgChecks && nMortars > 0) {   // geometry of a few mortars: coarse centre, fine centres, sub-face centroids
+    for (i32 m = 0; m < nMortars && m < 4; m++) {
+      const Mortar &M = mortarList[m];
+      double cx, cy, cdx, cdy, f0x, f0y, fdx, fdy, f1x, f1y;
+      cellGeomHost(M.coarse, cx, cy, cdx, cdy); cellGeomHost(M.fine[0], f0x, f0y, fdx, fdy); cellGeomHost(M.fine[1], f1x, f1y, fdx, fdy);
+      printf("[leaf] mortar %d dir %d side %d: coarse (%.5f,%.5f) h=%.5f flag %d | fine (%.5f,%.5f) (%.5f,%.5f) h=%.5f flags %d %d | faces (%.5f,%.5f) (%.5f,%.5f)\n",
+             m, M.dir, M.side, cx, cy, cdx, cFlagsList[M.coarse], f0x, f0y, f1x, f1y, fdx, cFlagsList[M.fine[0]], cFlagsList[M.fine[1]],
+             (double)M.cen[0][0], (double)M.cen[0][1], (double)M.cen[1][0], (double)M.cen[1][1]);
+    }
+  }
+}
+
 void CompressibleSolver::stampIbGeometry(void) {
-  if (immerserdBcType == 0) return;
+  if (immerserdBcType == 0) { if (leafFlux) { buildCutNear(); leafCensus(); } return; }
   ibStampGeometryKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  cudaDeviceSynchronize();
+  stampCutGeomCurved();   // --cutgeom 2: curved geometry over the linear cut
+  stampCutGeomClip();     // --cutgeom 3: exact segment clipping over the linear cut
+  buildCutMerge();        // --cutmerge: agglomerate small cells (indices: after EVERY sort)
+  buildP1Cut();           // --p1: element polygons, quadrature and face segments (needs the owners)
+  buildCutNear();         // --reconfar / --leaf: the band that keeps the least-squares reconstruction
+  leafCensus();
+  buildSrd();   // neighbourhoods follow the geometry
 }
 
 
@@ -1888,6 +3054,7 @@ void CompressibleSolver::stampIbGeometry(void) {
 // leave the fields PRIMITIVE and the state scattered; this reproduces exactly
 // the sequence a stage uses, so the residual is the one the explicit march sees.
 // R(q) for the WHOLE system.  The state vector is CONSERVATIVE (that is what the
+extern __device__ i32 g_p1LimPieces;
 extern __device__ unsigned long long g_qUsed;
 extern __device__ unsigned long long g_qDecl;
 extern __device__ unsigned long long g_rcDeadFace;
@@ -1913,14 +3080,6 @@ void CompressibleSolver::reportGhostQuad(void) {
 // Per-cell Ducros-like compression sensor into F_RHOK (recon 5 only; the
 // bank is free because recon 5 is refused under RANS).  Runs on PRIMITIVES,
 // after the ghosts and before the RHS reads the traces.
-// RCCM Eq. (10): the R-Cells are reconstructed from the boundary conditions and
-// the fresh NR-Cell values.  An R-Cell's stencil may contain other R-Cells, so
-// the paper assembles ONE global system for all of them; the Jacobi sweeps here
-// are its iterative form (the same structure the implicit interface method uses).
-void CompressibleSolver::reconstructRCells(void) {
-  for (i32 it = 0; it < ibRccmIter; it++)
-    rccmReconstructKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
-}
 
 void CompressibleSolver::computeShockSensor(void) {
   shockSensorKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
@@ -2037,12 +3196,101 @@ void CompressibleSolver::computeRightHandSide(void) {
     multiDRhsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     return;
   }
+  if (p1) {   // modal P1 DG: own kernels, no reconstruction stencil
+    p1RhsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    if (leafFlux && nMortars > 0)
+      p1MortarKernel<<<(nMortars + 127)/128, 128>>>(*this);
+    if (nP1Seg > 0)  p1SegKernel<<<(nP1Seg + 127)/128, 128>>>(*this);     // cut elements: open face pieces
+    if (nP1Elem > 0) p1ElemKernel<<<(nP1Elem + 127)/128, 128>>>(*this);   // cut elements: volume rule + wall
+    return;
+  }
   computeRightHandSideKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+  if (leafFlux && nMortars > 0)
+    mortarFluxKernel<<<(nMortars + 127)/128, 128>>>(*this);   // level-jump faces: one HLLC per fine sub-face, both sides
+  if (ibRccm && immerserdBcType != 0)
+    cutCellKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // wall fluxes, extra face segments, piece walls, tip faces
   if (detFlux) gatherFaceFluxKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
 }
 
 void CompressibleSolver::updateFields(i32 stage) {
+  static const i32 cutDbgIt0 = getenv("CUTDBG_IT0") ? atoi(getenv("CUTDBG_IT0")) : -1;   // scan only once iter >= this
+  if (cutDbg > 0 && iter >= cutDbgIt0) {   // --cutdbg: who is exploding in the first RHS?
+    cudaDeviceSynchronize();
+    real *R0 = getField(F_RHS), *R1 = getField(F_RHS+1), *A = getField(F_CUTA), *Ph = getField(F_PHI);
+    i32 shown = 0, nBig = 0;
+    for (i32 b = 0; b < hashTable.nKeys; b++) {
+      u64 loc = bLocList[b]; if (loc == kEmpty) continue;
+      i32 lvl, ib, jb, kb; decode(loc, lvl, ib, jb, kb);
+      for (i32 cc = 0; cc < blockSizeTot; cc++) {
+        const i32 c = b*blockSizeTot + cc;
+        const double m = fmax(fabs((double)R0[c]), fabs((double)R1[c]));
+        if (m < cutDbgThr) continue;   // NaN fails the test and is counted as bad
+        nBig++;
+        if (shown++ < 25) {
+          const i32 o = cutOwner ? cutOwner[c] : c;
+          const i32 oc = cutIsPiece(o) ? cutPiece[cutPieceOf(o)].cell : o;
+          double pxd, pyd, dxd, dyd; cellGeomHost(c, pxd, pyd, dxd, dyd);
+          const i32 mor[4] = { cellMortar ? cellMortar[(size_t)c*4+0] : -1, cellMortar ? cellMortar[(size_t)c*4+1] : -1, cellMortar ? cellMortar[(size_t)c*4+2] : -1, cellMortar ? cellMortar[(size_t)c*4+3] : -1 };
+          printf("[cutdbg] cell %d at (%.4f,%.4f) mortars(%d,%d,%d,%d) band %d blk %d lvl %d flag %d (i,j)=(%d,%d) |Rhs|=%.3e alpha=%.3e alphaE=%.3e owner=%d (cell %d flag %d alpha %.3e) phi/h=%.3f\n",
+                 c, pxd, pyd, mor[0], mor[1], mor[2], mor[3], cutNear ? cutNear[c] : -1, b, lvl, (i32)cFlagsList[c], cc%blockSize, (cc/blockSize)%blockSize, m,
+                 (double)A[c], cutAlphaE ? (double)cutAlphaE[c] : -1.0, o, oc, (i32)cFlagsList[oc],
+                 (double)A[oc], (double)Ph[c]/(double)(domainSize[0]/(baseGridSize[0]*powi(2,lvl))));
+        }
+      }
+    }
+    printf("[cutdbg] stage %d: %d cells with |Rhs| > %.1e\n", stage, nBig, cutDbgThr);
+    if (leafFlux) {   // conversion coverage: at this point every live cell must be CONSERVATIVE
+      real *Pp = getField(F_RHOE); i32 nPrim = 0, nCons = 0, firstPrim = -1, lastPrim = -1;
+      for (i32 b = 0; b < hashTable.nKeys; b++) { if (bLocList[b] == kEmpty) continue;
+        i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb); if (!isInteriorBlock(lvl, ib, jb, kb)) continue;
+        for (i32 cc = 0; cc < blockSize*blockSize; cc++) { const i32 c = b*blockSizeTot + cc; if (cFlagsList[c] != ACTIVE) continue;
+          const double v = Pp[c];
+          if (fabs(v - 7.9365079365) < 1e-4) { nPrim++; if (firstPrim < 0) firstPrim = b; lastPrim = b; }
+          else if (fabs(v - 20.3412698413) < 1e-3) nCons++; } }
+      printf("[cutdbg] live ACTIVE interior cells: %d still primitive (blocks %d..%d), %d conservative; nLeaf %d nExt %d nKeys %d\n",
+             nPrim, firstPrim, lastPrim, nCons, nLeafBlocks, nExtBlocks, hashTable.nKeys);
+      // sort-order sanity: recompute the group of a few slots from the hash
+      for (i32 b : {0, nLeafBlocks-1, nLeafBlocks, nLeafBlocks+nExtBlocks-1, nLeafBlocks+nExtBlocks, hashTable.nKeys-1}) {
+        if (b < 0 || b >= hashTable.nKeys) continue;
+        i32 lvl, ib, jb, kb; decode(bLocList[b], lvl, ib, jb, kb);
+        i32 nAct = 0, nPar = 0; for (i32 cc = 0; cc < blockSize*blockSize; cc++) { nAct += cFlagsList[b*blockSizeTot+cc] == ACTIVE; nPar += cFlagsList[b*blockSizeTot+cc] == PARENT; }
+        printf("[cutdbg]   slot %d: lvl %d interior %d  ACTIVE %d PARENT %d\n", b, lvl, (i32)isInteriorBlock(lvl, ib, jb, kb), nAct, nPar);
+      }
+    }
+    if (nBig > 0 && leafFlux) {   // the first offender's 3x3 neighbourhood
+      i32 c0 = -1;
+      for (i32 b = 0; b < hashTable.nKeys && c0 < 0; b++) { if (bLocList[b] == kEmpty) continue;
+        for (i32 cc = 0; cc < blockSizeTot && c0 < 0; cc++) { const i32 c = b*blockSizeTot + cc;
+          if (!(fmax(fabs((double)R0[c]), fabs((double)R1[c])) < cutDbgThr)) c0 = c; } }
+      const i32 b0 = c0/blockSizeTot, cc0 = c0%blockSizeTot, i0 = cc0%blockSize, j0 = (cc0/blockSize)%blockSize;
+      real *Rho = getField(F_RHO), *U = getField(F_RHOU), *P = getField(F_RHOE);
+      for (i32 dj = 1; dj >= -1; dj--) {
+        printf("[cutdbg]   ");
+        for (i32 di = -1; di <= 1; di++) {
+          const i32 m = hostNbrIdx(nbrIdxList, b0, i0+di, j0+dj);
+          const i32 mb = m/blockSizeTot;
+          const bool ok = m < bEmpty*blockSizeTot;
+          printf("[%6d blk %4d grp %d flag %d rho %.4f u %.4f p %.4f] ", m, mb,
+                 ok ? (mb < nLeafBlocks ? 0 : (mb < nLeafBlocks + nExtBlocks ? 1 : 2)) : -1,
+                 ok ? (i32)cFlagsList[m] : -1, ok ? (double)Rho[m] : 0.0, ok ? (double)U[m] : 0.0, ok ? (double)P[m] : 0.0);
+        }
+        printf("\n");
+      }
+    }
+    cutDbg--;
+  }
   updateFieldsKernel<<<cudaGridSize, cudaBlockSize>>>(*this, stage);
+  // piece-resident DOFs advance with the same LSRK stage (before the limiters read them)
+  if (cutSplit && nCutPiece > 0) cutPieceUpdateKernel<<<(nCutPiece + 127)/128, 128>>>(*this, stage);
+  if (p1 && gradLim > 0) {
+    p1LimitKernel<<<cudaGridSize, cudaBlockSize>>>(*this);   // slopes against the neighbour means
+    static const bool noCutLim = getenv("P1_NOCUTLIM") != nullptr;   // debug switch
+    static bool pieceLimSet = false;
+    if (!pieceLimSet) { pieceLimSet = true; i32 v = getenv("P1_NOPIECELIM") ? 0 : 1; cudaMemcpyToSymbol(g_p1LimPieces, &v, sizeof(i32)); }
+    if (nP1Elem > 0 && !noCutLim) p1LimitCutKernel<<<(nP1Elem + 127)/128, 128>>>(*this);
+  }
+  // merged elements: the owner advanced, the members take its state
+  if (cutMerge && cutOwner) cutBroadcastKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
 }
 
 #ifdef USE_MGPU
@@ -3260,9 +4508,38 @@ void CompressibleSolver::totalConserved(double &mass, double &momx, double &ener
     for (i32 c = 0; c < blockSizeTot; c++) {
       i32 cIdx = bIdx*blockSizeTot + c;
       if (cFlagsList[cIdx] != ACTIVE) continue;
-      mass   += Rho [cIdx] * dV;
-      momx   += RhoU[cIdx] * dV;
-      energy += RhoE[cIdx] * dV;
+      // CUT CELLS: the conserved quantity in a cut cell is rho * (alpha dV),
+      // not rho * dV.  Without this the totals are dominated by the DEAD cells
+      // buried in the body -- which are never advanced and just hold their
+      // initial state -- so the diagnostic cannot see a wall-treatment
+      // conservation error at all.  alpha lives in F_CUTA under --ibrccm.
+      double aC = 1.0;
+      if (ibRccm && immerserdBcType) {
+        aC = (double)getField(F_CUTA)[cIdx];
+        if (cutSplit && cutSplitId && cutSplitId[cIdx] >= 0) {
+          // split cell: piece 0 carries this cell's state, every extra piece its owner's
+          const CutSplitCell &Sc = cutSplitCell[cutSplitId[cIdx]];
+          aC = (double)Sc.a0;
+          for (i32 p = 0; p < Sc.n; p++) {
+            const CutPiece &P = cutPiece[Sc.first + p];
+            if (P.owner == CUT_DEAD) continue;
+            if (cutIsPiece(P.owner)) {
+              const i32 k = cutPieceOf(P.owner); const size_t cap = cutPieceQCap;
+              mass   += cutPieceQ[k]       * dV * (double)P.a;
+              momx   += cutPieceQ[cap + k] * dV * (double)P.a;
+              energy += cutPieceQ[4*cap+k] * dV * (double)P.a;
+            } else {
+              mass   += Rho [P.owner] * dV * (double)P.a;
+              momx   += RhoU[P.owner] * dV * (double)P.a;
+              energy += RhoE[P.owner] * dV * (double)P.a;
+            }
+          }
+        }
+        if (!(aC > (double)ibRccmAlphaMin)) continue;   // dead cell: no fluid in it
+      }
+      mass   += Rho [cIdx] * dV * aC;
+      momx   += RhoU[cIdx] * dV * aC;
+      energy += RhoE[cIdx] * dV * aC;
     }
   }
 }
@@ -3297,7 +4574,7 @@ __device__ real CompressibleSolver::lim(real &r) {
   return ((r > 0.0 && r < 1.0) ? (2.0*r + r*r*r) / (1.0 + 2.0*r*r) : r);
 }
 
-__device__ real CompressibleSolver::tvdRec(real &ul, real &uc, real &ur, real theta) {
+__device__ real CompressibleSolver::tvdRec(real &ul, real &uc, real &ur, real theta, i32 rc) {
   // NVD-form face reconstruction: face = ul + psi(phi)*(ur - ul), where
   // phi = (uc-ul)/(ur-ul) is the normalised variable (== the limiter ratio r).
   // The stencil (ul,uc,ur) is ordered upwind->downwind, so the same formula
@@ -3305,7 +4582,8 @@ __device__ real CompressibleSolver::tvdRec(real &ul, real &uc, real &ur, real th
   real du  = ur - ul;
   real phi = (uc - ul) / (copysign(1.0, du)*fmax(abs(du), (real)1e-32));
   real psi;
-  if (recon == 1) {
+  const i32 rcx = (rc < 0) ? recon : rc;      // --reconfar: a far cell asks for its own 1-D scheme
+  if (rcx == 1) {
     // ROUND (Huang et al. 2026, Eq. 4.1)
     if (phi <= 0.0)
       psi = fmax(fmin((real)0.5*phi + (real)0.5, (real)-1.5*phi - (real)1.8),
@@ -3316,7 +4594,7 @@ __device__ real CompressibleSolver::tvdRec(real &ul, real &uc, real &ur, real th
     else
       psi = (real)0.5*phi + (real)0.5;
   }
-  else if (recon == 2) {
+  else if (rcx == 2) {
     // LD-ROUND (Huang et al. 2026, Eq. 4.2): ROUND blended toward the 3rd-order
     // upwind line psi = 1/3 + (5/6)phi with quartic weights about phi = 1/2
     if (phi <= 0.0) {
@@ -3337,25 +4615,25 @@ __device__ real CompressibleSolver::tvdRec(real &ul, real &uc, real &ur, real th
       psi = (real)0.5*phi + (real)0.5;
     }
   }
-  else if (recon == 4) {
+  else if (rcx == 4) {
     // van Leer harmonic limiter in NVD form: MUSCL face u_c + (B(r)/2)(u_c-u_l)
     // with B(r) = 2r/(1+r) maps to psi = phi(2-phi) on 0 < phi < 1 (parabola
     // through (0,0),(1,1)); outside the TVD region fall back to upwind (u_c).
     psi = (phi > 0.0 && phi < 1.0) ? phi*((real)2.0 - phi) : phi;
   }
-  else if (recon == 3) {
+  else if (rcx == 3) {
     // unlimited 3rd-order upwind parabola (kappa = 1/3 MUSCL): the psi-line the
     // ROUND schemes blend toward, with no limiting at all.
     //   face = -1/6 ul + 5/6 uc + 1/3 ur
     // For SMOOTH tests only -- oscillates at shocks.
     psi = (real)(1.0/3.0) + (real)(5.0/6.0)*phi;
   }
-  else if (recon == 6) {
+  else if (rcx == 6) {
     // gradient MUSCL: the face states are built in the RHS kernel from a
     // limited least-squares gradient, so this 1-D path is never consulted.
     psi = (real)(1.0/3.0) + (real)(5.0/6.0)*phi;
   }
-  else if (recon == 5) {
+  else if (rcx == 5) {
     // Ducros-blended third order: the unlimited kappa=1/3 parabola pulled
     // toward the van Leer limiter by the per-face shock sensor theta
     // (max of the two adjacent cells' compression sensors, from F_RHOK).

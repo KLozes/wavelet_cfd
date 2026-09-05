@@ -12,7 +12,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-out, expf, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+out, expf, args = sys.argv[1], sys.argv[2], [a for a in sys.argv[3:] if not a.startswith("--title=")]
 G, M = 1.4, 0.729
 cpStar = 2/(G*M*M)*(((2 + (G-1)*M*M)/(G+1))**(G/(G-1)) - 1)
 grid = np.linspace(0.0, 1.0, 400)
@@ -35,7 +35,10 @@ def cn_shock(xu, cu, xl, cl):
     CN = np.trapezoid(il - iu, grid)
     w = (grid > 0.15) & (grid < 0.95)           # ignore the LE peak
     d = np.diff(iu)[w[:-1]]
-    xs = grid[w][:-1][np.argmax(d)] if len(d) else np.nan
+    # d[i] is the rise from grid[i] to grid[i+1] for the windowed i, so it has
+    # the SAME length as grid[w]; the old grid[w][:-1] was one short and threw
+    # IndexError whenever the steepest rise fell on the last windowed point.
+    xs = grid[w][np.argmax(d)] if len(d) else np.nan
     return CN, xs
 
 
@@ -73,8 +76,14 @@ ax.text(0.015, 0.03, txt, transform=ax.transAxes, fontsize=8, family="monospace"
 
 ax.invert_yaxis(); ax.set_xlim(-0.02, 1.02); ax.set_ylim(1.35, -1.6)
 ax.set_xlabel("x/c"); ax.set_ylabel("$C_p$")
-ax.set_title("RAE 2822 case 9  —  M$_\\infty$=0.729, $\\alpha$=2.31$^\\circ$, Re=6.5$\\times$10$^6$\n"
-             "immersed wall-modelled RANS (SA) vs Cook, McDonald & Firmin", fontsize=11)
+# The solver decides whether a run is inviscid or RANS; this script cannot know,
+# and hardcoding "wall-modelled RANS (SA)" mislabelled every Euler figure it made.
+# Pass --title to say what was actually run; the default states only the case.
+_ti = "computed vs Cook, McDonald & Firmin (AGARD AR-138)"
+for _a in sys.argv[1:]:
+    if _a.startswith("--title="): _ti = _a.split("=", 1)[1]
+ax.set_title("RAE 2822 case 9  —  M$_\\infty$=0.729, $\\alpha$=2.31$^\\circ$; experiment Re=6.5$\\times$10$^6$\n"
+             + _ti, fontsize=11)
 ax.grid(alpha=0.3); ax.legend(fontsize=8, ncol=2, loc="upper right", framealpha=0.93)
 fig.tight_layout(); fig.savefig(out, dpi=140)
 print("wrote", out)

@@ -378,10 +378,25 @@ void MultiLevelSparseGrid::adaptGrid(void) {
   }
 }
 
+void MultiLevelSparseGrid::allocLeafTables(void) {
+  if (chldIdxList) return;
+  cudaMallocManaged(&chldIdxList, (size_t)8*nBlocksMax*sizeof(i32));
+  cudaMallocManaged(&cellMortar, (size_t)4*blockSizeTot*nBlocksMax*sizeof(i32));
+  cudaMallocManaged(&rimList,    (size_t)blockSizeTot*nBlocksMax*sizeof(i32));
+  cudaMemset(rimList, 0, (size_t)blockSizeTot*nBlocksMax*sizeof(i32));
+  cudaMallocManaged(&mortarCnt,  sizeof(i32));
+  mortarCap = 2*blockSize*nBlocksMax;
+  cudaMallocManaged(&mortarList, (size_t)mortarCap*sizeof(Mortar));
+  cudaMemset(chldIdxList, 0, (size_t)8*nBlocksMax*sizeof(i32));
+  cudaMemset(cellMortar, 0xff, (size_t)4*blockSizeTot*nBlocksMax*sizeof(i32));   // -1 everywhere
+  cudaMemset(mortarCnt,  0, sizeof(i32));
+  cudaDeviceSynchronize();
+}
+
 void MultiLevelSparseGrid::sortBlocks(void) {
 
   cudaDeviceSynchronize();
-  if (sortCurve) {
+  if (sortCurve || leafFlux) {
     // sort along a level-major space-filling curve (Hilbert/Morton) instead of
     // the row-major location code: face neighbors in all directions and sibling
     // octets land close in memory (locality for gather-heavy solvers).  The loc
@@ -403,8 +418,26 @@ void MultiLevelSparseGrid::sortBlocks(void) {
   if (!lean) {   // parent/neighbor indices + cell flags are flow-solver-only
     updatePrntIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     updateNbrIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    if (leafFlux) allocLeafTables();
     flagActiveCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
     flagParentCellsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+    if (leafFlux) {
+      // leaf mode: children, the sort groups, and the mortar faces at level jumps
+      dbgCnt[8] = 0; dbgCnt[9] = 0;
+      cudaDeviceSynchronize();
+      cudaMemset(mortarCnt, 0, sizeof(i32));          // reused as the group counter first
+      countSortGroupsKernel<<<cudaGridSize, cudaBlockSize>>>(*this, dbgCnt + 8);   // [8] = leaf-bearing, [9] = exterior
+      cudaDeviceSynchronize();
+      nLeafBlocks = dbgCnt[8]; nExtBlocks = dbgCnt[9];
+      updateChldIndicesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+      resetLeafFacesKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+      cudaMemset(mortarCnt, 0, sizeof(i32));
+      cudaDeviceSynchronize();
+      buildMortarsKernel<<<cudaGridSize, cudaBlockSize>>>(*this);
+      cudaDeviceSynchronize();
+      nMortars = *mortarCnt;
+      if (nMortars > mortarCap) { printf("[leaf] mortar capacity exceeded (%d > %d)\n", nMortars, mortarCap); nMortars = mortarCap; }
+    }
   }
   cudaDeviceSynchronize();
 }

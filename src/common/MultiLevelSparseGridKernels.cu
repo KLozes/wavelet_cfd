@@ -107,6 +107,98 @@ __global__ void updateNbrIndicesKernel(MultiLevelSparseGrid &grid) {
 
 }
 
+// --leaf: count the sort groups from the (already sorted) keys
+__global__ void countSortGroupsKernel(MultiLevelSparseGrid &grid, i32 *cnt) {
+  START_BLOCK_LOOP
+    if (grid.bLocList[bIdx] != kEmpty) {
+      const u64 g = grid.sortKeyList[bIdx] >> 62;
+      if (g == 0) atomicAdd(&cnt[0], 1);
+      else if (g == 1) atomicAdd(&cnt[1], 1);
+    }
+  END_BLOCK_LOOP
+}
+
+// --leaf: child block slots (4 in pseudo-2D, 8 in 3-D), bEmpty where absent
+__global__ void updateChldIndicesKernel(MultiLevelSparseGrid &grid) {
+  if (blockIdx.x == 0 && threadIdx.x < 8) grid.chldIdxList[(size_t)bEmpty*8 + threadIdx.x] = bEmpty;
+  START_BLOCK_LOOP
+    u64 loc = grid.bLocList[bIdx];
+    if (loc != kEmpty) {
+      i32 lvl, ib, jb, kb; grid.decode(loc, lvl, ib, jb, kb);
+      for (i32 o = 0; o < 8; o++) {
+        i32 c = bEmpty;
+        if (lvl < grid.nLvls - 1 && (o < 4 || !grid.pseudo2D))
+          c = grid.getBlockIdx(grid.encode(lvl+1, 2*ib + (o&1), 2*jb + ((o>>1)&1), grid.pseudo2D ? kb : 2*kb + (o>>2)));
+        grid.chldIdxList[(size_t)bIdx*8 + o] = c;
+      }
+    }
+  END_BLOCK_LOOP
+}
+
+__global__ void resetLeafFacesKernel(MultiLevelSparseGrid &grid) {
+  START_BLOCK_LOOP
+    for (i32 c = 0; c < 4*blockSizeTot; c++) grid.cellMortar[(size_t)bIdx*4*blockSizeTot + c] = -1;
+  END_BLOCK_LOOP
+}
+
+// --leaf: one mortar per COARSE face at a level jump, built from the FINE side:
+// an interior block at lvl > 0 whose same-level face neighbour is missing sits
+// against a coarser block (the parent ring guarantees exactly one level
+// coarser).  The two fine cells sharing a coarse face (tangential pair) form
+// one mortar; both blocks' face tables point at it.
+__global__ void buildMortarsKernel(MultiLevelSparseGrid &grid) {
+  START_BLOCK_LOOP
+    u64 loc = grid.bLocList[bIdx];
+    i32 lvl, ib, jb, kb;
+    if (loc != kEmpty) {
+      grid.decode(loc, lvl, ib, jb, kb);
+      if (lvl > 0 && grid.isInteriorBlock(lvl, ib, jb, kb)) {
+        const real dx = grid.domainSize[0]/(grid.baseGridSize[0]*powi(2,lvl));
+        const real dy = grid.domainSize[1]/(grid.baseGridSize[1]*powi(2,lvl));
+        for (i32 d = 0; d < 4; d++) {
+          const i32 di = (d == 0) ? -1 : (d == 1) ? 1 : 0;
+          const i32 dj = (d == 2) ? -1 : (d == 3) ? 1 : 0;
+          // the same-level neighbour slot (nbrIdxList order: (di+1) + 3(dj+1) + 9)
+          const i32 nb = grid.nbrIdxList[(size_t)bIdx*27 + (di+1) + 3*(dj+1) + 9];
+          if (nb != bEmpty) continue;                       // same level: no mortar
+          const i32 cb = grid.getBlockIdx(grid.encode(lvl-1, (ib+di) >> 1, (jb+dj) >> 1, kb/2));
+          if (cb == bEmpty) continue;                       // no coarser block either (counted by the debug check)
+          i32 clvl, cib, cjb, ckb; grid.decode(grid.bLocList[cb], clvl, cib, cjb, ckb);
+          const bool xFace = (d < 2);
+          for (i32 t = 0; t < blockSize; t += 2) {         // tangential pairs (t, t+1)
+            const i32 m = atomicAdd(grid.mortarCnt, 1);
+            if (m >= grid.mortarCap) continue;
+            MultiLevelSparseGrid::Mortar &M = grid.mortarList[m];
+            // fine cells: the block-face row/column, tangential index t and t+1
+            const i32 iF = xFace ? ((d == 0) ? 0 : blockSize-1) : t;
+            const i32 jF = xFace ? t : ((d == 2) ? 0 : blockSize-1);
+            const i32 f0 = bIdx*blockSizeTot + iF + jF*blockSize;
+            const i32 f1 = xFace ? f0 + blockSize : f0 + 1;
+            M.fine[0] = f0; M.fine[1] = f1;
+            // the coarse cell across: global fine coordinates of the neighbour position
+            const i32 I = ib*blockSize + iF + di, J = jb*blockSize + jF + dj;
+            const i32 ci = (I >> 1) - cib*blockSize, cj = (J >> 1) - cjb*blockSize;
+            M.coarse = cb*blockSizeTot + ci + cj*blockSize;
+            M.dir = xFace ? 0 : 1;
+            M.side = (d == 0 || d == 2) ? 0 : 1;             // coarse on the low side for the low faces
+            // sub-face centroids (physical): the fine cells' face
+            for (i32 q = 0; q < 2; q++) {
+              const i32 iq = xFace ? iF : t + q, jq = xFace ? t + q : jF;
+              const real xf = (ib*blockSize + iq + (d == 1 ? 1 : 0))*dx + (xFace ? 0 : (real)0.5*dx);
+              const real yf = (jb*blockSize + jq + (d == 3 ? 1 : 0))*dy + (xFace ? (real)0.5*dy : 0);
+              M.cen[q][0] = xf; M.cen[q][1] = yf;
+            }
+            // per-cell face registration: both fine cells (face d) and the coarse cell (its opposite face)
+            grid.cellMortar[(size_t)f0*4 + d] = m;
+            grid.cellMortar[(size_t)f1*4 + d] = m;
+            grid.cellMortar[(size_t)M.coarse*4 + (d ^ 1)] = m;
+          }
+        }
+      }
+    }
+  END_BLOCK_LOOP
+}
+
 // level-major space-filling-curve sort keys (sortCurve == 1): Hilbert in
 // pseudo2D (no diagonal jumps), Morton in 3D.  Dead slots sort last.
 __device__ static u64 devHilbert2D(i32 x, i32 y) {
@@ -138,6 +230,28 @@ __global__ void buildSortKeysKernel(MultiLevelSparseGrid &grid) {
       i32 lvl, ib, jb, kb;
       grid.decode(loc, lvl, ib, jb, kb);
       u64 curve = grid.pseudo2D ? devHilbert2D(ib, jb) : devMorton3D(ib, jb, kb);
+      if (grid.leafFlux) {
+        // --leaf: group bits above the level so the per-stage kernels can stop
+        // at the last leaf-bearing block: 0 = interior with a leaf cell,
+        // 1 = exterior (boundary ring), 2 = fully covered by children
+        u64 grp = 1;
+        if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
+          grp = 0;
+          if (lvl < grid.nLvls - 1) {
+            bool covered = true;
+            for (i32 o = 0; o < (grid.pseudo2D ? 4 : 8) && covered; o++)
+              if (grid.getBlockIdx(grid.encode(lvl+1, 2*ib + (o&1), 2*jb + ((o>>1)&1),
+                                               grid.pseudo2D ? kb : 2*kb + (o>>2))) == bEmpty) covered = false;
+            if (covered) grp = 2;
+          }
+        }
+        // inside a group keep the DEFAULT order (level-major, row-major k,j,i:
+        // x-neighbours adjacent in memory) unless a curve was asked for -- the
+        // Hilbert order measured 2.3x slower on the RAE main kernel
+        const u64 within = grid.sortCurve ? (curve & ((1ull << 54) - 1))
+                         : (((u64)(kb+1) << 36) | ((u64)(jb+1) << 18) | (u64)(ib+1));
+        grid.sortKeyList[bIdx] = (grp << 62) | ((u64)lvl << 56) | within;
+      } else
       grid.sortKeyList[bIdx] = ((u64)lvl << 60) | curve;
     }
   END_BLOCK_LOOP
@@ -152,9 +266,26 @@ __global__ void flagActiveCellsKernel(MultiLevelSparseGrid &grid) {
     u64 loc = grid.bLocList[bIdx];
     grid.decode(loc, lvl, ib, jb, kb);
 
-    if (grid.leafMode) {
-      // leaf-only partition: every interior cell is a live solution node
+    if (grid.leafMode || grid.leafFlux) {
+      // leaf-only partition: every interior cell is a live solution node.  Under
+      // leafFlux the covered ones are then demoted to PARENT by flagParentCells,
+      // and a level jump is a block face served by a mortar -- no interior rim.
       grid.cFlagsList[cIdx] = grid.isInteriorBlock(lvl, ib, jb, kb) ? ACTIVE : GHOST;
+      if (grid.leafFlux && grid.rimList) {
+        // remember the old rim (the overlap scheme's ghost cells) for the wavelet
+        // thresholding, which must not see their detail
+        i32 rim = 0;
+        if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
+          const i32 cEmpty = bEmpty * blockSizeTot;
+          const i32 kk = grid.pseudo2D ? k : k;
+          i32 i00 = grid.getNbrIdx(bIdx, i-haloSize, j-haloSize, kk);
+          i32 i10 = grid.getNbrIdx(bIdx, i+haloSize, j-haloSize, kk);
+          i32 i01 = grid.getNbrIdx(bIdx, i-haloSize, j+haloSize, kk);
+          i32 i11 = grid.getNbrIdx(bIdx, i+haloSize, j+haloSize, kk);
+          if (i00 >= cEmpty || i10 >= cEmpty || i01 >= cEmpty || i11 >= cEmpty) rim = 1;
+        }
+        grid.rimList[cIdx] = rim;
+      }
     }
     else if (grid.isInteriorBlock(lvl, ib, jb, kb)) {
 
